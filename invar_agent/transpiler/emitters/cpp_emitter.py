@@ -283,10 +283,19 @@ class CppEmitter:
             return f"({cond} ? {self._num(then)} : {self._num(other)})"
         if t == "subscript":
             value = node.get("value")
-            idx = self.emit_expr(node.get("slice"))
-            if self._type_of(node.get("slice")) != INT:
+            slice_node = node.get("slice")
+            base = self.emit_expr(value)
+            # Python negative indexing (x[-k] == x[size - k]) is UB in C++;
+            # lower it to a bounds-safe size-relative calculation.
+            if (isinstance(slice_node, dict) and slice_node.get("type") == "unaryop"
+                    and slice_node.get("op") == "-"
+                    and self._type_of(slice_node.get("operand")) == INT):
+                operand = self.emit_expr(slice_node.get("operand"))
+                return (f"{base}[static_cast<long>({base}.size()) - ({operand})]")
+            idx = self.emit_expr(slice_node)
+            if self._type_of(slice_node) != INT:
                 idx = f"static_cast<long>({idx})"
-            return f"{self.emit_expr(value)}[{idx}]"
+            return f"{base}[{idx}]"
         if t == "list":
             elems = node.get("elements") or []
             if elems and (elems[0] or {}).get("type") == "list":
