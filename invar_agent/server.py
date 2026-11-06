@@ -512,10 +512,22 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         return _agent_sse_response(agent, prompt, [], {}, None)
 
     @app.get("/api/workspace/tree")
-    def api_workspace_tree() -> dict[str, Any]:
+    def api_workspace_tree(show_hidden_artifacts: bool = Query(False)) -> dict[str, Any]:
         root = state.workspace_root.resolve()
 
-        skip = {".git", "__pycache__", ".pytest_cache", ".invar_agent", "target", "node_modules", ".venv"}
+        # Build artifacts and internal scratch never clutter the explorer by
+        # default; dot-directories (.invar, .git, .venv) are always hidden
+        # unless the user explicitly toggles hidden artifacts on.
+        dir_skip = {"__pycache__", "target", "dist", "build", "node_modules"}
+        file_skip_suffixes = (".so", ".dylib", ".dll", ".o", ".a", ".pyc")
+        file_skip_names = {".gitignore", ".env"}
+
+        def _hidden(name: str) -> bool:
+            if name.startswith("."):
+                return not show_hidden_artifacts
+            if name in dir_skip or name.endswith(".egg-info"):
+                return True
+            return False
 
         def build(directory: Path, depth: int = 0) -> dict[str, Any]:
             node: dict[str, Any] = {"name": directory.name or str(directory), "type": "folder", "children": []}
@@ -526,12 +538,18 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
             except OSError:
                 return node
             for entry in entries:
-                if entry.name in skip or entry.name.startswith(".git"):
+                name = entry.name
+                if _hidden(name):
                     continue
                 if entry.is_dir():
                     node["children"].append(build(entry, depth + 1))
                 elif entry.is_file():
-                    node["children"].append({"name": entry.name, "type": "file", "size": entry.stat().st_size})
+                    if not show_hidden_artifacts and (
+                            name in file_skip_names or name.endswith(file_skip_suffixes)):
+                        continue
+                    node["children"].append({"name": name, "type": "file", "size": entry.stat().st_size})
+            # Pin the comprehensive research report at the top of its folder.
+            node["children"].sort(key=lambda c: (0 if c.get("name") == "research_report.md" else 1, c["name"].lower()))
             return node
 
         return build(root)

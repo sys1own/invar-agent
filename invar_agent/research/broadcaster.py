@@ -88,7 +88,8 @@ class ResearchRunManager:
             self.workspace_root / "research", progress_cb=self._progress,
             llm_planner=self.llm_planner, llm_fast=self.llm_fast,
             search_client=self.search_client,
-            abort_flag=self._abort.is_set)
+            abort_flag=self._abort.is_set,
+            workspace_root=self.workspace_root)
         self.active_state = ResearchRunState(blueprint=bp)
 
         def _run() -> None:

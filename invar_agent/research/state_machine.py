@@ -366,7 +366,8 @@ class ResearchStateMachine:
                  llm_fast: Optional[LLMFn] = None,
                  search_client: Optional[LiteratureSearchClient] = None,
                  stage_synthesizer: Optional[StageSynthFn] = None,
-                 abort_flag: Optional[Callable[[], bool]] = None):
+                 abort_flag: Optional[Callable[[], bool]] = None,
+                 workspace_root: Optional[Path] = None):
         self.workspace = Path(workspace)
         self.progress_cb = progress_cb
         self.llm_planner = llm_planner
@@ -374,7 +375,13 @@ class ResearchStateMachine:
         self.search_client = search_client
         self.stage_synthesizer = stage_synthesizer
         self.abort_flag = abort_flag
-        self.bridge = DynamicCABIBridge(self.workspace / "cabi")
+        # Compiler scratch is isolated under <workspace>/.invar/scratch/cabi
+        # (hidden from the file explorer) instead of cluttering research/cabi.
+        root = Path(workspace_root) if workspace_root else (
+            self.workspace.parent if self.workspace.name == "research"
+            else self.workspace)
+        self.workspace_root = root
+        self.bridge = DynamicCABIBridge(root / ".invar" / "scratch" / "cabi")
         self.overlay_dir = Path(tempfile.mkdtemp(prefix="invar-research-"))
         self.scheduler = GoIContractScheduler()
 
@@ -499,6 +506,8 @@ class ResearchStateMachine:
                                 "checkpoint preserved and exported"})
                 else:
                     state.status = "ABORTED" if state.aborted else "FAILED"
+                if state.status in ("PARTIAL", "FAILED"):
+                    await self._emit_report(state)
                 return state
             stage += 1
 
@@ -510,21 +519,42 @@ class ResearchStateMachine:
                 "verified_stages": len(pinned_layers),
                 "unified_module_hash": code_hash(state.blueprint.unified_module_code or ""),
                 "checkpoint_path": state.checkpoint_path})
-        if state.status in ("VERIFIED", "PARTIAL"):
+        if state.status in ("VERIFIED", "PARTIAL", "FAILED"):
             await self._emit_report(state)
         return state
 
     async def _emit_report(self, state: ResearchRunState) -> None:
-        """Synthesize and stream the Final Quantitative Research Report."""
+        """Synthesize, persist and stream the Comprehensive Research Report."""
         await self._emit("accelerator_log", "synthesizing_report", {
             "research_stage": state.research_stage, "status": state.status})
         try:
-            from .report import build_research_report
-            state.report = build_research_report(state)
+            from .reporter import generate_comprehensive_research_report
+            telemetry: Dict[str, Any] = {}
+            if state.results:
+                telemetry = dict(state.results[-1].telemetry)
+            state.report = generate_comprehensive_research_report(
+                state.blueprint, telemetry, state.literature,
+                results=state.results, status=state.status,
+                checkpoint_path=state.checkpoint_path)
         except Exception as exc:  # noqa: BLE001 - report is best-effort
             state.report = f"(report synthesis failed: {str(exc)[:200]})"
-        await self._emit("accelerator_log", "research_report", {
-            "status": state.status, "report": state.report})
+        # Persist: workspace root + archived checkpoint copy.
+        report_path: Optional[Path] = None
+        try:
+            root_report = self.workspace_root / "research_report.md"
+            root_report.parent.mkdir(parents=True, exist_ok=True)
+            root_report.write_text(state.report, encoding="utf-8")
+            report_path = root_report
+            ckpt_dir = self.workspace / "checkpoints" / state.blueprint.blueprint_id
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            (ckpt_dir / "research_report.md").write_text(state.report, encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001 - persistence is best-effort
+            await self._emit("accelerator_log", "report_persist_error",
+                             {"error": str(exc)[:200]})
+        await self._emit("accelerator_log", "research_completed", {
+            "status": state.status,
+            "report": state.report,
+            "report_path": str(report_path) if report_path else ""})
 
     # -- one round through the nine stages ------------------------------------
     async def _run_round(self, state: ResearchRunState, *, stage: int, attempt: int,
