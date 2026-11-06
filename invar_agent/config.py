@@ -17,16 +17,52 @@ class Tier(str, Enum):
 
 
 DEFAULT_TIER_MODELS: Dict[str, Dict[str, str]] = {
-    "gemini": {"fast": "gemini-2.5-flash", "reasoning": "gemini-2.5-pro"},
-    "openai": {"fast": "gpt-4o-mini", "reasoning": "gpt-4o"},
+    # Gemini 2.5 models are legacy (access-limited for new projects per the
+    # deprecations doc); current GA IDs verified against the live
+    # /v1beta/openai/models listing on 2026-11-06.
+    "gemini": {"fast": "gemini-3.8-flash", "reasoning": "gemini-3.1-pro-preview"},
+    "openai": {"fast": "gpt-5.4-mini", "reasoning": "gpt-5.5-pro"},
     # DeepSeek retired deepseek-chat / deepseek-reasoner on 2026-07-24; the
     # current IDs are deepseek-flash (V4.1-Flash) and deepseek-v4-pro (V4-Pro).
     "deepseek": {"fast": "deepseek-flash", "reasoning": "deepseek-v4-pro"},
     "openrouter": {"fast": "openrouter/auto", "reasoning": "openrouter/auto"},
 }
 
+# Ordered fallback candidates per provider/tier, used to auto-pick a model when
+# the resolved default is missing from the provider's live /models listing.
+TIER_MODEL_PREFERENCES: Dict[str, Dict[str, list]] = {
+    "gemini": {
+        "fast": ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+                 "gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"],
+        "reasoning": ["gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-2.5-pro"],
+    },
+    "openai": {
+        "fast": ["gpt-5.4-mini", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"],
+        "reasoning": ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5", "gpt-4o"],
+    },
+    "deepseek": {"fast": ["deepseek-flash"], "reasoning": ["deepseek-v4-pro"]},
+    "openrouter": {"fast": ["openrouter/auto"], "reasoning": ["openrouter/auto"]},
+}
+
 # Retired DeepSeek model IDs — never valid, kept only so tests can assert their absence.
 RETIRED_DEEPSEEK_MODELS = frozenset({"deepseek-chat", "deepseek-reasoner"})
+
+# Expected API-key prefixes, used only for soft mismatch warnings.
+PROVIDER_KEY_PREFIXES: Dict[str, str] = {
+    "gemini": "AIza",
+    "openrouter": "sk-or-",
+    "deepseek": "sk-",
+    "openai": "sk-",
+}
+
+PROVIDER_KEY_ENVS: Dict[str, str] = {
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+GENERIC_KEY_ENV = "INVAR_API_KEY"
+PROVIDER_ENV_VAR = "INVAR_LLM_PROVIDER"
 
 DEFAULT_CONFIG_PATH = Path.home() / ".invar-agent" / "config.json"
 
@@ -96,7 +132,21 @@ def resolve_tier_model(
     file_config: Optional[Dict[str, Any]] = None,
     override: Optional[Any] = None,
 ) -> Optional[str]:
-    """Return the model name for ``provider`` and ``tier``.
+    """Return the model name for ``provider`` and ``tier`` (see precedence below)."""
+    model, _source = resolve_tier_model_source(provider, tier, file_config=file_config, override=override)
+    return model
+
+
+def resolve_tier_model_source(
+    provider: str,
+    tier: str | Tier,
+    file_config: Optional[Dict[str, Any]] = None,
+    override: Optional[Any] = None,
+) -> tuple[Optional[str], str]:
+    """Like :func:`resolve_tier_model` but also reports where the value came from.
+
+    Returns ``(model, source)`` with ``source`` one of ``"override"``, ``"env"``,
+    ``"file"``, ``"default"`` or ``"unknown"``.
 
     Resolution precedence (first hit wins):
     1. Explicit override (a model string or an object with a ``model`` attribute).
@@ -109,7 +159,7 @@ def resolve_tier_model(
     if override is not None:
         model = override if isinstance(override, str) else getattr(override, "model", None)
         if isinstance(model, str) and model.strip():
-            return model.strip()
+            return model.strip(), "override"
 
     provider = (provider or "").lower()
     tier_value = tier.value if isinstance(tier, Tier) else str(tier).lower()
@@ -118,17 +168,79 @@ def resolve_tier_model(
     if provider_env:
         model = _parse_tier_env(provider_env, provider, tier_value)
         if model:
-            return model
+            return model, "env"
 
     env_value = os.environ.get(_tier_env_name(tier_value))
     if env_value:
         model = _parse_tier_env(env_value, provider, tier_value)
         if model:
-            return model
+            return model, "env"
 
     config = file_config if file_config is not None else load_file_config()
     model = _file_config_model(config, provider, tier_value)
     if model:
-        return model
+        return model, "file"
 
-    return copy.deepcopy(DEFAULT_TIER_MODELS).get(provider, {}).get(tier_value)
+    default = copy.deepcopy(DEFAULT_TIER_MODELS).get(provider, {}).get(tier_value)
+    if default:
+        return default, "default"
+    return None, "unknown"
+
+
+def detect_llm_from_env() -> Dict[str, Optional[str]]:
+    """Auto-detect provider and API key from the environment.
+
+    ``INVAR_LLM_PROVIDER`` picks the provider explicitly; otherwise exactly one
+    provider key present in the environment selects it. Returns
+    ``{"provider": ..., "api_key": ...}`` (either may be None).
+    """
+    provider_pref = (os.environ.get(PROVIDER_ENV_VAR) or "").strip().lower() or None
+    keys = {p: (os.environ.get(env) or "").strip() for p, env in PROVIDER_KEY_ENVS.items()}
+    present = {p for p, k in keys.items() if k}
+
+    if provider_pref:
+        api_key = keys.get(provider_pref) or (os.environ.get(GENERIC_KEY_ENV) or "").strip() or None
+        return {"provider": provider_pref, "api_key": api_key}
+    if len(present) == 1:
+        only = next(iter(present))
+        api_key = keys[only] or (os.environ.get(GENERIC_KEY_ENV) or "").strip() or None
+        return {"provider": only, "api_key": api_key}
+    return {"provider": None, "api_key": None}
+
+
+def persist_config(
+    provider: str,
+    tier_overrides: Optional[Dict[str, str]] = None,
+    api_key: Optional[str] = None,
+    path: Optional[str | Path] = None,
+) -> Path:
+    """Persist provider + explicit tier overrides to the config file (0600).
+
+    The API key is only persisted when ``INVAR_PERSIST_KEY=1`` is set.
+    """
+    config_path = Path(path) if path else Path(os.environ.get("INVAR_CONFIG_PATH", DEFAULT_CONFIG_PATH))
+    payload: Dict[str, Any] = {"provider": provider}
+    overrides = {k: v for k, v in (tier_overrides or {}).items() if isinstance(v, str) and v.strip()}
+    if overrides:
+        payload["tier_models"] = {provider: overrides}
+    if api_key and os.environ.get("INVAR_PERSIST_KEY") == "1":
+        payload["api_key"] = api_key
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(config_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.chmod(str(config_path), 0o600)
+    return config_path
+
+
+def load_persisted_state(path: Optional[str | Path] = None) -> Dict[str, Any]:
+    """Load persisted provider/overrides (and key only with INVAR_PERSIST_KEY=1)."""
+    data = load_file_config(path)
+    api_key = data.get("api_key") if isinstance(data.get("api_key"), str) else None
+    if os.environ.get("INVAR_PERSIST_KEY") != "1":
+        api_key = None
+    return {
+        "provider": data.get("provider") if isinstance(data.get("provider"), str) else None,
+        "api_key": api_key,
+        "tier_models": data.get("tier_models") if isinstance(data.get("tier_models"), dict) else {},
+    }
