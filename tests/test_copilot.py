@@ -76,11 +76,11 @@ def test_format_copilot_response_returns_legacy_action():
 # ---------------------------------------------------------------------------
 
 def test_resolve_tier_model_defaults_and_precedence(monkeypatch):
-    assert resolve_tier_model("gemini", Tier.FAST) == "gemini-2.5-flash"
-    assert resolve_tier_model("gemini", Tier.REASONING) == "gemini-2.5-pro"
-    assert resolve_tier_model("openai", Tier.FAST) == "gpt-4o-mini"
-    assert resolve_tier_model("deepseek", Tier.FAST) == "deepseek-flash"
-    assert resolve_tier_model("deepseek", Tier.REASONING) == "deepseek-v4-pro"
+    assert resolve_tier_model("gemini", Tier.FAST, file_config={}) == "gemini-3.8-flash"
+    assert resolve_tier_model("gemini", Tier.REASONING, file_config={}) == "gemini-3.1-pro-preview"
+    assert resolve_tier_model("openai", Tier.FAST, file_config={}) == "gpt-5.4-mini"
+    assert resolve_tier_model("deepseek", Tier.FAST, file_config={}) == "deepseek-flash"
+    assert resolve_tier_model("deepseek", Tier.REASONING, file_config={}) == "deepseek-v4-pro"
 
     # Explicit override wins over everything.
     assert resolve_tier_model("gemini", Tier.FAST, override="custom-model") == "custom-model"
@@ -189,6 +189,7 @@ def client(tmp_path, monkeypatch):
     for var in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
                 "OPENROUTER_API_KEY", "INVAR_API_KEY", "INVAR_LLM_PROVIDER"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "invar-config.json"))
     ws = tmp_path / "ws"
     ws.mkdir()
     _sample_workspace(ws)

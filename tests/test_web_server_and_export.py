@@ -25,6 +25,10 @@ def _sample_workspace(tmp_path):
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
+    for var in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+                "OPENROUTER_API_KEY", "INVAR_API_KEY", "INVAR_LLM_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "invar-config.json"))
     ws = tmp_path / "ws"
     ws.mkdir()
     _sample_workspace(ws)
@@ -115,15 +119,28 @@ def test_exports(client):
     assert bad.status_code == 404
 
 
-def test_config_endpoint(client):
+def test_config_endpoint(client, monkeypatch):
     tc, _ = client
+
+    def fake_validate(provider, api_key, tier_overrides=None, **kwargs):
+        return {"valid": True, "error": None, "models": ["gemini-3.8-flash"],
+                "tier_models": {"fast": "gemini-3.8-flash", "reasoning": "gemini-3.1-pro-preview"},
+                "warnings": []}
+
+    monkeypatch.setattr("invar_agent.server.validate_provider", fake_validate)
     resp = tc.post("/api/config", json={"provider": "gemini", "api_key": "test-key-123"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["configured"] is True
     assert data["api_key_set"] is True
+    assert data["key_validated"] is True
+    # The key is never echoed back.
+    assert "test-key-123" not in json.dumps(data)
     status = tc.get("/api/status").json()
     assert "router_budget" in status
+    assert status["llm"]["provider"] == "gemini"
+    assert status["llm"]["configured"] is True
+    assert status["llm"]["source"] == "ui"
 
 
 def test_workspace_tree_and_file(client):

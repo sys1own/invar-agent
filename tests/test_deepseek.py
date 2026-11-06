@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,14 +22,15 @@ from invar_agent.server import create_app
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_env(monkeypatch):
-    """Never leak real provider keys or tier overrides into these tests."""
+def _hermetic_env(monkeypatch, tmp_path_factory):
+    """Never leak real provider keys, tier overrides or file config into these tests."""
     for var in (
         "GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
         "INVAR_API_KEY", "INVAR_LLM_PROVIDER", "INVAR_LLM_TIER_FAST", "INVAR_LLM_TIER_REASONING",
         "DEEPSEEK_MODEL_FAST", "DEEPSEEK_MODEL_REASONING",
     ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path_factory.mktemp("cfg") / "config.json"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
 
 
@@ -206,6 +209,7 @@ def client(tmp_path, monkeypatch):
     for var in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
                 "OPENROUTER_API_KEY", "INVAR_API_KEY", "INVAR_LLM_PROVIDER"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "invar-config.json"))
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n")
@@ -214,20 +218,33 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def _mock_validation(monkeypatch, valid: bool, error: str = ""):
-    def fake_validate(api_key, **kwargs):
-        if valid:
-            return {"valid": True, "error": None, "models": ["deepseek-flash", "deepseek-v4-pro"]}
-        return {"valid": False, "error": error or "DeepSeek rejected the API key (HTTP 401)", "models": []}
+def _mock_validation(monkeypatch, valid: bool, error: str = "",
+                     models=None, tier_models=None):
+    """Mock the server-side validate_provider used by /api/config."""
+    calls = []
 
-    monkeypatch.setattr("invar_agent.llm.deepseek.validate_api_key", fake_validate)
+    def fake_validate(provider, api_key, tier_overrides=None, **kwargs):
+        calls.append({"provider": provider, "api_key": api_key})
+        if valid:
+            return {
+                "valid": True, "error": None,
+                "models": models if models is not None else ["deepseek-flash", "deepseek-v4-pro"],
+                "tier_models": tier_models or {"fast": "deepseek-flash", "reasoning": "deepseek-v4-pro"},
+                "warnings": [],
+            }
+        return {"valid": False, "error": error or "provider rejected the API key (HTTP 401)",
+                "models": [], "tier_models": {}, "warnings": []}
+
+    monkeypatch.setattr("invar_agent.server.validate_provider", fake_validate)
+    return calls
 
 
 def test_api_config_deepseek_invalid_key_rejected(client, monkeypatch):
     _mock_validation(monkeypatch, valid=False, error="DeepSeek rejected the API key (HTTP 401): Invalid API key")
     resp = client.post("/api/config", json={"provider": "deepseek", "api_key": "sk-bad"})
     assert resp.status_code == 400
-    assert "DeepSeek" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "DeepSeek" in detail["error"]
 
 
 def test_api_config_deepseek_valid_key_stores_tier_overrides(client, monkeypatch):
@@ -244,25 +261,30 @@ def test_api_config_deepseek_valid_key_stores_tier_overrides(client, monkeypatch
     assert data["api_key_set"] is True
     assert data["key_validated"] is True
     assert data["tier_models"] == {"fast": "deepseek-flash", "reasoning": "deepseek-v4-pro"}
+    assert "available_models" in data and "warnings" in data
     state = server.get_state()
     assert state.provider == "deepseek"
     assert state.tier_overrides == {"fast": "deepseek-flash", "reasoning": "deepseek-v4-pro"}
     # The copilot must resolve the FAST adapter with the stored override.
     copilot = state.ensure_copilot()
     assert copilot.tier_overrides["fast"] == "deepseek-flash"
+    # The key must never be echoed back or persisted to the config file.
+    assert "sk-good" not in json.dumps(data)
+    cfg_path = Path(os.environ["INVAR_CONFIG_PATH"])
+    assert cfg_path.exists()
+    assert "sk-good" not in cfg_path.read_text()
 
 
-def test_api_config_non_deepseek_skips_validation(client, monkeypatch):
-    called = []
-
-    def fake_validate(api_key, **kwargs):
-        called.append(api_key)
-        return {"valid": True, "error": None, "models": []}
-
-    monkeypatch.setattr("invar_agent.llm.deepseek.validate_api_key", fake_validate)
-    resp = client.post("/api/config", json={"provider": "gemini", "api_key": "g-key"})
+def test_api_config_validates_all_providers(client, monkeypatch):
+    calls = _mock_validation(
+        monkeypatch, valid=True,
+        models=["gemini-3.8-flash", "gemini-3.1-pro-preview"],
+        tier_models={"fast": "gemini-3.8-flash", "reasoning": "gemini-3.1-pro-preview"},
+    )
+    resp = client.post("/api/config", json={"provider": "gemini", "api_key": "AIza-test"})
     assert resp.status_code == 200
-    assert called == []
+    # Non-DeepSeek providers are validated too (no more unvalidated storage).
+    assert calls and calls[0]["provider"] == "gemini"
     data = resp.json()
-    assert data["key_validated"] is None
-    assert data["tier_models"]["fast"] == "gemini-2.5-flash"
+    assert data["key_validated"] is True
+    assert data["tier_models"]["fast"] == "gemini-3.8-flash"

@@ -39,11 +39,11 @@ def test_router_localized_to_flash_architectural_to_pro():
     router = CognitiveModelRouter()
     flash = router.route(TaskEventType.WAVEFRONT_NODE_EXEC)
     assert flash.tier == CognitiveTier.TIER_1_FLASH
-    assert flash.model_identifier == "gemini-2.5-flash"
+    assert flash.model_identifier == "gemini-3.8-flash"
 
     pro = router.route(TaskEventType.GOI_DAG_PLANNING)
     assert pro.tier == CognitiveTier.TIER_2_PRO
-    assert pro.model_identifier == "gemini-2.5-pro"
+    assert pro.model_identifier == "gemini-3.1-pro-preview"
 
     escalation = router.route(TaskEventType.WAVEFRONT_NODE_EXEC, tier_1_failures=2)
     assert escalation.tier == CognitiveTier.TIER_2_PRO
