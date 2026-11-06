@@ -31,6 +31,7 @@ invar-agent = "invar_agent.cli:main"
 [tool.maturin]
 python-source = "."
 module-name = "invar_agent._native"
+manifest-path = "invar_agent/_native/Cargo.toml"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

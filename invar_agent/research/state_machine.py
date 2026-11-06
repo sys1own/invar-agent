@@ -113,7 +113,10 @@ def v9_transpiler_violations(code: str) -> List[str]:
             out.append("forbidden construct: lambda")
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             out.append("forbidden construct: global/nonlocal")
-        elif isinstance(node, (ast.Dict, ast.Set, ast.DictComp, ast.SetComp,
+        elif isinstance(node, ast.Dict):
+            out.append("unsupported construct: dict literal "
+                       "(not supported by the C++ emitter)")
+        elif isinstance(node, (ast.Set, ast.DictComp, ast.SetComp,
                                ast.GeneratorExp)):
             out.append(f"forbidden construct: {type(node).__name__}")
         elif isinstance(node, ast.While) and isinstance(node.test, ast.Constant) \
