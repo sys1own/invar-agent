@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("workspace", nargs="?", default=".")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument("--provider", default=None,
+                         help="LLM provider (gemini, openai, deepseek, openrouter); "
+                              "overrides env detection and the saved config")
 
     args = parser.parse_args(argv)
 
@@ -87,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from invar_agent.server import create_app
 
-        app = create_app(args.workspace)
+        app = create_app(args.workspace, provider=args.provider)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 

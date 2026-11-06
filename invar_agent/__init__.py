@@ -27,8 +27,8 @@ class KernelConfig:
     def __init__(
         self,
         workspace_root: str = ".",
-        pro_model: str = "gemini-2.5-pro",
-        flash_model: str = "gemini-2.5-flash",
+        pro_model: str = "gemini-3.1-pro-preview",
+        flash_model: str = "gemini-3.8-flash",
         max_pro_tokens: int = 250_000,
         max_flash_tokens: int = 1_000_000,
     ) -> None:

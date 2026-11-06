@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import threading
 import time
@@ -14,11 +15,21 @@ from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from invar_agent.config import Tier
+from invar_agent.config import (
+    GENERIC_KEY_ENV,
+    PROVIDER_KEY_ENVS,
+    Tier,
+    detect_llm_from_env,
+    load_persisted_state,
+    persist_config,
+    resolve_tier_model,
+)
 from invar_agent.contracts import AgentStateStage, ASTSurgicalPatch, TaskWavefrontNode
 from invar_agent.core.agent import AgentRunReport, VerifiedAutonomousAgent
 from invar_agent.copilot.agent import CopilotAgent
 from invar_agent.export.exporter import ExportEngine
+from invar_agent.llm.errors import LLMProviderError, get_last_llm_error, record_llm_error
+from invar_agent.llm.validate import validate_provider
 from invar_agent.orchestrator.router import CognitiveModelRouter, TokenBudgetGuardrail
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -59,7 +70,7 @@ class CopilotRunBuildRequest(BaseModel):
 class ServerState:
     """Thread-safe server state: workspace, agent, latest run, overlay txs."""
 
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(self, workspace_root: str | Path, provider_override: Optional[str] = None) -> None:
         self.lock = threading.Lock()
         self.workspace_root = Path(workspace_root)
         self.agent: Optional[VerifiedAutonomousAgent] = None
@@ -70,13 +81,62 @@ class ServerState:
         self.api_key: str = ""
         self.provider: str = "gemini"
         self.tier_overrides: dict[str, str] = {}
+        self.key_source: str = "ui"  # "ui" | "env" | "file"
+        self.llm_validated: Optional[bool] = None
+        # Models auto-picked by live validation; they only replace factory
+        # defaults, never env/file/explicit overrides.
+        self.auto_tier_models: dict[str, str] = {}
         self.copilot: Optional[CopilotAgent] = None
+        self._load_startup_llm_config(provider_override)
+
+    # -- LLM configuration ---------------------------------------------------
+
+    def _load_startup_llm_config(self, provider_override: Optional[str]) -> None:
+        """Load persisted provider/overrides and auto-detect keys from env."""
+        persisted = load_persisted_state()
+        env = detect_llm_from_env()
+        provider = (
+            provider_override
+            or env.get("provider")
+            or persisted.get("provider")
+            or "gemini"
+        )
+        provider = str(provider).lower()
+        env_key = (
+            os.environ.get(PROVIDER_KEY_ENVS.get(provider, ""), "").strip()
+            or os.environ.get(GENERIC_KEY_ENV, "").strip()
+        )
+        if env_key:
+            self.api_key, self.key_source = env_key, "env"
+        elif persisted.get("api_key"):
+            self.api_key, self.key_source = persisted["api_key"], "file"
+        self.provider = provider
+        if self.api_key:
+            self.router.set_api_key(self.api_key)
+
+    def effective_tier_overrides(self) -> dict[str, str]:
+        """Explicit overrides plus auto-picked models for tiers on factory defaults."""
+        from invar_agent.config import resolve_tier_model_source
+
+        effective = dict(self.tier_overrides)
+        for tier, model in self.auto_tier_models.items():
+            if tier in effective:
+                continue
+            _resolved, source = resolve_tier_model_source(self.provider, tier)
+            if source == "default":
+                effective[tier] = model
+        return effective
 
     def set_api_key(self, provider: str, api_key: str,
-                    tier_overrides: Optional[dict[str, str]] = None) -> None:
+                    tier_overrides: Optional[dict[str, str]] = None,
+                    validated: Optional[bool] = None,
+                    auto_models: Optional[dict[str, str]] = None) -> None:
         with self.lock:
-            self.provider = provider or "gemini"
+            self.provider = (provider or "gemini").lower()
             self.api_key = api_key or ""
+            self.key_source = "ui"
+            self.llm_validated = validated
+            self.auto_tier_models = dict(auto_models or {})
             self.tier_overrides = {
                 str(tier): str(model).strip()
                 for tier, model in (tier_overrides or {}).items()
@@ -88,37 +148,40 @@ class ServerState:
             self.agent = None
             self.copilot = None
 
+    def _new_agent(self, root: Path) -> VerifiedAutonomousAgent:
+        # LLM call rationale: the builder performs code generation, repair, and
+        # SMT-guided synthesis, so it defaults to Tier.REASONING (pro model).
+        # No client is pre-built here: each healer resolves its own tier-bound
+        # client lazily (FAST for Tier-1 surgical repair, REASONING for Tier-2
+        # architectural repair) so a single pre-resolved client cannot bypass tiers.
+        return VerifiedAutonomousAgent(
+            root,
+            router=self.router,
+            llm_provider=self.provider if self.api_key else None,
+            llm_api_key=self.api_key or None,
+            llm_tier_overrides=self.effective_tier_overrides(),
+        )
+
     def ensure_agent(self) -> VerifiedAutonomousAgent:
         with self.lock:
             if self.agent is None:
-                # LLM call rationale: the builder performs code generation,
-                # repair, and SMT-guided synthesis, so it defaults to
-                # Tier.REASONING (pro model). No client is pre-built here: each
-                # healer resolves its own tier-bound client lazily (FAST for
-                # Tier-1 surgical repair, REASONING for Tier-2 architectural
-                # repair) so a single pre-resolved client cannot bypass tiers.
-                llm_provider = self.provider if self.api_key else None
-                llm_api_key = self.api_key or None
-                self.agent = VerifiedAutonomousAgent(
-                    self.workspace_root,
-                    router=self.router,
-                    llm_provider=llm_provider,
-                    llm_api_key=llm_api_key,
-                    llm_tier_overrides=self.tier_overrides,
-                )
+                self.agent = self._new_agent(self.workspace_root)
             return self.agent
+
+    def _new_copilot(self, root: Path) -> CopilotAgent:
+        # LLM call rationale: copilot chat is a lightweight planning task,
+        # so CopilotAgent routes every LLM call through Tier.FAST.
+        return CopilotAgent(
+            root,
+            provider=self.provider,
+            api_key=self.api_key,
+            tier_overrides=self.effective_tier_overrides(),
+        )
 
     def ensure_copilot(self) -> CopilotAgent:
         with self.lock:
             if self.copilot is None or self.copilot.workspace_path != self.workspace_root:
-                # LLM call rationale: copilot chat is a lightweight planning task,
-                # so CopilotAgent routes every LLM call through Tier.FAST.
-                self.copilot = CopilotAgent(
-                    self.workspace_root,
-                    provider=self.provider,
-                    api_key=self.api_key,
-                    tier_overrides=self.tier_overrides,
-                )
+                self.copilot = self._new_copilot(self.workspace_root)
             return self.copilot
 
     def ingest_path(self, path: str) -> dict[str, Any]:
@@ -127,7 +190,7 @@ class ServerState:
             raise HTTPException(status_code=404, detail=f"workspace path not found: {path}")
         with self.lock:
             self.workspace_root = root
-            self.agent = VerifiedAutonomousAgent(root, router=self.router)
+            self.agent = self._new_agent(root)
             self.copilot = None
             self.last_ingest = self.agent.ingest_workspace()
             return self.last_ingest
@@ -143,7 +206,7 @@ class ServerState:
         root = Path(report.workspace_root)
         with self.lock:
             self.workspace_root = root
-            self.agent = VerifiedAutonomousAgent(root, router=self.router)
+            self.agent = self._new_agent(root)
             self.copilot = None
             self.last_ingest = self.agent.ingest_workspace()
             self.uploaded_zips[filename] = root
@@ -153,28 +216,53 @@ class ServerState:
 _STATE: Optional[ServerState] = None
 
 
-def get_state(workspace_root: str | Path = ".") -> ServerState:
+def get_state(workspace_root: str | Path = ".", provider: Optional[str] = None) -> ServerState:
     global _STATE
     if _STATE is None:
-        _STATE = ServerState(workspace_root)
+        _STATE = ServerState(workspace_root, provider_override=provider)
     return _STATE
+
+
+def _resolved_tier_models(state: ServerState) -> dict[str, Optional[str]]:
+    effective = state.effective_tier_overrides()
+    return {
+        tier.value: resolve_tier_model(state.provider, tier, override=effective.get(tier.value))
+        for tier in Tier
+    }
+
+
+def _llm_status(state: ServerState) -> dict[str, Any]:
+    """LLM section of /api/status: provider, key state, models, last error."""
+    tier_models = _resolved_tier_models(state)
+    return {
+        "provider": state.provider,
+        "configured": bool(state.api_key),
+        "validated": state.llm_validated,
+        "tier_models": tier_models,
+        "last_error": get_last_llm_error(),
+        "source": state.key_source,
+    }
 
 
 def _native_status() -> dict[str, Any]:
     status: dict[str, Any] = {"available": False, "modules": {}}
     try:
         from invar_agent import _native  # type: ignore
-
-        status["available"] = True
-        for name in ("PyGoiSolver", "PyHinEngine", "PyDeterministicHealer", "PyHisRegister"):
-            status["modules"][name] = hasattr(_native, name)
     except Exception as e:  # noqa: BLE001
         status["error"] = str(e)
+        return status
+    # Only treat the native core as available when the compiled PyO3 module is
+    # really importable: an empty ``invar_agent/_native/`` crate directory would
+    # otherwise import as a namespace package and look ACTIVE.
+    modules = {name: hasattr(_native, name) for name in
+               ("PyGoiSolver", "PyHinEngine", "PyDeterministicHealer", "PyHisRegister")}
+    status["modules"] = modules
+    status["available"] = all(modules.values())
     return status
 
 
-def create_app(workspace_root: str | Path = ".") -> FastAPI:
-    state = get_state(workspace_root)
+def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None) -> FastAPI:
+    state = get_state(workspace_root, provider=provider)
     app = FastAPI(title="invar-agent Web Console", version="0.1.0")
 
     @app.get("/")
@@ -201,6 +289,7 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
                 "used_flash_tokens": state.router.budget.used_flash_tokens,
             },
             "workspace_root": str(state.workspace_root),
+            "llm": _llm_status(state),
         }
 
     @app.post("/api/workspace/ingest")
@@ -218,33 +307,75 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
     def api_config(req: ConfigRequest) -> dict[str, Any]:
         provider = (req.provider or "gemini").lower()
         key_validated: Optional[bool] = None
-        validation_error: Optional[str] = None
-        # DeepSeek keys are verified against GET /models before being stored so
-        # the UI surfaces an invalid key immediately instead of failing later.
-        if provider == "deepseek" and req.api_key:
-            from invar_agent.llm.deepseek import validate_api_key
-
-            verdict = validate_api_key(req.api_key)
-            key_validated = bool(verdict.get("valid"))
-            if not key_validated:
-                validation_error = verdict.get("error") or "DeepSeek API key validation failed"
-                raise HTTPException(status_code=400, detail=validation_error)
-        state.set_api_key(req.provider, req.api_key, tier_overrides=req.tier_overrides)
-        from invar_agent.config import resolve_tier_model
-
-        tier_models = {
-            tier.value: resolve_tier_model(
-                state.provider, tier,
-                override=state.tier_overrides.get(tier.value),
-            )
-            for tier in Tier
-        }
+        available_models: list[str] = []
+        warnings: list[str] = []
+        resolved_overrides = dict(req.tier_overrides or {})
+        if req.api_key:
+            # Every provider key is verified live against GET /models so the UI
+            # surfaces invalid keys, model mismatches and key/provider mix-ups
+            # immediately instead of failing on the first chat call.
+            verdict = validate_provider(provider, req.api_key, tier_overrides=req.tier_overrides)
+            if not verdict.get("valid"):
+                detail = {
+                    "error": verdict.get("error") or f"{provider} API key validation failed",
+                    "provider": provider,
+                    "warnings": verdict.get("warnings") or [],
+                }
+                raise HTTPException(status_code=400, detail=detail)
+            key_validated = True
+            available_models = list(verdict.get("models") or [])
+            warnings = list(verdict.get("warnings") or [])
+            auto_models = dict(verdict.get("auto_picked") or {})
+        else:
+            auto_models = {}
+        # Only explicit user overrides take override precedence; auto-picked
+        # models only replace factory defaults (env/file config still win).
+        state.set_api_key(provider, req.api_key, tier_overrides=resolved_overrides,
+                          validated=key_validated, auto_models=auto_models)
+        # Persist provider + explicit tier overrides (never the key unless INVAR_PERSIST_KEY=1).
+        try:
+            persist_config(provider, tier_overrides=resolved_overrides, api_key=req.api_key or None)
+        except OSError as exc:  # persistence must never break configuration
+            warnings.append(f"could not persist config file: {exc}")
         return {
             "configured": True,
             "provider": state.provider,
             "api_key_set": bool(state.api_key),
             "key_validated": key_validated,
-            "tier_models": tier_models,
+            "tier_models": _resolved_tier_models(state),
+            "available_models": available_models,
+            "warnings": warnings,
+        }
+
+    @app.post("/api/llm/test")
+    def api_llm_test() -> dict[str, Any]:
+        """One tiny FAST-tier completion to verify the configured provider."""
+        if not state.api_key:
+            raise HTTPException(status_code=400, detail={"error": "no LLM provider is configured"})
+        from invar_agent.llm.clients import get_llm_client
+
+        # LLM call rationale: connection tests are lightweight, so Tier.FAST.
+        client = get_llm_client(
+            state.provider, tier=Tier.FAST, api_key=state.api_key,
+            override=state.effective_tier_overrides().get(Tier.FAST.value),
+        )
+        if client is None:
+            raise HTTPException(status_code=400, detail={"error": "no LLM client could be resolved"})
+        start = time.perf_counter()
+        try:
+            response = client.complete("Reply with exactly: OK", max_tokens=32)
+        except Exception as exc:  # noqa: BLE001
+            error = exc if isinstance(exc, LLMProviderError) else LLMProviderError(
+                state.provider, getattr(client, "model", None), upstream_message=str(exc),
+            )
+            record_llm_error(error)
+            return {"ok": False, "error": error.to_dict()}
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return {
+            "ok": True,
+            "provider": state.provider,
+            "model": getattr(response, "model", None) or getattr(client, "model", None),
+            "latency_ms": round(latency_ms, 1),
         }
 
     @app.post("/api/copilot/chat")

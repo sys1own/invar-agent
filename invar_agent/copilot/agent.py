@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from invar_agent.config import Tier
 from invar_agent.copilot.action_parser import (
+
     ActionParser,
     _has_build_intent,
     _infer_target_from_text,
@@ -23,6 +24,7 @@ from invar_agent.copilot.action_parser import (
     sanitize_builder_prompt,
 )
 from invar_agent.copilot.prompts import COPILOT_SYSTEM_PROMPT
+from invar_agent.llm.errors import LLMProviderError, record_llm_error, redact_secrets
 
 logger = logging.getLogger("invar_agent.copilot.agent")
 
@@ -263,7 +265,8 @@ class CopilotAgent:
 
         client = self._llm_client()
         if client is None:
-            return self._fallback_reply(message)
+            # No provider/key at all — a different state from a failed call.
+            return self._offline_reply(message, llm_state="not_configured")
 
         messages = [{"role": "system", "content": self.system_prompt()}]
         for turn in self._sanitize_history(history):
@@ -274,14 +277,22 @@ class CopilotAgent:
             raw = client.generate(messages, temperature=0.2)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Copilot LLM call failed: %s", exc)
-            return self._fallback_reply(message, error=str(exc))
+            error = self._as_provider_error(exc, client)
+            record_llm_error(error)
+            return self._provider_error_reply(message, error)
 
         if not raw or not raw.strip():
-            return self._fallback_reply(message)
+            error = LLMProviderError(
+                self.provider, getattr(client, "model", None),
+                upstream_message="provider returned an empty response",
+                api_key=self.api_key,
+            )
+            record_llm_error(error)
+            return self._provider_error_reply(message, error)
 
         reply, action = format_copilot_response(raw)
         action = self._normalize_action(action)
-        return {"reply": reply or "I have no further comments.", "action": action}
+        return {"reply": reply or "I have no further comments.", "action": action, "llm_state": "ok"}
 
     # -- helpers ------------------------------------------------------------------
 
@@ -319,7 +330,59 @@ class CopilotAgent:
             },
         }
 
-    def _fallback_reply(self, message: str, error: str = "") -> Dict[str, Any]:
+    # -- fallback replies ---------------------------------------------------------
+
+    @staticmethod
+    def _as_provider_error(exc: Exception, client: Any) -> "LLMProviderError":
+        """Normalize any client exception to LLMProviderError (keys redacted)."""
+        if isinstance(exc, LLMProviderError):
+            return exc
+        return LLMProviderError(
+            getattr(exc, "provider", None) or "unknown",
+            getattr(client, "model", None) or getattr(exc, "model", None),
+            status_code=getattr(exc, "status_code", None),
+            upstream_message=str(exc),
+            retryable=bool(getattr(exc, "retryable", False)),
+        )
+
+    def _provider_error_reply(self, message: str, error: "LLMProviderError") -> Dict[str, Any]:
+        """Reply for a configured provider whose call failed (distinct from offline)."""
+        provider = getattr(error, "provider", None) or self.provider
+        model = getattr(error, "model", None) or self.model or "unknown"
+        status = getattr(error, "status_code", None)
+        detail = redact_secrets(getattr(error, "upstream_message", "") or str(error))
+        if status:
+            head = f"The LLM call to {provider}/{model} failed (HTTP {status}): {detail}"
+        else:
+            head = f"The LLM call to {provider}/{model} failed: {detail}"
+        hint = (
+            "Check that the API key matches the selected provider, that the model "
+            "is available for your account, and use \"Test connection\" in the settings modal."
+        )
+        reply = f"### LLM Provider Error\n\n{head}\n\n_{hint}_"
+        result: Dict[str, Any] = {
+            "reply": reply, "action": None, "llm_state": "provider_error",
+            "llm_error": f"{provider}/{model}: {detail}"[:500],
+        }
+        # Keep the offline build-prompt draft as a fallback for build requests.
+        if _has_build_intent(message):
+            prompt = sanitize_builder_prompt(message) or message.strip()
+            result["reply"] += (
+                "\n\nI drafted a build prompt directly from your request in the "
+                "Action Card; review it before sending it to the Builder."
+            )
+            result["action"] = {
+                "type": "SUGGEST_BUILD_PROMPT",
+                "params": {
+                    "prompt": prompt,
+                    "target": _normalize_target(prompt) or _infer_target_from_text(prompt),
+                    "acceleration": _normalize_acceleration(prompt),
+                    "explanation": "offline fallback after provider error",
+                },
+            }
+        return result
+
+    def _offline_reply(self, message: str, llm_state: str = "not_configured") -> Dict[str, Any]:
         """Deterministic offline fallback when no LLM provider is configured."""
         if _has_build_intent(message):
             prompt = sanitize_builder_prompt(message) or message.strip()
@@ -327,8 +390,7 @@ class CopilotAgent:
                 "### Suggested Build Prompt\n\n"
                 "No LLM provider is configured, so I drafted a build prompt directly "
                 "from your request. Review it in the Action Card before sending it to "
-                "the Builder.\n\n"
-                + (f"_Provider error: {error}_" if error else "")
+                "the Builder."
             )
             return {
                 "reply": reply,
@@ -341,12 +403,11 @@ class CopilotAgent:
                         "explanation": "offline fallback",
                     },
                 },
+                "llm_state": llm_state,
             }
         reply = (
             "I'm running in offline mode — no LLM provider is configured. "
             "Add an API key via the settings (gear) icon to enable full copilot "
             "planning. I can still draft build prompts for concrete build requests."
         )
-        if error:
-            reply += f"\n\n_Provider error: {error}_"
-        return {"reply": reply, "action": None}
+        return {"reply": reply, "action": None, "llm_state": llm_state}

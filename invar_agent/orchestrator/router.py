@@ -63,15 +63,19 @@ class CognitiveModelRouter:
 
     def __init__(
         self,
-        pro_model: str = "gemini-2.5-pro",
-        flash_model: str = "gemini-2.5-flash",
+        pro_model: Optional[str] = None,
+        flash_model: Optional[str] = None,
         cache_confidence_threshold: float = 0.92,
         blast_radius_threshold: float = 0.65,
         budget_guardrail: Optional[TokenBudgetGuardrail] = None,
         api_key: Optional[str] = None,
     ) -> None:
-        self.pro_model = pro_model
-        self.flash_model = flash_model
+        # Routing labels only (no LLM calls happen here); keep them in sync with
+        # the shared tier defaults instead of hardcoding model IDs.
+        from ..config import DEFAULT_TIER_MODELS
+
+        self.pro_model = pro_model or DEFAULT_TIER_MODELS["gemini"]["reasoning"]
+        self.flash_model = flash_model or DEFAULT_TIER_MODELS["gemini"]["fast"]
         self.cache_threshold = cache_confidence_threshold
         self.blast_threshold = blast_radius_threshold
         self.budget = budget_guardrail or TokenBudgetGuardrail()

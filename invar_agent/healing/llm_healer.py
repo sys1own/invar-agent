@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from invar_agent.config import Tier
 from invar_agent.contracts import ASTSurgicalPatch
+from invar_agent.llm.errors import LLMProviderError, record_llm_error, redact_secrets
 
 from .error_classifier import ClassifiedErrorPayload
 
@@ -87,7 +88,15 @@ class SurgicalLLMHealer:
         try:
             response = client.complete(prompt, system=self.system_prompt or None, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001
-            return LLMRepairResult(success=False, rationale=f"LLM call failed: {e}")
+            if isinstance(e, LLMProviderError):
+                record_llm_error(e)
+            else:
+                record_llm_error(LLMProviderError(
+                    self.provider or "unknown",
+                    getattr(client, "model", None),
+                    upstream_message=str(e),
+                ))
+            return LLMRepairResult(success=False, rationale=f"LLM call failed: {redact_secrets(str(e))}")
         content = response.content if hasattr(response, "content") else str(response)
         tokens = getattr(response, "output_tokens", 0) or max(1, len(content) // 4)
         return self._parse_response(content, sources, tokens)
