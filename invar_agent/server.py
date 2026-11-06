@@ -379,6 +379,14 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/static/{asset_path:path}")
+    def static_asset(asset_path: str) -> FileResponse:
+        # Serve static assets (logo, fonts, ...) safely from the package dir.
+        target = (STATIC_DIR / asset_path).resolve()
+        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+            raise HTTPException(status_code=404, detail="asset not found")
+        return FileResponse(target)
+
     @app.get("/api/status")
     def api_status() -> dict[str, Any]:
         return {
@@ -649,7 +657,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 status_code=502,
                 detail=f"research plan synthesis failed: {str(exc)[:300]}")
         feasibility = outcome["feasibility"]
-        if feasibility is not None and feasibility.verdict.startswith("REFUSED"):
+        if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "blueprint": None,
                     "feasibility": feasibility.model_dump()}
         blueprint_dict = outcome["blueprint"]
@@ -692,7 +700,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 status_code=502,
                 detail=f"expert prompt synthesis failed: {str(exc)[:300]}")
         feasibility = result["feasibility"]
-        if feasibility.verdict.startswith("REFUSED"):
+        if str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "feasibility": feasibility.model_dump()}
         return {"status": "ok", "feasibility": feasibility.model_dump(),
                 "expert_prompt": result["expert_prompt"],
@@ -721,7 +729,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 status_code=502,
                 detail=f"research plan synthesis failed: {str(exc)[:300]}")
         feasibility = outcome["feasibility"]
-        if feasibility is not None and feasibility.verdict.startswith("REFUSED"):
+        if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "started": False, "blueprint": None,
                     "feasibility": feasibility.model_dump()}
         blueprint_dict = outcome["blueprint"]
@@ -734,7 +742,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         manager.request_plan(bp)
         if not manager.approve():
             raise HTTPException(status_code=409, detail="could not start research run")
-        return {"status": "running", "blueprint_id": bp.blueprint_id,
+        return {"status": "running", "started": True, "blueprint_id": bp.blueprint_id,
                 "source": outcome.get("source"),
                 "feasibility": feasibility.model_dump() if feasibility else None}
 

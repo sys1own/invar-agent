@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from ..schemas.research import FeasibilityAssessment, ResearchBlueprint
+from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict, ResearchBlueprint
 
 # -- shared tool-mastery context ----------------------------------------------
 
@@ -239,6 +239,44 @@ surrogate model, never a repeating dummy vector. If the verdict is
 REFORMULATED_SURROGATE, implement exactly the surrogate equations named in the
 reformulation.
 
+## Executable-research requirements (ALL mandatory for quantitative problems)
+1. **Governing equations & scaling laws**: name the exact ODE/PDE or scaling
+   relations (e.g. Allen-Eggers aerothermodynamic entry relations, Sutton-Graves
+   radiative heating, Newtonian drag F = 0.5 rho v^2 Cd A) and how they couple.
+2. **Initial conditions & numerical grid**: specify mass, entry velocity,
+   atmospheric scale height, density profile, time step dt and integration
+   duration as concrete numbers inside the contracts/initial_state.
+3. **Falsifiable verification invariants with tolerances**: every contract
+   invariant must be a physically meaningful bound the simulation can violate
+   (e.g. peak acceleration <= 50 g, heat flux >= 0, total heat load finite,
+   energy monotonicity) with explicit tolerance values — never vacuous.
+4. **Backend recommendation**: prefer "cpp" (C-ABI) for ODE/PDE time stepping
+   and array workloads; use "rust_hin" for scalar recurrences/algebraic checks;
+   "multi_variant" only for genuine algorithm comparisons.
+5. **Named telemetry observables**: variable_map must name every requested
+   output with units (e.g. peak_g, peak_alt_km, max_heat_flux_mw_m2,
+   total_heat_load_mj_m2) mapped to buffer slots the module writes.
+6. **v9_transpiler_friendly code**: code_template uses ONLY the allowed subset
+   (pure functions, simulation_step(buf, dt), math.* only, no classes,
+   exceptions, dynamic imports, dicts/sets/comprehensions, strings).
+
+## Few-shot exemplar (aerothermodynamics entry)
+Request: "600 kg probe, 5.8 km/s entry, 1.4 m spherical-segment aeroshell
+(nose radius 0.7 m) — compute peak g, peak altitude, peak heat flux and total
+heat load."
+Blueprint sketch: title "Martian aerothermodynamic entry of 600 kg probe";
+hypothesis "A 1.4 m diameter 70 deg spherical-segment aeroshell survives Martian
+entry with peak deceleration below 50 g and radiative heat flux consistent with
+Sutton-Graves scaling"; contracts: cpp backend, dt=0.05 s, steps<=20000,
+initial_state [alt_km=125.0, v_kms=5.8, mass_kg=600.0, nose_radius_m=0.7,
+scale_height_km=11.1, rho0_kg_m3=0.02, Cd=1.5, sigma=5.67e-8, epsilon=0.85],
+invariants ["telemetry['final_max'] >= 0.0" boundedness, "state[8] <= 50.0"
+peak g bound with tolerance 1e-3, "state[10] >= 0.0" non-negative heat flux];
+variable_map {"peak_g": 8, "peak_alt_km": 9, "max_heat_flux_mw_m2": 10,
+"total_heat_load_mj_m2": 11}; code_template integrates m dv/dt = -0.5 rho v^2
+Cd A - m g, dh/dt = -v sin(gamma), rho = rho0 exp(-h/H), Sutton-Graves q =
+k sqrt(rho/Rn) v^3 with RK4 in the allowed subset.
+
 Output strict JSON only: {{"feasibility": {{...}}, "blueprint": {{...}}}}.
 No markdown fences, no <think> blocks.
 
@@ -295,6 +333,47 @@ markdown research brief with EXACTLY these sections:
 The expert_prompt must NEVER contain raw ResearchBlueprint JSON
 (no initial_state lists, no code_template) — it is a natural-language brief.
 No markdown fences, no <think> blocks. Output JSON only.
+
+## Executable-research requirements (the brief MUST make these explicit)
+The Research Agent executes the brief verbatim, so the expert_prompt must spell
+out ALL of the following (use the aerothermodynamics entry problem below as
+the style exemplar):
+1. **Governing equations & scaling laws** — exact ODE/PDE relations or scaling
+   laws (Allen-Eggers entry relations, Sutton-Graves heating, Newtonian drag)
+   and how they couple; name constants and where literature must supply them.
+2. **Initial conditions & numerical grid** — concrete mass, entry speed,
+   atmospheric scale height, density, dt and integration duration.
+3. **Falsifiable verification invariants with tolerances** — e.g. peak
+   deceleration <= 50 g, heat flux >= 0, cumulative heat load finite; each with
+   an explicit tolerance.
+4. **Backend recommendation** — cpp C-ABI for ODE/PDE stepping, rust_hin for
+   scalar/algebraic checks, multi_variant only for real comparisons.
+5. **Named telemetry observables** — e.g. peak_g, peak_alt_km,
+   max_heat_flux_mw_m2, total_heat_load_mj_m2, each with units.
+6. **v9_transpiler_friendly synthesis** — pure functions + simulation_step(buf,
+   dt) only; NO classes, exceptions, dynamic imports, dicts/sets/comprehensions
+   or non-math imports.
+
+## Few-shot exemplar (aerothermodynamics entry)
+User: "Research the aerothermodynamic entry environment for a 600 kg planetary
+probe entering the Martian atmosphere at 5.8 km/s with a 1.4-meter diameter
+spherical-segment aeroshell (nose radius 0.7 m). Determine peak deceleration,
+peak altitude, peak heat flux, and total integrated heat load."
+Expert brief (abridged): Objective — compute peak deceleration [g], peak
+altitude [km], Sutton-Graves peak heat flux [MW/m^2] and cumulative heat load
+[MJ/m^2] for the stated entry state. Physics — Newtonian drag F = 0.5 rho v^2
+Cd A with Cd from literature, m dv/dt = -F/m - m g sin(gamma), dh/dt = -v
+sin(gamma), rho(h) = rho0 exp(-h/H) with Martian scale height H ~ 11.1 km and
+surface density rho0 ~ 0.02 kg/m^3 (verify via literature search); Sutton-Graves
+q = k sqrt(rho/Rn) v^3 with emissivity/absorptivity from literature; RK4
+integration. Initial conditions — m0 = 600 kg, v0 = 5800 m/s, h0 = 125 km,
+Rn = 0.7 m, A = pi Rn^2-equivalent aeroshell area, dt = 0.05 s until impact or
+20000 steps. Invariants — peak deceleration <= 50 g (tol 1e-3), heat flux
+>= 0, heat load finite, mass constant, trajectory monotonic descent after peak
+altitude. Backend — cpp C-ABI. Observables — peak_g, peak_alt_km,
+max_heat_flux_mw_m2, total_heat_load_mj_m2. Literature — fetch Martian
+atmospheric density/scale-height profiles, Sutton-Graves constants,
+spherical-segment aeroshell drag coefficients.
 
 ## Literature context (may be empty)
 {literature}
@@ -608,15 +687,19 @@ async def generate_research_plan(question: str,
 
 
 def _coerce_feasibility(data: Any) -> Optional[FeasibilityAssessment]:
-    """Build a FeasibilityAssessment from a combined-prompt payload fragment."""
+    """Build a FeasibilityAssessment from a combined-prompt payload fragment.
+
+    Verdicts are coerced case-insensitively (LLM JSON often lowercases them);
+    the schema validator nulls refusal fields on feasible verdicts.
+    """
     if not isinstance(data, dict):
         return None
-    verdict = data.get("verdict")
-    if verdict not in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE",
-                       "REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
+    try:
+        verdict = FeasibilityVerdict(str(data.get("verdict") or ""))
+    except ValueError:
         return None
     reformulation = str(data.get("reformulation") or "").strip()
-    if not reformulation:
+    if not reformulation and verdict != FeasibilityVerdict.OPTIMAL_DIRECT:
         reformulation = ("Reformulate as a falsifiable quantitative question "
                          "with explicit governing equations and measurable "
                          "invariants that a deterministic sandbox can verify.")
@@ -624,8 +707,8 @@ def _coerce_feasibility(data: Any) -> Optional[FeasibilityAssessment]:
         return FeasibilityAssessment(
             verdict=verdict,
             rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
-            violated_boundary=str(data.get("violated_boundary") or "")[:400],
-            reformulation=reformulation[:600],
+            violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
+            reformulation=reformulation[:600] or None,
             assessed_by="llm")
     except Exception:  # noqa: BLE001
         return None

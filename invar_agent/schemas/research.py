@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class InvariantConstraint(BaseModel):
@@ -56,12 +57,19 @@ class StageTelemetry(BaseModel):
     timestamp: float = 0.0
 
 
-FeasibilityVerdict = Literal[
-    "OPTIMAL_DIRECT",
-    "REFORMULATED_SURROGATE",
-    "REFUSED_IMPOSSIBLE",
-    "REFUSED_UNSUITABLE",
-]
+class FeasibilityVerdict(str, Enum):
+    OPTIMAL_DIRECT = "OPTIMAL_DIRECT"
+    REFORMULATED_SURROGATE = "REFORMULATED_SURROGATE"
+    REFUSED_IMPOSSIBLE = "REFUSED_IMPOSSIBLE"
+    REFUSED_UNSUITABLE = "REFUSED_UNSUITABLE"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Case-insensitive coercion: LLM JSON often lowercases verdicts.
+        for member in cls:
+            if member.value.lower() == str(value).lower():
+                return member
+        return None
 
 
 class FeasibilityAssessment(BaseModel):
@@ -71,9 +79,44 @@ class FeasibilityAssessment(BaseModel):
 
     verdict: FeasibilityVerdict
     rationale: str
-    violated_boundary: str = ""
-    reformulation: str = ""
+    violated_boundary: Optional[str] = None
+    reformulation: Optional[str] = None
     assessed_by: Literal["heuristic", "llm"] = "heuristic"
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _coerce_verdict_case(cls, value):
+        # LLM JSON often lowercases/mixed-cases verdicts; Enum._missing_ alone
+        # is not consulted by pydantic's str-enum path, so normalise here.
+        if isinstance(value, str):
+            upper = value.upper()
+            for member in FeasibilityVerdict:
+                if member.value == upper:
+                    return member
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _feasible_verdicts_carry_no_refusal_fields(cls, data):
+        # A passing verdict must never look like a refusal downstream:
+        # OPTIMAL_DIRECT has no violated boundary and no reformulation.
+        # REFORMULATED_SURROGATE keeps its reformulation (that IS the explicit
+        # surrogate reduction) but has no violated boundary.
+        if not isinstance(data, dict):
+            return data
+        verdict = data.get("verdict")
+        if isinstance(verdict, FeasibilityVerdict):
+            verdict = verdict.value
+        verdict = str(verdict or "").upper()
+        if verdict == FeasibilityVerdict.OPTIMAL_DIRECT.value:
+            data = dict(data)
+            data["violated_boundary"] = None
+            data["reformulation"] = None
+        elif verdict == FeasibilityVerdict.REFORMULATED_SURROGATE.value \
+                and not str(data.get("reformulation") or "").strip():
+            data = dict(data)
+            data["reformulation"] = None
+        return data
 
 
 class ResearchBlueprint(BaseModel):

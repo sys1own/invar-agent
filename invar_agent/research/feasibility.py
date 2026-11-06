@@ -20,7 +20,7 @@ import json
 import re
 from typing import Any, Callable, Dict, Optional
 
-from ..schemas.research import FeasibilityAssessment
+from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict
 
 FEASIBILITY_PROMPT = """You are the Epistemic Feasibility Gate of a deterministic computational
 research engine. The engine can ONLY: search scientific literature, synthesise
@@ -186,12 +186,12 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment]:
-    verdict = data.get("verdict")
-    if verdict not in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE",
-                       "REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
+    try:
+        verdict = FeasibilityVerdict(str(data.get("verdict") or ""))
+    except ValueError:
         return None
     reformulation = str(data.get("reformulation") or "").strip()
-    if not reformulation:
+    if not reformulation and verdict != FeasibilityVerdict.OPTIMAL_DIRECT:
         reformulation = ("Reformulate as a falsifiable quantitative question "
                          "with explicit governing equations and measurable "
                          "invariants that a deterministic sandbox can verify.")
@@ -199,8 +199,8 @@ def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment
         return FeasibilityAssessment(
             verdict=verdict,
             rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
-            violated_boundary=str(data.get("violated_boundary") or "")[:400],
-            reformulation=reformulation[:600],
+            violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
+            reformulation=reformulation[:600] or None,
             assessed_by="llm")
     except Exception:  # noqa: BLE001
         return None

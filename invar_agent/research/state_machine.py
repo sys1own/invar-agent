@@ -390,13 +390,28 @@ class ResearchStateMachine:
     # -- top-level loop ----------------------------------------------------
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
         state = ResearchRunState(blueprint=blueprint)
-        # Defense-in-depth epistemic gate on the blueprint itself.
-        gate = _heuristic_verdict(f"{blueprint.title}. {blueprint.falsifiable_hypothesis}")
-        if gate.verdict.startswith("REFUSED"):
+        # Defense-in-depth epistemic gate. A blueprint that already carries a
+        # PASSING feasibility verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE)
+        # was approved upstream (Plan Mode / combined planner call) and must
+        # NEVER abort here; only explicit refusals or unassessed blueprints
+        # fall through to the heuristic re-check.
+        _bv = getattr(getattr(blueprint, "feasibility", None), "verdict", None)
+        bp_verdict = str(getattr(_bv, "value", _bv) or "").upper()
+        if bp_verdict in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE"):
+            pass
+        elif bp_verdict in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE") \
+                and blueprint.feasibility is not None:
             state.status = "REFUSED"
-            state.refusal = gate.model_dump()
-            await self._emit("search_log", "refused", {"feasibility": gate.model_dump()})
+            state.refusal = blueprint.feasibility.model_dump()
+            await self._emit("search_log", "refused", {"feasibility": state.refusal})
             return state
+        else:
+            gate = _heuristic_verdict(f"{blueprint.title}. {blueprint.falsifiable_hypothesis}")
+            if str(gate.verdict.value).upper().startswith("REFUSED"):
+                state.status = "REFUSED"
+                state.refusal = gate.model_dump()
+                await self._emit("search_log", "refused", {"feasibility": gate.model_dump()})
+                return state
 
         total = blueprint.target_research_stages
         pinned_code = ""          # verified layers only (drivers renamed)
