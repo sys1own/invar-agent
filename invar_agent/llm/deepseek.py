@@ -118,7 +118,7 @@ class DeepSeekChatClient:
     # -- chat interface (mirrors ChatLLMClient) ---------------------------------
 
     def generate(self, messages: List[Dict[str, str]], temperature: float = 0.2,
-                 max_tokens: int = 4096) -> str:
+                 max_tokens: int = 4096, thinking: Optional[bool] = None) -> str:
         """Multi-turn chat completion; returns the assistant message content.
 
         ``temperature`` is accepted for interface compatibility but deliberately
@@ -128,12 +128,20 @@ class DeepSeekChatClient:
         """
         start = time.perf_counter()
 
+        extra: Dict[str, Any] = {}
+        if thinking is False:
+            # DeepSeek thinking mode burns the whole completion budget on
+            # reasoning (observed: 1024/1024 tokens, empty content). Planning
+            # calls disable it explicitly; the API accepts this on flash.
+            extra["extra_body"] = {"thinking": {"type": "disabled"}}
+
         def _attempt():
             try:
                 return self._openai_client().chat.completions.create(
                     model=self.model,
                     messages=messages,
                     max_tokens=max_tokens,
+                    **extra,
                 )
             except Exception as exc:  # map SDK errors, keep the rest as-is
                 mapped = self._map_error(exc)
@@ -155,7 +163,8 @@ class DeepSeekChatClient:
             budget = min(budget * 2, 65536)
             response = call_with_retries(
                 lambda: self._openai_client().chat.completions.create(
-                    model=self.model, messages=messages, max_tokens=budget))
+                    model=self.model, messages=messages, max_tokens=budget,
+                    **extra))
         latency = (time.perf_counter() - start) * 1000.0
         choice = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)
@@ -169,13 +178,14 @@ class DeepSeekChatClient:
         return choice
 
     def complete(self, prompt: str, system: Optional[str] = None,
-                 max_tokens: int = 4096, temperature: float = 0.0):
+                 max_tokens: int = 4096, temperature: float = 0.0,
+                 thinking: Optional[bool] = None):
         """Single-turn completion compatible with the LLMClient protocol."""
         messages: List[Dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        content = self.generate(messages, max_tokens=max_tokens)
+        content = self.generate(messages, max_tokens=max_tokens, thinking=thinking)
         if self._last_response is not None:
             return self._last_response
         return _llm_response(content=content, model=self.model)

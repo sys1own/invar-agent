@@ -331,6 +331,7 @@ class ResearchRunState:
     literature: List[Dict[str, Any]] = field(default_factory=list)
     checkpoint_path: Optional[str] = None
     refusal: Optional[Dict[str, Any]] = None
+    report: Optional[str] = None  # Final Quantitative Research Report (markdown)
 
     def snapshot(self) -> Dict[str, Any]:
         bp = self.blueprint
@@ -347,6 +348,7 @@ class ResearchRunState:
             "aborted": self.aborted,
             "checkpoint_path": self.checkpoint_path,
             "refusal": self.refusal,
+            "report": self.report,
             "results": [r.model_dump() for r in self.results],
         }
 
@@ -493,7 +495,21 @@ class ResearchStateMachine:
                 "verified_stages": len(pinned_layers),
                 "unified_module_hash": code_hash(state.blueprint.unified_module_code or ""),
                 "checkpoint_path": state.checkpoint_path})
+        if state.status in ("VERIFIED", "PARTIAL"):
+            await self._emit_report(state)
         return state
+
+    async def _emit_report(self, state: ResearchRunState) -> None:
+        """Synthesize and stream the Final Quantitative Research Report."""
+        await self._emit("accelerator_log", "synthesizing_report", {
+            "research_stage": state.research_stage, "status": state.status})
+        try:
+            from .report import build_research_report
+            state.report = build_research_report(state)
+        except Exception as exc:  # noqa: BLE001 - report is best-effort
+            state.report = f"(report synthesis failed: {str(exc)[:200]})"
+        await self._emit("accelerator_log", "research_report", {
+            "status": state.status, "report": state.report})
 
     # -- one round through the nine stages ------------------------------------
     async def _run_round(self, state: ResearchRunState, *, stage: int, attempt: int,
@@ -507,6 +523,7 @@ class ResearchStateMachine:
 
         # 1. Ingest: live literature retrieval (never inside the sandbox).
         state.stage = "Ingest"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Ingest"})
         if attempt == 1:
             if stage == 1:
                 queries = list(bp.search_queries)
@@ -525,6 +542,7 @@ class ResearchStateMachine:
 
         # 2. GoI_Plan: accretive synthesis for stage k > 1.
         state.stage = "GoI_Plan"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "GoI_Plan"})
         if stage > 1 and candidate_code is None:
             try:
                 synth = await self._synthesize_stage(
@@ -563,6 +581,7 @@ class ResearchStateMachine:
 
         # 3. Wavefront_Schedule: GoI nilpotent schedule, SMW delta for new contracts.
         state.stage = "Wavefront_Schedule"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Wavefront_Schedule"})
         plan = self.scheduler.plan(len(contracts), len(pinned_layers))
         await emit("goi_stream", "plan", {**tag, **{k: plan[k] for k in (
             "nodes", "spectral_radius", "nilpotent", "smw_rank", "engine")}})
@@ -575,6 +594,7 @@ class ResearchStateMachine:
 
         # 4. Overlay_Mutate: copy-on-write scratch holds the candidate unified module.
         state.stage = "Overlay_Mutate"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Overlay_Mutate"})
         scratch = self.overlay_dir / f"round_{round_idx}"
         scratch.mkdir(parents=True, exist_ok=True)
         (scratch / "unified_module.py").write_text(unified)
@@ -584,6 +604,7 @@ class ResearchStateMachine:
 
         # 5. PreWrite_Guard: SHACL/Chiasmus firewall + v9 compliance + lowering.
         state.stage = "PreWrite_Guard"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "PreWrite_Guard"})
         violations = shacl_chiasmus_firewall(unified) + v9_transpiler_violations(unified)
         if violations:
             await emit("accelerator_log", "guard_reject", {**tag, "violations": violations})
@@ -603,6 +624,7 @@ class ResearchStateMachine:
 
         # 6. SMT_Concolic_Verify: Z3 consistency of every contract's invariants.
         state.stage = "SMT_Concolic_Verify"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "SMT_Concolic_Verify"})
         for contract in contracts:
             report = check_invariants_consistent([i.assertion for i in contract.invariants])
             await emit("goi_stream", "smt", {**tag, "contract_id": contract.contract_id,
@@ -626,6 +648,7 @@ class ResearchStateMachine:
 
         # 7. Sandbox_Execute: regression of pinned layers + new contracts.
         state.stage = "Sandbox_Execute"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Sandbox_Execute"})
         results, regression = await self._sandbox_execute(
             bp, uast, cpp_code, contracts, pinned_layers, stage, tag)
         state.results = results
@@ -641,6 +664,7 @@ class ResearchStateMachine:
 
         # 9. Adjoint_Commit_or_Rollback (delta-scoped).
         state.stage = "Adjoint_Commit_or_Rollback"
+        await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Adjoint_Commit_or_Rollback"})
         if results and all(r.status == "VERIFIED" for r in results):
             new_results = [r for r in results if r.contract_id in {c.contract_id for c in contracts}]
             stage_tel: Dict[str, float] = {}
@@ -791,6 +815,15 @@ class ResearchStateMachine:
                 self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
                 entry, contract.timeout_seconds, contract.max_memory_mb)
             telemetry = _telemetry(run, initial)
+            # Named observables: publish every blueprint variable_map entry as
+            # telemetry["obs_<metric_with_units>"] from the final state vector.
+            state_vec = run.get("state") or []
+            for name, idx in (bp.variable_map or {}).items():
+                if isinstance(idx, int) and 0 <= idx < len(state_vec):
+                    try:
+                        telemetry[f"obs_{name}"] = float(state_vec[idx])
+                    except (TypeError, ValueError):
+                        continue
             run_ctx = _counterexample_context(run)
             extra: Dict[str, Any] = {"initial": initial,
                                      "trace_min": run.get("trace_min", run["state"]),

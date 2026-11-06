@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from ..schemas.research import ResearchBlueprint
+from ..schemas.research import FeasibilityAssessment, ResearchBlueprint
 
 # -- shared tool-mastery context ----------------------------------------------
 
@@ -67,7 +67,26 @@ residual) in dedicated buffer slots inside simulation_step so invariants can
 read them, e.g. slot 2 = current energy, slot 3 = initial energy (set once when
 buf.data[3] == 0.0), slot 4 = max |E - E0| / E0 so far.
 Invariants must be falsifiable and physically meaningful; never write vacuous
-invariants (like x == x) and never loosen tolerances to force a pass."""
+invariants (like x == x) and never loosen tolerances to force a pass.
+
+## Domain observables & variable_map (MANDATORY for quantitative problems)
+- The blueprint MUST include `variable_map`: {"<metric_name_with_units>": <buf.data index>, ...}
+  mapping EVERY numerical quantity the user asked for (e.g.
+  "magnetic_field_B_tesla", "lorentz_factor_gamma", "drag_force_newtons",
+  "thermal_heat_flux_w_m2", "total_thermal_power_watts",
+  "optimal_shield_thickness_m", "shield_mass_tons") to the buffer slot holding
+  its FINAL computed value. Metric names must carry their units.
+- Inside simulation_step, compute the requested physical quantities and store
+  them in those slots (helpers may take `buf` as first parameter and return a
+  float; they may also return nothing and mutate buf.data directly).
+- initial_state MUST encode the actual physical state variables of the
+  surrogate model (positions, momenta, fields, temperatures, ...). NEVER emit a
+  lazy repeating vector such as [1, 1, 1, ...] with a dummy loop: the sandbox
+  must compute real domain quantities from real initial conditions.
+- For REFORMULATED_SURROGATE verdicts, implement exactly the surrogate
+  equations named in the feasibility reformulation (0D/1D reductions, scaling
+  laws, boundary conditions) and record the surrogate assumptions in the
+  hypothesis and contract rationales."""
 
 PLANNER_PROMPT = """You are the Research Agent planner of a mathematically verified computational
 research engine. Produce ONE falsifiable research blueprint for the request.
@@ -83,9 +102,15 @@ stage, stage 1 first), contracts (stage-1 contracts: list of {{contract_id,
 target_backend, timeout_seconds, invariants: [{{variable_name, assertion,
 tolerance}}], max_memory_mb, initial_state: [floats], dt, steps}}),
 code_template (the STAGE-1 module only, v9_transpiler_friendly Python),
-max_feedback_rounds (2-4).
-Keep initial_state small (<= 16 slots) and steps <= 20000.
-No markdown fences. Output JSON only.
+variable_map ({{"<metric_with_units>": <buf.data index>}} for every numerical
+quantity the user requested), max_feedback_rounds (2-4).
+Keep initial_state small (<= 16 slots unless the surrogate genuinely needs more,
+max 64) and steps <= 20000. initial_state must be the physical state of the
+surrogate model, never a repeating dummy vector.
+No markdown fences, no <think> blocks. Output JSON only.
+
+## Feasibility context (authoritative)
+{feasibility}
 
 ## Literature context (may be empty)
 {literature}
@@ -171,6 +196,112 @@ Write 3 precise literature search queries (arXiv/OpenAlex style, <= 12 words eac
 that target the higher-order effects, couplings, closures or algorithmic fixes the
 telemetry points to. Output a JSON list of strings only."""
 
+# -- combined feasibility + blueprint (single Tier-2 call, Task 4 latency fix) --
+
+COMBINED_PLAN_PROMPT = """You are the Epistemic Feasibility Gate AND the Research Agent planner
+of a mathematically verified computational research engine, in ONE pass. Produce
+ONE strict JSON object with two keys: "feasibility" and "blueprint".
+
+{tools}
+
+## Part 1 — feasibility (gate)
+Classify the request into EXACTLY ONE verdict:
+- OPTIMAL_DIRECT: quantitative, mathematical, physical, dynamical or algorithmic
+  research falsifiable by simulation.
+- REFORMULATED_SURROGATE: too large for full-scale local execution but admits a
+  rigorous reduced-order / 0D-1D asymptotic / scaling-law surrogate.
+- REFUSED_IMPOSSIBLE: mathematically, physically or logically impossible
+  (conservation-law violations, undecidable, contradictory invariants).
+- REFUSED_UNSUITABLE: subjective/qualitative/historical/clinical/literary tasks
+  without falsifiable governing equations, or requiring forbidden sandbox ops.
+For REFORMULATED_SURROGATE, the "reformulation" field MUST name the exact
+surrogate equations, scaling laws, boundary conditions and observables to
+synthesise (e.g. relativistic Lorentz factor, Larmor-radius magnetic deflection,
+kinetic-energy flux over a scoop cross-section, radiative/ablative thermal
+balance, stopping-range thickness optimisation).
+feasibility object keys: verdict, rationale, violated_boundary, reformulation.
+
+## Part 2 — blueprint (only if NOT refused)
+Produce ONE falsifiable research blueprint:
+blueprint_id (snake_case), title (5-120 chars), falsifiable_hypothesis,
+search_queries (3-6 concrete literature queries for arXiv/OpenAlex),
+target_research_stages (1-4; use 2-3 when the request describes a progression),
+stage_objectives (one short objective per stage, stage 1 first), contracts
+(stage-1 contracts: list of {{contract_id, target_backend, timeout_seconds,
+invariants: [{{variable_name, assertion, tolerance}}], max_memory_mb,
+initial_state: [floats], dt, steps}}), code_template (the STAGE-1 module only,
+v9_transpiler_friendly Python), variable_map ({{"<metric_with_units>":
+<buf.data index>}} for every numerical quantity the user requested),
+max_feedback_rounds (2-4).
+Keep initial_state small (<= 16 slots unless the surrogate genuinely needs more,
+max 64) and steps <= 20000. initial_state must encode the physical state of the
+surrogate model, never a repeating dummy vector. If the verdict is
+REFORMULATED_SURROGATE, implement exactly the surrogate equations named in the
+reformulation.
+
+Output strict JSON only: {{"feasibility": {{...}}, "blueprint": {{...}}}}.
+No markdown fences, no <think> blocks.
+
+## Literature context (may be empty)
+{literature}
+
+Research request: {question}
+"""
+
+# -- Plan Mode: expert deep-research prompt (never raw blueprint JSON) --------
+
+EXPERT_PROMPT_PLANNER_PROMPT = """You are the Expert Research Prompt Planner of a mathematically
+verified computational research engine. Turn the user's request into an
+EXPERT DEEP RESEARCH PROMPT that another Research Agent instance will execute
+verbatim. Also classify feasibility in the same pass.
+
+(No tool schema needed: you write a natural-language brief, not code. Keep the
+brief concise — at most ~900 words — while covering all four sections below.)
+
+## Feasibility gate (same pass)
+Classify the request into EXACTLY ONE verdict:
+- OPTIMAL_DIRECT, REFORMULATED_SURROGATE, REFUSED_IMPOSSIBLE, REFUSED_UNSUITABLE
+(OPTIMAL_DIRECT = fully specified computable model; REFORMULATED_SURROGATE =
+complex real-world problem that becomes computable via a rigorous 0D/1D
+reduced-order surrogate — this is the CORRECT verdict for sophisticated
+engineering/physics optimization requests such as relativistic spacecraft
+shielding, drag, thermal or materials problems; REFUSED_IMPOSSIBLE = violates
+conservation laws or physical upper bounds, e.g. COP > 1, efficiency > 1,
+perpetual motion, net energy from nothing; REFUSED_UNSUITABLE = no falsifiable
+mathematical model exists at all, e.g. romantic literature analysis).
+NEVER refuse a quantitative physics/engineering request merely because it
+needs a surrogate model or spans multiple physical effects — reformulate it.
+
+## Output: strict JSON only
+{{"feasibility": {{"verdict": ..., "rationale": ..., "violated_boundary": ...,
+"reformulation": ...}}, "expert_prompt": "..."}}
+If the verdict is REFUSED_IMPOSSIBLE or REFUSED_UNSUITABLE, set expert_prompt to
+"" (empty). Otherwise expert_prompt must be a complete, authoritative, editable
+markdown research brief with EXACTLY these sections:
+1. **Objective & Quantitative Targets** — the exact numerical values, optimal
+   parameters and physical/mathematical relationships the Research Agent must
+   compute and return (with units).
+2. **Surrogate & Governing Physics Formulation** — if REFORMULATED_SURROGATE,
+   the exact 0D/1D/analytical-numerical surrogate equations, scaling laws and
+   boundary conditions to synthesise; otherwise the governing equations.
+3. **Literature Retrieval Directives** — the specific empirical constants,
+   material limits and governing equations to extract via live literature
+   search (arXiv / OpenAlex / Wikipedia).
+4. **Computational Synthesis & Verification Protocol** — how to structure
+   Stage 1 (foundational physics/baseline model) and Stage 2+ (coupled
+   thermal/material/optimization accretion) in the v9_transpiler_friendly
+   compute synthesizer, which invariants to verify in Z3/Sandbox, and which
+   output variables to report via variable_map.
+The expert_prompt must NEVER contain raw ResearchBlueprint JSON
+(no initial_state lists, no code_template) — it is a natural-language brief.
+No markdown fences, no <think> blocks. Output JSON only.
+
+## Literature context (may be empty)
+{literature}
+
+Research request: {question}
+"""
+
 _FALLBACK_BLUEPRINT = {
     "blueprint_id": "kdv_soliton_scaling",
     "title": "KdV soliton amplitude-velocity scaling c = 2A",
@@ -204,8 +335,13 @@ _FALLBACK_BLUEPRINT = {
 }
 
 
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
 def _extract_json(text: str) -> Optional[Any]:
     text = (text or "").strip()
+    # Reasoning models may leak chain-of-thought wrappers; strip them first.
+    text = _THINK_BLOCK.sub("", text).strip()
     fence = re.search(r"```(?:json)?\s*([\[{].*[\]}])\s*```", text, re.S)
     if fence:
         text = fence.group(1)
@@ -222,8 +358,137 @@ def _extract_json(text: str) -> Optional[Any]:
     return None
 
 
+# -- schema-drift normalisation ------------------------------------------------
+
+_BLUEPRINT_FIELDS = {
+    "blueprint_id", "title", "falsifiable_hypothesis", "search_queries",
+    "contracts", "code_template", "max_feedback_rounds", "verified_layers",
+    "target_research_stages", "stage_objectives", "current_stage",
+    "evolution_history", "unified_module_code", "feasibility", "variable_map",
+}
+_CONTRACT_FIELDS = {
+    "contract_id", "target_backend", "timeout_seconds", "invariants",
+    "max_memory_mb", "initial_state", "dt", "steps",
+}
+_INVARIANT_FIELDS = {"variable_name", "assertion", "tolerance"}
+_BACKENDS = {"rust_hin", "cpp", "cuda", "multi_variant"}
+
+
+def _as_float_list(value: Any) -> Optional[List[float]]:
+    """Coerce a numeric list (int/float/str entries) to floats; None if not a list."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        return None
+    out: List[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    contract: Dict[str, Any] = {k: raw[k] for k in _CONTRACT_FIELDS if k in raw}
+    contract["contract_id"] = str(contract.get("contract_id") or f"contract_{index + 1}")[:120]
+    backend = str(contract.get("target_backend") or "cpp").strip().lower()
+    contract["target_backend"] = backend if backend in _BACKENDS else "cpp"
+    try:
+        contract["timeout_seconds"] = float(contract.get("timeout_seconds", 30.0))
+        contract["dt"] = float(contract.get("dt", 0.01))
+        contract["steps"] = int(contract.get("steps", 1000))
+        contract["max_memory_mb"] = int(contract.get("max_memory_mb", 1024))
+    except (TypeError, ValueError):
+        return None
+    initial = _as_float_list(contract.get("initial_state"))
+    if initial is not None:
+        contract["initial_state"] = initial[:4096]
+    else:
+        contract.pop("initial_state", None)
+    invariants = []
+    for inv in contract.get("invariants") or []:
+        if not isinstance(inv, dict):
+            continue
+        cleaned = {k: inv[k] for k in _INVARIANT_FIELDS if k in inv}
+        cleaned["variable_name"] = str(cleaned.get("variable_name") or "value")[:120]
+        cleaned["assertion"] = str(cleaned.get("assertion") or "")[:500]
+        try:
+            cleaned["tolerance"] = float(cleaned.get("tolerance", 1e-6))
+        except (TypeError, ValueError):
+            cleaned["tolerance"] = 1e-6
+        if cleaned["assertion"]:
+            invariants.append(cleaned)
+    if not invariants:
+        return None
+    contract["invariants"] = invariants
+    return contract
+
+
+def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce minor LLM schema drift instead of discarding the whole response.
+
+    Drops unknown keys (the pydantic models forbid extras), coerces int/float
+    and str/list mismatches on optional fields, and repairs contract shapes.
+    Required fields (blueprint_id, title, hypothesis, code_template, ...) are
+    left for pydantic validation to reject with a precise error.
+    """
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Any] = {k: data[k] for k in _BLUEPRINT_FIELDS if k in data}
+    for key in ("blueprint_id", "title", "falsifiable_hypothesis", "code_template"):
+        if key in out and out[key] is not None:
+            out[key] = str(out[key])
+    for key in ("search_queries", "stage_objectives"):
+        if key in out:
+            val = out[key]
+            if isinstance(val, str):
+                val = [val]
+            if isinstance(val, list):
+                out[key] = [str(x)[:300] for x in val if str(x).strip()][:12]
+            else:
+                out.pop(key, None)
+    for key, lo, hi in (("target_research_stages", 1, 10), ("max_feedback_rounds", 1, 10)):
+        if key in out:
+            try:
+                out[key] = max(lo, min(hi, int(out[key])))
+            except (TypeError, ValueError):
+                out.pop(key, None)
+    if "current_stage" in out:
+        try:
+            out["current_stage"] = max(1, min(10, int(out["current_stage"])))
+        except (TypeError, ValueError):
+            out.pop("current_stage", None)
+    contracts = out.get("contracts")
+    if isinstance(contracts, dict):
+        contracts = [contracts]
+    if isinstance(contracts, list):
+        cleaned = [c for c in (_coerce_contract(raw, i)
+                               for i, raw in enumerate(contracts)) if c]
+        if cleaned:
+            out["contracts"] = cleaned[:8]
+        else:
+            out.pop("contracts", None)
+    variable_map = out.get("variable_map")
+    if isinstance(variable_map, dict):
+        vm: Dict[str, int] = {}
+        for name, idx in list(variable_map.items())[:64]:
+            try:
+                i = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if i >= 0 and str(name).strip():
+                vm[str(name).strip()[:120]] = i
+        out["variable_map"] = vm
+    elif variable_map is not None:
+        out.pop("variable_map", None)
+    return out
+
+
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
-    return ResearchBlueprint.model_validate(payload)
+    return ResearchBlueprint.model_validate(normalize_blueprint_payload(payload))
 
 
 def _fill(template: str, **values: Any) -> str:
@@ -245,16 +510,40 @@ def format_literature(items: List[Dict[str, Any]], limit: int = 8) -> str:
     return "\n".join(lines)
 
 
+def _feasibility_context(feasibility: Any) -> str:
+    """Render a FeasibilityAssessment (or raw dict) for planner prompts."""
+    if feasibility is None:
+        return "(not yet assessed — classify implicitly from the request)"
+    if isinstance(feasibility, dict):
+        verdict = feasibility.get("verdict", "")
+        rationale = feasibility.get("rationale", "")
+        reformulation = feasibility.get("reformulation", "")
+    else:
+        verdict = getattr(feasibility, "verdict", "")
+        rationale = getattr(feasibility, "rationale", "")
+        reformulation = getattr(feasibility, "reformulation", "")
+    lines = [f"verdict: {verdict}", f"rationale: {rationale}"]
+    if reformulation:
+        lines.append(f"surrogate/reformulation: {reformulation}")
+    return "\n".join(lines)
+
+
 async def generate_research_plan(question: str,
                                  llm_complete: Optional[Callable[[str], Any]] = None,
                                  fallback: bool = True,
                                  literature: Optional[List[Dict[str, Any]]] = None,
+                                 feasibility: Any = None,
                                  ) -> Dict[str, Any]:
-    """Tier-2 REASONING plan synthesis; falls back to a deterministic blueprint."""
+    """Tier-2 REASONING plan synthesis; falls back to a deterministic blueprint.
+
+    ``fallback`` must be False whenever an LLM provider is configured: the canned
+    KdV stub is restricted to explicit offline (no-key) unit-test mode.
+    """
     error: Optional[str] = None
     if llm_complete is not None:
         try:
             prompt = _fill(PLANNER_PROMPT, tools=TOOLS_CONTEXT,
+                           feasibility=_feasibility_context(feasibility),
                            literature=format_literature(literature or []),
                            question=question)
             raw = await llm_complete(prompt)
@@ -271,6 +560,111 @@ async def generate_research_plan(question: str,
             out["planner_error"] = error
         return out
     raise RuntimeError(f"research plan synthesis failed: {error}")
+
+
+def _coerce_feasibility(data: Any) -> Optional[FeasibilityAssessment]:
+    """Build a FeasibilityAssessment from a combined-prompt payload fragment."""
+    if not isinstance(data, dict):
+        return None
+    verdict = data.get("verdict")
+    if verdict not in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE",
+                       "REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
+        return None
+    reformulation = str(data.get("reformulation") or "").strip()
+    if not reformulation:
+        reformulation = ("Reformulate as a falsifiable quantitative question "
+                         "with explicit governing equations and measurable "
+                         "invariants that a deterministic sandbox can verify.")
+    try:
+        return FeasibilityAssessment(
+            verdict=verdict,
+            rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
+            violated_boundary=str(data.get("violated_boundary") or "")[:400],
+            reformulation=reformulation[:600],
+            assessed_by="llm")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def generate_plan_with_feasibility(question: str,
+                                         llm_complete: Optional[Callable[[str], Any]] = None,
+                                         fallback: bool = True,
+                                         literature: Optional[List[Dict[str, Any]]] = None,
+                                         ) -> Dict[str, Any]:
+    """Single Tier-2 call: feasibility gate + blueprint (Task 4 latency fix).
+
+    Returns {"feasibility": FeasibilityAssessment|None, "blueprint": dict|None,
+    "source": "llm"|"fallback"|"heuristic", ...}. When the verdict is a refusal,
+    ``blueprint`` is None. With ``fallback=False`` (live provider configured) any
+    synthesis failure raises instead of returning the canned KdV stub.
+    """
+    from .feasibility import _heuristic_verdict
+
+    heuristic = _heuristic_verdict(question)
+    if heuristic.verdict.startswith("REFUSED"):
+        # Fast path: clear-cut refusals never reach the LLM.
+        return {"feasibility": heuristic, "blueprint": None, "source": "heuristic"}
+    if llm_complete is None:
+        if fallback:
+            return {"feasibility": heuristic,
+                    "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback"}
+        raise RuntimeError("research plan synthesis failed: no LLM planner configured")
+    prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
+                   literature=format_literature(literature or []),
+                   question=question)
+    raw = await llm_complete(prompt)
+    data = _extract_json(str(raw))
+    if not isinstance(data, dict):
+        if fallback:
+            return {"feasibility": heuristic,
+                    "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
+                    "planner_error": "combined planner returned no JSON object"}
+        raise RuntimeError("research plan synthesis failed: combined planner returned no JSON object")
+    feasibility = _coerce_feasibility(data.get("feasibility")) or heuristic
+    if feasibility.verdict.startswith("REFUSED"):
+        return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
+    bp_raw = data.get("blueprint")
+    if not isinstance(bp_raw, dict):
+        if fallback:
+            return {"feasibility": feasibility,
+                    "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
+                    "planner_error": "combined planner returned no blueprint object"}
+        raise RuntimeError("research plan synthesis failed: no blueprint object in response")
+    bp = parse_blueprint(bp_raw)
+    return {"feasibility": feasibility, "blueprint": bp.model_dump(), "source": "llm"}
+
+
+async def generate_expert_research_prompt(question: str,
+                                          llm_complete: Optional[Callable[[str], Any]] = None,
+                                          literature: Optional[List[Dict[str, Any]]] = None,
+                                          ) -> Dict[str, Any]:
+    """Plan Mode: one Tier-2 call -> feasibility + editable expert research prompt.
+
+    Returns {"feasibility": FeasibilityAssessment, "expert_prompt": str,
+    "source": "llm"|"heuristic"}. Raises RuntimeError when the LLM call fails or
+    returns no JSON (never silently substitutes a canned stub).
+    """
+    from .feasibility import _heuristic_verdict
+
+    heuristic = _heuristic_verdict(question)
+    if heuristic.verdict.startswith("REFUSED"):
+        return {"feasibility": heuristic, "expert_prompt": "", "source": "heuristic"}
+    if llm_complete is None:
+        raise RuntimeError("expert prompt synthesis failed: no LLM planner configured")
+    prompt = _fill(EXPERT_PROMPT_PLANNER_PROMPT, tools="",
+                   literature=format_literature(literature or []),
+                   question=question)
+    raw = await llm_complete(prompt)
+    data = _extract_json(str(raw))
+    if not isinstance(data, dict):
+        raise RuntimeError("expert prompt synthesis failed: no JSON object in response")
+    feasibility = _coerce_feasibility(data.get("feasibility")) or heuristic
+    expert_prompt = str(data.get("expert_prompt") or "").strip()
+    if feasibility.verdict.startswith("REFUSED"):
+        return {"feasibility": feasibility, "expert_prompt": "", "source": "llm"}
+    if not expert_prompt:
+        raise RuntimeError("expert prompt synthesis failed: empty expert_prompt")
+    return {"feasibility": feasibility, "expert_prompt": expert_prompt, "source": "llm"}
 
 
 async def synthesize_accretive_stage(llm_complete: Callable[[str], Any], *,

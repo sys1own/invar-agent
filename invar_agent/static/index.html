@@ -15,8 +15,12 @@
   .mode-toggle { display:flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; margin-left:12px; }
   .mode-toggle button { background:transparent; border:none; color:var(--muted); padding:5px 12px; cursor:pointer; font-size:12px; }
   .mode-toggle button.active { background:var(--accent); color:#fff; }
-  #research-panel { display:none; flex:1; flex-direction:column; min-height:0; }
+  .seg-toggle { display:flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .seg-toggle button { background:transparent; border:none; color:var(--muted); padding:5px 12px; cursor:pointer; font-size:12px; }
+  .seg-toggle button.active { background:var(--green); color:#06160e; font-weight:600; }
+  #research-panel { display:none; flex:1; flex-direction:column; min-height:0; overflow:hidden; }
   #research-panel.active { display:flex; }
+  #research-cards { flex:none; max-height:38%; overflow-y:auto; }
   .research-logs { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; padding:10px; overflow:auto; flex:1; min-height:0; }
   .log-pane { background:#0d1119; border:1px solid var(--border); border-radius:8px; display:flex; flex-direction:column; min-height:120px; }
   .log-pane h4 { margin:0; padding:6px 10px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border); letter-spacing:.5px; }
@@ -119,6 +123,7 @@
   <span class="badge">Native Core: <b id="native-status">…</b></span>
   <span class="badge">Tier 0 Reflex: <b>&lt; 1.5 ms | 0 Tokens</b></span>
   <span class="badge">Boundary: <b>BLAKE3 256-bit</b></span>
+  <span class="badge">LLM: <b id="llm-badge">…</b></span>
   <span class="spacer"></span>
   <button class="ghost" onclick="downloadWorkspace()">⬇ Download Workspace</button>
   <button class="iconbtn" title="API key settings" onclick="openModal()">⚙</button>
@@ -147,6 +152,10 @@
     <div class="composer">
       <textarea id="input" placeholder="Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="row">
+        <div class="seg-toggle" id="exec-toggle" title="Direct Mode runs immediately; Plan Mode returns an editable expert prompt card first">
+          <button id="exec-direct" class="active" onclick="setExecMode('direct')">⚡ Direct Build</button>
+          <button id="exec-plan" onclick="setExecMode('plan')">📋 Plan Mode</button>
+        </div>
         <button class="primary" id="send" onclick="if(researchMode)sendResearch();else sendCopilot()">Send</button>
         <span class="hint" id="run-status"></span>
       </div>
@@ -169,7 +178,7 @@
     <div class="row">
       <button class="ghost" onclick="testConnection()">Test connection</button>
       <button class="ghost" onclick="closeModal()">Cancel</button>
-      <button class="primary" onclick="saveKey()">Save</button>
+      <button class="primary" id="save-key-btn" onclick="saveKey()">Save</button>
     </div>
   </div>
 </div>
@@ -245,6 +254,10 @@ async function refreshStatus() {
     const s = await api('/api/status');
     document.getElementById('native-status').textContent = s.native_core_status;
     serverLlm = s.llm || null;
+    const lb = document.getElementById('llm-badge');
+    if (serverLlm && serverLlm.provider) {
+      lb.textContent = serverLlm.provider + (serverLlm.configured ? '' : ' (no key)');
+    } else { lb.textContent = 'not configured'; }
   } catch (e) {}
 }
 /* ---- file explorer ---- */
@@ -290,6 +303,13 @@ async function openFile(rel) {
 async function sendCopilot() {
   const text = input.value.trim();
   if (!text || builderRunning) return;
+  if (executionMode === 'direct') {
+    // Direct Mode: bypass the plan-approval card, run the Builder immediately.
+    addMsg('user', text);
+    input.value = '';
+    runBuild(text);
+    return;
+  }
   addMsg('user', text);
   copilotHistory.push({role: 'user', content: text});
   input.value = '';
@@ -370,7 +390,38 @@ function addResearchRefusalCard(feasibility) {
 }
 function addResearchCardAction(action) {
   if (action.type === 'RESEARCH_REFUSED') { addResearchRefusalCard(action.feasibility); return; }
-  const bp = action.research_prompt || {};
+  const rp = action.research_prompt || {};
+  if (rp.expert_prompt) {
+    // Plan Mode card: editable Expert Deep Research Prompt (never raw blueprint JSON).
+    const f = rp.feasibility || {};
+    const verdict = f.verdict || '';
+    const card = el(`<div class="action-card">
+      <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+        <span class="action-title">📋 Expert Deep Research Prompt</span>
+        ${verdict ? `<span class="badge">${escapeHtml(verdict)}</span>` : ''}
+        <span class="action-toggle">click to edit</span>
+      </div>
+      <div class="action-body" style="display:none">
+        <textarea class="mono" style="min-height:220px"></textarea>
+        <div class="row"><button class="build">Approve &amp; Run Deep Research</button></div>
+      </div>
+    </div>`);
+    const ta = card.querySelector('textarea');
+    ta.value = rp.expert_prompt;
+    card.querySelector('.action-head').onclick = () => {
+      const body = card.querySelector('.action-body');
+      body.style.display = body.style.display === 'none' ? 'block' : 'none';
+    };
+    card.querySelector('button.build').onclick = async () => {
+      const edited = ta.value.trim();
+      if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
+      setMode('research');
+      await runResearchDirect(edited);
+    };
+    chat.appendChild(card); scrollChat();
+    return;
+  }
+  const bp = rp;
   const card = el(`<div class="action-card">
     <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
       <span class="action-title">🔬 Suggested Research Plan</span>
@@ -462,15 +513,25 @@ function handleBuilderEvent(msg) {
 /* ---- research mode ---- */
 let researchMode = false;
 let researchSource = null;
+let executionMode = 'direct'; // 'direct' | 'plan'
+function setExecMode(mode) {
+  executionMode = (mode === 'plan') ? 'plan' : 'direct';
+  updateExecToggle();
+}
+function updateExecToggle() {
+  document.getElementById('exec-direct').classList.toggle('active', executionMode === 'direct');
+  document.getElementById('exec-plan').classList.toggle('active', executionMode === 'plan');
+  document.getElementById('exec-direct').textContent = researchMode ? '⚡ Direct Research' : '⚡ Direct Build';
+}
 function setMode(mode) {
   researchMode = (mode === 'research');
   document.getElementById('mode-builder').classList.toggle('active', !researchMode);
   document.getElementById('mode-research').classList.toggle('active', researchMode);
-  document.getElementById('chat').style.display = researchMode ? 'none' : 'flex';
   document.getElementById('research-panel').classList.toggle('active', researchMode);
   input.placeholder = researchMode
-    ? 'Describe a research question to plan & verify (e.g. KdV soliton c = 2A)…'
+    ? 'Describe a research question — Direct Mode runs it now, Plan Mode drafts an expert prompt…'
     : 'Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)';
+  updateExecToggle();
 }
 function logTo(paneId, text) {
   const pane = document.getElementById(paneId);
@@ -482,28 +543,73 @@ async function sendResearch() {
   if (!text || builderRunning) return;
   addMsg('user', text);
   input.value = '';
+  if (executionMode === 'plan') { await planResearch(text); return; }
+  await runResearchDirect(text);
+}
+async function planResearch(text) {
   setComposerEnabled(false);
-  statusEl.textContent = 'planning research…';
+  statusEl.textContent = 'planning research prompt…';
   try {
-    const data = await api('/api/v1/research/plan', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+    const data = await api('/api/v1/research/plan-prompt', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: text})
     });
-    if (data.status === 'refused' || !data.blueprint) {
+    if (data.status === 'refused') {
       renderResearchRefusal(data.feasibility);
-      statusEl.textContent = '';
-      return;
+    } else {
+      renderExpertPromptCard(data.feasibility, data.expert_prompt || '', text);
     }
-    renderResearchCard(data.blueprint);
-    statusEl.textContent = '';
-    openResearchStream();
   } catch (e) {
     addMsg('system', 'Research plan error: ' + e);
   } finally {
     setComposerEnabled(true);
+    statusEl.textContent = '';
     input.focus();
   }
+}
+async function runResearchDirect(text) {
+  setComposerEnabled(false);
+  statusEl.textContent = 'starting deep research…';
+  try {
+    const data = await api('/api/v1/research/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: text})
+    });
+    if (data.status === 'refused' || !data.started) {
+      renderResearchRefusal(data.feasibility);
+      statusEl.textContent = '';
+      return;
+    }
+    openResearchStream();
+  } catch (e) {
+    addMsg('system', 'Research run error: ' + e);
+  } finally {
+    setComposerEnabled(true);
+    input.focus();
+  }
+}
+function renderExpertPromptCard(feasibility, expertPrompt, question) {
+  const wrap = document.getElementById('research-cards');
+  wrap.innerHTML = '';
+  const f = feasibility || {};
+  const verdict = f.verdict || '';
+  const badge = verdict ? `<span class="badge" style="margin-left:8px">${escapeHtml(verdict)}</span>` : '';
+  const card = el(`<div class="research-card">
+    <h4>📋 Expert Deep Research Prompt${badge}</h4>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${f.rationale ? escapeHtml(String(f.rationale).slice(0, 220)) : 'Edit the prompt below, then approve to dispatch the full verified research loop.'}</div>
+    <textarea class="mono" style="min-height:260px"></textarea>
+    <div class="row">
+      <button class="primary" id="approve-expert">Approve &amp; Run Deep Research</button>
+    </div>
+  </div>`);
+  const ta = card.querySelector('textarea');
+  ta.value = expertPrompt;
+  card.querySelector('#approve-expert').onclick = async () => {
+    const edited = ta.value.trim();
+    if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
+    await runResearchDirect(edited || question);
+  };
+  wrap.appendChild(card);
 }
 function renderResearchRefusal(feasibility) {
   const wrap = document.getElementById('research-cards');
@@ -571,6 +677,16 @@ function openResearchStream() {
     }
     if (msg.event === 'checkpoint_preserved') {
       addMsg('system', `📦 ${msg.note} — exported to ${msg.path}`);
+    }
+    if (msg.event === 'kernel_stage') {
+      statusEl.textContent = `kernel ${msg.stage || ''}`.trim();
+    }
+    if (msg.event === 'synthesizing_report') {
+      statusEl.textContent = 'synthesizing final quantitative report…';
+    }
+    if (msg.event === 'research_report' && msg.report) {
+      statusEl.textContent = '';
+      addCopilotMsg(msg.report);
     }
     if (msg.event === 'research_complete') {
       addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
@@ -645,26 +761,24 @@ async function saveKey() {
   const provider = document.getElementById('provider').value;
   const key = document.getElementById('api-key').value.trim();
   const status = document.getElementById('key-status');
+  const btn = document.getElementById('save-key-btn');
   status.textContent = 'Saving…'; status.className = 'hint';
+  btn.textContent = 'Saving…'; btn.disabled = true;
   try {
     // tier_overrides are intentionally never sent from the UI: the server is
     // the single source of truth for default/auto-picked tier models.
     const data = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({provider: provider, api_key: key})});
     const warnings = (data.warnings || []).join('\n');
-    if (data.key_validated) {
-      status.textContent = '✅ Key validated' + (data.available_models ? ` (${data.available_models.length} models available)` : '');
-      status.className = 'hint ok';
-    } else {
-      status.textContent = 'Saved (key not validated — none provided).';
-      status.className = 'hint';
-    }
     renderTierModels(provider, data.tier_models);
-    document.getElementById('llm-status-detail').textContent = warnings;
-    document.getElementById('llm-status-detail').className = 'hint' + (warnings ? ' err' : '');
-    refreshStatus();
+    // Update the header LLM badge, then auto-close the modal on success.
+    await refreshStatus();
+    closeModal();
   } catch (e) {
+    // Keep the modal open on failure so the error stays visible.
     status.textContent = String(e); status.className = 'hint err';
+  } finally {
+    btn.textContent = 'Save'; btn.disabled = false;
   }
 }
 async function testConnection() {

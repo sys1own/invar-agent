@@ -94,6 +94,10 @@ class ResearchBlueprint(BaseModel):
     evolution_history: List[StageTelemetry] = Field(default_factory=list)
     unified_module_code: Optional[str] = None
     feasibility: Optional[FeasibilityAssessment] = None
+    # Named observables: human-readable metric (with units, e.g.
+    # "magnetic_field_B_tesla") -> index into the final buf.data state vector.
+    # Sandbox_Execute publishes each mapping as telemetry["obs_<name>"].
+    variable_map: Dict[str, int] = Field(default_factory=dict, max_length=64)
 
 
 class SimulationResult(BaseModel):

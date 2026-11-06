@@ -10,7 +10,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -33,8 +33,11 @@ from invar_agent.llm.errors import LLMProviderError, get_last_llm_error, record_
 from invar_agent.llm.validate import validate_provider
 from invar_agent.orchestrator.router import CognitiveModelRouter, TokenBudgetGuardrail
 from invar_agent.research.broadcaster import ResearchEventBroadcaster, ResearchRunManager
-from invar_agent.research.feasibility import evaluate_research_feasibility
-from invar_agent.research.planner import generate_research_plan, parse_blueprint
+from invar_agent.research.planner import (
+    generate_expert_research_prompt,
+    generate_plan_with_feasibility,
+    parse_blueprint,
+)
 from invar_agent.research.search import LiteratureSearchClient
 from invar_agent.schemas.research import ResearchBlueprint
 
@@ -75,6 +78,14 @@ class CopilotRunBuildRequest(BaseModel):
 
 class ResearchPlanRequest(BaseModel):
     question: str = Field(min_length=3, max_length=4000)
+
+
+class ResearchPlanPromptRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=4000)
+
+
+class ResearchRunRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=8000)
 
 
 class ResearchActionRequest(BaseModel):
@@ -324,6 +335,36 @@ def _native_status() -> dict[str, Any]:
     status["modules"] = modules
     status["available"] = all(modules.values())
     return status
+
+
+async def _plan_llm_callable(state: ServerState, question: str,
+                             max_tokens: int = 8192):
+    """Bounded Tier-1 FAST call for plan/prompt synthesis.
+
+    Planning must stay fast (~10-60s): the Tier-2 reasoning model was observed
+    taking 5-10 minutes (thinking budget exhaustion + retries) on planning
+    prompts, so feasibility + blueprint/expert-prompt synthesis runs on the
+    FAST tier with a bounded output budget. Deep domain reasoning still
+    happens inside the verified sandbox, not in the planner.
+    """
+    from invar_agent.config import Tier
+    from invar_agent.llm.clients import get_llm_client
+
+    client = get_llm_client(
+        provider=state.provider, tier=Tier.FAST,
+        api_key=state.api_key or None,
+        override=state.effective_tier_overrides().get(Tier.FAST.value),
+    )
+    if client is None:
+        return None
+    from invar_agent.llm.deepseek import DeepSeekChatClient
+    kwargs: Dict[str, Any] = {}
+    if isinstance(client, DeepSeekChatClient):
+        # Thinking mode would consume the whole planning budget on reasoning.
+        kwargs["thinking"] = False
+    resp = await asyncio.to_thread(client.complete, question,
+                                   max_tokens=max_tokens, temperature=0.2, **kwargs)
+    return resp.content if resp else None
 
 
 def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None) -> FastAPI:
@@ -583,21 +624,112 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
 
     @app.post("/api/v1/research/plan")
     async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
+        """Feasibility gate + blueprint synthesis in a SINGLE Tier-2 call.
+
+        Never returns the canned kdv_soliton_scaling stub when an LLM provider
+        is configured: with a key, ``fallback=False`` and synthesis errors
+        surface as HTTP 502. The stub is restricted to explicit offline
+        (no-key) mode.
+        """
         manager = state.ensure_research_manager()
-        # Epistemic Feasibility Gate: refuse impossible/unsuitable tasks before
-        # any blueprint is synthesised or simulated.
-        feasibility = await evaluate_research_feasibility(
-            req.question, llm_complete=manager.llm_planner)
-        if feasibility.verdict.startswith("REFUSED"):
+        has_llm = bool(state.api_key)
+        try:
+            outcome = await generate_plan_with_feasibility(
+                req.question,
+                llm_complete=(
+                    (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                fallback=not has_llm,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"research plan synthesis failed: {str(exc)[:300]}")
+        feasibility = outcome["feasibility"]
+        if feasibility is not None and feasibility.verdict.startswith("REFUSED"):
             return {"status": "refused", "blueprint": None,
                     "feasibility": feasibility.model_dump()}
-        result = await generate_research_plan(
-            req.question, llm_complete=manager.llm_planner, fallback=True)
-        bp = ResearchBlueprint.model_validate(result["blueprint"])
-        bp = bp.model_copy(update={"feasibility": feasibility})
+        blueprint_dict = outcome["blueprint"]
+        if not blueprint_dict:
+            raise HTTPException(status_code=502,
+                                detail="research plan synthesis returned no blueprint")
+        bp = ResearchBlueprint.model_validate(blueprint_dict)
+        if feasibility is not None:
+            bp = bp.model_copy(update={"feasibility": feasibility})
         manager.request_plan(bp)
         return {"status": "pending_approval", "blueprint": bp.model_dump(),
-                "source": result["source"], "feasibility": feasibility.model_dump()}
+                "source": outcome.get("source"),
+                "feasibility": feasibility.model_dump() if feasibility else None}
+
+    @app.post("/api/v1/research/plan-prompt")
+    async def api_research_plan_prompt(req: ResearchPlanPromptRequest) -> dict[str, Any]:
+        """Plan Mode: feasibility + editable Expert Deep Research Prompt.
+
+        One Tier-2 call; refusals come back as a refusal payload, otherwise an
+        expert prompt with objective/targets, surrogate physics formulation,
+        literature directives and the verification protocol. Never raw
+        blueprint JSON. Requires an LLM provider (no offline stub path).
+        """
+        state.ensure_research_manager()
+        # Clear-cut heuristic refusals are answered without an LLM key.
+        from invar_agent.research.feasibility import _heuristic_verdict
+        heuristic = _heuristic_verdict(req.question)
+        if heuristic.verdict.startswith("REFUSED"):
+            return {"status": "refused", "feasibility": heuristic.model_dump()}
+        if not state.api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Plan Mode requires an LLM provider: configure an API key first")
+        try:
+            result = await generate_expert_research_prompt(
+                req.question,
+                llm_complete=lambda q: _plan_llm_callable(state, q, max_tokens=4096))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"expert prompt synthesis failed: {str(exc)[:300]}")
+        feasibility = result["feasibility"]
+        if feasibility.verdict.startswith("REFUSED"):
+            return {"status": "refused", "feasibility": feasibility.model_dump()}
+        return {"status": "ok", "feasibility": feasibility.model_dump(),
+                "expert_prompt": result["expert_prompt"],
+                "source": result.get("source")}
+
+    @app.post("/api/v1/research/run")
+    async def api_research_run(req: ResearchRunRequest) -> dict[str, Any]:
+        """Direct Mode: immediately generate the plan and start the full
+        verified loop (single combined Tier-2 call), streaming via
+        /api/v1/research/stream.
+        """
+        manager = state.ensure_research_manager()
+        has_llm = bool(state.api_key)
+        try:
+            outcome = await generate_plan_with_feasibility(
+                req.question,
+                llm_complete=(
+                    (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                fallback=not has_llm,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"research plan synthesis failed: {str(exc)[:300]}")
+        feasibility = outcome["feasibility"]
+        if feasibility is not None and feasibility.verdict.startswith("REFUSED"):
+            return {"status": "refused", "started": False, "blueprint": None,
+                    "feasibility": feasibility.model_dump()}
+        blueprint_dict = outcome["blueprint"]
+        if not blueprint_dict:
+            raise HTTPException(status_code=502,
+                                detail="research plan synthesis returned no blueprint")
+        bp = ResearchBlueprint.model_validate(blueprint_dict)
+        if feasibility is not None:
+            bp = bp.model_copy(update={"feasibility": feasibility})
+        manager.request_plan(bp)
+        if not manager.approve():
+            raise HTTPException(status_code=409, detail="could not start research run")
+        return {"status": "running", "blueprint_id": bp.blueprint_id,
+                "source": outcome.get("source"),
+                "feasibility": feasibility.model_dump() if feasibility else None}
 
     @app.post("/api/v1/research/action")
     def api_research_action(req: ResearchActionRequest) -> dict[str, Any]:

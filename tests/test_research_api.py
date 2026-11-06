@@ -11,6 +11,15 @@ from fastapi.testclient import TestClient
 from invar_agent.server import create_app
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_llm_env(monkeypatch):
+    """Unit tests must never call a live LLM, even when the shell exports keys."""
+    from invar_agent.config import GENERIC_KEY_ENV, PROVIDER_KEY_ENVS
+    for name in set(PROVIDER_KEY_ENVS.values()) | {GENERIC_KEY_ENV}:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "0")
+
+
 @pytest.fixture()
 def client(tmp_path):
     import invar_agent.server as server

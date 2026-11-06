@@ -155,6 +155,8 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     text = (text or "").strip()
+    # Strip reasoning-model chain-of-thought wrappers before fence/JSON parsing.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
     fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
     if fence:
         text = fence.group(1)

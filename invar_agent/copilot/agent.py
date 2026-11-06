@@ -310,30 +310,34 @@ class CopilotAgent:
     # -- research planning ------------------------------------------------------
 
     def _maybe_research_action(self, message: str) -> Optional[Dict[str, Any]]:
-        """Tier-2 REASONING research planning for research-intent messages."""
+        """Tier-2 REASONING research planning for research-intent messages.
+
+        Plan Mode never exposes raw ResearchBlueprint JSON: it returns an
+        editable Expert Deep Research Prompt (SUGGEST_RESEARCH_PROMPT) plus the
+        feasibility verdict, or a RESEARCH_REFUSED card.
+        """
         if not is_research_intent(message):
             return None
         import asyncio
 
         from invar_agent.llm.clients import get_llm_client
-        from invar_agent.research.feasibility import evaluate_research_feasibility
-        from invar_agent.research.planner import generate_research_plan
+        from invar_agent.research.planner import generate_expert_research_prompt
 
-        # LLM call rationale: blueprint planning, feasibility judgement and
-        # hypothesis synthesis are deep reasoning tasks, so they use
-        # Tier.REASONING (pro model).
+        # LLM call rationale: expert research-prompt synthesis must stay fast
+        # (the Tier-2 reasoning model was observed taking 5-10 minutes on
+        # planning prompts), so it uses Tier.FAST with a bounded budget. Deep
+        # reasoning happens later inside the verified sandbox.
         client = get_llm_client(
-            self.provider, tier=Tier.REASONING, api_key=self.api_key or None,
-            override=self.tier_overrides.get(Tier.REASONING.value),
+            self.provider, tier=Tier.FAST, api_key=self.api_key or None,
+            override=self.tier_overrides.get(Tier.FAST.value),
         )
 
         async def _call(question: str):
             if client is None:
                 return None
-            # Reasoning-tier models can exhaust small budgets on thinking
-            # (observed finish_reason=length with empty content), so use a
-            # generous budget.
-            resp = client.complete(question, max_tokens=32768, temperature=0.2)
+            from invar_agent.llm.deepseek import DeepSeekChatClient
+            kwargs = {"thinking": False} if isinstance(client, DeepSeekChatClient) else {}
+            resp = client.complete(question, max_tokens=4096, temperature=0.2, **kwargs)
             return resp.content if resp else None
 
         def _run(coro):
@@ -345,21 +349,25 @@ class CopilotAgent:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(asyncio.run, coro).result()
 
-        # Epistemic Feasibility Gate: refuse impossible/unsuitable tasks before
-        # synthesising a plan.
-        feasibility = _run(evaluate_research_feasibility(message, llm_complete=_call))
+        try:
+            result = _run(generate_expert_research_prompt(message, llm_complete=_call))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Research expert-prompt synthesis failed: %s", exc)
+            return None
+        feasibility = result["feasibility"]
         if feasibility.verdict.startswith("REFUSED"):
             return {
                 "type": "RESEARCH_REFUSED",
                 "feasibility": feasibility.model_dump(),
                 "params": {"question": message},
             }
-        result = _run(generate_research_plan(message, llm_complete=_call))
-        blueprint = result.get("blueprint") or {}
-        blueprint["feasibility"] = feasibility.model_dump()
         return {
-            "type": "SUGGEST_RESEARCH_PLAN",
-            "research_prompt": blueprint,
+            "type": "SUGGEST_RESEARCH_PROMPT",
+            "research_prompt": {
+                "expert_prompt": result["expert_prompt"],
+                "question": message,
+                "feasibility": feasibility.model_dump(),
+            },
             "params": {"question": message},
         }
 
