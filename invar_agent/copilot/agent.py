@@ -205,6 +205,7 @@ class CopilotAgent:
         tier: Tier = Tier.FAST,
         max_history: int = 12,
         client_factory=None,
+        tier_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         self.workspace_path = Path(workspace_path)
         self.provider = provider or "gemini"
@@ -213,6 +214,7 @@ class CopilotAgent:
         self.tier = tier
         self.max_history = max_history
         self._client_factory = client_factory
+        self.tier_overrides = dict(tier_overrides or {})
 
     # -- prompt assembly ---------------------------------------------------------
 
@@ -234,6 +236,11 @@ class CopilotAgent:
             prompt += "\n\n" + context
         return prompt
 
+    def _tier_override(self) -> Optional[str]:
+        """Explicit FAST-tier model override (e.g. from ``/api/config``)."""
+        model = self.tier_overrides.get(Tier.FAST.value)
+        return model.strip() if isinstance(model, str) and model.strip() else None
+
     def _llm_client(self):
         if self._client_factory is not None:
             return self._client_factory(self.provider, tier=self.tier, api_key=self.api_key, model=self.model)
@@ -242,7 +249,8 @@ class CopilotAgent:
         # LLM call rationale: copilot chat is a lightweight planning/summarisation
         # task, so it always uses Tier.FAST (light model, low latency).
         return get_llm_client(
-            self.provider, tier=Tier.FAST, api_key=self.api_key, model=self.model
+            self.provider, tier=Tier.FAST, api_key=self.api_key, model=self.model,
+            override=self._tier_override(),
         )
 
     # -- chat ---------------------------------------------------------------------

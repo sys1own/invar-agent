@@ -85,6 +85,7 @@ class VerifiedAutonomousAgent:
         llm_provider: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         llm_client_factory=None,
+        llm_tier_overrides: Optional[dict] = None,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.router = router
@@ -100,6 +101,7 @@ class VerifiedAutonomousAgent:
         self.llm_provider = llm_provider
         self.llm_api_key = llm_api_key
         self._llm_client_factory = llm_client_factory
+        self._llm_tier_overrides = dict(llm_tier_overrides or {})
         self.current_stage = AgentStateStage.INGEST
         self.stage_history: list[dict[str, Any]] = []
         self._sources_cache: dict[str, str] = {}
@@ -370,6 +372,7 @@ class VerifiedAutonomousAgent:
                     provider=self.llm_provider,
                     api_key=self.llm_api_key,
                     client_factory=self._llm_client_factory,
+                    tier_overrides=self._llm_tier_overrides,
                 )
                 # LLM call rationale: Tier-2 pro architectural repair and code
                 # generation require deep reasoning, so it uses Tier.REASONING.
@@ -379,6 +382,7 @@ class VerifiedAutonomousAgent:
                     provider=self.llm_provider,
                     api_key=self.llm_api_key,
                     client_factory=self._llm_client_factory,
+                    tier_overrides=self._llm_tier_overrides,
                 )
                 self._healer = AutonomicHealerOrchestrator(
                     flash_healer=flash_healer, pro_healer=pro_healer

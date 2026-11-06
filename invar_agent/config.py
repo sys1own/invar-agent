@@ -19,15 +19,25 @@ class Tier(str, Enum):
 DEFAULT_TIER_MODELS: Dict[str, Dict[str, str]] = {
     "gemini": {"fast": "gemini-2.5-flash", "reasoning": "gemini-2.5-pro"},
     "openai": {"fast": "gpt-4o-mini", "reasoning": "gpt-4o"},
-    "deepseek": {"fast": "deepseek-v4-flash", "reasoning": "deepseek-chat"},
+    # DeepSeek retired deepseek-chat / deepseek-reasoner on 2026-07-24; the
+    # current IDs are deepseek-flash (V4.1-Flash) and deepseek-v4-pro (V4-Pro).
+    "deepseek": {"fast": "deepseek-flash", "reasoning": "deepseek-v4-pro"},
     "openrouter": {"fast": "openrouter/auto", "reasoning": "openrouter/auto"},
 }
+
+# Retired DeepSeek model IDs — never valid, kept only so tests can assert their absence.
+RETIRED_DEEPSEEK_MODELS = frozenset({"deepseek-chat", "deepseek-reasoner"})
 
 DEFAULT_CONFIG_PATH = Path.home() / ".invar-agent" / "config.json"
 
 
 def _tier_env_name(tier: str) -> str:
     return f"INVAR_LLM_TIER_{tier.upper()}"
+
+
+def _provider_tier_env_name(provider: str, tier: str) -> str:
+    """Provider-specific override, e.g. ``DEEPSEEK_MODEL_FAST``."""
+    return f"{provider.upper()}_MODEL_{tier.upper()}"
 
 
 def _parse_tier_env(value: str, provider: str, tier: str) -> Optional[str]:
@@ -90,9 +100,11 @@ def resolve_tier_model(
 
     Resolution precedence (first hit wins):
     1. Explicit override (a model string or an object with a ``model`` attribute).
-    2. Environment variable ``INVAR_LLM_TIER_<TIER>`` (JSON mapping or raw model name).
-    3. File config ``tier_models`` section.
-    4. ``DEFAULT_TIER_MODELS``.
+    2. Provider-specific environment variable, e.g. ``DEEPSEEK_MODEL_FAST`` /
+       ``DEEPSEEK_MODEL_REASONING`` (raw model name or JSON mapping).
+    3. Generic environment variable ``INVAR_LLM_TIER_<TIER>`` (JSON mapping or raw model name).
+    4. File config ``tier_models`` section.
+    5. ``DEFAULT_TIER_MODELS``.
     """
     if override is not None:
         model = override if isinstance(override, str) else getattr(override, "model", None)
@@ -101,6 +113,12 @@ def resolve_tier_model(
 
     provider = (provider or "").lower()
     tier_value = tier.value if isinstance(tier, Tier) else str(tier).lower()
+
+    provider_env = os.environ.get(_provider_tier_env_name(provider, tier_value))
+    if provider_env:
+        model = _parse_tier_env(provider_env, provider, tier_value)
+        if model:
+            return model
 
     env_value = os.environ.get(_tier_env_name(tier_value))
     if env_value:

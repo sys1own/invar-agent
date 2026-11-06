@@ -232,14 +232,17 @@ def get_llm_client(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    override: Optional[str] = None,
 ) -> Optional[ChatLLMClient]:
     """Resolve a chat client for ``provider``/``tier`` via :func:`resolve_tier_model`.
 
     Returns ``None`` when no API key is available so callers can fall back to
-    deterministic local behaviour.
+    deterministic local behaviour. ``override`` is an explicit per-call model
+    override (e.g. from ``/api/config`` tier_overrides) that wins over env,
+    file config, and defaults.
     """
     provider_name = (provider or os.environ.get("INVAR_LLM_PROVIDER", "gemini")).lower()
-    resolved_model = model or resolve_tier_model(provider_name, tier)
+    resolved_model = model or resolve_tier_model(provider_name, tier, override=override)
     if not resolved_model:
         return None
     key = (
@@ -249,6 +252,19 @@ def get_llm_client(
     )
     if not key:
         return None
+    if provider_name == "deepseek":
+        # DeepSeek gets its own OpenAI-SDK adapter: it omits sampling params
+        # (temperature/top_p) that DeepSeek thinking mode rejects, and resolves
+        # the tier model through resolve_tier_model (deepseek-flash /
+        # deepseek-v4-pro).
+        from .deepseek import DeepSeekChatClient
+
+        return DeepSeekChatClient(
+            tier=tier,
+            api_key=key,
+            model=resolved_model,
+            base_url=base_url,
+        )
     return ChatLLMClient(
         provider=provider_name,
         model=resolved_model,

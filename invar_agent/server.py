@@ -44,6 +44,7 @@ class RollbackRequest(BaseModel):
 class ConfigRequest(BaseModel):
     provider: str = "gemini"
     api_key: str = ""
+    tier_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class CopilotChatRequest(BaseModel):
@@ -68,12 +69,19 @@ class ServerState:
         self.uploaded_zips: dict[str, Path] = {}
         self.api_key: str = ""
         self.provider: str = "gemini"
+        self.tier_overrides: dict[str, str] = {}
         self.copilot: Optional[CopilotAgent] = None
 
-    def set_api_key(self, provider: str, api_key: str) -> None:
+    def set_api_key(self, provider: str, api_key: str,
+                    tier_overrides: Optional[dict[str, str]] = None) -> None:
         with self.lock:
             self.provider = provider or "gemini"
             self.api_key = api_key or ""
+            self.tier_overrides = {
+                str(tier): str(model).strip()
+                for tier, model in (tier_overrides or {}).items()
+                if isinstance(model, str) and model.strip()
+            }
             if self.router is not None:
                 self.router.set_api_key(self.api_key)
             # Rebuild the agent/copilot so LLM clients pick up the new key.
@@ -83,29 +91,20 @@ class ServerState:
     def ensure_agent(self) -> VerifiedAutonomousAgent:
         with self.lock:
             if self.agent is None:
-                llm_client = None
-                llm_provider = None
-                llm_api_key = None
-                if self.api_key:
-                    try:
-                        from invar_agent.llm.clients import get_llm_client
-
-                        # LLM call rationale: the builder performs code generation,
-                        # repair, and SMT-guided synthesis, so its default tier is
-                        # Tier.REASONING (pro model).
-                        llm_client = get_llm_client(
-                            self.provider, tier=Tier.REASONING, api_key=self.api_key
-                        )
-                        llm_provider = self.provider
-                        llm_api_key = self.api_key
-                    except Exception:  # noqa: BLE001
-                        llm_client = None
+                # LLM call rationale: the builder performs code generation,
+                # repair, and SMT-guided synthesis, so it defaults to
+                # Tier.REASONING (pro model). No client is pre-built here: each
+                # healer resolves its own tier-bound client lazily (FAST for
+                # Tier-1 surgical repair, REASONING for Tier-2 architectural
+                # repair) so a single pre-resolved client cannot bypass tiers.
+                llm_provider = self.provider if self.api_key else None
+                llm_api_key = self.api_key or None
                 self.agent = VerifiedAutonomousAgent(
                     self.workspace_root,
                     router=self.router,
-                    llm_client=llm_client,
                     llm_provider=llm_provider,
                     llm_api_key=llm_api_key,
+                    llm_tier_overrides=self.tier_overrides,
                 )
             return self.agent
 
@@ -118,6 +117,7 @@ class ServerState:
                     self.workspace_root,
                     provider=self.provider,
                     api_key=self.api_key,
+                    tier_overrides=self.tier_overrides,
                 )
             return self.copilot
 
@@ -216,8 +216,36 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
 
     @app.post("/api/config")
     def api_config(req: ConfigRequest) -> dict[str, Any]:
-        state.set_api_key(req.provider, req.api_key)
-        return {"configured": True, "provider": state.provider, "api_key_set": bool(state.api_key)}
+        provider = (req.provider or "gemini").lower()
+        key_validated: Optional[bool] = None
+        validation_error: Optional[str] = None
+        # DeepSeek keys are verified against GET /models before being stored so
+        # the UI surfaces an invalid key immediately instead of failing later.
+        if provider == "deepseek" and req.api_key:
+            from invar_agent.llm.deepseek import validate_api_key
+
+            verdict = validate_api_key(req.api_key)
+            key_validated = bool(verdict.get("valid"))
+            if not key_validated:
+                validation_error = verdict.get("error") or "DeepSeek API key validation failed"
+                raise HTTPException(status_code=400, detail=validation_error)
+        state.set_api_key(req.provider, req.api_key, tier_overrides=req.tier_overrides)
+        from invar_agent.config import resolve_tier_model
+
+        tier_models = {
+            tier.value: resolve_tier_model(
+                state.provider, tier,
+                override=state.tier_overrides.get(tier.value),
+            )
+            for tier in Tier
+        }
+        return {
+            "configured": True,
+            "provider": state.provider,
+            "api_key_set": bool(state.api_key),
+            "key_validated": key_validated,
+            "tier_models": tier_models,
+        }
 
     @app.post("/api/copilot/chat")
     def api_copilot_chat(req: CopilotChatRequest) -> dict[str, Any]:

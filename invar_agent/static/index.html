@@ -83,8 +83,12 @@
   .modal-bg.open { display:flex; }
   .modal { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:20px; width:380px; }
   .modal h3 { margin:0 0 12px; }
-  .modal input { width:100%; background:#0d1119; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:9px 11px; margin-bottom:10px; font-family:ui-monospace, monospace; font-size:12px; }
+  .modal input, .modal select { width:100%; background:#0d1119; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:9px 11px; margin-bottom:10px; font-family:ui-monospace, monospace; font-size:12px; }
   .modal .row { display:flex; justify-content:flex-end; gap:8px; }
+  .modal .hint { font-size:11px; color:var(--muted); margin:-4px 0 10px; }
+  .modal .hint.ok { color:#3fb950; }
+  .modal .hint.err { color:#f85149; }
+  .modal .models { font-size:11px; color:var(--muted); background:#0d1119; border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin-bottom:10px; font-family:ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -120,7 +124,18 @@
 <div class="modal-bg" id="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal">
     <h3>Provider API Key</h3>
-    <input id="api-key" type="password" placeholder="Gemini / OpenRouter API key" autocomplete="off">
+    <select id="provider" onchange="onProviderChange()">
+      <option value="gemini">Gemini</option>
+      <option value="openai">OpenAI</option>
+      <option value="deepseek">DeepSeek</option>
+      <option value="openrouter">OpenRouter</option>
+    </select>
+    <input id="api-key" type="password" placeholder="Provider API key" autocomplete="off">
+    <div class="models" id="deepseek-models" style="display:none">
+      Fast tier: <code>deepseek-flash</code> (DeepSeek-V4.1-Flash)<br>
+      Reasoning tier: <code>deepseek-v4-pro</code> (DeepSeek-V4-Pro)
+    </div>
+    <div class="hint" id="key-status"></div>
     <div class="row">
       <button class="ghost" onclick="closeModal()">Cancel</button>
       <button class="primary" onclick="saveKey()">Save</button>
@@ -346,14 +361,64 @@ function downloadWorkspace() { window.location = '/api/export/workspace_zip'; }
 /* ---- settings modal ---- */
 function openModal() { document.getElementById('modal-bg').classList.add('open'); }
 function closeModal() { document.getElementById('modal-bg').classList.remove('open'); }
-async function saveKey() {
-  const key = document.getElementById('api-key').value.trim();
-  try {
-    await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({provider:'gemini', api_key: key})});
-    closeModal(); addMsg('system', 'API key saved.'); refreshStatus();
-  } catch (e) { alert(String(e)); }
+function onProviderChange() {
+  const provider = document.getElementById('provider').value;
+  const isDeepseek = provider === 'deepseek';
+  document.getElementById('deepseek-models').style.display = isDeepseek ? 'block' : 'none';
+  document.getElementById('api-key').placeholder = isDeepseek
+    ? 'DeepSeek API key (sk-...)' : 'Provider API key';
+  const status = document.getElementById('key-status');
+  status.textContent = ''; status.className = 'hint';
 }
+async function validateDeepSeekKey(key) {
+  // Direct browser check against DeepSeek's OpenAI-compatible /models endpoint.
+  try {
+    const resp = await fetch('https://api.deepseek.com/models', {
+      headers: {Authorization: 'Bearer ' + key}
+    });
+    if (resp.ok) return {ok: true};
+    let msg = 'HTTP ' + resp.status;
+    try {
+      const data = await resp.json();
+      msg = (data.error && data.error.message) || data.message || msg;
+    } catch (_) {}
+    return {ok: false, error: msg};
+  } catch (e) {
+    // CORS/network failure: the server performs the same validation on save.
+    return {ok: null, error: String(e)};
+  }
+}
+async function saveKey() {
+  const provider = document.getElementById('provider').value;
+  const key = document.getElementById('api-key').value.trim();
+  const status = document.getElementById('key-status');
+  status.textContent = 'Saving…'; status.className = 'hint';
+  try {
+    const payload = {provider: provider, api_key: key};
+    if (provider === 'deepseek') {
+      payload.tier_overrides = {fast: 'deepseek-flash', reasoning: 'deepseek-v4-pro'};
+    }
+    await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)});
+    if (provider === 'deepseek' && key) {
+      const verdict = await validateDeepSeekKey(key);
+      if (verdict.ok === true) {
+        status.textContent = '✅ Key validated'; status.className = 'hint ok';
+      } else if (verdict.ok === false) {
+        status.textContent = '⚠️ ' + verdict.error; status.className = 'hint err';
+      } else {
+        // Server already validated the key via GET /models before storing it.
+        status.textContent = '✅ Key validated by server'; status.className = 'hint ok';
+      }
+    } else {
+      closeModal(); addMsg('system', 'API key saved.');
+    }
+    refreshStatus();
+  } catch (e) {
+    status.textContent = String(e); status.className = 'hint err';
+  }
+}
+onProviderChange();
 /* ---- boot ---- */
 addMsg('system', 'Welcome to invar-agent. Chat with the copilot to plan a verified build, then send it to the Builder from the Action Card.');
 loadTree();

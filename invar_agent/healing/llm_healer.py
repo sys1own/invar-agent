@@ -38,6 +38,7 @@ class SurgicalLLMHealer:
         provider: Optional[str] = None,
         api_key: Optional[str] = None,
         client_factory=None,
+        tier_overrides: Optional[dict] = None,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -45,7 +46,13 @@ class SurgicalLLMHealer:
         self.provider = provider
         self.api_key = api_key
         self._client_factory = client_factory
+        self.tier_overrides = dict(tier_overrides or {})
         self._resolved_client = client
+
+    def _tier_override(self) -> Optional[str]:
+        """Explicit per-tier model override (e.g. from ``/api/config``)."""
+        model = self.tier_overrides.get(self.tier.value)
+        return model.strip() if isinstance(model, str) and model.strip() else None
 
     def _resolve_client(self):
         if self._resolved_client is not None:
@@ -61,7 +68,8 @@ class SurgicalLLMHealer:
             from invar_agent.llm.clients import get_llm_client
 
             self._resolved_client = get_llm_client(
-                self.provider, tier=self.tier, api_key=self.api_key
+                self.provider, tier=self.tier, api_key=self.api_key,
+                override=self._tier_override(),
             )
         return self._resolved_client
 

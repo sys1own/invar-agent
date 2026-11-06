@@ -79,7 +79,8 @@ def test_resolve_tier_model_defaults_and_precedence(monkeypatch):
     assert resolve_tier_model("gemini", Tier.FAST) == "gemini-2.5-flash"
     assert resolve_tier_model("gemini", Tier.REASONING) == "gemini-2.5-pro"
     assert resolve_tier_model("openai", Tier.FAST) == "gpt-4o-mini"
-    assert resolve_tier_model("deepseek", Tier.REASONING) == "deepseek-chat"
+    assert resolve_tier_model("deepseek", Tier.FAST) == "deepseek-flash"
+    assert resolve_tier_model("deepseek", Tier.REASONING) == "deepseek-v4-pro"
 
     # Explicit override wins over everything.
     assert resolve_tier_model("gemini", Tier.FAST, override="custom-model") == "custom-model"
@@ -150,7 +151,7 @@ def test_builder_healer_wiring_assigns_tiers(tmp_path):
 def test_surgical_llm_healer_resolves_client_with_tier(monkeypatch):
     calls = []
 
-    def fake_get_llm_client(provider, tier=None, api_key=None, model=None):
+    def fake_get_llm_client(provider, tier=None, api_key=None, model=None, **kwargs):
         calls.append({"provider": provider, "tier": tier})
         return _FakeChatClient(
             json.dumps({"ast_patches": [], "replacements": {"calc.py": "x = 1\n"}})
