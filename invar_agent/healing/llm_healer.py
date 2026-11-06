@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from invar_agent.config import Tier
 from invar_agent.contracts import ASTSurgicalPatch
 
 from .error_classifier import ClassifiedErrorPayload
@@ -22,11 +23,47 @@ class LLMRepairResult:
 
 
 class SurgicalLLMHealer:
-    """Tier-1 surgical healer backed by an injectable LLM client."""
+    """Tier-1 surgical healer backed by an injectable LLM client.
 
-    def __init__(self, client=None, system_prompt: str = "") -> None:
+    ``tier`` records the model-routing tier this healer's LLM calls must use:
+    ``Tier.FAST`` for lightweight surgical repair (Tier-1 flash) and
+    ``Tier.REASONING`` for architectural repair / code generation (Tier-2 pro).
+    """
+
+    def __init__(
+        self,
+        client=None,
+        system_prompt: str = "",
+        tier: Tier = Tier.REASONING,
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        client_factory=None,
+    ) -> None:
         self.client = client
         self.system_prompt = system_prompt
+        self.tier = tier
+        self.provider = provider
+        self.api_key = api_key
+        self._client_factory = client_factory
+        self._resolved_client = client
+
+    def _resolve_client(self):
+        if self._resolved_client is not None:
+            return self._resolved_client
+        if self._client_factory is not None:
+            # LLM call rationale: repair patch generation; tier chosen by the caller
+            # (FAST for Tier-1 surgical repair, REASONING for Tier-2 architectural repair).
+            self._resolved_client = self._client_factory(
+                self.provider, tier=self.tier, api_key=self.api_key
+            )
+            return self._resolved_client
+        if self.provider and self.api_key:
+            from invar_agent.llm.clients import get_llm_client
+
+            self._resolved_client = get_llm_client(
+                self.provider, tier=self.tier, api_key=self.api_key
+            )
+        return self._resolved_client
 
     def generate_ast_repair_patch(
         self,
@@ -35,11 +72,12 @@ class SurgicalLLMHealer:
         prompt_payload: Optional[dict[str, Any]] = None,
         max_tokens: int = 4096,
     ) -> LLMRepairResult:
-        if self.client is None:
+        client = self._resolve_client()
+        if client is None:
             return LLMRepairResult(success=False, rationale="no LLM client configured")
         prompt = self._build_prompt(classified, sources, prompt_payload)
         try:
-            response = self.client.complete(prompt, system=self.system_prompt or None, max_tokens=max_tokens)
+            response = client.complete(prompt, system=self.system_prompt or None, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001
             return LLMRepairResult(success=False, rationale=f"LLM call failed: {e}")
         content = response.content if hasattr(response, "content") else str(response)

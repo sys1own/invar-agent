@@ -14,8 +14,10 @@ from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from invar_agent.config import Tier
 from invar_agent.contracts import AgentStateStage, ASTSurgicalPatch, TaskWavefrontNode
 from invar_agent.core.agent import AgentRunReport, VerifiedAutonomousAgent
+from invar_agent.copilot.agent import CopilotAgent
 from invar_agent.export.exporter import ExportEngine
 from invar_agent.orchestrator.router import CognitiveModelRouter, TokenBudgetGuardrail
 
@@ -44,6 +46,15 @@ class ConfigRequest(BaseModel):
     api_key: str = ""
 
 
+class CopilotChatRequest(BaseModel):
+    message: str = ""
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CopilotRunBuildRequest(BaseModel):
+    prompt: str = ""
+
+
 class ServerState:
     """Thread-safe server state: workspace, agent, latest run, overlay txs."""
 
@@ -57,6 +68,7 @@ class ServerState:
         self.uploaded_zips: dict[str, Path] = {}
         self.api_key: str = ""
         self.provider: str = "gemini"
+        self.copilot: Optional[CopilotAgent] = None
 
     def set_api_key(self, provider: str, api_key: str) -> None:
         with self.lock:
@@ -64,24 +76,50 @@ class ServerState:
             self.api_key = api_key or ""
             if self.router is not None:
                 self.router.set_api_key(self.api_key)
-            # Rebuild the agent so the LLM client picks up the new key.
+            # Rebuild the agent/copilot so LLM clients pick up the new key.
             self.agent = None
+            self.copilot = None
 
     def ensure_agent(self) -> VerifiedAutonomousAgent:
         with self.lock:
             if self.agent is None:
                 llm_client = None
+                llm_provider = None
+                llm_api_key = None
                 if self.api_key:
                     try:
-                        from invar_agent.llm.clients import TieredLLMClient
+                        from invar_agent.llm.clients import get_llm_client
 
-                        llm_client = TieredLLMClient(api_key=self.api_key)
+                        # LLM call rationale: the builder performs code generation,
+                        # repair, and SMT-guided synthesis, so its default tier is
+                        # Tier.REASONING (pro model).
+                        llm_client = get_llm_client(
+                            self.provider, tier=Tier.REASONING, api_key=self.api_key
+                        )
+                        llm_provider = self.provider
+                        llm_api_key = self.api_key
                     except Exception:  # noqa: BLE001
                         llm_client = None
                 self.agent = VerifiedAutonomousAgent(
-                    self.workspace_root, router=self.router, llm_client=llm_client
+                    self.workspace_root,
+                    router=self.router,
+                    llm_client=llm_client,
+                    llm_provider=llm_provider,
+                    llm_api_key=llm_api_key,
                 )
             return self.agent
+
+    def ensure_copilot(self) -> CopilotAgent:
+        with self.lock:
+            if self.copilot is None or self.copilot.workspace_path != self.workspace_root:
+                # LLM call rationale: copilot chat is a lightweight planning task,
+                # so CopilotAgent routes every LLM call through Tier.FAST.
+                self.copilot = CopilotAgent(
+                    self.workspace_root,
+                    provider=self.provider,
+                    api_key=self.api_key,
+                )
+            return self.copilot
 
     def ingest_path(self, path: str) -> dict[str, Any]:
         root = Path(path)
@@ -90,6 +128,7 @@ class ServerState:
         with self.lock:
             self.workspace_root = root
             self.agent = VerifiedAutonomousAgent(root, router=self.router)
+            self.copilot = None
             self.last_ingest = self.agent.ingest_workspace()
             return self.last_ingest
 
@@ -105,6 +144,7 @@ class ServerState:
         with self.lock:
             self.workspace_root = root
             self.agent = VerifiedAutonomousAgent(root, router=self.router)
+            self.copilot = None
             self.last_ingest = self.agent.ingest_workspace()
             self.uploaded_zips[filename] = root
             return self.last_ingest
@@ -179,6 +219,21 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
         state.set_api_key(req.provider, req.api_key)
         return {"configured": True, "provider": state.provider, "api_key_set": bool(state.api_key)}
 
+    @app.post("/api/copilot/chat")
+    def api_copilot_chat(req: CopilotChatRequest) -> dict[str, Any]:
+        copilot = state.ensure_copilot()
+        return copilot.chat(req.message, history=req.history)
+
+    @app.post("/api/copilot/run-build")
+    def api_copilot_run_build(req: CopilotRunBuildRequest) -> StreamingResponse:
+        prompt = (req.prompt or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        agent = state.ensure_agent()
+        # Forward the copilot-approved prompt to the verified builder and stream
+        # the same SSE progress events as /api/agent/stream.
+        return _agent_sse_response(agent, prompt, [], {}, None)
+
     @app.get("/api/workspace/tree")
     def api_workspace_tree() -> dict[str, Any]:
         root = state.workspace_root.resolve()
@@ -247,33 +302,7 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"invalid nodes/patches payload: {e}") from None
 
-        events: "queue.Queue[dict[str, Any]]" = queue.Queue()
-
-        def progress_cb(payload: dict[str, Any]) -> None:
-            events.put(payload)
-
-        def worker() -> None:
-            try:
-                report = agent.run_until_verified(
-                    objective, node_list, patches_by_node=patches_by_node,
-                    sandbox_cmd=cmd, progress_cb=progress_cb,
-                )
-                events.put({"type": "done", "report": _report_to_dict(report)})
-            except Exception as e:  # noqa: BLE001
-                events.put({"type": "error", "message": str(e)})
-            finally:
-                events.put({"type": "eof"})
-
-        threading.Thread(target=worker, daemon=True).start()
-
-        def event_generator():
-            while True:
-                item = events.get()
-                if item.get("type") == "eof":
-                    break
-                yield f"data: {json.dumps(item, default=str)}\n\n"
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return _agent_sse_response(agent, objective, node_list, patches_by_node, cmd)
 
     @app.post("/api/agent/execute")
     def api_execute(req: ExecuteRequest) -> dict[str, Any]:
@@ -327,6 +356,46 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
         )
 
     return app
+
+
+def _agent_sse_response(
+    agent: VerifiedAutonomousAgent,
+    objective: str,
+    node_list: list[TaskWavefrontNode],
+    patches_by_node: dict[str, list[ASTSurgicalPatch]],
+    sandbox_cmd: Optional[list[str]],
+) -> StreamingResponse:
+    """Run the synchronous agent in a worker thread and stream progress as SSE."""
+    events: "queue.Queue[dict[str, Any]]" = queue.Queue()
+
+    def progress_cb(payload: dict[str, Any]) -> None:
+        events.put(payload)
+
+    def worker() -> None:
+        try:
+            report = agent.run_until_verified(
+                objective,
+                node_list,
+                patches_by_node=patches_by_node,
+                sandbox_cmd=sandbox_cmd,
+                progress_cb=progress_cb,
+            )
+            events.put({"type": "done", "report": _report_to_dict(report)})
+        except Exception as e:  # noqa: BLE001
+            events.put({"type": "error", "message": str(e)})
+        finally:
+            events.put({"type": "eof"})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_generator():
+        while True:
+            item = events.get()
+            if item.get("type") == "eof":
+                break
+            yield f"data: {json.dumps(item, default=str)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 def _node_from_dict(d: dict[str, Any]) -> TaskWavefrontNode:

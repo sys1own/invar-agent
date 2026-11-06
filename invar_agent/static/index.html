@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>invar-agent — Verified Agent Chat</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <style>
   :root { --bg:#0b0e14; --panel:#12161f; --panel2:#161b26; --border:#232a38; --text:#d7deea; --muted:#7d8798; --accent:#5ad1ff; --green:#3ddc84; --amber:#ffb454; --red:#ff6b6b; }
   * { box-sizing:border-box; }
@@ -32,23 +33,51 @@
   /* Main chat */
   .main { flex:1; display:flex; flex-direction:column; min-width:0; }
   .chat { flex:1; overflow-y:auto; padding:18px 22px; display:flex; flex-direction:column; gap:12px; }
-  .msg { max-width:78%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
-  .msg.user { align-self:flex-end; background:#1d3a52; border:1px solid #2a4a68; }
-  .msg.agent { align-self:flex-start; background:var(--panel2); border:1px solid var(--border); }
+  .msg { max-width:78%; padding:10px 14px; border-radius:12px; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:#1d3a52; border:1px solid #2a4a68; white-space:pre-wrap; }
+  .msg.copilot { align-self:flex-start; background:var(--panel2); border:1px solid var(--border); }
   .msg.system { align-self:center; background:transparent; color:var(--muted); font-size:12px; max-width:100%; }
+  /* Markdown body inside copilot messages */
+  .md { font-size:13.5px; }
+  .md h1,.md h2,.md h3,.md h4 { margin:10px 0 6px; color:var(--text); }
+  .md h1 { font-size:16px; } .md h2 { font-size:15px; } .md h3 { font-size:14px; }
+  .md p { margin:6px 0; }
+  .md ul,.md ol { margin:6px 0; padding-left:20px; }
+  .md code { background:#0d1119; border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:12px; font-family:ui-monospace, monospace; }
+  .md pre { background:#0d1119; border:1px solid var(--border); border-radius:8px; padding:10px 12px; overflow-x:auto; }
+  .md pre code { background:none; border:0; padding:0; }
+  .md blockquote { border-left:3px solid var(--border); margin:6px 0; padding:2px 12px; color:var(--muted); }
+  .md a { color:var(--accent); }
+  /* Action card */
+  .action-card { align-self:flex-start; max-width:85%; background:#0f1a14; border:1px solid #1f4d33; border-radius:10px; padding:10px 14px; }
+  .action-card .action-head { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
+  .action-card .action-title { color:var(--green); font-weight:600; font-size:13px; }
+  .action-card .action-toggle { margin-left:auto; color:var(--muted); font-size:11px; }
+  .action-card .action-body { margin-top:10px; }
+  .action-card textarea { width:100%; min-height:90px; resize:vertical; background:#0d1119; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:9px 11px; font:12.5px/1.5 ui-monospace, monospace; }
+  .action-card textarea:focus { outline:none; border-color:var(--green); }
+  .action-card .row { display:flex; justify-content:flex-end; gap:8px; margin-top:8px; }
+  /* Builder progress */
   .stage-pill { display:inline-block; background:#14202e; border:1px solid #274356; color:var(--accent); border-radius:999px; padding:2px 10px; font-size:11px; margin:2px 4px 2px 0; font-family:ui-monospace, monospace; }
   details.thought { background:#10151f; border:1px solid var(--border); border-radius:8px; padding:6px 10px; max-width:78%; align-self:flex-start; font-size:12px; color:var(--muted); }
   details.thought summary { cursor:pointer; color:var(--amber); }
   .done-card { align-self:flex-start; max-width:85%; background:#0f1a14; border:1px solid #1f4d33; border-radius:10px; padding:10px 14px; font-size:12.5px; }
   .done-card .ok { color:var(--green); } .done-card .bad { color:var(--red); }
+  .thinking { align-self:flex-start; color:var(--muted); font-size:12.5px; padding:4px 6px; }
+  .spinner { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   .composer { border-top:1px solid var(--border); padding:12px 18px; background:var(--panel); }
   .composer textarea { width:100%; min-height:52px; max-height:180px; resize:vertical; background:#0d1119; border:1px solid var(--border); color:var(--text); border-radius:10px; padding:10px 12px; font:inherit; }
   .composer textarea:focus { outline:none; border-color:var(--accent); }
+  .composer textarea:disabled { opacity:.55; cursor:not-allowed; }
   .composer .row { display:flex; gap:8px; margin-top:8px; align-items:center; }
   button.primary { background:var(--accent); color:#06121c; border:0; border-radius:8px; padding:8px 16px; font-weight:600; cursor:pointer; }
   button.primary:disabled { opacity:.5; cursor:default; }
+  button.build { background:var(--green); color:#06160e; border:0; border-radius:8px; padding:8px 16px; font-weight:600; cursor:pointer; }
+  button.build:disabled { opacity:.5; cursor:default; }
   button.ghost { background:none; border:1px solid var(--border); color:var(--muted); border-radius:8px; padding:8px 12px; cursor:pointer; font-size:12px; }
   .hint { font-size:11px; color:var(--muted); }
+  .mono { font-family:ui-monospace, monospace; }
   /* Modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:20; }
   .modal-bg.open { display:flex; }
@@ -80,9 +109,9 @@
   <main class="main">
     <div class="chat" id="chat"></div>
     <div class="composer">
-      <textarea id="input" placeholder="Describe an engineering objective for the verified agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <textarea id="input" placeholder="Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="row">
-        <button class="primary" id="send" onclick="sendObjective()">Send</button>
+        <button class="primary" id="send" onclick="sendCopilot()">Send</button>
         <span class="hint" id="run-status"></span>
       </div>
     </div>
@@ -102,8 +131,10 @@
 const STAGES = ["Ingest","GoI_Plan","Wavefront_Schedule","Overlay_Mutate","PreWrite_Guard","SMT_Concolic_Verify","Sandbox_Execute","Reflex_Heal","Adjoint_Commit_or_Rollback"];
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
-let currentStageIdx = -1;
-let es = null;
+const sendBtn = document.getElementById('send');
+const statusEl = document.getElementById('run-status');
+let builderRunning = false;
+let copilotHistory = [];
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -113,18 +144,35 @@ async function api(path, opts) {
 }
 function el(html) { const d = document.createElement('div'); d.innerHTML = html; return d.firstElementChild; }
 function scrollChat() { chat.scrollTop = chat.scrollHeight; }
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function addMsg(cls, text) {
   const m = el(`<div class="msg ${cls}"></div>`);
   m.textContent = text; chat.appendChild(m); scrollChat(); return m;
 }
+function renderMarkdown(text) {
+  if (typeof marked !== 'undefined') {
+    try {
+      if (marked.setOptions) marked.setOptions({breaks: true, gfm: true});
+      const tmp = document.createElement('div');
+      tmp.innerHTML = marked.parse(text);
+      // Strip active content from model output before injecting.
+      tmp.querySelectorAll('script,iframe,object,embed').forEach(n => n.remove());
+      return tmp.innerHTML;
+    } catch (e) { /* fall through to plain text */ }
+  }
+  return escapeHtml(text).replace(/\n/g, '<br>');
+}
+function addCopilotMsg(markdown) {
+  const m = el(`<div class="msg copilot"><div class="md"></div></div>`);
+  m.querySelector('.md').innerHTML = renderMarkdown(markdown);
+  chat.appendChild(m); scrollChat(); return m;
+}
 function addStagePill(stage, message) {
   const idx = STAGES.indexOf(stage);
-  if (idx >= 0) currentStageIdx = idx;
   const label = idx >= 0 ? `[Stage ${idx + 1}/9] ${stage}` : stage;
   const pill = el(`<span class="stage-pill">${label}${message ? ' — ' + escapeHtml(message) : ''}</span>`);
   chat.appendChild(pill); scrollChat();
 }
-function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function addThought(text) {
   const d = el(`<details class="thought"><summary>Thinking…</summary><div></div></details>`);
   d.querySelector('div').textContent = text;
@@ -134,6 +182,11 @@ function addDone(report) {
   const pill = report.success ? '<span class="ok">✓ PASSED</span>' : '<span class="bad">✗ FAILED</span>';
   const card = el(`<div class="done-card">${pill} — committed ${report.nodes_committed}/${report.nodes_total}, rolled back ${report.nodes_rolled_back}, healed ${report.nodes_healed} · ${(report.duration_ms || 0).toFixed(0)} ms<div class="hint mono">digest ${report.boundary_digest_after || ''}</div></div>`);
   chat.appendChild(card); scrollChat();
+}
+function setComposerEnabled(enabled) {
+  input.disabled = !enabled;
+  sendBtn.disabled = !enabled;
+  if (!enabled) input.blur();
 }
 async function refreshStatus() {
   try {
@@ -180,40 +233,114 @@ async function openFile(rel) {
     document.getElementById('viewer-content').textContent = String(e);
   }
 }
-function sendObjective() {
+/* ---- copilot chat ---- */
+async function sendCopilot() {
   const text = input.value.trim();
-  if (!text) return;
+  if (!text || builderRunning) return;
   addMsg('user', text);
+  copilotHistory.push({role: 'user', content: text});
   input.value = '';
-  document.getElementById('run-status').textContent = 'running…';
-  document.getElementById('send').disabled = true;
-  if (es) es.close();
-  es = new EventSource('/api/agent/stream?objective=' + encodeURIComponent(text));
-  let stageWrap = null;
-  es.onmessage = (ev) => {
-    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === 'stage') {
-      addStagePill(msg.stage, msg.message);
-    } else if (msg.type === 'thought') {
-      addThought(msg.text);
-    } else if (msg.type === 'done') {
-      addDone(msg.report);
-      finishRun();
-    } else if (msg.type === 'error') {
-      addMsg('system', 'Error: ' + msg.message);
-      finishRun();
+  setComposerEnabled(false);
+  statusEl.textContent = '';
+  const thinking = el('<div class="thinking"><span class="spinner"></span>Thinking…</div>');
+  chat.appendChild(thinking); scrollChat();
+  try {
+    const data = await api('/api/copilot/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text, history: copilotHistory.slice(0, -1)})
+    });
+    thinking.remove();
+    addCopilotMsg(data.reply || '(empty reply)');
+    copilotHistory.push({role: 'assistant', content: data.reply || ''});
+    if (data.action && data.action.type === 'SUGGEST_BUILD_PROMPT') {
+      addActionCard(data.action);
     }
-  };
-  es.onerror = () => { addMsg('system', 'Stream interrupted.'); finishRun(); };
+  } catch (e) {
+    thinking.remove();
+    addMsg('system', 'Copilot error: ' + e);
+  } finally {
+    setComposerEnabled(true);
+    input.focus();
+  }
 }
-function finishRun() {
-  if (es) { es.close(); es = null; }
-  document.getElementById('send').disabled = false;
-  document.getElementById('run-status').textContent = '';
-  loadTree(); refreshStatus();
+function addActionCard(action) {
+  const params = action.params || {};
+  const card = el(`<div class="action-card">
+    <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="action-title">⚙ Suggested Build Prompt</span>
+      <span class="action-toggle">click to edit</span>
+    </div>
+    <div class="action-body" style="display:none">
+      <textarea class="mono"></textarea>
+      <div class="row"><button class="build">Send to Builder &amp; Run</button></div>
+    </div>
+  </div>`);
+  const ta = card.querySelector('textarea');
+  ta.value = params.prompt || '';
+  card.querySelector('.action-head').onclick = () => {
+    const body = card.querySelector('.action-body');
+    body.style.display = body.style.display === 'none' ? 'block' : 'none';
+  };
+  card.querySelector('button.build').onclick = () => runBuild(ta.value);
+  chat.appendChild(card); scrollChat();
+}
+/* ---- builder streaming (SSE over POST) ---- */
+async function runBuild(prompt) {
+  if (builderRunning) return;
+  const text = (prompt || '').trim();
+  if (!text) { addMsg('system', 'Build prompt is empty.'); return; }
+  builderRunning = true;
+  setComposerEnabled(false);
+  statusEl.textContent = 'builder running…';
+  addMsg('system', '▶ Builder run started: ' + text.slice(0, 120));
+  try {
+    const resp = await fetch('/api/copilot/run-build', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt: text})
+    });
+    if (!resp.ok || !resp.body) throw new Error('run-build -> ' + resp.status);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, idx); buffer = buffer.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          let msg; try { msg = JSON.parse(line.slice(5).trim()); } catch { continue; }
+          handleBuilderEvent(msg);
+        }
+      }
+    }
+  } catch (e) {
+    addMsg('system', 'Builder stream error: ' + e);
+  } finally {
+    builderRunning = false;
+    setComposerEnabled(true);
+    statusEl.textContent = '';
+    loadTree(); refreshStatus();
+    input.focus();
+  }
+}
+function handleBuilderEvent(msg) {
+  if (msg.type === 'stage') {
+    addStagePill(msg.stage, msg.message);
+  } else if (msg.type === 'thought') {
+    addThought(msg.text);
+  } else if (msg.type === 'done') {
+    addDone(msg.report);
+  } else if (msg.type === 'error') {
+    addMsg('system', 'Builder error: ' + msg.message);
+  }
 }
 input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendObjective(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCopilot(); }
 });
 function downloadWorkspace() { window.location = '/api/export/workspace_zip'; }
 /* ---- settings modal ---- */
@@ -228,7 +355,7 @@ async function saveKey() {
   } catch (e) { alert(String(e)); }
 }
 /* ---- boot ---- */
-addMsg('system', 'Welcome to invar-agent. Describe an objective to run the verified 9-stage kernel.');
+addMsg('system', 'Welcome to invar-agent. Chat with the copilot to plan a verified build, then send it to the Builder from the Action Card.');
 loadTree();
 refreshStatus(); setInterval(refreshStatus, 8000);
 </script>

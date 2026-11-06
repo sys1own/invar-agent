@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from invar_agent.config import Tier
 from invar_agent.contracts import (
     AgentStateStage,
     ASTSurgicalPatch,
@@ -80,6 +81,10 @@ class VerifiedAutonomousAgent:
         healer=None,
         llm_client=None,
         native_solver=None,
+        tier: Tier = Tier.REASONING,
+        llm_provider: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+        llm_client_factory=None,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.router = router
@@ -89,6 +94,12 @@ class VerifiedAutonomousAgent:
         self._healer = healer
         self._llm_client = llm_client
         self._native_solver = native_solver
+        # Builder tier: the verified kernel performs code generation, repair, and
+        # SMT-guided synthesis, so it defaults to the reasoning (pro) tier.
+        self.tier = tier
+        self.llm_provider = llm_provider
+        self.llm_api_key = llm_api_key
+        self._llm_client_factory = llm_client_factory
         self.current_stage = AgentStateStage.INGEST
         self.stage_history: list[dict[str, Any]] = []
         self._sources_cache: dict[str, str] = {}
@@ -343,8 +354,37 @@ class VerifiedAutonomousAgent:
     def _healer_for(self, node=None):
         if self._healer is None:
             from invar_agent.healing.healer import AutonomicHealerOrchestrator
+            from invar_agent.healing.llm_healer import SurgicalLLMHealer
 
-            self._healer = AutonomicHealerOrchestrator()
+            has_llm = (
+                self._llm_client is not None
+                or self.llm_api_key
+                or self._llm_client_factory is not None
+            )
+            if has_llm:
+                # LLM call rationale: Tier-1 flash surgical repair is a lightweight
+                # sub-task, so it uses the FAST tier (light model).
+                flash_healer = SurgicalLLMHealer(
+                    client=self._llm_client,
+                    tier=Tier.FAST,
+                    provider=self.llm_provider,
+                    api_key=self.llm_api_key,
+                    client_factory=self._llm_client_factory,
+                )
+                # LLM call rationale: Tier-2 pro architectural repair and code
+                # generation require deep reasoning, so it uses Tier.REASONING.
+                pro_healer = SurgicalLLMHealer(
+                    client=self._llm_client,
+                    tier=Tier.REASONING,
+                    provider=self.llm_provider,
+                    api_key=self.llm_api_key,
+                    client_factory=self._llm_client_factory,
+                )
+                self._healer = AutonomicHealerOrchestrator(
+                    flash_healer=flash_healer, pro_healer=pro_healer
+                )
+            else:
+                self._healer = AutonomicHealerOrchestrator()
         return self._healer
 
     def _apply_healed_sources(self, tx_id: str, healed_sources: dict[str, str],
@@ -358,7 +398,12 @@ class VerifiedAutonomousAgent:
         return self._healer_for(node).heal_staged_sources_tier0_only(staged, diagnostic, node=node)
 
     def _shield_heal_sources(self, node, staged, shield_report):
-        """SMT counterexample healing: only reflex-eligible categories."""
+        """SMT counterexample healing: only reflex-eligible categories.
+
+        LLM call rationale (when SMT-guided synthesis is wired): generating
+        repairs from SMT counterexamples is code generation, so it must use
+        Tier.REASONING (pro model), never the FAST tier.
+        """
         return None
 
     def _sandbox_heal(self, node, staged, sandbox_result) -> Optional[HealingVerdict]:
