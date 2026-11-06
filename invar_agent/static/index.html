@@ -6,10 +6,10 @@
 <title>invar-agent — Verified Agent Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <style>
-  :root { --bg:#0f1217; --bg-workspace:#0f1217; --bg-card:#161b22; --bg-surface:#1e2430; --border:#2b3545; --text:#f1f5f9; --muted:#94a3b8; --faint:#64748b; --accent:#38bdf8; --green:#34d399; --amber:#fbbf24; --red:#f87171; }
+  :root { --bg:#0f1217; --bg-workspace:#0f1217; --bg-panel:#161b22; --bg-card:#1a202c; --bg-surface:#1e2430; --border:#2d3748; --text:#f8fafc; --text2:#cbd5e1; --muted:#94a3b8; --faint:#64748b; --accent:#38bdf8; --green:#34d399; --amber:#fbbf24; --red:#f87171; }
   * { box-sizing:border-box; }
   body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg-workspace); color:var(--text); font:14px/1.55 "Segoe UI", system-ui, sans-serif; overflow:hidden; }
-  header { display:flex; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--border); background:var(--bg-card); }
+  header { display:flex; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--border); background:var(--bg-panel); }
   header .logo { height:34px; width:34px; border-radius:6px; }
   header .brand { display:flex; align-items:center; gap:10px; margin-right:8px; }
   header h1 { display:none; }
@@ -19,13 +19,53 @@
   .seg-toggle { display:flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:#12161f; }
   .seg-toggle button { background:transparent; border:none; color:#94a3b8; padding:6px 14px; cursor:pointer; font-size:12px; }
   .seg-toggle button.active { background:#283347; color:#f8fafc; font-weight:600; }
-  #research-panel { display:none; flex:1 1 0; flex-direction:column; min-height:0; overflow:hidden; }
+  #research-panel { display:none; flex:none; flex-direction:column; min-height:0; overflow:hidden; }
   #research-panel.active { display:flex; }
   #research-cards { flex:none; max-height:38%; overflow-y:auto; padding-top:6px; }
-  .research-logs { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); grid-template-rows:minmax(0, 1fr); gap:8px; padding:8px 10px 10px; overflow:hidden; flex:1; min-height:0; }
-  .log-pane { background:#12161f; border:1px solid var(--border); border-radius:6px; display:flex; flex-direction:column; min-height:0; overflow:hidden; }
-  .log-pane h4 { flex:none; margin:0; padding:6px 10px 8px; font-size:11px; color:var(--faint); border-bottom:1px solid var(--border); letter-spacing:.5px; }
-  .log-pane pre { margin:0; padding:8px 10px; font-size:11px; overflow:auto; flex:1; min-height:0; white-space:pre-wrap; }
+  /* Collapsible bottom runtime drawer (replaces the fixed 3-pane log strip) */
+  .runtime-drawer { flex:none; background:#12161f; border-top:1px solid #283142; display:flex; flex-direction:column; height:36px; overflow:hidden; transition:height .15s ease; }
+  .runtime-drawer.expanded { height:260px; max-height:40vh; }
+  .drawer-header { display:flex; align-items:center; gap:12px; padding:0 12px; height:36px; cursor:pointer; user-select:none; flex:none; }
+  .drawer-tabs { display:flex; gap:6px; align-items:center; }
+  .drawer-tab { background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:3px 10px; font-size:11px; cursor:pointer; }
+  .drawer-tab.active { background:#283347; color:#f8fafc; border-color:#3b475d; }
+  .tab-badge { background:#1e3a2f; color:#a7f3d0; border-radius:999px; padding:0 6px; font-size:10px; margin-left:4px; }
+  .tab-badge.pulse { animation:badgepulse .6s ease; }
+  @keyframes badgepulse { 0% { background:#78350f; color:#fbbf24; } 100% { background:#1e3a2f; color:#a7f3d0; } }
+  .drawer-actions { margin-left:auto; display:flex; align-items:center; gap:10px; }
+  .status-summary { font-size:11px; color:var(--muted); max-width:46vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .drawer-toggle-btn { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer; font-size:11px; }
+  .drawer-toggle-btn:hover { color:var(--text); border-color:#3b475d; }
+  .drawer-body { flex:1; min-height:0; display:none; overflow:hidden; }
+  .runtime-drawer.expanded .drawer-body { display:flex; }
+  .drawer-pane { display:none; flex:1; min-width:0; overflow:auto; padding:8px 12px; font-size:11px; font-family:ui-monospace,monospace; white-space:pre-wrap; color:var(--muted); }
+  .drawer-pane.active { display:block; }
+  /* Research action cards rendered inside the chat flow */
+  .rcard { align-self:flex-start; width:min(760px, 92%); background:#161b24; border:1px solid #2d3748; border-radius:8px; padding:16px; margin:12px 0; box-shadow:0 4px 12px rgba(0,0,0,.3); }
+  .rcard h4 { margin:0 0 8px; font-size:13px; color:var(--text); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .rcard .rcard-sub { font-size:12px; color:var(--muted); margin-bottom:10px; }
+  .rcard .rcard-ta { width:100%; min-height:120px; resize:vertical; background:#0f1217; border:1px solid #242c3d; color:#e2e8f0; font-family:ui-monospace,monospace; font-size:11.5px; padding:12px; border-radius:6px; }
+  .rcard .rcard-ta:focus { outline:none; border-color:#4f5d7a; }
+  .rcard .row { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .badge-optimal { background:#064e3b; color:#34d399; border:1px solid #059669; }
+  .badge-surrogate { background:#78350f; color:#fbbf24; border:1px solid #d97706; }
+  .btn-approve { background:#1e3a2f; color:#a7f3d0; border:1px solid #2a5a44; border-radius:6px; padding:6px 14px; cursor:pointer; font-size:12px; }
+  .btn-approve:hover { background:#24503c; border-color:#35755a; }
+  .btn-dismiss { background:none; color:var(--muted); border:1px solid var(--border); border-radius:6px; padding:6px 14px; cursor:pointer; font-size:12px; }
+  .btn-dismiss:hover { color:var(--text); border-color:#3b475d; }
+  /* Final research report message */
+  .report-card { align-self:flex-start; width:min(860px, 96%); background:var(--bg-card); border:1px solid #2a5a44; border-radius:8px; padding:6px 0; margin:12px 0; overflow:hidden; }
+  .report-card .report-head { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid var(--border); background:#101b16; }
+  .report-card .report-head .title { font-size:13px; font-weight:600; color:var(--green); }
+  .report-card .md { padding:4px 18px 14px; }
+  .report-card .md table { border-collapse:collapse; margin:8px 0; font-size:12.5px; }
+  .report-card .md th, .report-card .md td { border:1px solid var(--border); padding:5px 10px; text-align:left; }
+  .report-card .md th { background:#12161f; }
+  .report-card .md pre { background:#0f1217; }
+  .files-head { display:flex; align-items:center; justify-content:space-between; }
+  .files-head button { background:none; border:1px solid var(--border); border-radius:6px; color:var(--muted); padding:2px 7px; cursor:pointer; font-size:12px; }
+  .files-head button:hover { color:var(--text); border-color:#3b475d; }
+  .files-head button.on { color:var(--accent); border-color:var(--accent); }
   .plan-mode-banner { display:none; padding:8px 16px; background:#1c1708; border-bottom:1px solid #3d3419; color:var(--amber); font-size:12px; z-index:10; flex:none; }
   .research-card { border:1px solid var(--border); border-radius:6px; padding:12px; margin:10px; background:var(--bg-card); }
   .research-card h4 { margin:0 0 8px; font-size:13px; }
@@ -41,7 +81,7 @@
   .iconbtn:hover { color:var(--text); border-color:#3b475d; }
   .layout { flex:1; display:flex; min-height:0; overflow:hidden; }
   /* Sidebar */
-  .sidebar { width:20%; min-width:220px; max-width:340px; border-right:1px solid var(--border); background:var(--bg-card); display:flex; flex-direction:column; }
+  .sidebar { width:20%; min-width:220px; max-width:340px; border-right:1px solid var(--border); background:var(--bg-panel); display:flex; flex-direction:column; }
   .sidebar h2 { margin:0; padding:10px 14px; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); border-bottom:1px solid var(--border); }
   .tree { flex:1; overflow:auto; padding:8px; font-size:12.5px; }
   .tree-item { padding:3px 6px; border-radius:5px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text); }
@@ -88,7 +128,7 @@
   .thinking { align-self:flex-start; color:var(--muted); font-size:12.5px; padding:4px 6px; }
   .spinner { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .composer { border-top:1px solid var(--border); padding:12px 18px; background:var(--bg-card); }
+  .composer { border-top:1px solid var(--border); padding:12px 18px; background:var(--bg-panel); }
   .composer textarea { width:100%; min-height:52px; max-height:180px; resize:vertical; background:#12161f; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:10px 12px; font:inherit; }
   .composer textarea:focus { outline:none; border-color:var(--accent); }
   .composer textarea:disabled { opacity:.55; cursor:not-allowed; }
@@ -106,7 +146,7 @@
   /* Modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:20; }
   .modal-bg.open { display:flex; }
-  .modal { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:20px; width:380px; }
+  .modal { background:var(--bg-panel); border:1px solid var(--border); border-radius:6px; padding:20px; width:380px; }
   .modal h3 { margin:0 0 12px; }
   .modal input, .modal select { width:100%; background:#12161f; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:9px 11px; margin-bottom:10px; font-family:ui-monospace, monospace; font-size:12px; }
   .modal .row { display:flex; justify-content:flex-end; gap:8px; }
@@ -139,7 +179,7 @@
 <div class="banner" id="llm-banner"></div>
 <div class="layout">
   <aside class="sidebar">
-    <h2>Files</h2>
+    <h2 class="files-head"><span>Files</span><button id="hidden-toggle" title="Show internal build artifacts" onclick="toggleHiddenArtifacts()">👁️</button></h2>
     <div class="tree" id="tree"><div class="tree-item">Loading…</div></div>
     <div class="viewer" id="viewer" style="display:none">
       <div class="head mono" id="viewer-name"></div>
@@ -154,13 +194,7 @@
       <span class="hint">mathematically verified quantitative research, end-to-end</span>
     </div>
     <div class="research-panel" id="research-panel">
-      <div id="research-cards"></div>
       <div class="telemetry" id="research-telemetry"></div>
-      <div class="research-logs">
-        <div class="log-pane"><h4>SEARCH LOG</h4><pre id="log-search"></pre></div>
-        <div class="log-pane"><h4>GoI/HIN STREAM</h4><pre id="log-goi"></pre></div>
-        <div class="log-pane"><h4>ACCELERATOR LOG</h4><pre id="log-accel"></pre></div>
-      </div>
     </div>
     <div class="chat" id="chat"></div>
     <div class="composer">
@@ -172,6 +206,24 @@
         </div>
         <button class="primary" id="send" onclick="if(researchMode)sendResearch();else sendCopilot()">Send</button>
         <span class="hint" id="run-status"></span>
+      </div>
+    </div>
+    <div id="runtime-drawer" class="runtime-drawer collapsed">
+      <div class="drawer-header" onclick="toggleDrawer()">
+        <div class="drawer-tabs">
+          <button class="drawer-tab active" data-tab="search-log" onclick="event.stopPropagation();switchDrawerTab('search-log')">🔍 Literature Search <span id="search-count" class="tab-badge">0</span></button>
+          <button class="drawer-tab" data-tab="goi-stream" onclick="event.stopPropagation();switchDrawerTab('goi-stream')">⚡ GoI / HIN Stream</button>
+          <button class="drawer-tab" data-tab="accelerator-log" onclick="event.stopPropagation();switchDrawerTab('accelerator-log')">⚙️ Accelerator <span id="accel-count" class="tab-badge">0</span></button>
+        </div>
+        <div class="drawer-actions">
+          <span id="drawer-status-summary" class="status-summary">Idle</span>
+          <button class="drawer-toggle-btn" id="drawer-toggle-btn" onclick="event.stopPropagation();toggleDrawer()">▲</button>
+        </div>
+      </div>
+      <div class="drawer-body">
+        <div id="tab-search-log" class="drawer-pane active"></div>
+        <div id="tab-goi-stream" class="drawer-pane"></div>
+        <div id="tab-accelerator-log" class="drawer-pane"></div>
       </div>
     </div>
   </main>
@@ -277,11 +329,18 @@ async function refreshStatus() {
 /* ---- file explorer ---- */
 async function loadTree() {
   const tree = document.getElementById('tree');
+  const hidden = document.getElementById('hidden-toggle');
   try {
-    const data = await api('/api/workspace/tree');
+    const data = await api('/api/workspace/tree' + (showHiddenArtifacts ? '?show_hidden_artifacts=true' : ''));
     tree.innerHTML = '';
     tree.appendChild(renderNode(data, true));
   } catch (e) { tree.textContent = 'workspace unavailable'; }
+  if (hidden) hidden.classList.toggle('on', showHiddenArtifacts);
+}
+let showHiddenArtifacts = false;
+function toggleHiddenArtifacts() {
+  showHiddenArtifacts = !showHiddenArtifacts;
+  loadTree();
 }
 function renderNode(node, isRoot, prefix) {
   const wrap = document.createElement('div');
@@ -551,8 +610,32 @@ function setMode(mode) {
 }
 function logTo(paneId, text) {
   const pane = document.getElementById(paneId);
+  if (!pane) return;
   pane.textContent += text + '\n';
   pane.scrollTop = pane.scrollHeight;
+}
+/* ---- collapsible runtime drawer ---- */
+let drawerExpanded = false;
+function toggleDrawer() {
+  drawerExpanded = !drawerExpanded;
+  const d = document.getElementById('runtime-drawer');
+  d.classList.toggle('expanded', drawerExpanded);
+  d.classList.toggle('collapsed', !drawerExpanded);
+  document.getElementById('drawer-toggle-btn').textContent = drawerExpanded ? '▼' : '▲';
+}
+function switchDrawerTab(tab) {
+  document.querySelectorAll('.drawer-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.drawer-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
+}
+function pulseBadge(id) {
+  const b = document.getElementById(id);
+  if (!b) return;
+  b.textContent = String((parseInt(b.textContent, 10) || 0) + 1);
+  b.classList.remove('pulse'); void b.offsetWidth; b.classList.add('pulse');
+}
+function setDrawerSummary(text) {
+  const s = document.getElementById('drawer-status-summary');
+  if (s) s.textContent = String(text || 'Idle').slice(0, 120);
 }
 async function sendResearch() {
   const text = input.value.trim();
@@ -618,18 +701,28 @@ async function runResearchDirect(text, feasibility) {
     input.focus();
   }
 }
+/* Research action cards live in the main conversation flow (#chat) so the
+   conversation, cards and results own 85%+ of the screen. */
+function clearResearchCards() {
+  chat.querySelectorAll('.rcard').forEach(n => n.remove());
+}
+function verdictBadge(verdict) {
+  const v = String(verdict || '').toUpperCase();
+  if (v === 'OPTIMAL_DIRECT') return '<span class="badge badge-optimal">OPTIMAL DIRECT</span>';
+  if (v === 'REFORMULATED_SURROGATE') return '<span class="badge badge-surrogate">REFORMULATED SURROGATE</span>';
+  if (v) return `<span class="badge">${escapeHtml(v)}</span>`;
+  return '';
+}
 function renderExpertPromptCard(feasibility, expertPrompt, question) {
-  const wrap = document.getElementById('research-cards');
-  wrap.innerHTML = '';
+  clearResearchCards();
   const f = feasibility || {};
-  const verdict = f.verdict || '';
-  const badge = verdict ? `<span class="badge" style="margin-left:8px">${escapeHtml(verdict)}</span>` : '';
-  const card = el(`<div class="research-card">
-    <h4>📋 Expert Deep Research Prompt${badge}</h4>
-    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${f.rationale ? escapeHtml(String(f.rationale).slice(0, 220)) : 'Edit the prompt below, then approve to dispatch the full verified research loop.'}</div>
-    <textarea class="mono" style="min-height:260px"></textarea>
+  const card = el(`<div class="rcard">
+    <h4>📋 Expert Deep Research Prompt ${verdictBadge(f.verdict)}</h4>
+    <div class="rcard-sub">${f.rationale ? escapeHtml(String(f.rationale).slice(0, 260)) : 'Edit the prompt below, then approve to dispatch the full verified research loop.'}</div>
+    <textarea class="rcard-ta"></textarea>
     <div class="row">
-      <button class="primary" id="approve-expert">Approve &amp; Run Deep Research</button>
+      <button class="btn-approve" id="approve-expert">⚡ Approve &amp; Run Deep Research</button>
+      <button class="btn-dismiss" id="dismiss-expert">✕ Dismiss</button>
     </div>
   </div>`);
   const ta = card.querySelector('textarea');
@@ -639,7 +732,8 @@ function renderExpertPromptCard(feasibility, expertPrompt, question) {
     if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
     await runResearchDirect(edited || question, feasibility);
   };
-  wrap.appendChild(card);
+  card.querySelector('#dismiss-expert').onclick = () => card.remove();
+  chat.appendChild(card); scrollChat();
 }
 function renderResearchRefusal(feasibility) {
   const f = feasibility || {};
@@ -649,35 +743,34 @@ function renderResearchRefusal(feasibility) {
     addMsg('system', `Feasibility verdict: ${v}`);
     return;
   }
-  const wrap = document.getElementById('research-cards');
-  wrap.innerHTML = '';
-  const card = el(`<div class="research-card refusal">
-    <h4>⛔ Epistemic Feasibility Gate: ${f.verdict || 'REFUSED'}</h4>
-    <div style="font-size:12px;margin:8px 0"><b>Why:</b> ${f.rationale || ''}</div>
-    <div style="font-size:12px;margin:8px 0"><b>Boundary:</b> ${f.violated_boundary || 'n/a'}</div>
-    ${f.reformulation ? `<div style="font-size:12px;margin:8px 0"><b>Reformulate:</b> ${f.reformulation}</div>` : ''}
+  clearResearchCards();
+  const card = el(`<div class="rcard" style="border-color:#f85149">
+    <h4>⛔ Epistemic Feasibility Gate: ${escapeHtml(f.verdict || 'REFUSED')}</h4>
+    <div class="rcard-sub"><b>Why:</b> ${escapeHtml(f.rationale || '')}</div>
+    <div class="rcard-sub"><b>Boundary:</b> ${escapeHtml(f.violated_boundary || 'n/a')}</div>
+    ${f.reformulation ? `<div class="rcard-sub"><b>Reformulate:</b> ${escapeHtml(f.reformulation)}</div>` : ''}
+    <div class="row"><button class="btn-dismiss" onclick="this.closest('.rcard').remove()">✕ Dismiss</button></div>
   </div>`);
-  wrap.appendChild(card);
+  chat.appendChild(card); scrollChat();
 }
 function renderResearchCard(bp) {
-  const wrap = document.getElementById('research-cards');
-  wrap.innerHTML = '';
-  const card = el(`<div class="research-card">
-    <h4>🔬 Research Plan: ${bp.title || bp.blueprint_id}</h4>
-    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${bp.falsifiable_hypothesis || ''}</div>
-    <textarea class="mono"></textarea>
+  clearResearchCards();
+  const card = el(`<div class="rcard">
+    <h4>🔬 Research Plan: ${escapeHtml(bp.title || bp.blueprint_id)} ${verdictBadge((bp.feasibility || {}).verdict)}</h4>
+    <div class="rcard-sub">${escapeHtml(bp.falsifiable_hypothesis || '')}</div>
+    <textarea class="rcard-ta" style="min-height:200px"></textarea>
     <div class="row">
-      <button class="primary" id="approve-research">Approve &amp; Run Deep Research</button>
-      <button class="ghost" id="edit-research">Edit Plan</button>
-      <button class="ghost" id="abort-research">Abort</button>
+      <button class="btn-approve" id="approve-research">⚡ Approve &amp; Run Deep Research</button>
+      <button class="btn-dismiss" id="edit-research">✏️ Edit</button>
+      <button class="btn-dismiss" id="dismiss-research">✕ Dismiss</button>
     </div>
   </div>`);
   const ta = card.querySelector('textarea');
   ta.value = JSON.stringify(bp, null, 2);
   card.querySelector('#approve-research').onclick = () => researchAction('approve_plan', ta.value);
   card.querySelector('#edit-research').onclick = () => { ta.focus(); };
-  card.querySelector('#abort-research').onclick = () => researchAction('abort');
-  wrap.appendChild(card);
+  card.querySelector('#dismiss-research').onclick = () => researchAction('abort');
+  chat.appendChild(card); scrollChat();
 }
 async function researchAction(action, blueprintJson) {
   const body = {action};
@@ -692,14 +785,35 @@ async function researchAction(action, blueprintJson) {
     });
   } catch (e) { addMsg('system', 'Research action error: ' + e); }
 }
+function addResearchReportCard(markdown, path) {
+  const card = el(`<div class="report-card">
+    <div class="report-head">
+      <span class="title">📄 Quantitative Research Report</span>
+      <span class="hint">${path ? escapeHtml(path) : ''}</span>
+      <span style="flex:1"></span>
+      <button class="btn-approve" id="open-report-editor">📄 Open research_report.md in Editor</button>
+    </div>
+    <div class="md"></div>
+  </div>`);
+  card.querySelector('.md').innerHTML = renderMarkdown(markdown);
+  card.querySelector('#open-report-editor').onclick = () => openFile('research_report.md');
+  chat.appendChild(card); scrollChat();
+  loadTree();
+}
 function openResearchStream() {
   if (researchSource) researchSource.close();
   researchSource = new EventSource('/api/v1/research/stream');
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const ch = msg.channel || 'accelerator_log';
-    const pane = ch === 'search_log' ? 'log-search' : ch === 'goi_stream' ? 'log-goi' : 'log-accel';
+    const pane = ch === 'search_log' ? 'tab-search-log' : ch === 'goi_stream' ? 'tab-goi-stream' : 'tab-accelerator-log';
     logTo(pane, `[${ch}] ${msg.event || 'log'} ${JSON.stringify(msg).slice(0, 300)}`);
+    if (ch === 'search_log') pulseBadge('search-count');
+    if (ch !== 'search_log') pulseBadge('accel-count');
+    if (msg.event === 'run_start') {
+      // A new run supersedes any previously rendered report card.
+      chat.querySelectorAll('.report-card').forEach(n => n.remove());
+    }
     if (msg.event === 'result' && msg.telemetry) {
       const tel = document.getElementById('research-telemetry');
       tel.textContent = `contract=${msg.contract_id} status=${msg.status} time=${Number(msg.execution_time_ms || 0).toFixed(1)}ms ` +
@@ -707,6 +821,7 @@ function openResearchStream() {
     }
     if (msg.event === 'stage_start') {
       statusEl.textContent = `research stage ${msg.research_stage}/${msg.total_stages} (${msg.mode}): ${msg.objective || ''}`;
+      setDrawerSummary(`Stage ${msg.research_stage}/${msg.total_stages}: ${msg.objective || msg.mode || ''}`);
     }
     if (msg.event === 'checkpoint') {
       addMsg('system', `📌 Stage ${msg.research_stage} verified & pinned. Checkpoint: ${msg.bundle_hash || ''} (${(msg.pinned_layers || []).join(', ')})`);
@@ -716,13 +831,21 @@ function openResearchStream() {
     }
     if (msg.event === 'kernel_stage') {
       statusEl.textContent = `kernel ${msg.stage || ''}`.trim();
+      setDrawerSummary(`kernel ${msg.stage || ''}`.trim());
     }
     if (msg.event === 'synthesizing_report') {
       statusEl.textContent = 'synthesizing final quantitative report…';
+      setDrawerSummary('synthesizing final quantitative report…');
+    }
+    if (msg.event === 'research_completed' && msg.report) {
+      statusEl.textContent = '';
+      setDrawerSummary(`Report ready — run ${msg.status || ''}`);
+      addResearchReportCard(msg.report, msg.report_path || '');
     }
     if (msg.event === 'research_report' && msg.report) {
+      // Legacy event name (older servers): same rendering path.
       statusEl.textContent = '';
-      addCopilotMsg(msg.report);
+      addResearchReportCard(msg.report, '');
     }
     if (msg.event === 'research_complete') {
       addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
@@ -737,6 +860,7 @@ function openResearchStream() {
         tel.textContent = snap.evolution_history.map(h =>
           `stage ${h.stage}: ${h.status}${h.note ? ' — ' + h.note.slice(0, 80) : ''}`).join('  |  ');
       }
+      setDrawerSummary(`Run ${msg.status || 'done'}`);
     }
     if (msg.event === 'commit') {
       addMsg('system', '✅ Research run committed. Bundle: ' + (msg.bundle_hash || '').slice(0, 16));

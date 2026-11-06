@@ -258,7 +258,7 @@ reformulation.
    total_heat_load_mj_m2) mapped to buffer slots the module writes.
 6. **v9_transpiler_friendly code**: code_template uses ONLY the allowed subset
    (pure functions, simulation_step(buf, dt), math.* only, no classes,
-   exceptions, dynamic imports, dicts/sets/comprehensions, strings).
+   exceptions, dynamic imports, dicts/sets/tuples/comprehensions, strings).
 
 ## Few-shot exemplar (aerothermodynamics entry)
 Request: "600 kg probe, 5.8 km/s entry, 1.4 m spherical-segment aeroshell
@@ -351,7 +351,7 @@ the style exemplar):
 5. **Named telemetry observables** — e.g. peak_g, peak_alt_km,
    max_heat_flux_mw_m2, total_heat_load_mj_m2, each with units.
 6. **v9_transpiler_friendly synthesis** — pure functions + simulation_step(buf,
-   dt) only; NO classes, exceptions, dynamic imports, dicts/sets/comprehensions
+   dt) only; NO classes, exceptions, dynamic imports, dicts/sets/tuples/comprehensions
    or non-math imports.
 
 ## Few-shot exemplar (aerothermodynamics entry)
