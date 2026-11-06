@@ -1,0 +1,141 @@
+"""Tiered LLM clients with token budget accounting."""
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol
+
+import httpx
+
+from ..orchestrator.router import CognitiveModelRouter, CognitiveTier, ModelRouteDecision, TaskEventType, TokenBudgetGuardrail
+
+
+@dataclass
+class LLMResponse:
+    content: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    latency_ms: float = 0.0
+
+
+class LLMClient(Protocol):
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 max_tokens: int = 4096, temperature: float = 0.0) -> LLMResponse:
+        ...
+
+
+class TokenBudgetAccountant:
+    """Tracks tiered token consumption against guardrail budgets."""
+
+    def __init__(self, guardrail: Optional[TokenBudgetGuardrail] = None) -> None:
+        self.budget = guardrail or TokenBudgetGuardrail()
+
+    def record(self, tier: CognitiveTier, input_tokens: int, output_tokens: int) -> None:
+        self.budget.record_usage(tier, input_tokens, output_tokens)
+
+    def remaining(self, tier: CognitiveTier) -> int:
+        if tier == CognitiveTier.TIER_2_PRO:
+            return max(0, self.budget.max_pro_tokens - self.budget.used_pro_tokens)
+        return max(0, self.budget.max_flash_tokens - self.budget.used_flash_tokens)
+
+
+class _OpenRouterClient:
+    """Minimal OpenRouter chat-completions client (used only when keyed)."""
+
+    def __init__(self, model: str, api_key: Optional[str] = None) -> None:
+        self.model = model
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self.base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 max_tokens: int = 4096, temperature: float = 0.0) -> LLMResponse:
+        if not self.api_key:
+            raise RuntimeError("OPENROUTER_API_KEY not configured; cannot call remote model.")
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        start = time.perf_counter()
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(
+                self.base_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        latency = (time.perf_counter() - start) * 1000.0
+        choice = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        return LLMResponse(
+            content=choice,
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            model=self.model,
+            latency_ms=latency,
+        )
+
+
+class ProModelClient:
+    def __init__(self, model: str = "gemini-2.5-pro", api_key: Optional[str] = None) -> None:
+        self._client = _OpenRouterClient(model, api_key)
+        self.model = model
+
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 max_tokens: int = 4096, temperature: float = 0.0) -> LLMResponse:
+        return self._client.complete(prompt, system, max_tokens, temperature)
+
+
+class FlashModelClient:
+    def __init__(self, model: str = "gemini-2.5-flash", api_key: Optional[str] = None) -> None:
+        self._client = _OpenRouterClient(model, api_key)
+        self.model = model
+
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 max_tokens: int = 4096, temperature: float = 0.0) -> LLMResponse:
+        return self._client.complete(prompt, system, max_tokens, temperature)
+
+
+class TieredLLMClient:
+    """Routes prompts through the CognitiveModelRouter and records budgets."""
+
+    def __init__(
+        self,
+        router: Optional[CognitiveModelRouter] = None,
+        pro_client: Optional[LLMClient] = None,
+        flash_client: Optional[LLMClient] = None,
+    ) -> None:
+        self.router = router or CognitiveModelRouter()
+        self.pro_client = pro_client or ProModelClient(self.router.pro_model)
+        self.flash_client = flash_client or FlashModelClient(self.router.flash_model)
+        self.accountant = TokenBudgetAccountant(self.router.budget)
+
+    def complete(
+        self,
+        event_type: TaskEventType,
+        prompt: str,
+        system: Optional[str] = None,
+        **route_kwargs: Any,
+    ) -> tuple[ModelRouteDecision, LLMResponse]:
+        decision = self.router.route(event_type, **route_kwargs)
+        if decision.tier == CognitiveTier.TIER_0_REFLEX:
+            raise RuntimeError("Tier-0 reflex path must be handled locally without an LLM call.")
+        client = self.pro_client if decision.tier == CognitiveTier.TIER_2_PRO else self.flash_client
+        response = client.complete(
+            prompt,
+            system=system,
+            max_tokens=decision.max_output_tokens,
+            temperature=decision.temperature,
+        )
+        # Rough token accounting when provider does not report usage.
+        in_tokens = response.input_tokens or max(1, len(prompt) // 4)
+        out_tokens = response.output_tokens or max(1, len(response.content) // 4)
+        self.accountant.record(decision.tier, in_tokens, out_tokens)
+        return decision, response

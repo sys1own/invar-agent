@@ -1,0 +1,19 @@
+[package]
+name = "invar_agent_native"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 native acceleration core for the invar-agent verified autonomous agent kernel"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+blake3 = "1.5"
+regex = "1.10"
+aho-corasick = "1.1"

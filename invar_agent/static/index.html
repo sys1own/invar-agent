@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>invar-agent — Verified Autonomous Agent Kernel</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#12161f; --border:#232a38; --text:#d7deea; --muted:#7d8798; --accent:#5ad1ff; --green:#3ddc84; --amber:#ffb454; --red:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 20px; border-bottom:1px solid var(--border); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:17px; margin:0; letter-spacing:.5px; }
+  header h1 span { color:var(--accent); }
+  .pill { background:#1b2230; border:1px solid var(--border); border-radius:999px; padding:4px 12px; font-size:12px; color:var(--muted); white-space:nowrap; }
+  .pill b { color:var(--green); font-weight:600; }
+  main { padding:16px 20px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .panel h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); }
+  .full { grid-column:1 / -1; }
+  input, textarea, select { background:#0d1119; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 10px; width:100%; font-family:inherit; }
+  textarea { min-height:90px; font-family:ui-monospace, monospace; font-size:12px; }
+  button { background:var(--accent); color:#06121c; border:0; border-radius:6px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#26303f; color:var(--text); }
+  button.danger { background:var(--red); color:#1c0606; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .stages { display:flex; gap:4px; overflow-x:auto; padding:6px 0; }
+  .stage { flex:1; min-width:90px; text-align:center; padding:8px 4px; border:1px solid var(--border); border-radius:8px; font-size:11px; color:var(--muted); background:#161b26; transition:all .2s; }
+  .stage.active { border-color:var(--accent); color:var(--accent); box-shadow:0 0 8px rgba(90,209,255,.35); }
+  .stage.done { border-color:var(--green); color:var(--green); }
+  .stage.fail { border-color:var(--red); color:var(--red); }
+  .badges span { display:inline-block; background:#1b2230; border:1px solid var(--border); border-radius:4px; padding:2px 8px; margin:2px 4px 2px 0; font-size:11px; color:var(--accent); }
+  .budget { margin:8px 0; }
+  .budget .bar { height:8px; background:#1b2230; border-radius:4px; overflow:hidden; margin-top:3px; }
+  .budget .fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); }
+  pre { background:#0d1119; border:1px solid var(--border); border-radius:8px; padding:10px; overflow:auto; max-height:280px; font-size:12px; }
+  .mono { font-family:ui-monospace, monospace; }
+  .digest { color:var(--amber); font-family:ui-monospace, monospace; font-size:11px; word-break:break-all; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>invar<span>-agent</span> Console</h1>
+  <span class="pill">Native Core Status: <b id="native-status">…</b></span>
+  <span class="pill">Tier 0 Reflex Latency: <b>&lt; 1.5 ms | 0 Tokens</b></span>
+  <span class="pill">Holographic Boundary Register: <b>BLAKE3 256-bit H(d_Ω)</b></span>
+  <span class="pill">Stage: <b id="stage-pill" class="mono">Ingest</b></span>
+</header>
+<main>
+  <section class="panel">
+    <h2>Workspace Ingestion</h2>
+    <div class="row">
+      <input id="ws-path" placeholder="/path/to/workspace" value=".">
+      <button onclick="ingest()">Ingest Workspace</button>
+    </div>
+    <div class="row">
+      <input id="ws-zip" type="file" accept=".zip">
+      <button class="secondary" onclick="ingestZip()">Upload ZIP</button>
+    </div>
+    <pre id="ingest-out" class="hidden"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Autonomous Objective &amp; Dual-Tier Router</h2>
+    <textarea id="objective" placeholder="Describe the engineering objective…">Add subtract and divide helpers to the sample package with verified wavefront execution.</textarea>
+    <div class="row">
+      <select id="tier" style="width:auto"><option>TIER_1_FLASH</option><option>TIER_2_PRO</option></select>
+      <button onclick="execute()">Execute Kernel</button>
+    </div>
+    <div class="budget">
+      <div class="mono" style="font-size:11px;color:var(--muted)">Pro tier (gemini-2.5-pro)</div>
+      <div class="bar"><div class="fill" id="pro-bar" style="width:0%"></div></div>
+      <div class="mono" style="font-size:11px;color:var(--muted);margin-top:4px">Flash tier (gemini-2.5-flash)</div>
+      <div class="bar"><div class="fill" id="flash-bar" style="width:0%"></div></div>
+    </div>
+    <div id="router-info" class="mono" style="font-size:11px;color:var(--muted)"></div>
+  </section>
+
+  <section class="panel full">
+    <h2>Live 9-Stage State Machine Pipeline</h2>
+    <div class="stages" id="stages"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Transactional CoW Overlay &amp; Precision Shield Inspector</h2>
+    <div class="badges">
+      <span>FOGE</span><span>Z3 SMT</span><span>Concolic</span><span>Chiasmus</span><span>Holographic Parity</span><span>Rust Shield</span>
+    </div>
+    <div class="row">
+      <button class="secondary" onclick="rollback()">Adjoint Rollback (T†)</button>
+      <span class="mono" id="overlay-info" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <pre id="shield-out" class="hidden"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Curated Export Menu</h2>
+    <div class="row">
+      <button class="secondary" onclick="exportArtifact('workspace_zip')">workspace_zip</button>
+      <button class="secondary" onclick="exportArtifact('patch_adjoint_bundle')">patch_adjoint_bundle</button>
+      <button class="secondary" onclick="exportArtifact('verification_certificate')">verification_certificate</button>
+    </div>
+    <pre id="export-out" class="hidden"></pre>
+  </section>
+</main>
+<script>
+const STAGES = ["Ingest","GoI_Plan","Wavefront_Schedule","Overlay_Mutate","PreWrite_Guard","SMT_Concolic_Verify","Sandbox_Execute","Reflex_Heal","Adjoint_Commit_or_Rollback"];
+const stageEl = {};
+function renderStages() {
+  const box = document.getElementById('stages'); box.innerHTML = '';
+  STAGES.forEach(s => {
+    const d = document.createElement('div'); d.className = 'stage'; d.textContent = s; d.id = 'stage-' + s;
+    box.appendChild(d); stageEl[s] = d;
+  });
+}
+function setStage(name, cls) {
+  Object.values(stageEl).forEach(e => { e.className = 'stage'; });
+  if (stageEl[name]) stageEl[name].className = 'stage ' + (cls || 'active');
+  document.getElementById('stage-pill').textContent = name;
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + ' -> ' + r.status + ' ' + await r.text());
+  const ct = r.headers.get('content-type') || '';
+  return ct.includes('json') ? r.json() : r.blob();
+}
+async function refreshStatus() {
+  try {
+    const s = await api('/api/status');
+    document.getElementById('native-status').textContent = s.native_core_status;
+    const b = s.router_budget || {};
+    const proPct = Math.min(100, 100 * (b.used_pro_tokens || 0) / Math.max(1, b.max_pro_tokens));
+    const flPct = Math.min(100, 100 * (b.used_flash_tokens || 0) / Math.max(1, b.max_flash_tokens));
+    document.getElementById('pro-bar').style.width = proPct + '%';
+    document.getElementById('flash-bar').style.width = flPct + '%';
+    document.getElementById('router-info').textContent =
+      'pro ' + (b.used_pro_tokens||0) + '/' + (b.max_pro_tokens||0) + ' tok · flash ' + (b.used_flash_tokens||0) + '/' + (b.max_flash_tokens||0) + ' tok';
+  } catch (e) { console.error(e); }
+}
+async function ingest() {
+  const path = document.getElementById('ws-path').value;
+  const out = document.getElementById('ingest-out');
+  try {
+    const r = await api('/api/workspace/ingest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path})});
+    out.classList.remove('hidden'); out.textContent = JSON.stringify(r, null, 2);
+  } catch (e) { out.classList.remove('hidden'); out.textContent = String(e); }
+}
+async function ingestZip() {
+  const f = document.getElementById('ws-zip').files[0]; if (!f) return;
+  const fd = new FormData(); fd.append('file', f);
+  const out = document.getElementById('ingest-out');
+  try {
+    const r = await api('/api/workspace/ingest_zip', {method:'POST', body: fd});
+    out.classList.remove('hidden'); out.textContent = JSON.stringify(r, null, 2);
+  } catch (e) { out.classList.remove('hidden'); out.textContent = String(e); }
+}
+async function execute() {
+  const objective = document.getElementById('objective').value;
+  setStage('Ingest', 'active');
+  try {
+    const r = await api('/api/agent/execute', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({objective, nodes: sampleNodes(), patches_by_node: samplePatches()})});
+    renderReport(r);
+  } catch (e) { document.getElementById('shield-out').classList.remove('hidden');
+    document.getElementById('shield-out').textContent = String(e); }
+}
+function sampleNodes() {
+  return [
+    {node_id:'wf_calc', wavefront_generation:0, assigned_tier:'TIER_1_FLASH', description:'Fix calculator module',
+     read_set_paths:['test_calc.py'], write_set_paths:['calc.py'], target_ast_symbols:['calc.add'],
+     output_ports:[{port_name:'out', symbol_contract:'calc.add'}],
+     verification_contract:{smt_postconditions:[], sandbox_verification_cmd:null}},
+    {node_id:'wf_util', wavefront_generation:1, assigned_tier:'TIER_1_FLASH', description:'Extend utils module',
+     read_set_paths:['test_util.py'], write_set_paths:['util.py'], target_ast_symbols:['util.mul'],
+     input_ports:[{port_name:'in', source_node_id:'wf_calc', symbol_contract:'calc.add'}],
+     verification_contract:{smt_postconditions:[], sandbox_verification_cmd:null}}
+  ];
+}
+function samplePatches() {
+  return {
+    wf_calc: [{file_path:'calc.py', operation:'REPLACE_EXACT_SPAN', target_symbol:null,
+      search_block:'def add(a, b)\n    return a + b\n',
+      replacement_code:'def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n'}],
+    wf_util: [{file_path:'util.py', operation:'INSERT_AFTER_SYMBOL', target_symbol:'mul',
+      search_block:'', replacement_code:'def div(a, b):\n    return a / b\n'}]
+  };
+}
+function renderReport(r) {
+  const stages = r.stage_trace || [];
+  STAGES.forEach(s => {
+    const idx = stages.indexOf(s);
+    if (idx >= 0) setStage(s, 'done');
+  });
+  setStage(r.success ? 'Adjoint_Commit_or_Rollback' : 'Adjoint_Commit_or_Rollback', r.success ? 'done' : 'fail');
+  const out = document.getElementById('shield-out'); out.classList.remove('hidden');
+  out.textContent = JSON.stringify(r, null, 2);
+  document.getElementById('overlay-info').textContent =
+    'committed=' + r.nodes_committed + ' rolled_back=' + r.nodes_rolled_back + ' healed=' + r.nodes_healed;
+  refreshStatus();
+}
+async function rollback() {
+  try {
+    const r = await api('/api/overlay/rollback', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
+    document.getElementById('overlay-info').textContent = 'rollback: ' + JSON.stringify(r);
+  } catch (e) { document.getElementById('overlay-info').textContent = String(e); }
+}
+async function exportArtifact(type) {
+  try {
+    const blob = await api('/api/export/' + type);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = type + (type === 'workspace_zip' ? '.zip' : '.json');
+    a.click(); URL.revokeObjectURL(url);
+    const out = document.getElementById('export-out'); out.classList.remove('hidden');
+    out.textContent = 'exported ' + type;
+  } catch (e) { const out = document.getElementById('export-out'); out.classList.remove('hidden'); out.textContent = String(e); }
+}
+renderStages(); refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>

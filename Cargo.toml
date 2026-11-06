@@ -1,0 +1,3 @@
+[workspace]
+members = ["invar_agent/_native"]
+resolver = "2"
