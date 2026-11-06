@@ -86,6 +86,10 @@ class ResearchPlanPromptRequest(BaseModel):
 
 class ResearchRunRequest(BaseModel):
     question: str = Field(min_length=3, max_length=8000)
+    # Feasibility verdict already approved during Plan Mode; when it is
+    # OPTIMAL_DIRECT / REFORMULATED_SURROGATE the pre-flight substring
+    # heuristics must not reject the approved expert prompt on execution.
+    prior_feasibility: Optional[Dict[str, Any]] = None
 
 
 class ResearchActionRequest(BaseModel):
@@ -702,12 +706,15 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         """
         manager = state.ensure_research_manager()
         has_llm = bool(state.api_key)
+        prior_verdict = str((req.prior_feasibility or {}).get("verdict") or "")
+        assume_feasible = prior_verdict in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE")
         try:
             outcome = await generate_plan_with_feasibility(
                 req.question,
                 llm_complete=(
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                 fallback=not has_llm,
+                assume_feasible=assume_feasible,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

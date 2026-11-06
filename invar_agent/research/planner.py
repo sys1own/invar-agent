@@ -336,26 +336,71 @@ _FALLBACK_BLUEPRINT = {
 
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n?(.*?)```", re.S)
+_WHOLE_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", re.S)
+
+
+def _iter_balanced(text: str, open_c: str, close_c: str, limit: int = 12):
+    """Yield balanced open_c..close_c chunks, string-aware, left to right."""
+    i, n, yielded = 0, len(text), 0
+    while yielded < limit:
+        start = text.find(open_c, i)
+        if start == -1:
+            return
+        depth, in_str, esc, j = 0, False, False, start
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == open_c:
+                    depth += 1
+                elif ch == close_c:
+                    depth -= 1
+                    if depth == 0:
+                        yield text[start:j + 1]
+                        yielded += 1
+                        break
+            j += 1
+        i = start + 1
 
 
 def _extract_json(text: str) -> Optional[Any]:
+    """Robust JSON extraction: strip think-blocks, unwrap fences, then use a
+    string-aware balanced-brace matcher so trailing prose after the JSON
+    object does not break parsing."""
     text = (text or "").strip()
     # Reasoning models may leak chain-of-thought wrappers; strip them first.
     text = _THINK_BLOCK.sub("", text).strip()
-    fence = re.search(r"```(?:json)?\s*([\[{].*[\]}])\s*```", text, re.S)
-    if fence:
-        text = fence.group(1)
-    candidates = []
-    for open_c, close_c in (("{", "}"), ("[", "]")):
-        start, end = text.find(open_c), text.rfind(close_c)
-        if start != -1 and end > start:
-            candidates.append((start, text[start:end + 1]))
-    for _, chunk in sorted(candidates):
-        try:
-            return json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
+    if not text:
+        return None
+    candidates = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+    candidates = [c for c in candidates if c] + [text]
+    for candidate in candidates:
+        for open_c, close_c in (("{", "}"), ("[", "]")):
+            for chunk in _iter_balanced(candidate, open_c, close_c):
+                try:
+                    return json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
     return None
+
+
+def _clean_prompt_text(raw: Any) -> str:
+    """Think-block-stripped, fence-unwrapped plain text for the Markdown
+    fallback path (no JSON object present in the LLM response)."""
+    text = _THINK_BLOCK.sub("", str(raw or "")).strip()
+    whole = _WHOLE_FENCE_RE.match(text)
+    if whole:
+        text = whole.group(1).strip()
+    return text
 
 
 # -- schema-drift normalisation ------------------------------------------------
@@ -590,6 +635,7 @@ async def generate_plan_with_feasibility(question: str,
                                          llm_complete: Optional[Callable[[str], Any]] = None,
                                          fallback: bool = True,
                                          literature: Optional[List[Dict[str, Any]]] = None,
+                                         assume_feasible: bool = False,
                                          ) -> Dict[str, Any]:
     """Single Tier-2 call: feasibility gate + blueprint (Task 4 latency fix).
 
@@ -597,11 +643,17 @@ async def generate_plan_with_feasibility(question: str,
     "source": "llm"|"fallback"|"heuristic", ...}. When the verdict is a refusal,
     ``blueprint`` is None. With ``fallback=False`` (live provider configured) any
     synthesis failure raises instead of returning the canned KdV stub.
+
+    ``assume_feasible=True`` is set when Plan Mode already approved this prompt
+    (OPTIMAL_DIRECT / REFORMULATED_SURROGATE): the pre-flight substring
+    heuristics must not reject the approved expert prompt on re-submission;
+    the LLM feasibility assessment inside the combined call still decides.
     """
     from .feasibility import _heuristic_verdict
 
     heuristic = _heuristic_verdict(question)
-    if heuristic.verdict.startswith("REFUSED"):
+    bypass = assume_feasible and llm_complete is not None
+    if heuristic.verdict.startswith("REFUSED") and not bypass:
         # Fast path: clear-cut refusals never reach the LLM.
         return {"feasibility": heuristic, "blueprint": None, "source": "heuristic"}
     if llm_complete is None:
@@ -641,8 +693,10 @@ async def generate_expert_research_prompt(question: str,
     """Plan Mode: one Tier-2 call -> feasibility + editable expert research prompt.
 
     Returns {"feasibility": FeasibilityAssessment, "expert_prompt": str,
-    "source": "llm"|"heuristic"}. Raises RuntimeError when the LLM call fails or
-    returns no JSON (never silently substitutes a canned stub).
+    "source": "llm"|"llm_text"|"heuristic"}. Raises RuntimeError when the LLM
+    call itself fails or returns an empty response; plain-Markdown answers
+    without a JSON object are wrapped as the expert prompt (never a canned
+    stub, never a 502 for parse drift).
     """
     from .feasibility import _heuristic_verdict
 
@@ -655,15 +709,27 @@ async def generate_expert_research_prompt(question: str,
                    literature=format_literature(literature or []),
                    question=question)
     raw = await llm_complete(prompt)
-    data = _extract_json(str(raw))
+    text = _clean_prompt_text(raw)
+    data = _extract_json(text)
     if not isinstance(data, dict):
-        raise RuntimeError("expert prompt synthesis failed: no JSON object in response")
+        # Safe fallback wrapper: the model answered in plain Markdown (or
+        # emitted unparseable JSON). Wrap the cleaned text as the expert
+        # prompt instead of failing the request with a 502.
+        if not text:
+            raise RuntimeError("expert prompt synthesis failed: empty LLM response")
+        return {"feasibility": heuristic, "expert_prompt": text[:8000],
+                "source": "llm_text"}
     feasibility = _coerce_feasibility(data.get("feasibility")) or heuristic
     expert_prompt = str(data.get("expert_prompt") or "").strip()
     if feasibility.verdict.startswith("REFUSED"):
         return {"feasibility": feasibility, "expert_prompt": "", "source": "llm"}
     if not expert_prompt:
-        raise RuntimeError("expert prompt synthesis failed: empty expert_prompt")
+        # JSON parsed but carried no prompt: fall back to any non-JSON prose
+        # the model produced rather than erroring out.
+        if not text:
+            raise RuntimeError("expert prompt synthesis failed: empty expert_prompt")
+        return {"feasibility": feasibility, "expert_prompt": text[:8000],
+                "source": "llm_text"}
     return {"feasibility": feasibility, "expert_prompt": expert_prompt, "source": "llm"}
 
 

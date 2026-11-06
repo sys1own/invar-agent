@@ -18,26 +18,27 @@
   .seg-toggle { display:flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   .seg-toggle button { background:transparent; border:none; color:var(--muted); padding:5px 12px; cursor:pointer; font-size:12px; }
   .seg-toggle button.active { background:var(--green); color:#06160e; font-weight:600; }
-  #research-panel { display:none; flex:1; flex-direction:column; min-height:0; overflow:hidden; }
+  #research-panel { display:none; flex:1 1 0; flex-direction:column; min-height:0; overflow:hidden; }
   #research-panel.active { display:flex; }
-  #research-cards { flex:none; max-height:38%; overflow-y:auto; }
-  .research-logs { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; padding:10px; overflow:auto; flex:1; min-height:0; }
-  .log-pane { background:#0d1119; border:1px solid var(--border); border-radius:8px; display:flex; flex-direction:column; min-height:120px; }
-  .log-pane h4 { margin:0; padding:6px 10px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border); letter-spacing:.5px; }
-  .log-pane pre { margin:0; padding:8px 10px; font-size:11px; overflow:auto; flex:1; white-space:pre-wrap; }
+  #research-cards { flex:none; max-height:38%; overflow-y:auto; padding-top:6px; }
+  .research-logs { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); grid-template-rows:minmax(0, 1fr); gap:8px; padding:8px 10px 10px; overflow:hidden; flex:1; min-height:0; }
+  .log-pane { background:#0d1119; border:1px solid var(--border); border-radius:8px; display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+  .log-pane h4 { flex:none; margin:0; padding:6px 10px 8px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border); letter-spacing:.5px; }
+  .log-pane pre { margin:0; padding:8px 10px; font-size:11px; overflow:auto; flex:1; min-height:0; white-space:pre-wrap; }
+  .plan-mode-banner { display:none; padding:8px 16px; background:#241a10; border-bottom:1px solid #4d3a1f; color:var(--amber); font-size:12px; z-index:10; flex:none; }
   .research-card { border:1px solid var(--border); border-radius:10px; padding:12px; margin:10px; background:var(--panel); }
   .research-card h4 { margin:0 0 8px; font-size:13px; }
-  .research-card textarea { width:100%; min-height:180px; background:#0d1119; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:8px; font-family:ui-monospace,monospace; font-size:11px; }
+  .research-card textarea { width:100%; min-height:180px; background:#0d1119; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px; font-family:ui-monospace,monospace; font-size:11px; }
   .research-card .row { display:flex; gap:8px; margin-top:8px; }
   .research-card.refusal, .action-card.refusal { border-color:#f85149; }
   .action-card.refusal .action-title { color:#f85149; }
-  .telemetry { display:flex; gap:12px; padding:6px 12px; font-size:11px; color:var(--muted); flex-wrap:wrap; }
+  .telemetry { display:flex; gap:12px; padding:6px 12px; font-size:11px; color:var(--muted); flex-wrap:wrap; flex:none; }
   .badge { background:#1b2230; border:1px solid var(--border); border-radius:999px; padding:3px 10px; font-size:11px; color:var(--muted); white-space:nowrap; }
   .badge b { color:var(--green); font-weight:600; }
   .spacer { flex:1; }
   .iconbtn { background:none; border:1px solid var(--border); border-radius:6px; color:var(--muted); padding:6px 9px; cursor:pointer; font-size:14px; }
   .iconbtn:hover { color:var(--text); border-color:var(--accent); }
-  .layout { flex:1; display:flex; min-height:0; }
+  .layout { flex:1; display:flex; min-height:0; overflow:hidden; }
   /* Sidebar */
   .sidebar { width:20%; min-width:220px; max-width:340px; border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; }
   .sidebar h2 { margin:0; padding:10px 14px; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); border-bottom:1px solid var(--border); }
@@ -51,7 +52,7 @@
   .viewer pre { margin:0; padding:10px 12px; overflow:auto; font-size:11.5px; background:#0d1119; flex:1; }
   .sidebar-actions { padding:8px 12px; border-top:1px solid var(--border); display:flex; gap:6px; }
   /* Main chat */
-  .main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
   .chat { flex:1; overflow-y:auto; padding:18px 22px; display:flex; flex-direction:column; gap:12px; }
   .msg { max-width:78%; padding:10px 14px; border-radius:12px; word-break:break-word; }
   .msg.user { align-self:flex-end; background:#1d3a52; border:1px solid #2a4a68; white-space:pre-wrap; }
@@ -111,6 +112,7 @@
   .modal .models { font-size:11px; color:var(--muted); background:#0d1119; border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin-bottom:10px; font-family:ui-monospace, monospace; }
   .banner { background:#2d1113; border-bottom:1px solid #f8514966; color:#ff9d9d; font-size:12px; padding:8px 16px; display:none; white-space:pre-wrap; }
   .banner.show { display:block; }
+  .plan-mode-banner.show { display:block; }
 </style>
 </head>
 <body>
@@ -139,6 +141,7 @@
     </div>
   </aside>
   <main class="main">
+    <div class="plan-mode-banner" id="plan-mode-banner">📋 Plan Mode — your request is drafted as an editable Expert Deep Research Prompt card first; nothing executes until you approve it.</div>
     <div class="research-panel" id="research-panel">
       <div id="research-cards"></div>
       <div class="telemetry" id="research-telemetry"></div>
@@ -416,7 +419,7 @@ function addResearchCardAction(action) {
       const edited = ta.value.trim();
       if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
       setMode('research');
-      await runResearchDirect(edited);
+      await runResearchDirect(edited, f);
     };
     chat.appendChild(card); scrollChat();
     return;
@@ -522,6 +525,8 @@ function updateExecToggle() {
   document.getElementById('exec-direct').classList.toggle('active', executionMode === 'direct');
   document.getElementById('exec-plan').classList.toggle('active', executionMode === 'plan');
   document.getElementById('exec-direct').textContent = researchMode ? '⚡ Direct Research' : '⚡ Direct Build';
+  const banner = document.getElementById('plan-mode-banner');
+  if (banner) banner.classList.toggle('show', researchMode && executionMode === 'plan');
 }
 function setMode(mode) {
   researchMode = (mode === 'research');
@@ -567,13 +572,17 @@ async function planResearch(text) {
     input.focus();
   }
 }
-async function runResearchDirect(text) {
+async function runResearchDirect(text, feasibility) {
   setComposerEnabled(false);
   statusEl.textContent = 'starting deep research…';
   try {
+    const body = {question: text};
+    // Carry the Plan Mode feasibility approval so pre-flight heuristics do
+    // not reject an already-approved expert prompt on execution.
+    if (feasibility && feasibility.verdict) body.prior_feasibility = feasibility;
     const data = await api('/api/v1/research/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: text})
+      body: JSON.stringify(body)
     });
     if (data.status === 'refused' || !data.started) {
       renderResearchRefusal(data.feasibility);
@@ -607,7 +616,7 @@ function renderExpertPromptCard(feasibility, expertPrompt, question) {
   card.querySelector('#approve-expert').onclick = async () => {
     const edited = ta.value.trim();
     if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
-    await runResearchDirect(edited || question);
+    await runResearchDirect(edited || question, feasibility);
   };
   wrap.appendChild(card);
 }

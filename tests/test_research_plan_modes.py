@@ -282,3 +282,170 @@ def test_plan_endpoint_offline_fallback_stub(client):
     data = resp.json()
     assert data["blueprint"]["blueprint_id"] == "kdv_soliton_scaling"
     assert data["source"] == "fallback"
+
+
+# -- robust JSON extraction (Task: plan-prompt 502 fix) ---------------------------
+
+def test_extract_json_trailing_prose_with_braces():
+    text = 'Plan: {"a": 1} — note {"b": 2} appears only in prose afterwards.'
+    assert _extract_json(text) == {"a": 1}
+
+
+def test_extract_json_braces_inside_strings():
+    text = '{"note": "use {curly} and \\"quoted\\" braces", "a": 1}'
+    assert _extract_json(text) == {"note": 'use {curly} and "quoted" braces', "a": 1}
+
+
+def test_extract_json_multiple_fences_first_wins():
+    text = '```json\n{"a": 1}\n```\nprose\n```json\n{"b": 2}\n```'
+    assert _extract_json(text) == {"a": 1}
+
+
+def test_extract_json_think_block_json_ignored():
+    text = '<think>{"secret": true}</think>\n{"a": 1}'
+    assert _extract_json(text) == {"a": 1}
+
+
+def test_extract_json_no_object_returns_none():
+    assert _extract_json("just plain markdown, no json at all") is None
+    assert _extract_json("") is None
+
+
+# -- expert prompt Markdown fallback (never 502 on parse drift) -------------------
+
+@pytest.mark.asyncio
+async def test_expert_prompt_plain_markdown_fallback():
+    async def llm(prompt: str):
+        return ("# Expert Deep Research Prompt\n\n## 1. Objective & Quantitative Targets\n"
+                "Compute the magnetic field in Tesla for the 0.25c spacecraft.")
+
+    out = await generate_expert_research_prompt("0.25c spacecraft shield", llm_complete=llm)
+    assert out["source"] == "llm_text"
+    assert out["expert_prompt"].startswith("# Expert Deep Research Prompt")
+    assert out["feasibility"].verdict == "OPTIMAL_DIRECT"
+
+
+@pytest.mark.asyncio
+async def test_expert_prompt_fenced_markdown_fallback_unwraps():
+    async def llm(prompt: str):
+        return "```markdown\n# Expert Deep Research Prompt\n\nCompute drag in Newtons.\n```"
+
+    out = await generate_expert_research_prompt("0.25c drag", llm_complete=llm)
+    assert out["source"] == "llm_text"
+    assert out["expert_prompt"].startswith("# Expert Deep Research Prompt")
+    assert "```" not in out["expert_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_expert_prompt_empty_response_still_raises():
+    async def llm(prompt: str):
+        return ""
+
+    with pytest.raises(RuntimeError):
+        await generate_expert_research_prompt("0.25c drag", llm_complete=llm)
+
+
+def test_plan_prompt_markdown_fallback_returns_200(client, monkeypatch):
+    import invar_agent.server as server
+    state = server._STATE
+    assert state is not None
+    state.api_key = "sk-fake"
+
+    async def fake(state_arg, question, max_tokens=8192):
+        return "# Expert Deep Research Prompt\n\n## 1. Objective\nCompute B in Tesla."
+
+    monkeypatch.setattr(server, "_plan_llm_callable", fake)
+    resp = client.post("/api/v1/research/plan-prompt",
+                       json={"question": "quantify 0.25c magnetic drag"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["source"] == "llm_text"
+    assert "Expert Deep Research Prompt" in data["expert_prompt"]
+
+
+# -- epistemic heuristic hardening ------------------------------------------------
+
+def test_heuristic_no_false_refusal_on_scientific_phrasing():
+    from invar_agent.research.feasibility import _heuristic_verdict
+    ok_prompts = [
+        "ingest literature for Martian shock chemistry",
+        "Analyze scaling constants and re-entry decelerations for the probe",
+        "simulate Couette flow with eta = 1.2e-3 Pa.s",
+        "historical atmospheric density data for Mars entry",
+        "LU solver efficiency = 1.5 speedup over baseline",
+        "quantify drag force; literature scaling constants from ISM papers",
+    ]
+    for prompt in ok_prompts:
+        verdict = _heuristic_verdict(prompt).verdict
+        assert not verdict.startswith("REFUSED"), f"{prompt!r} -> {verdict}"
+
+
+def test_heuristic_still_refuses_true_impossibles():
+    from invar_agent.research.feasibility import _heuristic_verdict
+    assert _heuristic_verdict(
+        "closed-loop mechanical flywheel with COP = 1.25").verdict == "REFUSED_IMPOSSIBLE"
+    assert _heuristic_verdict(
+        "Design a perpetual motion heat pump with COP = 1.25").verdict == "REFUSED_IMPOSSIBLE"
+    assert _heuristic_verdict(
+        "19th-century Romantic literature caused modern trade unions"
+    ).verdict == "REFUSED_UNSUITABLE"
+    assert _heuristic_verdict(
+        "literary criticism of Victorian novels").verdict == "REFUSED_UNSUITABLE"
+
+
+# -- prior feasibility approval (Plan Mode -> execution) ---------------------------
+
+@pytest.mark.asyncio
+async def test_assume_feasible_bypasses_heuristic_refusal():
+    """An approved Plan Mode prompt must not be rejected by substring heuristics."""
+    async def llm(prompt: str):
+        return _COMBINED_JSON
+
+    out = await generate_plan_with_feasibility(
+        "perpetual motion COP = 1.25 approved expert prompt",
+        llm_complete=llm, fallback=False, assume_feasible=True)
+    assert out["source"] == "llm"
+    assert out["blueprint"]["blueprint_id"] == "bp-combined"
+
+
+@pytest.mark.asyncio
+async def test_assume_feasible_llm_refusal_still_wins():
+    async def llm(prompt: str):
+        return ('{"feasibility": {"verdict": "REFUSED_IMPOSSIBLE",'
+                ' "rationale": "overunity", "violated_boundary": "",'
+                ' "reformulation": "bound the gain"}}')
+
+    out = await generate_plan_with_feasibility(
+        "perpetual motion COP = 1.25 approved expert prompt",
+        llm_complete=llm, fallback=False, assume_feasible=True)
+    assert out["blueprint"] is None
+    assert out["feasibility"].verdict == "REFUSED_IMPOSSIBLE"
+
+
+def test_run_endpoint_prior_feasibility_reaches_llm(client, monkeypatch):
+    """With an approved prior verdict, a heuristic-refused prompt must reach
+    the LLM (proven by the 502 when the planner fails) instead of an instant
+    heuristic refusal."""
+    import invar_agent.server as server
+    state = server._STATE
+    assert state is not None
+    state.api_key = "sk-fake"
+
+    async def _boom(state_arg, question, max_tokens=8192):  # noqa: ANN001
+        raise RuntimeError("upstream exploded")
+
+    monkeypatch.setattr(server, "_plan_llm_callable", _boom)
+    resp = client.post("/api/v1/research/run", json={
+        "question": "perpetual motion COP = 1.25 approved expert prompt",
+        "prior_feasibility": {"verdict": "OPTIMAL_DIRECT", "rationale": "approved"},
+    })
+    assert resp.status_code == 502  # LLM was attempted -> heuristic was bypassed
+
+
+def test_run_endpoint_without_prior_still_refuses(client):
+    resp = client.post("/api/v1/research/run",
+                       json={"question": "perpetual motion COP = 1.25"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "refused" and data["started"] is False

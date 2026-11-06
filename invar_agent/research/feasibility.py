@@ -55,8 +55,14 @@ _IMPOSSIBLE_PATTERNS = [
     (r"perpetual motion", "perpetual motion"),
     (r"overunity|over-unity|free energy device", "over-unity claim"),
     (r"100\s*%\s*efficien", "impossible efficiency bound"),
-    (r"\b(?:cop|eta|efficiency)\s*(?:=|>=|>)\s*(?:1\.[0-9]+|[2-9])",
-     "coefficient of performance / efficiency above unity"),
+    # Explicit over-unity claims only: bare "efficiency"/"eta" would false-
+    # positive on normal numbers (viscosity eta = 1.2e-3, speedup ratios).
+    (r"\b(?:cop|coefficient\s+of\s+performance)\s*(?:=|>=|>|of)\s*"
+     r"(?:1\.[0-9]+|[2-9][0-9]*(?:\.[0-9]+)?)",
+     "coefficient of performance above unity"),
+    (r"\b(?:thermal|heat[- ]transfer|energy|thermodynamic)\s+efficiency\s*"
+     r"(?:=|>=|>|of)\s*(?:1\.[0-9]+|[2-9][0-9]*(?:\.[0-9]+)?)",
+     "thermodynamic efficiency above unity"),
     (r"violat\w*\s+(energy\s+)?conservation", "conservation-law violation"),
     (r"create energy from nothing|energy from nothing", "energy creation"),
     (r"halting problem|undecidable", "undecidable problem"),
@@ -67,10 +73,19 @@ _CONSERVATION_WORDS = re.compile(r"conserv\w+|hamiltonian|energy", re.I)
 _GAIN_WORDS = re.compile(r"gain|generat\w+|produc\w+|increas\w+|positive energy|net positive", re.I)
 
 _UNSUITABLE_PATTERNS = [
-    # NOTE: bare "literature" is intentionally excluded — quantitative research
-    # requests legitimately say "search the literature".
-    (r"\bpoetry\b|\bpoem\b|\bliterary\b|\brhym(e|es|ing)\b", "literary/subjective subject"),
-    (r"\bhistor(y|ical)\b", "historical interpretation"),
+    # NOTE: bare "literature"/"history"/"book"/"paper"/"reading" are
+    # intentionally excluded — quantitative research routinely says "ingest
+    # literature", "literature scaling constants", "historical atmospheric
+    # density data" or "re-entry decelerations". Only strict non-computational
+    # collocations refuse.
+    (r"\bpoetry\b|\bpoem\b", "poetry/verse subject"),
+    (r"\b(?:literary|romantic|victorian|renaissance)\s+"
+     r"(?:criticism|poetry|literature|prose|novels?|drama)\b",
+     "literary/humanities subject"),
+    (r"\bliterary\s+(?:criticism|analysis|theory|review)\b", "literary criticism"),
+    (r"\btheological\s+(?:debate|argument|doctrine|controversy)\b",
+     "theological debate"),
+    (r"\bmoral\s+(?:superiority|philosophy|debate|dilemma)\b", "moral philosophy"),
     (r"causal effect on|effect on .*legislation|influence on .*policy", "non-quantifiable causal claim"),
     (r"\bbeaut(y|iful)\b|\bmeaning of life\b|\bmorality\b|\bethics\b", "subjective value judgement"),
     (r"\bclinical\b(?!.*(trial|endpoint|biomarker|dose))", "clinical/wet-lab task without a model"),
