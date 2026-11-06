@@ -197,17 +197,15 @@ class ServerState:
                     )
                     if client is None:
                         return None
-                    # Reasoning-tier models spend output budget on thinking and
-                    # intermittently return empty content; retry once with a
-                    # larger budget before giving up (planner then falls back).
-                    # The LLM call is blocking, so offload it from the event loop.
-                    for max_tokens in (8192, 16384):
-                        resp = await asyncio.to_thread(
-                            client.complete, question,
-                            max_tokens=max_tokens, temperature=0.2)
-                        if resp and resp.content:
-                            return resp.content
-                    return None
+                    # Reasoning-tier models can spend >8k tokens on thinking
+                    # before emitting content (observed: 8192 budget exhausted
+                    # with finish_reason=length and empty content), so start
+                    # with a generous budget. The LLM call is blocking, so
+                    # offload it from the event loop.
+                    resp = await asyncio.to_thread(
+                        client.complete, question,
+                        max_tokens=32768, temperature=0.2)
+                    return resp.content if resp else None
 
                 self.research_manager = ResearchRunManager(
                     self.workspace_root, self.research_broadcaster,
