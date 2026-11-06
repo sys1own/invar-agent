@@ -142,6 +142,20 @@ class DeepSeekChatClient:
                 raise
 
         response = call_with_retries(_attempt)
+        # Thinking models spend completion tokens on reasoning first; when the
+        # budget is exhausted the visible content comes back empty with
+        # finish_reason="length". Retry with a doubled budget (bounded).
+        budget = max_tokens
+        for _ in range(2):
+            choice0 = response.choices[0]
+            if choice0.message.content and choice0.message.content.strip():
+                break
+            if getattr(choice0, "finish_reason", None) != "length" or budget >= 65536:
+                break
+            budget = min(budget * 2, 65536)
+            response = call_with_retries(
+                lambda: self._openai_client().chat.completions.create(
+                    model=self.model, messages=messages, max_tokens=budget))
         latency = (time.perf_counter() - start) * 1000.0
         choice = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)

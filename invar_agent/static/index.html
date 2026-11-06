@@ -12,6 +12,20 @@
   header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--panel); }
   header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
   header h1 span { color:var(--accent); }
+  .mode-toggle { display:flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; margin-left:12px; }
+  .mode-toggle button { background:transparent; border:none; color:var(--muted); padding:5px 12px; cursor:pointer; font-size:12px; }
+  .mode-toggle button.active { background:var(--accent); color:#fff; }
+  #research-panel { display:none; flex:1; flex-direction:column; min-height:0; }
+  #research-panel.active { display:flex; }
+  .research-logs { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; padding:10px; overflow:auto; flex:1; min-height:0; }
+  .log-pane { background:#0d1119; border:1px solid var(--border); border-radius:8px; display:flex; flex-direction:column; min-height:120px; }
+  .log-pane h4 { margin:0; padding:6px 10px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border); letter-spacing:.5px; }
+  .log-pane pre { margin:0; padding:8px 10px; font-size:11px; overflow:auto; flex:1; white-space:pre-wrap; }
+  .research-card { border:1px solid var(--border); border-radius:10px; padding:12px; margin:10px; background:var(--panel); }
+  .research-card h4 { margin:0 0 8px; font-size:13px; }
+  .research-card textarea { width:100%; min-height:180px; background:#0d1119; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:8px; font-family:ui-monospace,monospace; font-size:11px; }
+  .research-card .row { display:flex; gap:8px; margin-top:8px; }
+  .telemetry { display:flex; gap:12px; padding:6px 12px; font-size:11px; color:var(--muted); flex-wrap:wrap; }
   .badge { background:#1b2230; border:1px solid var(--border); border-radius:999px; padding:3px 10px; font-size:11px; color:var(--muted); white-space:nowrap; }
   .badge b { color:var(--green); font-weight:600; }
   .spacer { flex:1; }
@@ -96,6 +110,10 @@
 <body>
 <header>
   <h1>invar<span>-agent</span> Chat Console</h1>
+  <div class="mode-toggle" id="mode-toggle">
+    <button id="mode-builder" class="active" onclick="setMode('builder')">Builder Agent</button>
+    <button id="mode-research" onclick="setMode('research')">Research Agent</button>
+  </div>
   <span class="badge">Native Core: <b id="native-status">…</b></span>
   <span class="badge">Tier 0 Reflex: <b>&lt; 1.5 ms | 0 Tokens</b></span>
   <span class="badge">Boundary: <b>BLAKE3 256-bit</b></span>
@@ -114,11 +132,20 @@
     </div>
   </aside>
   <main class="main">
+    <div class="research-panel" id="research-panel">
+      <div id="research-cards"></div>
+      <div class="telemetry" id="research-telemetry"></div>
+      <div class="research-logs">
+        <div class="log-pane"><h4>SEARCH LOG</h4><pre id="log-search"></pre></div>
+        <div class="log-pane"><h4>GoI/HIN STREAM</h4><pre id="log-goi"></pre></div>
+        <div class="log-pane"><h4>ACCELERATOR LOG</h4><pre id="log-accel"></pre></div>
+      </div>
+    </div>
     <div class="chat" id="chat"></div>
     <div class="composer">
       <textarea id="input" placeholder="Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="row">
-        <button class="primary" id="send" onclick="sendCopilot()">Send</button>
+        <button class="primary" id="send" onclick="if(researchMode)sendResearch();else sendCopilot()">Send</button>
         <span class="hint" id="run-status"></span>
       </div>
     </div>
@@ -280,6 +307,9 @@ async function sendCopilot() {
     if (data.action && data.action.type === 'SUGGEST_BUILD_PROMPT') {
       addActionCard(data.action);
     }
+    if (data.action && data.action.type === 'SUGGEST_RESEARCH_PLAN') {
+      addResearchCardAction(data.action);
+    }
     if (data.llm_state === 'provider_error') {
       const err = data.llm_error || '';
       showLlmBanner('Last LLM call failed' + (err ? ': ' + err : '') +
@@ -314,6 +344,38 @@ function addActionCard(action) {
     body.style.display = body.style.display === 'none' ? 'block' : 'none';
   };
   card.querySelector('button.build').onclick = () => runBuild(ta.value);
+  chat.appendChild(card); scrollChat();
+}
+function addResearchCardAction(action) {
+  const bp = action.research_prompt || {};
+  const card = el(`<div class="action-card">
+    <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="action-title">🔬 Suggested Research Plan</span>
+      <span class="action-toggle">click to review</span>
+    </div>
+    <div class="action-body" style="display:none">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${bp.falsifiable_hypothesis || ''}</div>
+      <textarea class="mono"></textarea>
+      <div class="row"><button class="build">Approve &amp; Run Deep Research</button></div>
+    </div>
+  </div>`);
+  const ta = card.querySelector('textarea');
+  ta.value = JSON.stringify(bp, null, 2);
+  card.querySelector('.action-head').onclick = () => {
+    const body = card.querySelector('.action-body');
+    body.style.display = body.style.display === 'none' ? 'block' : 'none';
+  };
+  card.querySelector('button.build').onclick = async () => {
+    try {
+      const plan = await api('/api/v1/research/plan', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({question: (action.params && action.params.question) || bp.title || ''})
+      });
+      setMode('research');
+      renderResearchCard(plan.blueprint);
+      openResearchStream();
+    } catch (e) { addMsg('system', 'Research plan error: ' + e); }
+  };
   chat.appendChild(card); scrollChat();
 }
 /* ---- builder streaming (SSE over POST) ---- */
@@ -370,8 +432,106 @@ function handleBuilderEvent(msg) {
     addMsg('system', 'Builder error: ' + msg.message);
   }
 }
+/* ---- research mode ---- */
+let researchMode = false;
+let researchSource = null;
+function setMode(mode) {
+  researchMode = (mode === 'research');
+  document.getElementById('mode-builder').classList.toggle('active', !researchMode);
+  document.getElementById('mode-research').classList.toggle('active', researchMode);
+  document.getElementById('chat').style.display = researchMode ? 'none' : 'flex';
+  document.getElementById('research-panel').classList.toggle('active', researchMode);
+  input.placeholder = researchMode
+    ? 'Describe a research question to plan & verify (e.g. KdV soliton c = 2A)…'
+    : 'Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)';
+}
+function logTo(paneId, text) {
+  const pane = document.getElementById(paneId);
+  pane.textContent += text + '\n';
+  pane.scrollTop = pane.scrollHeight;
+}
+async function sendResearch() {
+  const text = input.value.trim();
+  if (!text || builderRunning) return;
+  addMsg('user', text);
+  input.value = '';
+  setComposerEnabled(false);
+  statusEl.textContent = 'planning research…';
+  try {
+    const data = await api('/api/v1/research/plan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: text})
+    });
+    renderResearchCard(data.blueprint);
+    statusEl.textContent = '';
+    openResearchStream();
+  } catch (e) {
+    addMsg('system', 'Research plan error: ' + e);
+  } finally {
+    setComposerEnabled(true);
+    input.focus();
+  }
+}
+function renderResearchCard(bp) {
+  const wrap = document.getElementById('research-cards');
+  wrap.innerHTML = '';
+  const card = el(`<div class="research-card">
+    <h4>🔬 Research Plan: ${bp.title || bp.blueprint_id}</h4>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${bp.falsifiable_hypothesis || ''}</div>
+    <textarea class="mono"></textarea>
+    <div class="row">
+      <button class="primary" id="approve-research">Approve &amp; Run Deep Research</button>
+      <button class="ghost" id="edit-research">Edit Plan</button>
+      <button class="ghost" id="abort-research">Abort</button>
+    </div>
+  </div>`);
+  const ta = card.querySelector('textarea');
+  ta.value = JSON.stringify(bp, null, 2);
+  card.querySelector('#approve-research').onclick = () => researchAction('approve_plan', ta.value);
+  card.querySelector('#edit-research').onclick = () => { ta.focus(); };
+  card.querySelector('#abort-research').onclick = () => researchAction('abort');
+  wrap.appendChild(card);
+}
+async function researchAction(action, blueprintJson) {
+  const body = {action};
+  if (blueprintJson) {
+    try { body.blueprint = JSON.parse(blueprintJson); }
+    catch { addMsg('system', 'Invalid blueprint JSON.'); return; }
+  }
+  try {
+    await api('/api/v1/research/action', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+  } catch (e) { addMsg('system', 'Research action error: ' + e); }
+}
+function openResearchStream() {
+  if (researchSource) researchSource.close();
+  researchSource = new EventSource('/api/v1/research/stream');
+  researchSource.onmessage = (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    const ch = msg.channel || 'accelerator_log';
+    const pane = ch === 'search_log' ? 'log-search' : ch === 'goi_stream' ? 'log-goi' : 'log-accel';
+    logTo(pane, `[${ch}] ${msg.event || 'log'} ${JSON.stringify(msg).slice(0, 300)}`);
+    if (msg.event === 'result' && msg.telemetry) {
+      const tel = document.getElementById('research-telemetry');
+      tel.textContent = `contract=${msg.contract_id} status=${msg.status} time=${Number(msg.execution_time_ms || 0).toFixed(1)}ms ` +
+        Object.entries(msg.telemetry).map(([k, v]) => `${k}=${Number(v).toPrecision(4)}`).join('  ');
+    }
+    if (msg.event === 'commit') {
+      addMsg('system', '✅ Research run committed. Bundle: ' + (msg.bundle_hash || '').slice(0, 16));
+    }
+    if (msg.event === 'rollback') {
+      addMsg('system', '↩ Adjoint rollback — looping with feedback.');
+    }
+  };
+}
 input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCopilot(); }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (researchMode) sendResearch(); else sendCopilot();
+  }
 });
 function downloadWorkspace() { window.location = '/api/export/workspace_zip'; }
 /* ---- settings modal ---- */

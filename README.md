@@ -118,7 +118,37 @@ fallbacks, never as defaults. DeepSeek retired `deepseek-chat` / `deepseek-reaso
 `GEMINI_API_KEY` or `DEEPSEEK_API_KEY` set to validate the key, list models and complete one token
 per fast tier.
 
+## Research Agent
+
+invar-agent ships a second, selectable **Research Agent** alongside the Builder Agent. It runs the
+same nine-stage verified kernel as a *cyclic* research loop: Ingest (question + falsifiable
+hypothesis + search queries) → GoI_Plan → Wavefront_Schedule (nilpotency ρ(UM) < 1, with
+Sherman-Morrison-Woodbury rank-k incremental updates) → Overlay_Mutate (CoW scratch) →
+PreWrite_Guard (SHACL/Chiasmus firewall rejecting `os`/`sys`/`socket`/unbounded-loop code) →
+SMT_Concolic_Verify → Sandbox_Execute (`rust_hin`, `cpp` C-ABI, or `multi_variant` Pareto
+benchmarks) → Reflex_Heal (egg equality-saturation, Tier-0) → Adjoint_Commit_or_Rollback
+(commits telemetry + a BLAKE3 bundle hash on VERIFIED; rolls back and feeds the counterexample
+back into the next round on FALSIFIED/DIVERGED/ERROR).
+
+- **Cognitive routing**: Tier-2 REASONING synthesises the research blueprint (search queries,
+  invariants, simulation code template); Tier-1 FAST handles search-query expansion; Tier-0 Reflex
+  handles SMT/Z3/concolic checks, the security firewall, compilation and egg-based repair.
+- **Web console**: a `[ Builder Agent | Research Agent ]` toggle in the navbar switches the main
+  pane. Research mode shows a plan card (editable blueprint JSON with **Approve & Run Deep
+  Research** / **Edit Plan** / **Abort**), three live log panes (`SEARCH LOG`, `GoI/HIN STREAM`,
+  `ACCELERATOR LOG`), and a telemetry strip (contract, status, execution time, residuals).
+  Copilot answers to research questions render a `SUGGEST_RESEARCH_PLAN` action card.
+- **API**: `POST /api/v1/research/plan` (synthesise a `ResearchBlueprint`),
+  `POST /api/v1/research/action` (`approve_plan` / `edit_plan` / `abort`),
+  `GET /api/v1/research/status`, and `GET /api/v1/research/stream` (SSE across the three channels).
+- **Native acceleration**: `invar_agent._native` exposes `PyUASTGraph`, `PyHINArenaEngine`,
+  `PyGoIWavefrontScheduler` (with Sherman-Morrison incremental updates), `GoIProofNet`,
+  `GoIWavefrontSolverNative`, `PyGraphPolyglotMaterializer` and the egg-based
+  `PyProofTheoreticHealer` / `repair_uast_expression`.
+
 ## Verification
 
-- `cargo test` — Rust core unit tests (GoI nilpotency, HIN reduction, reflex healer, HIS register).
-- `pytest` — kernel, overlay/adjoint, precision shield, reflex/router, end-to-end agent, and web server/export suites.
+- `cargo test` — Rust core unit tests (GoI nilpotency, HIN reduction, reflex healer, HIS register,
+  GoI wavefront Sherman-Morrison updates).
+- `pytest` — kernel, overlay/adjoint, precision shield, reflex/router, end-to-end agent, web server/export,
+  and research suites (schemas, transpiler/emitters, C-ABI bridge, algorithms, state machine, API).

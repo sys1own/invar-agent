@@ -11,14 +11,24 @@ use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 mod deterministic_healer;
+mod egraph_healer;
+mod goi_matrix;
 mod goi_solver;
+mod goi_wavefront;
+mod hin_arena;
 mod hin_engine;
 mod his;
+mod uast;
 
 use deterministic_healer::DeterministicHealerCore;
+use egraph_healer::{repair_uast_expression, align_return_type, ASTRewritePatch, PreWriteHealer};
+use goi_matrix::{GoIProofNet, GoIWavefrontSolverNative};
 use goi_solver::{GoiEdge, GoiNode, GoiSolverCore};
+use goi_wavefront::PyGoIWavefrontScheduler;
+use hin_arena::{reduce_hin_uast, PyHinEngine as PyHinArenaEngine};
 use hin_engine::HinEngineCore;
 use his::HisBoundaryCore;
+use uast::{PyGraphPolyglotMaterializer, PyUASTGraph, PyUASTKind};
 
 fn to_set(items: Vec<String>) -> HashSet<String> {
     items.into_iter().collect()
@@ -219,5 +229,18 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHinEngine>()?;
     m.add_class::<PyDeterministicHealer>()?;
     m.add_class::<PyHisRegister>()?;
+    // Consolidated aero-forge research-agent surface.
+    m.add_class::<PyUASTKind>()?;
+    m.add_class::<PyUASTGraph>()?;
+    m.add_class::<PyHinArenaEngine>()?;
+    m.add_class::<PyGoIWavefrontScheduler>()?;
+    m.add_class::<GoIProofNet>()?;
+    m.add_class::<GoIWavefrontSolverNative>()?;
+    m.add_class::<PyGraphPolyglotMaterializer>()?;
+    m.add_function(wrap_pyfunction!(repair_uast_expression, m)?)?;
+    m.add_function(wrap_pyfunction!(align_return_type, m)?)?;
+    m.add_class::<ASTRewritePatch>()?;
+    m.add_class::<PreWriteHealer>()?;
+    m.add_function(wrap_pyfunction!(reduce_hin_uast, m)?)?;
     Ok(())
 }
