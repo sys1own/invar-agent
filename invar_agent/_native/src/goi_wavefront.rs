@@ -9,6 +9,33 @@ use nalgebra::DMatrix;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+/// 2-norm condition number κ(A) = σ_max / σ_min via SVD; infinite when the
+/// matrix is rank-deficient (or SVD fails to converge).
+fn inner_condition_number(a: &DMatrix<f64>) -> f64 {
+    if a.nrows() == 0 || a.ncols() == 0 {
+        return f64::INFINITY;
+    }
+    let svd = nalgebra::SVD::new(a.clone(), false, false);
+    let s = svd.singular_values;
+    if s.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut smax = 0.0f64;
+    let mut smin = f64::INFINITY;
+    for &v in s.iter() {
+        if v > smax {
+            smax = v;
+        }
+        if v > 0.0 && v < smin {
+            smin = v;
+        }
+    }
+    if smin.is_infinite() || smin == 0.0 {
+        return f64::INFINITY;
+    }
+    smax / smin
+}
+
 pub struct GoIWavefrontScheduler {
     dim: usize,
     m_matrix: DMatrix<f64>,
@@ -76,6 +103,11 @@ impl GoIWavefrontScheduler {
     }
 
     /// Sherman-Morrison-Woodbury update for `ΔM = P·Qᵀ` (rank k = P.ncols()).
+    ///
+    /// The inner system `I - Qᵀ·K·U·P` must be well conditioned; when it is
+    /// singular or ill-conditioned (κ > 1e8) the low-rank update would
+    /// accumulate floating-point drift, so we fall back to a full
+    /// recomputation `EX(M, U) = (I - U·M)^{-1} · U` from the updated M.
     pub fn apply_incremental_update(
         &mut self,
         p: &DMatrix<f64>,
@@ -92,6 +124,11 @@ impl GoIWavefrontScheduler {
         let k_dim = p.ncols();
         let mid_id = DMatrix::identity(k_dim, k_dim);
         let inner = mid_id - (q.transpose() * &kup);
+        if inner_condition_number(&inner) > 1e8 {
+            self.m_matrix += p * q.transpose();
+            self.k_cached = None;
+            return self.compute_execution_operator();
+        }
         let inner_inv = inner
             .try_inverse()
             .ok_or("Singular perturbation in delta update")?;

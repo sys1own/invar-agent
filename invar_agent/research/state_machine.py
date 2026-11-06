@@ -293,6 +293,32 @@ def _json_safe(tel: Dict[str, float]) -> Dict[str, float]:
             for k, v in tel.items()}
 
 
+def _fmt_vec(values: List[float], limit: int = 4) -> str:
+    """Compact head/tail formatting of a state vector for prompt context."""
+    vals = [float(v) for v in values]
+    if len(vals) <= 2 * limit:
+        body = ", ".join(f"{v:.6g}" for v in vals)
+    else:
+        head = ", ".join(f"{v:.6g}" for v in vals[:limit])
+        tail = ", ".join(f"{v:.6g}" for v in vals[-limit:])
+        body = f"{head}, …({len(vals)} values)…, {tail}"
+    return f"[{body}]"
+
+
+def _counterexample_context(run: Dict[str, Any]) -> str:
+    """Numerical divergence context fed back into GoI_Plan on falsification.
+
+    Carries the exact final state vector, trace bounds and the first
+    non-finite step so the planner sees the precise divergence point.
+    """
+    state = run.get("state") or []
+    return (f"final_state={_fmt_vec(state)}; "
+            f"trace_min={_fmt_vec(run.get('trace_min', state))}; "
+            f"trace_max={_fmt_vec(run.get('trace_max', state))}; "
+            f"first_nonfinite_step={run.get('first_nonfinite_step', -1)}; "
+            f"final_l2={float(_telemetry(run, state).get('final_l2', float('nan'))):.6g}")
+
+
 @dataclass
 class ResearchRunState:
     blueprint: ResearchBlueprint
@@ -639,6 +665,10 @@ class ResearchStateMachine:
                     "candidate_code": candidate_code, "contracts": contracts}
         failed = next((r for r in results if r.status != "VERIFIED"), None)
         self._rollback_overlay(scratch)
+        # Transactional cleanup: unlink the rejected stage's compiled kernel
+        # (.cpp/.so/.dylib) and evict it from the bridge cache; verified
+        # stages keep their artifacts.
+        self.bridge.discard(cpp_code)
         await emit("accelerator_log", "rollback", {
             **tag, "scope": "stage_delta" if stage > 1 else "stage",
             "preserved_layers": [layer.layer_id for layer in pinned_layers],
@@ -754,12 +784,14 @@ class ResearchStateMachine:
         initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
         telemetry: Dict[str, float] = {}
         counterexample: Optional[str] = None
+        run_ctx: Optional[str] = None
         status = "ERROR"
         try:
             run = await asyncio.to_thread(
                 self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
                 entry, contract.timeout_seconds, contract.max_memory_mb)
             telemetry = _telemetry(run, initial)
+            run_ctx = _counterexample_context(run)
             extra: Dict[str, Any] = {"initial": initial,
                                      "trace_min": run.get("trace_min", run["state"]),
                                      "trace_max": run.get("trace_max", run["state"])}
@@ -780,7 +812,8 @@ class ResearchStateMachine:
             if not run.get("finite", True):
                 status = "DIVERGED"
                 counterexample = (f"non-finite state at step {run.get('first_nonfinite_step', -1)} "
-                                  f"(dt={contract.dt}, steps={contract.steps})")
+                                  f"(dt={contract.dt}, steps={contract.steps})"
+                                  + (f"; {run_ctx}" if run_ctx else ""))
             elif telemetry.get("hin_timed_out", 0.0) > 0:
                 status = "DIVERGED"
                 counterexample = "HIN arena reduction did not normalise within budget"
@@ -796,7 +829,8 @@ class ResearchStateMachine:
                         failed.append(f"`{inv.assertion}` ({inv.variable_name}) observed {observed}")
                 if failed:
                     status = "FALSIFIED"
-                    counterexample = "; ".join(failed)[:1500]
+                    counterexample = ("; ".join(failed)
+                                      + (f"; {run_ctx}" if run_ctx else ""))[:1500]
         except KernelExecutionError as exc:
             status = "DIVERGED" if exc.timed_out else "ERROR"
             counterexample = str(exc)[:1500]

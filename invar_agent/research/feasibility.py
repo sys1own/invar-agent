@@ -51,9 +51,12 @@ Research request: {question}
 
 _IMPOSSIBLE_PATTERNS = [
     (r"net positive energy", "demanding net energy gain"),
+    (r"net positive (?:energy|work)", "demanding net energy/work gain"),
     (r"perpetual motion", "perpetual motion"),
     (r"overunity|over-unity|free energy device", "over-unity claim"),
     (r"100\s*%\s*efficien", "impossible efficiency bound"),
+    (r"\b(?:cop|eta|efficiency)\s*(?:=|>=|>)\s*(?:1\.[0-9]+|[2-9])",
+     "coefficient of performance / efficiency above unity"),
     (r"violat\w*\s+(energy\s+)?conservation", "conservation-law violation"),
     (r"create energy from nothing|energy from nothing", "energy creation"),
     (r"halting problem|undecidable", "undecidable problem"),
@@ -170,12 +173,17 @@ def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment
     if verdict not in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE",
                        "REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
         return None
+    reformulation = str(data.get("reformulation") or "").strip()
+    if not reformulation:
+        reformulation = ("Reformulate as a falsifiable quantitative question "
+                         "with explicit governing equations and measurable "
+                         "invariants that a deterministic sandbox can verify.")
     try:
         return FeasibilityAssessment(
             verdict=verdict,
             rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
             violated_boundary=str(data.get("violated_boundary") or "")[:400],
-            reformulation=str(data.get("reformulation") or "")[:600],
+            reformulation=reformulation[:600],
             assessed_by="llm")
     except Exception:  # noqa: BLE001
         return None
