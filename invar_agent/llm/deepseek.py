@@ -18,6 +18,12 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from invar_agent.config import Tier, resolve_tier_model
+from invar_agent.llm.errors import (
+    LLMProviderError,
+    call_with_retries,
+    extract_upstream_error,
+    is_retryable_status,
+)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PROVIDER = "deepseek"
@@ -66,6 +72,49 @@ class DeepSeekChatClient:
             self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._client
 
+    # -- error mapping ---------------------------------------------------------
+
+    def _map_error(self, exc: Exception) -> Optional[LLMProviderError]:
+        """Map OpenAI SDK / httpx exceptions to the shared LLMProviderError."""
+        try:
+            import openai  # noqa: PLC0415
+        except ImportError:  # pragma: no cover - openai is a required dependency
+            openai = None
+        if openai is not None and isinstance(exc, openai.APIStatusError):
+            status = getattr(exc, "status_code", None)
+            body = getattr(exc, "body", None)
+            response = getattr(exc, "response", None)
+            if body is None and response is not None:
+                body = getattr(response, "text", "") or str(exc)
+            headers = dict(getattr(response, "headers", {}) or {})
+            message, request_id = extract_upstream_error(
+                status or 0, body, headers, api_key=self.api_key,
+            )
+            return LLMProviderError(
+                DEEPSEEK_PROVIDER, self.model, status_code=status,
+                upstream_message=message, request_id=request_id,
+                retryable=is_retryable_status(status or 0), api_key=self.api_key,
+            )
+        if openai is not None and isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+            return LLMProviderError(
+                DEEPSEEK_PROVIDER, self.model, status_code=None,
+                upstream_message=f"{type(exc).__name__}: {exc}", retryable=True,
+                api_key=self.api_key,
+            )
+        if isinstance(exc, httpx.TimeoutException):
+            return LLMProviderError(
+                DEEPSEEK_PROVIDER, self.model, status_code=None,
+                upstream_message=f"Request timed out: {exc}", retryable=True,
+                api_key=self.api_key,
+            )
+        if isinstance(exc, httpx.HTTPError):
+            return LLMProviderError(
+                DEEPSEEK_PROVIDER, self.model, status_code=None,
+                upstream_message=f"Transport error: {exc}", retryable=True,
+                api_key=self.api_key,
+            )
+        return None
+
     # -- chat interface (mirrors ChatLLMClient) ---------------------------------
 
     def generate(self, messages: List[Dict[str, str]], temperature: float = 0.2,
@@ -74,13 +123,25 @@ class DeepSeekChatClient:
 
         ``temperature`` is accepted for interface compatibility but deliberately
         NOT forwarded: DeepSeek thinking mode rejects sampling parameters.
+        429/5xx/timeout failures are retried with backoff; every failure is
+        raised as :class:`LLMProviderError` with the upstream detail preserved.
         """
         start = time.perf_counter()
-        response = self._openai_client().chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
+
+        def _attempt():
+            try:
+                return self._openai_client().chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                )
+            except Exception as exc:  # map SDK errors, keep the rest as-is
+                mapped = self._map_error(exc)
+                if mapped is not None:
+                    raise mapped from exc
+                raise
+
+        response = call_with_retries(_attempt)
         latency = (time.perf_counter() - start) * 1000.0
         choice = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)
