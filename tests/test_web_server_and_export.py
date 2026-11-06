@@ -113,3 +113,49 @@ def test_exports(client):
 
     bad = tc.get("/api/export/nope")
     assert bad.status_code == 404
+
+
+def test_config_endpoint(client):
+    tc, _ = client
+    resp = tc.post("/api/config", json={"provider": "gemini", "api_key": "test-key-123"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["configured"] is True
+    assert data["api_key_set"] is True
+    status = tc.get("/api/status").json()
+    assert "router_budget" in status
+
+
+def test_workspace_tree_and_file(client):
+    tc, ws = client
+    tc.post("/api/workspace/ingest", json={"path": str(ws)})
+
+    tree = tc.get("/api/workspace/tree")
+    assert tree.status_code == 200
+    data = tree.json()
+    names = {c["name"] for c in data["children"]}
+    assert {"calc.py", "test_calc.py", "conftest.py"} <= names
+
+    f = tc.get("/api/workspace/file", params={"path": "calc.py"})
+    assert f.status_code == 200
+    assert "def add" in f.json()["content"]
+
+    missing = tc.get("/api/workspace/file", params={"path": "nope.py"})
+    assert missing.status_code == 404
+
+    traversal = tc.get("/api/workspace/file", params={"path": "../outside.py"})
+    assert traversal.status_code == 403
+
+
+def test_agent_stream_emits_sse_events(client):
+    tc, ws = client
+    tc.post("/api/workspace/ingest", json={"path": str(ws)})
+    resp = tc.get("/api/agent/stream", params={"objective": "inspect workspace"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    body = resp.text
+    assert "data: " in body
+    assert '"type": "stage"' in body or '"type":"stage"' in body
+    assert '"type": "done"' in body or '"type":"done"' in body
+    # Final event carries the run report.
+    assert '"nodes_total"' in body

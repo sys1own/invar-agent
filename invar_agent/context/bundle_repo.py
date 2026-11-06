@@ -72,9 +72,12 @@ class WorkspaceIngestor:
         for rel in files or self.ignore_filter.iter_workspace_files():
             full = self.workspace_root / rel
             try:
-                out[rel] = full.read_text(encoding="utf-8", errors="replace")
+                text = full.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            if "\x00" in text:
+                continue  # binary artifact (e.g. compiled extensions)
+            out[rel] = text
         return out
 
     def ingest_zip(self, zip_path: str | os.PathLike, dest: Optional[str | os.PathLike] = None) -> WorkspaceIngestionReport:

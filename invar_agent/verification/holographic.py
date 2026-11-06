@@ -49,7 +49,7 @@ def extract_boundary_signature(source: str) -> str:
     """
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return ""
     entries: list[str] = []
     for node in tree.body:

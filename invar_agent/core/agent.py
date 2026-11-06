@@ -92,12 +92,26 @@ class VerifiedAutonomousAgent:
         self.current_stage = AgentStateStage.INGEST
         self.stage_history: list[dict[str, Any]] = []
         self._sources_cache: dict[str, str] = {}
+        self._progress_cb = None
 
     # -- stage plumbing ------------------------------------------------------------
 
     def _enter_stage(self, stage: AgentStateStage, detail: str = "") -> None:
         self.current_stage = stage
-        self.stage_history.append({"stage": stage.value, "at": time.time(), "detail": detail})
+        entry = {"stage": stage.value, "at": time.time(), "detail": detail}
+        self.stage_history.append(entry)
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb({"type": "stage", "stage": stage.value, "message": detail})
+            except Exception:  # noqa: BLE001 - progress reporting must never break the kernel
+                pass
+
+    def _emit_thought(self, text: str) -> None:
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb({"type": "thought", "text": text})
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- public API ------------------------------------------------------------------
 
@@ -261,24 +275,45 @@ class VerifiedAutonomousAgent:
         nodes: list[TaskWavefrontNode],
         patches_by_node: Optional[dict[str, list[ASTSurgicalPatch]]] = None,
         sandbox_cmd: Optional[list[str]] = None,
+        progress_cb=None,
     ) -> AgentRunReport:
         """Full run: ingest -> plan -> schedule -> execute all wavefronts."""
         report = AgentRunReport(run_id=f"run-{uuid.uuid4().hex[:10]}", objective=objective)
         report.started_at = time.time()
         self.stage_history = []
+        self._progress_cb = progress_cb
+        try:
+            return self._run_until_verified_inner(objective, nodes, patches_by_node, sandbox_cmd, report)
+        finally:
+            self._progress_cb = None
+
+    def _run_until_verified_inner(
+        self,
+        objective: str,
+        nodes: list[TaskWavefrontNode],
+        patches_by_node: Optional[dict[str, list[ASTSurgicalPatch]]],
+        sandbox_cmd: Optional[list[str]],
+        report: AgentRunReport,
+    ) -> AgentRunReport:
         ingest = self.ingest_workspace()
         report.boundary_digest_before = ingest["boundary_digest"]
 
         patches_by_node = patches_by_node or {}
+        self._emit_thought(f"Objective accepted: {objective!r}. Ingesting workspace graph…")
         try:
             wavefronts = self.plan_wavefronts(nodes)
         except Exception as e:  # noqa: BLE001
+            self._emit_thought(f"GoI planning rejected the candidate graph: {e}")
             report.finished_at = time.time()
             report.nodes_total = len(nodes)
             for node in nodes:
                 report.results.append(NodeExecutionResult(node_id=node.node_id, success=False, error=str(e)))
                 report.nodes_rolled_back += 1
             return report
+        self._emit_thought(
+            f"GoI nilpotency verified; {len(nodes)} nodes scheduled into "
+            f"{len(wavefronts)} Bernstein-disjoint wavefront(s)."
+        )
 
         report.nodes_total = len(nodes)
         node_by_id = {n.node_id: n for n in nodes}

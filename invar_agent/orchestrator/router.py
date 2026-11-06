@@ -68,12 +68,18 @@ class CognitiveModelRouter:
         cache_confidence_threshold: float = 0.92,
         blast_radius_threshold: float = 0.65,
         budget_guardrail: Optional[TokenBudgetGuardrail] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         self.pro_model = pro_model
         self.flash_model = flash_model
         self.cache_threshold = cache_confidence_threshold
         self.blast_threshold = blast_radius_threshold
         self.budget = budget_guardrail or TokenBudgetGuardrail()
+        self.api_key = api_key or ""
+
+    def set_api_key(self, api_key: str) -> None:
+        """Configure the provider API key used for Tier-1/Tier-2 LLM calls."""
+        self.api_key = api_key
 
     @staticmethod
     def compute_blast_radius(

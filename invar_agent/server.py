@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 import threading
 import time
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from invar_agent.contracts import AgentStateStage, ASTSurgicalPatch, TaskWavefrontNode
@@ -38,6 +39,11 @@ class RollbackRequest(BaseModel):
     run_id: Optional[str] = None
 
 
+class ConfigRequest(BaseModel):
+    provider: str = "gemini"
+    api_key: str = ""
+
+
 class ServerState:
     """Thread-safe server state: workspace, agent, latest run, overlay txs."""
 
@@ -49,11 +55,32 @@ class ServerState:
         self.last_report: Optional[AgentRunReport] = None
         self.last_ingest: dict[str, Any] = {}
         self.uploaded_zips: dict[str, Path] = {}
+        self.api_key: str = ""
+        self.provider: str = "gemini"
+
+    def set_api_key(self, provider: str, api_key: str) -> None:
+        with self.lock:
+            self.provider = provider or "gemini"
+            self.api_key = api_key or ""
+            if self.router is not None:
+                self.router.set_api_key(self.api_key)
+            # Rebuild the agent so the LLM client picks up the new key.
+            self.agent = None
 
     def ensure_agent(self) -> VerifiedAutonomousAgent:
         with self.lock:
             if self.agent is None:
-                self.agent = VerifiedAutonomousAgent(self.workspace_root, router=self.router)
+                llm_client = None
+                if self.api_key:
+                    try:
+                        from invar_agent.llm.clients import TieredLLMClient
+
+                        llm_client = TieredLLMClient(api_key=self.api_key)
+                    except Exception:  # noqa: BLE001
+                        llm_client = None
+                self.agent = VerifiedAutonomousAgent(
+                    self.workspace_root, router=self.router, llm_client=llm_client
+                )
             return self.agent
 
     def ingest_path(self, path: str) -> dict[str, Any]:
@@ -146,6 +173,107 @@ def create_app(workspace_root: str | Path = ".") -> FastAPI:
     async def api_ingest_zip(file: UploadFile) -> dict[str, Any]:
         data = await file.read()
         return state.ingest_zip_bytes(data, file.filename or "workspace.zip")
+
+    @app.post("/api/config")
+    def api_config(req: ConfigRequest) -> dict[str, Any]:
+        state.set_api_key(req.provider, req.api_key)
+        return {"configured": True, "provider": state.provider, "api_key_set": bool(state.api_key)}
+
+    @app.get("/api/workspace/tree")
+    def api_workspace_tree() -> dict[str, Any]:
+        root = state.workspace_root.resolve()
+
+        skip = {".git", "__pycache__", ".pytest_cache", ".invar_agent", "target", "node_modules", ".venv"}
+
+        def build(directory: Path, depth: int = 0) -> dict[str, Any]:
+            node: dict[str, Any] = {"name": directory.name or str(directory), "type": "folder", "children": []}
+            if depth > 12:
+                return node
+            try:
+                entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            except OSError:
+                return node
+            for entry in entries:
+                if entry.name in skip or entry.name.startswith(".git"):
+                    continue
+                if entry.is_dir():
+                    node["children"].append(build(entry, depth + 1))
+                elif entry.is_file():
+                    node["children"].append({"name": entry.name, "type": "file", "size": entry.stat().st_size})
+            return node
+
+        return build(root)
+
+    @app.get("/api/workspace/file")
+    def api_workspace_file(path: str = Query(..., min_length=1)) -> dict[str, Any]:
+        root = state.workspace_root.resolve()
+        candidate = (root / path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes the workspace root") from None
+        if not candidate.exists() or not candidate.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {path}")
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=415, detail="file is not valid UTF-8 text") from None
+        return {"path": path, "content": content}
+
+    @app.get("/api/agent/stream")
+    def api_agent_stream(
+        objective: str = Query(..., min_length=1),
+        nodes: Optional[str] = None,
+        patches: Optional[str] = None,
+        sandbox_cmd: Optional[str] = None,
+    ) -> StreamingResponse:
+        agent = state.ensure_agent()
+        node_list: list[TaskWavefrontNode] = []
+        patches_by_node: dict[str, list[ASTSurgicalPatch]] = {}
+        cmd: Optional[list[str]] = None
+        try:
+            if nodes:
+                parsed_nodes = json.loads(nodes)
+                if isinstance(parsed_nodes, dict):
+                    parsed_nodes = parsed_nodes.get("nodes", [])
+                node_list = [_node_from_dict(n) for n in parsed_nodes]
+            if patches:
+                patches_by_node = {
+                    nid: [_patch_from_dict(p) for p in plist]
+                    for nid, plist in json.loads(patches).items()
+                }
+            if sandbox_cmd:
+                cmd = json.loads(sandbox_cmd)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"invalid nodes/patches payload: {e}") from None
+
+        events: "queue.Queue[dict[str, Any]]" = queue.Queue()
+
+        def progress_cb(payload: dict[str, Any]) -> None:
+            events.put(payload)
+
+        def worker() -> None:
+            try:
+                report = agent.run_until_verified(
+                    objective, node_list, patches_by_node=patches_by_node,
+                    sandbox_cmd=cmd, progress_cb=progress_cb,
+                )
+                events.put({"type": "done", "report": _report_to_dict(report)})
+            except Exception as e:  # noqa: BLE001
+                events.put({"type": "error", "message": str(e)})
+            finally:
+                events.put({"type": "eof"})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def event_generator():
+            while True:
+                item = events.get()
+                if item.get("type") == "eof":
+                    break
+                yield f"data: {json.dumps(item, default=str)}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @app.post("/api/agent/execute")
     def api_execute(req: ExecuteRequest) -> dict[str, Any]:
