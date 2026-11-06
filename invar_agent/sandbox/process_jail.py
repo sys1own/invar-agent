@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import os
-import resource
 import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module
+    resource = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,8 @@ class ProcessJail:
 
     def enforce_rlimits(self) -> None:
         """Apply rlimits in the child process (preexec_fn)."""
+        if resource is None:
+            return
         lim = self.limits
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (lim.cpu_seconds, lim.cpu_seconds + 5))
@@ -67,8 +73,15 @@ class ProcessJail:
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
-            "TMPDIR": "/tmp",
+            "TMPDIR": os.environ.get("TEMP", os.environ.get("TMP", "/tmp")),
         }
+        if os.name == "nt":
+            # Winsock (ws2_32.dll) needs these to initialise sockets/asyncio in
+            # child processes; omitting SystemRoot causes WinError 10106.
+            for var in ("SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "PATHEXT",
+                        "TEMP", "TMP", "USERPROFILE"):
+                if var in os.environ:
+                    env[var] = os.environ[var]
         if extra:
             env.update(extra)
         return env
@@ -95,7 +108,7 @@ def capture_streams_deterministic(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
-            preexec_fn=jail.preexec,
+            preexec_fn=jail.preexec if (os.name != "nt" and resource is not None) else None,
         )
         duration = (time.perf_counter() - start) * 1000.0
         return CaptureResult(

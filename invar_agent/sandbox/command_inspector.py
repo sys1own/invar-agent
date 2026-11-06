@@ -29,6 +29,11 @@ class ShellCommandInspector:
 
     _ALLOW_PREFIXES = ("pytest", "python", "python3", "cargo", "rustc", "uv", "pip", "ls", "cat", "echo", "grep", "find", "maturin", "git", "mkdir", "cp", "mv", "touch", "rm")
 
+    @staticmethod
+    def _exe_name(token: str) -> str:
+        """Normalise a path/executable token: backslashes -> slashes, strip .exe."""
+        return re.sub(r"\.exe$", "", token.replace("\\", "/").split("/")[-1], flags=re.IGNORECASE)
+
     def parse_and_validate_shell_ast(self, command: str | list[str]) -> CommandRiskVerdict:
         if isinstance(command, list):
             tokens = list(command)
@@ -46,11 +51,11 @@ class ShellCommandInspector:
                 violations.append(reason)
 
         if tokens:
-            head = tokens[0].split("/")[-1]
+            head = self._exe_name(tokens[0])
             if head not in self._ALLOW_PREFIXES and head not in ("env",):
-                violations.append(f"non-allowlisted executable: {head}")
+                violations.append(f"non-allowlisted executable: {tokens[0]}")
         # `git` is allowlisted only for read/test operations.
-        if tokens and tokens[0].split("/")[-1] == "git":
+        if tokens and self._exe_name(tokens[0]) == "git":
             if len(tokens) > 1 and tokens[1] not in ("status", "diff", "log", "show", "rev-parse", "ls-files"):
                 violations.append("git mutation subcommand not permitted in sandbox")
         if not tokens:

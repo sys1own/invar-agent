@@ -17,7 +17,6 @@ import ctypes
 import hashlib
 import json
 import math
-import resource
 import shutil
 import subprocess
 import sys
@@ -25,6 +24,11 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module
+    resource = None
 
 
 class SimulationBuffer(ctypes.Structure):
@@ -122,11 +126,26 @@ class DynamicCABIBridge:
             cmd[1:1] = ["-march=native"]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
+            cpp_path.unlink(missing_ok=True)
             raise KernelExecutionError(
                 f"C-ABI compilation failed ({self.compiler}):\n"
                 f"{proc.stderr.strip()[:2000]}")
         self._cache[key] = so_path
         return so_path
+
+    def discard(self, cpp_code: str) -> None:
+        """Unlink the compiled artifacts of a rejected candidate.
+
+        Used by Adjoint_Commit_or_Rollback: only verified stages keep their
+        ``.cpp``/``.so``/``.dylib`` kernels in the bridge workspace.
+        """
+        key = self.cache_key(cpp_code)
+        self._cache.pop(key, None)
+        for suffix in (".cpp", ".so", ".dylib"):
+            try:
+                (self.workspace / f"kernel_{key}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def exported_symbols(self, so_path: Path) -> List[str]:
         """List exported function symbols via ``nm -D`` (empty if unavailable)."""
@@ -203,27 +222,33 @@ class DynamicCABIBridge:
                 f"entry point {entry} not exported by kernel "
                 f"(available: {', '.join(symbols[:8])})")
         run_dir = Path(tempfile.mkdtemp(prefix="invar-kernel-"))
-        runner = run_dir / "runner.py"
-        runner.write_text(_RUNNER_SOURCE)
-        cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
-        mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
-
-        def _limits() -> None:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-
-        start = time.perf_counter()
         try:
-            proc = subprocess.run(
-                [sys.executable, str(runner), str(so_path), entry,
-                 json.dumps([float(v) for v in initial_state]), str(float(dt)), str(int(steps))],
-                capture_output=True, text=True, timeout=timeout_seconds + 10,
-                preexec_fn=_limits, cwd=str(run_dir))
-        except subprocess.TimeoutExpired as exc:
-            raise KernelExecutionError(
-                f"kernel execution timed out after {timeout_seconds:.1f}s",
-                timed_out=True) from exc
-        wall_ms = (time.perf_counter() - start) * 1000.0
+            runner = run_dir / "runner.py"
+            runner.write_text(_RUNNER_SOURCE)
+            cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
+            mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
+
+            def _limits() -> None:
+                if resource is not None:
+                    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+
+            preexec = _limits if (sys.platform != "win32" and resource is not None) else None
+            start = time.perf_counter()
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(runner), str(so_path), entry,
+                     json.dumps([float(v) for v in initial_state]), str(float(dt)), str(int(steps))],
+                    capture_output=True, text=True, timeout=timeout_seconds + 10,
+                    preexec_fn=preexec, cwd=str(run_dir))
+            except subprocess.TimeoutExpired as exc:
+                raise KernelExecutionError(
+                    f"kernel execution timed out after {timeout_seconds:.1f}s",
+                    timed_out=True) from exc
+            wall_ms = (time.perf_counter() - start) * 1000.0
+        finally:
+            # The runner script and any subprocess scratch are ephemeral.
+            shutil.rmtree(run_dir, ignore_errors=True)
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip()[-1500:]
             lowered = tail.lower()

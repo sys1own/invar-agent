@@ -364,7 +364,7 @@ def test_keys_never_leak(app_client, monkeypatch, caplog):
 
 # (9) UI does not send tier_overrides; env tier overrides take effect
 def test_ui_does_not_send_tier_overrides():
-    html = (Path(invar_agent.__file__).parent / "static" / "index.html").read_text()
+    html = (Path(invar_agent.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
     assert "payload.tier_overrides" not in html
     assert "tier_overrides: {" not in html
     assert "JSON.stringify({provider: provider, api_key: key})" in html
