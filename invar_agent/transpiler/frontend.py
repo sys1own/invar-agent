@@ -30,6 +30,14 @@ class UnsupportedError(ValueError):
 
 def python_source_to_uast(source: str) -> dict:
     tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for inner in ast.walk(node):
+                if inner is not node and isinstance(
+                        inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    raise UnsupportedError("nested closures", node=inner)
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            raise UnsupportedError("global/nonlocal", node=node)
     _lower_expr.local_functions = {
         node.name for node in tree.body if isinstance(node, ast.FunctionDef)
     }
@@ -55,11 +63,12 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
         return None
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
         raise UnsupportedError("with statements", node=stmt)
-    if isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ()))):
-        body = [n for n in (_lower_stmt(s) for s in stmt.body) if n is not None]
-        return body[-1] if body else None
-    if isinstance(stmt, (ast.Yield, ast.YieldFrom)):
-        raise UnsupportedError("generators", node=stmt)
+    if isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        raise UnsupportedError("try/except", node=stmt)
+    if isinstance(stmt, ast.ClassDef):
+        raise UnsupportedError("classes/dataclasses", node=stmt)
+    if isinstance(stmt, (ast.Pass, ast.Break, ast.Continue)):
+        return {"type": type(stmt).__name__.lower()}
     if isinstance(stmt, (ast.AsyncFor, ast.AsyncFunctionDef, ast.Match)):
         raise UnsupportedError(type(stmt).__name__, node=stmt)
     if isinstance(stmt, ast.FunctionDef):
@@ -74,16 +83,21 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
                     "value": _lower_expr(stmt.value)}
         if isinstance(target, (ast.Tuple, ast.List)) and all(
                 isinstance(e, ast.Name) for e in target.elts):
-            return {"type": "binding",
-                    "name": [e.id for e in target.elts],
-                    "value": _lower_expr(stmt.value)}
+            if (isinstance(stmt.value, (ast.Tuple, ast.List))
+                    and len(stmt.value.elts) == len(target.elts)):
+                # Simultaneous assignment: a, b = x, y
+                return {"type": "multi_binding",
+                        "names": [e.id for e in target.elts],
+                        "values": [_lower_expr(v) for v in stmt.value.elts]}
+            raise UnsupportedError("tuple unpacking of non-tuple values", node=stmt)
         # Subscript/attribute targets: buf.data[i] = ...
         lowered_target = _lower_expr(target)
         if lowered_target is not None:
             return {"type": "binding", "target": lowered_target,
                     "value": _lower_expr(stmt.value)}
     if isinstance(stmt, ast.Return):
-        return _lower_expr(stmt.value) if stmt.value is not None else None
+        return {"type": "return",
+                "value": _lower_expr(stmt.value) if stmt.value is not None else None}
     if isinstance(stmt, ast.If):
         return _lower_if(stmt)
     if isinstance(stmt, ast.For):
@@ -95,7 +109,10 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
         return {"type": "loop_while", "condition": _lower_expr(stmt.test),
                 "body": body}
     if isinstance(stmt, ast.Expr):
-        return _lower_expr(stmt.value)
+        if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            return None  # docstring
+        value = _lower_expr(stmt.value)
+        return {"type": "expr", "value": value} if value is not None else None
     if isinstance(stmt, ast.AugAssign):
         op = _binop_name(stmt.op)
         target_expr = _lower_expr(stmt.target)
@@ -172,6 +189,16 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
     if isinstance(expr, ast.Compare) and len(expr.ops) == 1:
         return {"type": "compare", "op": _cmp_op_name(expr.ops[0]),
                 "left": _lower_expr(expr.left), "right": _lower_expr(expr.comparators[0])}
+    if isinstance(expr, ast.Compare):
+        # Chained comparison a < b < c  ->  (a < b) and (b < c)
+        parts = []
+        left = expr.left
+        for op, right in zip(expr.ops, expr.comparators):
+            parts.append({"type": "compare", "op": _cmp_op_name(op),
+                          "left": _lower_expr(left), "right": _lower_expr(right)})
+            left = right
+        return {"type": "call", "function": {"type": "reference", "name": "__boolop_and__"},
+                "argument": {"type": "literal", "value": parts}}
     if isinstance(expr, ast.BoolOp):
         op_name = "and" if isinstance(expr.op, ast.And) else "or"
         return {"type": "call", "function": {"type": "reference", "name": f"__boolop_{op_name}__"},
@@ -196,7 +223,21 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
     if isinstance(expr, ast.List):
         return {"type": "list", "elements": [_lower_expr(e) for e in expr.elts]}
     if isinstance(expr, ast.ListComp):
+        # Only the 2-D allocation idiom is supported:
+        #   [[0.0] * n for _ in range(m)]
+        gen = expr.generators[0] if len(expr.generators) == 1 else None
+        elt = expr.elt
+        if (gen is not None and not gen.ifs and isinstance(gen.iter, ast.Call)
+                and isinstance(gen.iter.func, ast.Name) and gen.iter.func.id == "range"
+                and len(gen.iter.args) == 1 and isinstance(elt, ast.BinOp)
+                and isinstance(elt.op, ast.Mult) and isinstance(elt.left, ast.List)
+                and len(elt.left.elts) == 1):
+            return {"type": "list2d_alloc", "rows": _lower_expr(gen.iter.args[0]),
+                    "cols": _lower_expr(elt.right),
+                    "fill": _lower_expr(elt.left.elts[0])}
         raise UnsupportedError("list comprehensions", node=expr)
+    if isinstance(expr, ast.Tuple):
+        raise UnsupportedError("tuples", node=expr)
     if isinstance(expr, ast.Lambda):
         raise UnsupportedError("lambda expressions", node=expr)
     return None

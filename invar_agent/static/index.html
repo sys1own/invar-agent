@@ -25,6 +25,8 @@
   .research-card h4 { margin:0 0 8px; font-size:13px; }
   .research-card textarea { width:100%; min-height:180px; background:#0d1119; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:8px; font-family:ui-monospace,monospace; font-size:11px; }
   .research-card .row { display:flex; gap:8px; margin-top:8px; }
+  .research-card.refusal, .action-card.refusal { border-color:#f85149; }
+  .action-card.refusal .action-title { color:#f85149; }
   .telemetry { display:flex; gap:12px; padding:6px 12px; font-size:11px; color:var(--muted); flex-wrap:wrap; }
   .badge { background:#1b2230; border:1px solid var(--border); border-radius:999px; padding:3px 10px; font-size:11px; color:var(--muted); white-space:nowrap; }
   .badge b { color:var(--green); font-weight:600; }
@@ -346,7 +348,28 @@ function addActionCard(action) {
   card.querySelector('button.build').onclick = () => runBuild(ta.value);
   chat.appendChild(card); scrollChat();
 }
+function addResearchRefusalCard(feasibility) {
+  const f = feasibility || {};
+  const verdict = f.verdict || 'REFUSED';
+  const card = el(`<div class="action-card refusal">
+    <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="action-title">⛔ Research Refused (${verdict})</span>
+      <span class="action-toggle">why?</span>
+    </div>
+    <div class="action-body" style="display:none">
+      <p><b>Why:</b> ${f.rationale || ''}</p>
+      <p><b>Epistemic boundary:</b> ${f.violated_boundary || 'n/a'}</p>
+      ${f.reformulation ? `<p><b>How to reformulate:</b> ${f.reformulation}</p>` : ''}
+    </div>
+  </div>`);
+  card.querySelector('.action-head').onclick = () => {
+    const body = card.querySelector('.action-body');
+    body.style.display = body.style.display === 'none' ? 'block' : 'none';
+  };
+  chat.appendChild(card); scrollChat();
+}
 function addResearchCardAction(action) {
+  if (action.type === 'RESEARCH_REFUSED') { addResearchRefusalCard(action.feasibility); return; }
   const bp = action.research_prompt || {};
   const card = el(`<div class="action-card">
     <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
@@ -372,7 +395,11 @@ function addResearchCardAction(action) {
         body: JSON.stringify({question: (action.params && action.params.question) || bp.title || ''})
       });
       setMode('research');
-      renderResearchCard(plan.blueprint);
+      if (plan.status === 'refused' || !plan.blueprint) {
+        renderResearchRefusal(plan.feasibility);
+      } else {
+        renderResearchCard(plan.blueprint);
+      }
       openResearchStream();
     } catch (e) { addMsg('system', 'Research plan error: ' + e); }
   };
@@ -463,6 +490,11 @@ async function sendResearch() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: text})
     });
+    if (data.status === 'refused' || !data.blueprint) {
+      renderResearchRefusal(data.feasibility);
+      statusEl.textContent = '';
+      return;
+    }
     renderResearchCard(data.blueprint);
     statusEl.textContent = '';
     openResearchStream();
@@ -472,6 +504,18 @@ async function sendResearch() {
     setComposerEnabled(true);
     input.focus();
   }
+}
+function renderResearchRefusal(feasibility) {
+  const wrap = document.getElementById('research-cards');
+  wrap.innerHTML = '';
+  const f = feasibility || {};
+  const card = el(`<div class="research-card refusal">
+    <h4>⛔ Epistemic Feasibility Gate: ${f.verdict || 'REFUSED'}</h4>
+    <div style="font-size:12px;margin:8px 0"><b>Why:</b> ${f.rationale || ''}</div>
+    <div style="font-size:12px;margin:8px 0"><b>Boundary:</b> ${f.violated_boundary || 'n/a'}</div>
+    ${f.reformulation ? `<div style="font-size:12px;margin:8px 0"><b>Reformulate:</b> ${f.reformulation}</div>` : ''}
+  </div>`);
+  wrap.appendChild(card);
 }
 function renderResearchCard(bp) {
   const wrap = document.getElementById('research-cards');
@@ -518,6 +562,29 @@ function openResearchStream() {
       const tel = document.getElementById('research-telemetry');
       tel.textContent = `contract=${msg.contract_id} status=${msg.status} time=${Number(msg.execution_time_ms || 0).toFixed(1)}ms ` +
         Object.entries(msg.telemetry).map(([k, v]) => `${k}=${Number(v).toPrecision(4)}`).join('  ');
+    }
+    if (msg.event === 'stage_start') {
+      statusEl.textContent = `research stage ${msg.research_stage}/${msg.total_stages} (${msg.mode}): ${msg.objective || ''}`;
+    }
+    if (msg.event === 'checkpoint') {
+      addMsg('system', `📌 Stage ${msg.research_stage} verified & pinned. Checkpoint: ${msg.bundle_hash || ''} (${(msg.pinned_layers || []).join(', ')})`);
+    }
+    if (msg.event === 'checkpoint_preserved') {
+      addMsg('system', `📦 ${msg.note} — exported to ${msg.path}`);
+    }
+    if (msg.event === 'research_complete') {
+      addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
+    }
+    if (msg.event === 'refused' && msg.feasibility) {
+      renderResearchRefusal(msg.feasibility);
+    }
+    if (msg.event === 'run_done') {
+      const snap = msg.snapshot || {};
+      if (snap.evolution_history && snap.evolution_history.length) {
+        const tel = document.getElementById('research-telemetry');
+        tel.textContent = snap.evolution_history.map(h =>
+          `stage ${h.stage}: ${h.status}${h.note ? ' — ' + h.note.slice(0, 80) : ''}`).join('  |  ');
+      }
     }
     if (msg.event === 'commit') {
       addMsg('system', '✅ Research run committed. Bundle: ' + (msg.bundle_hash || '').slice(0, 16));

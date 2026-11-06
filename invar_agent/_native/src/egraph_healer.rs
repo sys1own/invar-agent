@@ -70,8 +70,16 @@ fn value_to_enode(v: &Value) -> Option<AeroAstLanguage> {
 }
 
 fn collect_args(map: &serde_json::Map<String, Value>) -> Vec<Value> {
+    if let (Some(l), Some(r)) = (map.get("left"), map.get("right")) {
+        return vec![l.clone(), r.clone()];
+    }
+    if let Some(operand) = map.get("operand") {
+        return vec![operand.clone()];
+    }
     if let Some(Value::Array(arr)) = map.get("arguments") {
-        return arr.clone();
+        if !arr.is_empty() {
+            return arr.clone();
+        }
     }
     if let Some(Value::Array(arr)) = map.get("argument") {
         return arr.clone();
@@ -105,12 +113,22 @@ fn value_to_recexpr(v: &Value, expr: &mut RecExpr<AeroAstLanguage>) -> Result<Id
             return Ok(expr.add(AeroAstLanguage::Var(Symbol::new(name))));
         }
         if node_type == "call" || node_type == "binop" || node_type == "unaryop" {
-            let name = map
-                .get("function")
-                .or_else(|| map.get("name"))
-                .or_else(|| map.get("op"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let fn_name = match map.get("function") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Object(f)) => f.get("name").and_then(Value::as_str).map(|s| {
+                    s.strip_prefix("math.").unwrap_or(s).to_string()
+                }),
+                _ => None,
+            };
+            let name_owned = fn_name
+                .or_else(|| map.get("name").and_then(Value::as_str).map(str::to_string))
+                .or_else(|| map.get("op").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            let name = if node_type == "unaryop" && name_owned == "-" {
+                "neg"
+            } else {
+                name_owned.as_str()
+            };
             let args = collect_args(map);
             let child_ids: Vec<Id> = args
                 .iter()
@@ -128,46 +146,38 @@ fn build_enode(
     expr: &mut RecExpr<AeroAstLanguage>,
     kids: &[Id],
 ) -> Result<Id, String> {
-    let binary = |expr: &mut RecExpr<AeroAstLanguage>, kids: &[Id]| {
-        if kids.len() != 2 {
-            Err("binary operator needs two arguments".to_string())
+    let two = |kids: &[Id]| -> Result<[Id; 2], String> {
+        if kids.len() == 2 {
+            Ok([kids[0], kids[1]])
         } else {
-            Ok(expr.add(AeroAstLanguage::Add([kids[0], kids[1]])))
+            Err(format!("operator {} needs two arguments", name))
         }
     };
-    let unary = |expr: &mut RecExpr<AeroAstLanguage>, kids: &[Id]| {
-        if kids.len() != 1 {
-            Err("unary operator needs one argument".to_string())
+    let one = |kids: &[Id]| -> Result<[Id; 1], String> {
+        if kids.len() == 1 {
+            Ok([kids[0]])
         } else {
-            Ok(expr.add(AeroAstLanguage::Neg([kids[0]])))
+            Err(format!("operator {} needs one argument", name))
         }
     };
 
+    // Unknown operators are rejected (the caller returns the expression
+    // unchanged) rather than being silently reinterpreted.
     match name {
-        "+" | "add" => Ok(expr.add(AeroAstLanguage::Add([kids[0], kids[1]]))),
-        "-" | "sub" => Ok(expr.add(AeroAstLanguage::Sub([kids[0], kids[1]]))),
-        "*" | "mul" => Ok(expr.add(AeroAstLanguage::Mul([kids[0], kids[1]]))),
-        "/" | "div" => Ok(expr.add(AeroAstLanguage::Div([kids[0], kids[1]]))),
-        "**" | "pow" => Ok(expr.add(AeroAstLanguage::Pow([kids[0], kids[1]]))),
-        "neg" | "-u" | "unary-" => unary(expr, kids),
-        "sin" => unary(expr, kids),
-        "cos" => unary(expr, kids),
-        "sqrt" => unary(expr, kids),
-        "log" => unary(expr, kids),
-        "abs" => unary(expr, kids),
-        "to_f64" => if kids.len() == 1 { Ok(expr.add(AeroAstLanguage::ToF64([kids[0]]))) } else { Err("to_f64 needs one argument".to_string()) },
-        "to_i64" => if kids.len() == 1 { Ok(expr.add(AeroAstLanguage::ToI64([kids[0]]))) } else { Err("to_i64 needs one argument".to_string()) },
-        _ => {
-            // If two children were provided but the operator name is unknown,
-            // treat it as a generic add so the expression still rewrites.
-            if kids.len() == 2 {
-                binary(expr, kids)
-            } else if kids.len() == 1 {
-                unary(expr, kids)
-            } else {
-                Err(format!("unsupported call function: {}", name))
-            }
-        }
+        "+" | "add" => Ok(expr.add(AeroAstLanguage::Add(two(kids)?))),
+        "-" | "sub" if kids.len() == 2 => Ok(expr.add(AeroAstLanguage::Sub(two(kids)?))),
+        "*" | "mul" => Ok(expr.add(AeroAstLanguage::Mul(two(kids)?))),
+        "/" | "div" => Ok(expr.add(AeroAstLanguage::Div(two(kids)?))),
+        "**" | "pow" => Ok(expr.add(AeroAstLanguage::Pow(two(kids)?))),
+        "-" | "neg" | "-u" | "unary-" => Ok(expr.add(AeroAstLanguage::Neg(one(kids)?))),
+        "sin" => Ok(expr.add(AeroAstLanguage::Sin(one(kids)?))),
+        "cos" => Ok(expr.add(AeroAstLanguage::Cos(one(kids)?))),
+        "sqrt" => Ok(expr.add(AeroAstLanguage::Sqrt(one(kids)?))),
+        "log" => Ok(expr.add(AeroAstLanguage::Log(one(kids)?))),
+        "abs" | "fabs" => Ok(expr.add(AeroAstLanguage::Abs(one(kids)?))),
+        "to_f64" => Ok(expr.add(AeroAstLanguage::ToF64(one(kids)?))),
+        "to_i64" => Ok(expr.add(AeroAstLanguage::ToI64(one(kids)?))),
+        _ => Err(format!("unsupported call function: {}", name)),
     }
 }
 

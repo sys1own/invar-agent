@@ -33,7 +33,9 @@ from invar_agent.llm.errors import LLMProviderError, get_last_llm_error, record_
 from invar_agent.llm.validate import validate_provider
 from invar_agent.orchestrator.router import CognitiveModelRouter, TokenBudgetGuardrail
 from invar_agent.research.broadcaster import ResearchEventBroadcaster, ResearchRunManager
+from invar_agent.research.feasibility import evaluate_research_feasibility
 from invar_agent.research.planner import generate_research_plan, parse_blueprint
+from invar_agent.research.search import LiteratureSearchClient
 from invar_agent.schemas.research import ResearchBlueprint
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -184,16 +186,18 @@ class ServerState:
             return self.agent
 
     def ensure_research_manager(self) -> ResearchRunManager:
-        """Research manager with a Tier-2 REASONING LLM planner when configured."""
+        """Research manager with Tier-2 REASONING / Tier-1 FAST planners."""
         with self.lock:
             if self.research_manager is None:
-                async def _planner(question: str):
+
+                async def _planner(question: str, tier: Tier = Tier.REASONING,
+                                   max_tokens: int = 32768):
                     from invar_agent.llm.clients import get_llm_client
 
                     client = get_llm_client(
-                        provider=self.provider, tier=Tier.REASONING,
+                        provider=self.provider, tier=tier,
                         api_key=self.api_key or None,
-                        override=self.effective_tier_overrides().get("reasoning"),
+                        override=self.effective_tier_overrides().get(tier.value),
                     )
                     if client is None:
                         return None
@@ -204,12 +208,28 @@ class ServerState:
                     # offload it from the event loop.
                     resp = await asyncio.to_thread(
                         client.complete, question,
-                        max_tokens=32768, temperature=0.2)
+                        max_tokens=max_tokens, temperature=0.2)
                     return resp.content if resp else None
+
+                async def _reasoning_planner(question: str):
+                    return await _planner(question, Tier.REASONING, 32768)
+
+                async def _fast_planner(question: str):
+                    # Tier-1 FAST: telemetry-guided query formulation is cheap.
+                    return await _planner(question, Tier.FAST, 2048)
+
+                # Literature search is live only when explicitly enabled; unit
+                # tests stay hermetic via the offline deterministic cache.
+                import os
+                search_live = os.environ.get("INVAR_RESEARCH_SEARCH_LIVE") == "1"
+                search_client = LiteratureSearchClient(
+                    self.workspace_root / "research" / "literature_cache",
+                    offline=not search_live)
 
                 self.research_manager = ResearchRunManager(
                     self.workspace_root, self.research_broadcaster,
-                    llm_planner=_planner)
+                    llm_planner=_reasoning_planner, llm_fast=_fast_planner,
+                    search_client=search_client)
             return self.research_manager
 
     def _new_copilot(self, root: Path) -> CopilotAgent:
@@ -564,11 +584,20 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     @app.post("/api/v1/research/plan")
     async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
         manager = state.ensure_research_manager()
+        # Epistemic Feasibility Gate: refuse impossible/unsuitable tasks before
+        # any blueprint is synthesised or simulated.
+        feasibility = await evaluate_research_feasibility(
+            req.question, llm_complete=manager.llm_planner)
+        if feasibility.verdict.startswith("REFUSED"):
+            return {"status": "refused", "blueprint": None,
+                    "feasibility": feasibility.model_dump()}
         result = await generate_research_plan(
             req.question, llm_complete=manager.llm_planner, fallback=True)
         bp = ResearchBlueprint.model_validate(result["blueprint"])
+        bp = bp.model_copy(update={"feasibility": feasibility})
         manager.request_plan(bp)
-        return {"blueprint": bp.model_dump(), "source": result["source"]}
+        return {"status": "pending_approval", "blueprint": bp.model_dump(),
+                "source": result["source"], "feasibility": feasibility.model_dump()}
 
     @app.post("/api/v1/research/action")
     def api_research_action(req: ResearchActionRequest) -> dict[str, Any]:

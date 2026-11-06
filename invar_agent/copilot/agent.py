@@ -316,10 +316,12 @@ class CopilotAgent:
         import asyncio
 
         from invar_agent.llm.clients import get_llm_client
+        from invar_agent.research.feasibility import evaluate_research_feasibility
         from invar_agent.research.planner import generate_research_plan
 
-        # LLM call rationale: blueprint planning and hypothesis synthesis are
-        # deep reasoning tasks, so they use Tier.REASONING (pro model).
+        # LLM call rationale: blueprint planning, feasibility judgement and
+        # hypothesis synthesis are deep reasoning tasks, so they use
+        # Tier.REASONING (pro model).
         client = get_llm_client(
             self.provider, tier=Tier.REASONING, api_key=self.api_key or None,
             override=self.tier_overrides.get(Tier.REASONING.value),
@@ -328,19 +330,33 @@ class CopilotAgent:
         async def _call(question: str):
             if client is None:
                 return None
-            resp = client.complete(question, max_tokens=2048, temperature=0.2)
+            # Reasoning-tier models can exhaust small budgets on thinking
+            # (observed finish_reason=length with empty content), so use a
+            # generous budget.
+            resp = client.complete(question, max_tokens=32768, temperature=0.2)
             return resp.content if resp else None
 
-        try:
-            result = asyncio.run(generate_research_plan(message, llm_complete=_call))
-        except RuntimeError:
-            # Already inside a running event loop: execute in a worker thread.
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(
-                    asyncio.run, generate_research_plan(message, llm_complete=_call)
-                ).result()
+        def _run(coro):
+            try:
+                return asyncio.run(coro)
+            except RuntimeError:
+                # Already inside a running event loop: execute in a worker thread.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, coro).result()
+
+        # Epistemic Feasibility Gate: refuse impossible/unsuitable tasks before
+        # synthesising a plan.
+        feasibility = _run(evaluate_research_feasibility(message, llm_complete=_call))
+        if feasibility.verdict.startswith("REFUSED"):
+            return {
+                "type": "RESEARCH_REFUSED",
+                "feasibility": feasibility.model_dump(),
+                "params": {"question": message},
+            }
+        result = _run(generate_research_plan(message, llm_complete=_call))
         blueprint = result.get("blueprint") or {}
+        blueprint["feasibility"] = feasibility.model_dump()
         return {
             "type": "SUGGEST_RESEARCH_PLAN",
             "research_prompt": blueprint,

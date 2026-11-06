@@ -124,15 +124,83 @@ invar-agent ships a second, selectable **Research Agent** alongside the Builder 
 same nine-stage verified kernel as a *cyclic* research loop: Ingest (question + falsifiable
 hypothesis + search queries) → GoI_Plan → Wavefront_Schedule (nilpotency ρ(UM) < 1, with
 Sherman-Morrison-Woodbury rank-k incremental updates) → Overlay_Mutate (CoW scratch) →
-PreWrite_Guard (SHACL/Chiasmus firewall rejecting `os`/`sys`/`socket`/unbounded-loop code) →
-SMT_Concolic_Verify → Sandbox_Execute (`rust_hin`, `cpp` C-ABI, or `multi_variant` Pareto
-benchmarks) → Reflex_Heal (egg equality-saturation, Tier-0) → Adjoint_Commit_or_Rollback
-(commits telemetry + a BLAKE3 bundle hash on VERIFIED; rolls back and feeds the counterexample
-back into the next round on FALSIFIED/DIVERGED/ERROR).
+PreWrite_Guard (SHACL/Chiasmus firewall + v9 transpiler compliance) →
+SMT_Concolic_Verify (real Z3 consistency check via `research/smt.py`) → Sandbox_Execute
+(isolated subprocess C-ABI with rlimits; `rust_hin`, `cpp`, or `multi_variant` Pareto
+benchmarks) → Reflex_Heal (deterministic Tier-0 source repair + egg simplification) →
+Adjoint_Commit_or_Rollback.
 
-- **Cognitive routing**: Tier-2 REASONING synthesises the research blueprint (search queries,
-  invariants, simulation code template); Tier-1 FAST handles search-query expansion; Tier-0 Reflex
-  handles SMT/Z3/concolic checks, the security firewall, compilation and egg-based repair.
+### Cumulative Blueprint Evolution
+
+A `ResearchBlueprint` can target **multiple research stages** (`target_research_stages`, default 1).
+Stage 1 synthesises and verifies a foundation module, then pins it as a checkpoint layer
+(`ModuleLayer` with BLAKE3 bundle hash, contracts, and baseline invariants). Stage k > 1 re-enters
+Ingest → GoI_Plan in **accretive mode**: telemetry from stage k-1 (residuals, energy drift,
+finite/divergence flags) steers targeted literature queries; the Tier-2 LLM receives the exact
+verified code and contracts of the previous stages and must *extend and couple* into the same
+unified module; the GoI wavefront scheduler is updated incrementally via Sherman-Morrison-Woodbury
+ΔM = P·Qᵀ (`PyGoIWavefrontScheduler.apply_incremental_update`); and Sandbox_Execute re-verifies
+every pinned layer inside the same compiled artefact as the new logic (regression contracts are
+prefixed `regression:<layer>:<contract>`). Rollback is **delta-scoped**: a failed stage k rolls back
+only its delta to the stage k-1 checkpoint, feeds the counterexample back into GoI_Plan, and when
+retries are exhausted the last verified unified checkpoint is preserved and exported under
+`<workspace>/checkpoints/<blueprint_id>/stage_k_unified_module.py` + `blueprint.json` rather than
+losing verified work. The accretion validator (`research/accretion.py`) makes pinned functions
+immutable (redefinitions are reverted, not rejected), restores deleted pinned functions, requires
+the new driver to call at least one pinned function, and extracts the stage delta for rollback.
+
+### Live Literature Search
+
+`research/search.py` provides `LiteratureSearchClient` with three sources: arXiv
+(`export.arxiv.org/api/query`), OpenAlex (`api.openalex.org/works`, with Crossref fallback) and a
+Wikipedia opensearch+summary fallback. It has clean timeout handling, rate-limit backoff
+(0s/1.5s/4s), and deterministic BLAKE2b-keyed caching so offline unit tests stay hermetic
+(`offline=True` serves only the cache; network failure falls back to cache). Search runs strictly
+during Ingest/GoI_Plan — Sandbox_Execute stays network-isolated (subprocess with rlimits). Every
+query, retrieved paper and extracted mathematical insight (equations/coefficients/scaling laws) is
+emitted as structured `search_log` SSE events (`query` / `paper` / `insight` / `query_done`).
+Live fetching is opt-in via `INVAR_RESEARCH_SEARCH_LIVE=1`; otherwise the offline cache is used.
+
+### Epistemic Feasibility Guardrails
+
+Before any blueprint is synthesised or simulated, `research/feasibility.py` classifies the request
+into one of four verdicts (`FeasibilityAssessment` on the blueprint):
+
+- `OPTIMAL_DIRECT` — quantitative research suited for literature + deterministic native verify.
+- `REFORMULATED_SURROGATE` — too large for local execution (3D DNS turbulence, ab-initio,
+  macro-scale); the engine must define a reduced-order surrogate and justify the reduction.
+- `REFUSED_IMPOSSIBLE` — axiomatic impossibility (net positive energy with conservation
+  invariants, perpetual motion, undecidable/contradictory constraints). Also enforced *during*
+  execution: if Z3 proves a contract's invariants mutually unsatisfiable, the run halts as
+  REFUSED before any simulation.
+- `REFUSED_UNSUITABLE` — subjective/historical/literary/clinical tasks without falsifiable
+  governing equations ("math-washing").
+
+A deterministic heuristic gate runs first (and is authoritative for refusals); the Tier-2 REASONING
+model may escalate or refine the verdict. The gate runs in `POST /api/v1/research/plan`, in Copilot
+`SUGGEST_RESEARCH_PLAN` (which returns a `RESEARCH_REFUSED` card), and defensively inside the state
+machine. Refusals never reach compilation or simulation; the API returns
+`{"status": "refused", "feasibility": {...}}` and the Web Console renders a red refusal card
+explaining **why**, **which epistemic boundary** was violated, and **how to reformulate**.
+
+### Prompt Optimisation
+
+The planner prompts (`research/planner.py`) encode tool mastery heuristics: `cpp` C-ABI for
+RK4 ODE/PDE, matrix ops and heavy loops; `rust_hin` for scalar/vector recurrences, discrete math
+and algebraic invariants (HIN structural normalisation telemetry `hin_steps`/`hin_stalled_pairs`);
+`multi_variant` for Pareto comparison of candidate algorithms (residual vs wall-time frontier).
+All synthesis prompts enforce the strict v9_transpiler_friendly subset: primitive
+int/float/bool/`list[float]`/`list[list[float]]`, for/while with guards, `range`, `math.*`,
+deterministic intrinsics (`prng_uniform`, `clamp`, `sign`) and top-level pure functions — with
+classes, try/except, with, yield, async, `import os/sys/socket/random/re/json`, nested closures
+and unbounded loops forbidden (enforced both in the prompt and by the PreWrite_Guard AST check).
+Accretive prompts receive the exact verified code + contracts of stage k-1 plus sandbox observables
+(`state`, `initial`, `trace_min`, `trace_max`, `telemetry`, `variants`) and instruct the model to
+extend and couple rather than overwrite.
+
+- **Cognitive routing**: Tier-2 REASONING synthesises blueprints and accretive stages; Tier-1 FAST
+  formulates telemetry-guided literature queries; Tier-0 Reflex handles SMT/Z3/concolic checks,
+  the security firewall, compilation and egg-based repair.
 - **Web console**: a `[ Builder Agent | Research Agent ]` toggle in the navbar switches the main
   pane. Research mode shows a plan card (editable blueprint JSON with **Approve & Run Deep
   Research** / **Edit Plan** / **Abort**), three live log panes (`SEARCH LOG`, `GoI/HIN STREAM`,

@@ -60,10 +60,12 @@ class ResearchRunManager:
     """Owns the active research run; supports approve/edit/abort."""
 
     def __init__(self, workspace_root, broadcaster: ResearchEventBroadcaster,
-                 llm_planner=None):
+                 llm_planner=None, llm_fast=None, search_client=None):
         self.workspace_root = workspace_root
         self.broadcaster = broadcaster
         self.llm_planner = llm_planner
+        self.llm_fast = llm_fast
+        self.search_client = search_client
         self.pending_blueprint: Optional[ResearchBlueprint] = None
         self.active_state: Optional[ResearchRunState] = None
         self._thread: Optional[threading.Thread] = None
@@ -84,7 +86,9 @@ class ResearchRunManager:
         self._abort.clear()
         machine = ResearchStateMachine(
             self.workspace_root / "research", progress_cb=self._progress,
-            llm_planner=self.llm_planner)
+            llm_planner=self.llm_planner, llm_fast=self.llm_fast,
+            search_client=self.search_client,
+            abort_flag=self._abort.is_set)
         self.active_state = ResearchRunState(blueprint=bp)
 
         def _run() -> None:
@@ -102,11 +106,13 @@ class ResearchRunManager:
         self.broadcaster.publish("accelerator_log", "run_start",
                                  {"blueprint_id": bp.blueprint_id})
         state = await machine.run(bp)
+        self.active_state = state
         if state.aborted:
             self.broadcaster.publish("accelerator_log", "aborted", {})
         else:
             self.broadcaster.publish("accelerator_log", "run_done",
-                                     {"stage": state.stage})
+                                     {"stage": state.stage, "status": state.status,
+                                      "snapshot": state.snapshot()})
 
     def edit(self, blueprint: ResearchBlueprint) -> None:
         self.pending_blueprint = blueprint
@@ -118,8 +124,11 @@ class ResearchRunManager:
         return True
 
     def status(self) -> Dict[str, Any]:
+        bp = self.pending_blueprint
         return {
-            "pending": self.pending_blueprint.model_dump() if self.pending_blueprint else None,
+            "pending": bp.model_dump() if bp else None,
+            "pending_feasibility": (bp.feasibility.model_dump()
+                                    if bp and bp.feasibility else None),
             "running": self._thread is not None and self._thread.is_alive(),
             "active": self.active_state.snapshot() if self.active_state else None,
         }
