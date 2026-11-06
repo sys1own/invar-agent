@@ -11,6 +11,7 @@ import pytest
 
 from invar_agent.config import Tier
 from invar_agent.llm.clients import get_llm_client
+from invar_agent.llm.errors import LLMProviderError
 from invar_agent.llm.validate import validate_provider
 
 pytestmark = pytest.mark.live
@@ -32,5 +33,12 @@ def test_live_validate_and_fast_completion(provider, env, monkeypatch, tmp_path)
     for tier in ("fast", "reasoning"):
         assert verdict["tier_models"][tier] in verdict["models"], verdict["warnings"]
     client = get_llm_client(provider, tier=Tier.FAST, api_key=key, override=verdict["tier_models"]["fast"])
-    response = client.complete("Reply with exactly: OK", max_tokens=64)
+    try:
+        response = client.complete("Reply with exactly: OK", max_tokens=64)
+    except LLMProviderError as exc:
+        # Free-tier keys are often capacity-limited (429/503 "high demand");
+        # that is not a client regression, so skip instead of failing.
+        if exc.retryable and (exc.status_code == 429 or (exc.status_code or 0) >= 500):
+            pytest.skip(f"{provider} transiently unavailable: {exc.describe()}")
+        raise
     assert response.model == verdict["tier_models"]["fast"]
