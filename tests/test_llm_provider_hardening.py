@@ -427,3 +427,61 @@ def test_native_status_requires_compiled_symbols(monkeypatch):
     monkeypatch.setitem(sys.modules, "invar_agent._native", full)
     monkeypatch.setattr(invar_agent, "_native", full, raising=False)
     assert server._native_status()["available"] is True
+
+
+def test_status_source_is_null_without_key(app_client):
+    llm = app_client.get("/api/status").json()["llm"]
+    assert llm["configured"] is False
+    assert llm["source"] is None
+
+
+def test_api_saved_config_survives_server_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_MODEL_FAST", "deepseek-flash")
+    cfg = tmp_path / "config.json"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]})
+
+    monkeypatch.setattr(server, "validate_provider",
+                        lambda provider, api_key, tier_overrides=None, **kw: validate_provider(
+                            provider, api_key, tier_overrides, client=_models_client(handler)))
+
+    server._STATE = None
+    first = TestClient(create_app(str(ws)))
+    resp = first.post("/api/config", json={"provider": "deepseek", "api_key": SK_SECRET,
+                                           "tier_overrides": {"reasoning": "deepseek-v4-pro"}})
+    assert resp.status_code == 200
+    raw = json.loads(cfg.read_text())
+    assert raw["provider"] == "deepseek" and SK_SECRET not in cfg.read_text()
+    assert raw["tier_models"]["deepseek"] == {"reasoning": "deepseek-v4-pro"}
+
+    # New process state, no env keys: provider + overrides come from the file.
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(cfg))
+    server._STATE = None
+    second = TestClient(create_app(str(ws)))
+    llm = second.get("/api/status").json()["llm"]
+    assert llm["provider"] == "deepseek"
+    assert llm["tier_models"]["reasoning"] == "deepseek-v4-pro"
+    assert llm["configured"] is False and llm["source"] is None
+
+    # With INVAR_PERSIST_KEY=1 the key round-trips through the file (0600).
+    monkeypatch.setenv("INVAR_PERSIST_KEY", "1")
+    monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "with-key.json"))
+    first.post("/api/config", json={"provider": "deepseek", "api_key": SK_SECRET})
+    key_path = tmp_path / "with-key.json"
+    assert SK_SECRET in key_path.read_text()
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    server._STATE = None
+    third = TestClient(create_app(str(ws)))
+    llm = third.get("/api/status").json()["llm"]
+    assert llm["configured"] is True and llm["source"] == "file"
+
+
+def test_single_env_key_selects_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", SK_SECRET)
+    monkeypatch.delenv("INVAR_LLM_PROVIDER", raising=False)
+    state = server.ServerState(tmp_path)
+    assert state.provider == "deepseek" and state.key_source == "env"

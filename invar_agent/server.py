@@ -240,7 +240,8 @@ def _llm_status(state: ServerState) -> dict[str, Any]:
         "validated": state.llm_validated,
         "tier_models": tier_models,
         "last_error": get_last_llm_error(),
-        "source": state.key_source,
+        # Where the key came from; null when no key is configured.
+        "source": state.key_source if state.api_key else None,
     }
 
 
