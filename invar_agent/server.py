@@ -1,6 +1,7 @@
 """FastAPI web console for the invar-agent verified kernel."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -31,6 +32,9 @@ from invar_agent.export.exporter import ExportEngine
 from invar_agent.llm.errors import LLMProviderError, get_last_llm_error, record_llm_error
 from invar_agent.llm.validate import validate_provider
 from invar_agent.orchestrator.router import CognitiveModelRouter, TokenBudgetGuardrail
+from invar_agent.research.broadcaster import ResearchEventBroadcaster, ResearchRunManager
+from invar_agent.research.planner import generate_research_plan, parse_blueprint
+from invar_agent.schemas.research import ResearchBlueprint
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -67,6 +71,15 @@ class CopilotRunBuildRequest(BaseModel):
     prompt: str = ""
 
 
+class ResearchPlanRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=4000)
+
+
+class ResearchActionRequest(BaseModel):
+    action: str  # approve_plan | edit_plan | abort
+    blueprint: Optional[dict[str, Any]] = None
+
+
 class ServerState:
     """Thread-safe server state: workspace, agent, latest run, overlay txs."""
 
@@ -87,6 +100,8 @@ class ServerState:
         # defaults, never env/file/explicit overrides.
         self.auto_tier_models: dict[str, str] = {}
         self.copilot: Optional[CopilotAgent] = None
+        self.research_broadcaster = ResearchEventBroadcaster()
+        self.research_manager: Optional[ResearchRunManager] = None
         self._load_startup_llm_config(provider_override)
 
     # -- LLM configuration ---------------------------------------------------
@@ -167,6 +182,35 @@ class ServerState:
             if self.agent is None:
                 self.agent = self._new_agent(self.workspace_root)
             return self.agent
+
+    def ensure_research_manager(self) -> ResearchRunManager:
+        """Research manager with a Tier-2 REASONING LLM planner when configured."""
+        with self.lock:
+            if self.research_manager is None:
+                async def _planner(question: str):
+                    from invar_agent.llm.clients import get_llm_client
+
+                    client = get_llm_client(
+                        provider=self.provider, tier=Tier.REASONING,
+                        api_key=self.api_key or None,
+                        override=self.effective_tier_overrides().get("reasoning"),
+                    )
+                    if client is None:
+                        return None
+                    # Reasoning-tier models can spend >8k tokens on thinking
+                    # before emitting content (observed: 8192 budget exhausted
+                    # with finish_reason=length and empty content), so start
+                    # with a generous budget. The LLM call is blocking, so
+                    # offload it from the event loop.
+                    resp = await asyncio.to_thread(
+                        client.complete, question,
+                        max_tokens=32768, temperature=0.2)
+                    return resp.content if resp else None
+
+                self.research_manager = ResearchRunManager(
+                    self.workspace_root, self.research_broadcaster,
+                    llm_planner=_planner)
+            return self.research_manager
 
     def _new_copilot(self, root: Path) -> CopilotAgent:
         # LLM call rationale: copilot chat is a lightweight planning task,
@@ -514,6 +558,61 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
             media_type=artifact.content_type,
             headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
         )
+
+    # -- Research Agent endpoints -------------------------------------------
+
+    @app.post("/api/v1/research/plan")
+    async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
+        manager = state.ensure_research_manager()
+        result = await generate_research_plan(
+            req.question, llm_complete=manager.llm_planner, fallback=True)
+        bp = ResearchBlueprint.model_validate(result["blueprint"])
+        manager.request_plan(bp)
+        return {"blueprint": bp.model_dump(), "source": result["source"]}
+
+    @app.post("/api/v1/research/action")
+    def api_research_action(req: ResearchActionRequest) -> dict[str, Any]:
+        manager = state.ensure_research_manager()
+        if req.action == "approve_plan":
+            if req.blueprint is not None:
+                manager.edit(parse_blueprint(req.blueprint))
+            ok = manager.approve()
+            if not ok:
+                raise HTTPException(status_code=409, detail="no pending research plan to approve")
+            return {"status": "running"}
+        if req.action == "edit_plan":
+            if req.blueprint is None:
+                raise HTTPException(status_code=400, detail="edit_plan requires a blueprint")
+            manager.edit(parse_blueprint(req.blueprint))
+            return {"status": "edited"}
+        if req.action == "abort":
+            manager.abort()
+            return {"status": "aborted"}
+        raise HTTPException(status_code=400, detail=f"unknown action: {req.action}")
+
+    @app.get("/api/v1/research/status")
+    def api_research_status() -> dict[str, Any]:
+        return state.ensure_research_manager().status()
+
+    @app.get("/api/v1/research/stream")
+    def api_research_stream() -> StreamingResponse:
+        manager = state.ensure_research_manager()
+        q = state.research_broadcaster.subscribe()
+
+        def event_generator():
+            # Sync generator (same pattern as /api/agent/stream): the broadcaster
+            # publishes from the research worker thread into a thread-safe queue.
+            try:
+                while True:
+                    try:
+                        payload = q.get(timeout=15.0)
+                        yield f"data: {json.dumps(payload, default=str)}\n\n"
+                    except queue.Empty:
+                        yield "event: keep-alive\ndata: {}\n\n"
+            finally:
+                state.research_broadcaster.unsubscribe(q)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return app
 

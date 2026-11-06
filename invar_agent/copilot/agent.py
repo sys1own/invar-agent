@@ -28,6 +28,16 @@ from invar_agent.llm.errors import LLMProviderError, record_llm_error, redact_se
 
 logger = logging.getLogger("invar_agent.copilot.agent")
 
+_RESEARCH_INTENT = re.compile(
+    r"\b(research|hypothesis|soliton|kdv|korteweg|investigate|experiment|"
+    r"scientific|verify that|verify the)\b",
+    re.IGNORECASE,
+)
+
+
+def is_research_intent(message: str) -> bool:
+    return bool(_RESEARCH_INTENT.search(message or ""))
+
 
 def _legacy_action_type(action: Dict[str, Any]) -> str:
     """Map the canonical ActionParser type to the legacy UI action type."""
@@ -292,7 +302,50 @@ class CopilotAgent:
 
         reply, action = format_copilot_response(raw)
         action = self._normalize_action(action)
+        research_action = self._maybe_research_action(message)
+        if research_action is not None:
+            action = research_action
         return {"reply": reply or "I have no further comments.", "action": action, "llm_state": "ok"}
+
+    # -- research planning ------------------------------------------------------
+
+    def _maybe_research_action(self, message: str) -> Optional[Dict[str, Any]]:
+        """Tier-2 REASONING research planning for research-intent messages."""
+        if not is_research_intent(message):
+            return None
+        import asyncio
+
+        from invar_agent.llm.clients import get_llm_client
+        from invar_agent.research.planner import generate_research_plan
+
+        # LLM call rationale: blueprint planning and hypothesis synthesis are
+        # deep reasoning tasks, so they use Tier.REASONING (pro model).
+        client = get_llm_client(
+            self.provider, tier=Tier.REASONING, api_key=self.api_key or None,
+            override=self.tier_overrides.get(Tier.REASONING.value),
+        )
+
+        async def _call(question: str):
+            if client is None:
+                return None
+            resp = client.complete(question, max_tokens=2048, temperature=0.2)
+            return resp.content if resp else None
+
+        try:
+            result = asyncio.run(generate_research_plan(message, llm_complete=_call))
+        except RuntimeError:
+            # Already inside a running event loop: execute in a worker thread.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(
+                    asyncio.run, generate_research_plan(message, llm_complete=_call)
+                ).result()
+        blueprint = result.get("blueprint") or {}
+        return {
+            "type": "SUGGEST_RESEARCH_PLAN",
+            "research_prompt": blueprint,
+            "params": {"question": message},
+        }
 
     # -- helpers ------------------------------------------------------------------
 
