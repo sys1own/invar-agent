@@ -25,6 +25,22 @@
   .seg-toggle button.active { background:#283347; color:#f8fafc; font-weight:600; }
   #research-panel { display:none; flex:none; flex-direction:column; min-height:0; overflow:hidden; }
   #research-panel.active { display:flex; }
+  /* Interactive visual pipeline stepper */
+  .research-stepper { display:flex; align-items:center; gap:6px; padding:7px 12px; flex:none; border-bottom:1px solid var(--border); background:#12161f; overflow-x:auto; }
+  .research-stepper .step { display:flex; align-items:center; gap:5px; font-size:11px; color:var(--muted); padding:3px 9px; border-radius:999px; border:1px solid var(--border); white-space:nowrap; transition:all .2s ease; }
+  .research-stepper .step.active { color:#38bdf8; border-color:#38bdf8; animation:stepPulse 1.2s ease-in-out infinite; }
+  .research-stepper .step.completed { color:#34d399; border-color:#059669; background:#064e3b; }
+  .research-stepper .step.failed { color:#f87171; border-color:#f87171; background:#3f1d1d; }
+  .research-stepper .step-line { flex:1; min-width:10px; height:1px; background:var(--border); }
+  @keyframes stepPulse { 0%,100% { box-shadow:0 0 0 0 rgba(56,189,248,.4); } 50% { box-shadow:0 0 0 4px rgba(56,189,248,0); } }
+  /* Live activity console (dedicated research feed) */
+  .research-activity-feed { flex:none; height:190px; overflow-y:auto; padding:6px 12px; background:#0f1217; border-bottom:1px solid var(--border); font-family:ui-monospace,monospace; font-size:11px; }
+  .activity-line { padding:1px 0; color:#cbd5e1; white-space:pre-wrap; word-break:break-word; }
+  .activity-tag { font-weight:700; margin-right:6px; }
+  .tag-INGEST { color:#38bdf8; } .tag-BUILD { color:#fbbf24; } .tag-SANDBOX { color:#34d399; } .tag-ERROR { color:#f87171; } .tag-INFO { color:#94a3b8; }
+  .failure-card { border-color:#f87171 !important; }
+  .failure-card h4 { color:#f87171; }
+  .failure-card pre { background:#0f1217; border:1px solid #3f1d1d; border-radius:6px; padding:8px 10px; font-size:10.5px; overflow:auto; color:#fca5a5; max-height:180px; }
   #research-cards { flex:none; max-height:38%; overflow-y:auto; padding-top:6px; }
   /* Collapsible bottom runtime drawer (replaces the fixed 3-pane log strip) */
   .runtime-drawer { flex:none; background:#12161f; border-top:1px solid #283142; display:flex; flex-direction:column; height:36px; overflow:hidden; transition:height .15s ease; }
@@ -286,6 +302,18 @@
     </div>
     <div id="view-chat" class="workspace-view active">
       <div class="research-panel" id="research-panel">
+        <div id="research-stepper" class="research-stepper">
+          <div class="step" id="step-feasibility"><span class="step-icon">⚖️</span> Feasibility</div>
+          <div class="step-line"></div>
+          <div class="step" id="step-ingest"><span class="step-icon">📚</span> Literature (<span id="ingest-count">0</span>)</div>
+          <div class="step-line"></div>
+          <div class="step" id="step-stage1"><span class="step-icon">🚀</span> Stage 1: Kinematics</div>
+          <div class="step-line"></div>
+          <div class="step" id="step-stage2"><span class="step-icon">🔥</span> Stage 2: Thermal</div>
+          <div class="step-line"></div>
+          <div class="step" id="step-report"><span class="step-icon">📊</span> Report &amp; Vault</div>
+        </div>
+        <div id="research-activity-feed" class="research-activity-feed"></div>
         <div class="telemetry" id="research-telemetry"></div>
       </div>
       <div class="chat" id="chat"></div>
@@ -1033,19 +1061,107 @@ function addResearchReportCard(markdown, path, runId) {
   chat.appendChild(card); scrollChat();
   loadVault();
 }
+/* ---- research stepper + live activity feed ---- */
+const STEPPER_STEPS = ['step-feasibility', 'step-ingest', 'step-stage1', 'step-stage2', 'step-report'];
+let stepperMax = -1;
+function setStepState(id, state) {
+  const n = document.getElementById(id); if (!n) return;
+  n.classList.remove('active', 'completed', 'failed');
+  if (state) n.classList.add(state);
+}
+function activateStep(id) {
+  const idx = STEPPER_STEPS.indexOf(id);
+  if (idx < 0) return;
+  if (idx <= stepperMax) return;  // monotonic: re-ingest in later stages never rewinds the stepper
+  stepperMax = idx;
+  STEPPER_STEPS.forEach((sid, i) => {
+    if (i < idx) setStepState(sid, 'completed');
+    else if (i === idx) setStepState(sid, 'active');
+    else setStepState(sid, '');
+  });
+}
+function resetResearchStepper() {
+  stepperMax = -1;
+  STEPPER_STEPS.forEach(id => setStepState(id, ''));
+  const c = document.getElementById('ingest-count'); if (c) c.textContent = '0';
+}
+function failActiveStep() {
+  const active = document.querySelector('#research-stepper .step.active');
+  if (active) { active.classList.remove('active'); active.classList.add('failed'); }
+}
+function stepForActivity(stage) {
+  if (stage === 'FEASIBILITY') return 'step-feasibility';
+  if (stage === 'INGEST') return 'step-ingest';
+  const m = /^STAGE_(\d+)_(?:BUILD|EXEC)$/.exec(stage || '');
+  if (m) return parseInt(m[1], 10) === 1 ? 'step-stage1' : 'step-stage2';
+  if (stage === 'ACCRETION') return 'step-stage2';
+  if (stage === 'REPORT') return 'step-report';
+  return null;
+}
+function activityTagClass(stage) {
+  if (stage === 'INGEST') return 'tag-INGEST';
+  if (stage && stage.includes('BUILD')) return 'tag-BUILD';
+  if (stage === 'SANDBOX' || (stage && stage.includes('EXEC'))) return 'tag-SANDBOX';
+  if (stage === 'ERROR') return 'tag-ERROR';
+  return 'tag-INFO';
+}
+function appendActivity(msg) {
+  const feed = document.getElementById('research-activity-feed');
+  if (!feed) return;
+  const ts = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  line.className = 'activity-line';
+  const stage = String(msg.stage || 'INFO');
+  line.innerHTML = `<span style="color:#64748b">[${escapeHtml(ts)}]</span> <span class="activity-tag ${activityTagClass(stage)}">[${escapeHtml(stage)}]</span> ${escapeHtml(msg.message || '')}`;
+  feed.appendChild(line);
+  while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;  // auto-scroll sticks to the latest message
+}
+function renderResearchFailure(msg) {
+  chat.querySelectorAll('.failure-card').forEach(n => n.remove());
+  const error = String(msg.error || 'unknown error');
+  const card = el(`<div class="rcard failure-card">
+    <h4>⚠️ Research Run Halted: ${escapeHtml(error.slice(0, 160))}</h4>
+    <div class="rcard-sub">Run <code>${escapeHtml(msg.blueprint_id || '')}</code> stopped.${msg.partial_results_available ? ' Verified partial results were preserved in the Research Vault.' : ''}</div>
+    <details><summary class="hint" style="cursor:pointer">Diagnostic details (traceback)</summary><pre>${escapeHtml(msg.traceback || '')}</pre></details>
+    <div class="row">
+      ${msg.partial_results_available ? '<button class="btn-approve" id="btn-view-partial">🔬 View Partial Results in Research Vault</button>' : ''}
+      <button class="ghost" id="btn-dismiss-failure">Dismiss</button>
+    </div>
+  </div>`);
+  chat.appendChild(card); scrollChat();
+  card.querySelector('#btn-dismiss-failure').onclick = () => card.remove();
+  const viewBtn = card.querySelector('#btn-view-partial');
+  if (viewBtn) viewBtn.onclick = () => { switchSidebarTab('research'); loadVault(); };
+}
 function openResearchStream() {
   if (researchSource) researchSource.close();
   researchSource = new EventSource('/api/v1/research/stream');
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const ch = msg.channel || 'accelerator_log';
+    if (ch === 'activity_log' && msg.event === 'activity') {
+      // Dedicated live activity feed + stepper; not duplicated into the drawer logs.
+      appendActivity(msg);
+      const stepId = stepForActivity(msg.stage);
+      if (stepId) { if (msg.level === 'error') failActiveStep(); else activateStep(stepId); }
+      return;
+    }
     const pane = ch === 'search_log' ? 'tab-search-log' : ch === 'goi_stream' ? 'tab-goi-stream' : 'tab-accelerator-log';
     logTo(pane, `[${ch}] ${msg.event || 'log'} ${JSON.stringify(msg).slice(0, 300)}`);
     if (ch === 'search_log') pulseBadge('search-count');
     if (ch !== 'search_log') pulseBadge('accel-count');
+    if (msg.event === 'paper') {
+      const c = document.getElementById('ingest-count');
+      if (c) c.textContent = String((parseInt(c.textContent, 10) || 0) + 1);
+    }
     if (msg.event === 'run_start') {
       // A new run supersedes any previously rendered report card.
       chat.querySelectorAll('.report-card').forEach(n => n.remove());
+      chat.querySelectorAll('.failure-card').forEach(n => n.remove());
+      resetResearchStepper();
+      const feed = document.getElementById('research-activity-feed'); if (feed) feed.innerHTML = '';
+      activateStep('step-feasibility');
     }
     if (msg.event === 'result' && msg.telemetry) {
       const tel = document.getElementById('research-telemetry');
@@ -1058,6 +1174,7 @@ function openResearchStream() {
     }
     if (msg.event === 'checkpoint') {
       addMsg('system', `📌 Stage ${msg.research_stage} verified & pinned. Checkpoint: ${msg.bundle_hash || ''} (${(msg.pinned_layers || []).join(', ')})`);
+      loadVault();  // intermediate checkpoints refresh the Research Explorer
     }
     if (msg.event === 'checkpoint_preserved') {
       addMsg('system', `📦 ${msg.note} — exported to ${msg.path}`);
@@ -1073,7 +1190,17 @@ function openResearchStream() {
     if (msg.event === 'research_completed' && msg.report) {
       statusEl.textContent = '';
       setDrawerSummary(`Report ready — run ${msg.status || ''}`);
+      chat.querySelectorAll('.report-card').forEach(n => n.remove());  // reconnect replay dedupe
+      activateStep('step-report');
+      setStepState('step-report', 'completed');
       addResearchReportCard(msg.report, msg.report_path || '', msg.run_id || '');
+    }
+    if (msg.event === 'research_failed') {
+      statusEl.textContent = `research halted: ${String(msg.error || '').slice(0, 120)}`;
+      setDrawerSummary('research failed — see diagnostic card');
+      failActiveStep();
+      renderResearchFailure(msg);
+      loadVault();  // partial verified results stay visible in the Explorer
     }
     if (msg.event === 'research_report' && msg.report) {
       // Legacy event name (older servers): same rendering path.

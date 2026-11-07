@@ -921,6 +921,10 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     def api_research_stream() -> StreamingResponse:
         manager = state.ensure_research_manager()
         q = state.research_broadcaster.subscribe()
+        # Sequence watermark: replayed history (seq <= watermark) must never
+        # close the stream; only fresh terminal events do.
+        initial_seq = state.research_broadcaster.seq
+        terminal_events = ("research_completed", "research_failed")
 
         def event_generator():
             # Sync generator (same pattern as /api/agent/stream): the broadcaster
@@ -929,9 +933,16 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 while True:
                     try:
                         payload = q.get(timeout=15.0)
-                        yield f"data: {json.dumps(payload, default=str)}\n\n"
                     except queue.Empty:
                         yield "event: keep-alive\ndata: {}\n\n"
+                        continue
+                    terminal = (payload.get("event") in terminal_events
+                                and payload.get("seq", 0) > initial_seq)
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                    if terminal:
+                        # Graceful close after the final event; EventSource
+                        # reconnects and replays history without re-closing.
+                        break
             finally:
                 state.research_broadcaster.unsubscribe(q)
 

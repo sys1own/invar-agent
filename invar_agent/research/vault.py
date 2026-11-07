@@ -131,6 +131,93 @@ class ResearchVaultManager:
             json.dumps(metadata, indent=2, default=str), encoding="utf-8")
         return metadata
 
+    def mark_status(self, run_id: str, status: str) -> bool:
+        """Update only the status field of an existing vault entry."""
+        path = self._metadata_path(run_id)
+        if not path.is_file():
+            return False
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(meta, dict):
+            return False
+        meta["status"] = status
+        try:
+            path.write_text(json.dumps(meta, indent=2, default=str),
+                            encoding="utf-8")
+        except OSError:
+            return False
+        return True
+
+    def recover_orphans(self) -> List[str]:
+        """Rebuild metadata for vault dirs that have artifacts but no valid
+        metadata.json (e.g. a crash between artifact writes)."""
+        recovered: List[str] = []
+        if not self.root.is_dir():
+            return recovered
+        for directory in sorted(self.root.iterdir()):
+            if not directory.is_dir():
+                continue
+            run_id = directory.name
+            meta = self._read_metadata(directory)
+            has_artifacts = any((directory / name).is_file()
+                                for name in ("report.md", "blueprint.json",
+                                             "unified_module.py"))
+            if meta is not None or not has_artifacts:
+                continue
+            bp_raw = ""
+            bp_path = directory / "blueprint.json"
+            stages = 0
+            if bp_path.is_file():
+                try:
+                    bp_raw = bp_path.read_text(encoding="utf-8", errors="replace")
+                    bp = ResearchBlueprint.model_validate_json(bp_raw)
+                    stages = len(bp.verified_layers or [])
+                except Exception:  # noqa: BLE001 - legacy blueprints may predate schema
+                    stages = 0
+            module_path = directory / "unified_module.py"
+            module_code = ""
+            if module_path.is_file():
+                try:
+                    module_code = module_path.read_text(encoding="utf-8",
+                                                        errors="replace")
+                except OSError:
+                    module_code = ""
+            metadata: Dict[str, Any] = {
+                "run_id": _safe_run_id(run_id),
+                "title": run_id.replace("_", " ").title(),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "verdict": "",
+                "status": "PARTIALLY_VERIFIED" if stages else "LEGACY",
+                "target_backend": "",
+                "stages_completed": stages,
+                "key_metrics": {},
+                "extracted_constants": {},
+                "governing_equations": [],
+                "verified_functions": _verified_functions(module_code),
+                "recovered": True,
+            }
+            if bp_raw:
+                try:
+                    bp = ResearchBlueprint.model_validate_json(bp_raw)
+                    metadata["title"] = bp.title
+                    feasibility = bp.feasibility
+                    metadata["verdict"] = str(
+                        getattr(getattr(feasibility, "verdict", None), "value",
+                                getattr(feasibility, "verdict", "")) or "")
+                    metadata["governing_equations"] = _governing_equations(bp)
+                    metadata["extracted_constants"] = _extracted_constants(bp)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                (directory / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+                recovered.append(run_id)
+            except OSError:
+                continue
+        return recovered
+
     # -- read -----------------------------------------------------------------
     def _read_metadata(self, directory: Path) -> Optional[Dict[str, Any]]:
         path = directory / "metadata.json"
@@ -142,6 +229,7 @@ class ResearchVaultManager:
 
     def list_runs(self) -> List[Dict[str, Any]]:
         """All vault entries, newest first, with a search snippet."""
+        self.recover_orphans()
         runs: List[Dict[str, Any]] = []
         if not self.root.is_dir():
             return runs
@@ -282,6 +370,11 @@ def _migrate_checkpoint_dir(vault: ResearchVaultManager, checkpoint_dir: Path,
                             report_md: str = "") -> Optional[str]:
     """Archive one legacy checkpoint directory as a vault run."""
     run_id = _safe_run_id(checkpoint_dir.name)
+    # Never clobber an existing vault entry: a live run registers its own
+    # metadata (PARTIALLY_VERIFIED/VERIFIED) and also exports checkpoints/,
+    # which startup migration must not overwrite with a LEGACY stub.
+    if vault._read_metadata(vault.run_dir(run_id)) is not None:
+        return None
     blueprint_raw = ""
     bp_path = checkpoint_dir / "blueprint.json"
     if bp_path.is_file():

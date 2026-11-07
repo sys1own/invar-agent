@@ -22,6 +22,12 @@ class ResearchEventBroadcaster:
         self._subscribers: List["queue.Queue[Dict[str, Any]]"] = []
         self._history: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._seq = 0
+
+    @property
+    def seq(self) -> int:
+        """Monotonic event counter; subscribers use it to ignore replayed history."""
+        return self._seq
 
     def subscribe(self) -> "queue.Queue[Dict[str, Any]]":
         q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1000)
@@ -43,7 +49,10 @@ class ResearchEventBroadcaster:
 
     def publish(self, channel: str, event: str, data: Dict[str, Any]) -> None:
         """Thread-safe fan-out; safe to call from any thread/loop."""
-        payload = {"channel": channel, "event": event, **data}
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+        payload = {"channel": channel, "event": event, "seq": seq, **data}
         with self._lock:
             self._history.append(payload)
             if len(self._history) > 500:

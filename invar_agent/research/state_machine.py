@@ -27,12 +27,15 @@ import ast
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import shutil
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -61,6 +64,8 @@ FORBIDDEN_IMPORTS = ("os", "sys", "subprocess", "socket", "requests", "urllib",
 FORBIDDEN_CALLS = ("eval", "exec", "compile", "open", "input", "__import__")
 ALLOWED_IMPORTS = ("math",)
 DEFAULT_INITIAL_STATE = [1.0] * 16
+
+logger = logging.getLogger(__name__)
 
 _INSIGHT_RE = re.compile(
     r"([^.;]*?(?:=|\\approx|\\propto|proportional to|scales? (?:as|like|with)|"
@@ -293,6 +298,43 @@ def _json_safe(tel: Dict[str, float]) -> Dict[str, float]:
             for k, v in tel.items()}
 
 
+def _aggregate_telemetry(results: List[SimulationResult]) -> Dict[str, float]:
+    """Flat finite telemetry merged across all sandbox results of a run."""
+    out: Dict[str, float] = {}
+    for result in results or []:
+        for key, value in (getattr(result, "telemetry", {}) or {}).items():
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                out[key] = float(value)
+    return out
+
+
+def _sandbox_step_summary(results: List[SimulationResult],
+                          verified_count: int) -> str:
+    """Human-readable Sandbox_Execute progress line with peak observables."""
+    peak_g: Optional[float] = None
+    peak_alt: Optional[float] = None
+    for r in results:
+        if r.status != "VERIFIED":
+            continue
+        for key, value in (r.telemetry or {}).items():
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                continue
+            lowered = key.lower()
+            if lowered.endswith("_g"):
+                peak_g = value if peak_g is None else max(peak_g, value)
+            elif lowered.endswith("_km"):
+                peak_alt = value if peak_alt is None else max(peak_alt, value)
+    parts: List[str] = []
+    if peak_g is not None:
+        parts.append(f"a_max={peak_g:.2f}g")
+    if peak_alt is not None:
+        parts.append(f"h_peak={peak_alt:.1f}km")
+    if parts:
+        return "Stepping trajectory: " + ", ".join(parts)
+    return (f"Sandbox execution complete: {len(results)} contract run(s), "
+            f"{verified_count} VERIFIED.")
+
+
 def _fmt_vec(values: List[float], limit: int = 4) -> str:
     """Compact head/tail formatting of a state vector for prompt context."""
     vals = [float(v) for v in values]
@@ -389,6 +431,20 @@ class ResearchStateMachine:
         if self.progress_cb is not None:
             await self.progress_cb(channel, {"event": event, **data})
 
+    async def emit_activity(self, stage: str, step: str, message: str,
+                            level: str = "info",
+                            telemetry: Optional[Dict[str, Any]] = None) -> None:
+        """Structured real-time activity event for the Research Explorer feed."""
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "step": step,
+            "message": message,
+            "level": level,
+            "telemetry": telemetry or {},
+        }
+        await self._emit("activity_log", "activity", payload)
+
     def _aborted(self, state: ResearchRunState) -> bool:
         if self.abort_flag is not None and self.abort_flag():
             state.aborted = True
@@ -420,6 +476,18 @@ class ResearchStateMachine:
                 await self._emit("search_log", "refused", {"feasibility": gate.model_dump()})
                 return state
 
+        await self.emit_activity(
+            "FEASIBILITY", "gate_passed",
+            f"Feasibility gate passed ({bp_verdict or 'HEURISTIC_PASS'}); "
+            "starting the verified research loop.")
+        try:
+            return await self._run_stages(state)
+        except Exception as exc:  # noqa: BLE001 - bulletproof exception shield
+            return await self._handle_loop_exception(state, exc)
+
+    async def _run_stages(self, state: ResearchRunState) -> ResearchRunState:
+        """Drive the accretive stage loop (wrapped by run()'s shield)."""
+        blueprint = state.blueprint
         total = blueprint.target_research_stages
         pinned_code = ""          # verified layers only (drivers renamed)
         pinned_layers: List[ModuleLayer] = list(blueprint.verified_layers)
@@ -438,6 +506,11 @@ class ResearchStateMachine:
                 "research_stage": stage, "total_stages": total, "objective": objective,
                 "mode": "foundation" if stage == 1 else "accretive",
                 "pinned_layers": [layer.layer_id for layer in pinned_layers]})
+            if stage > 1:
+                await self.emit_activity(
+                    "ACCRETION", f"stage_{stage}_start",
+                    f"Accreting stage {stage}/{total} onto the verified unified "
+                    f"module ({len(pinned_layers)} pinned layer(s))...")
             failures: List[str] = []
             candidate_code: Optional[str] = blueprint.code_template if stage == 1 else None
             contracts: List[VerificationContract] = list(blueprint.contracts) if stage == 1 else []
@@ -474,6 +547,13 @@ class ResearchStateMachine:
                         "research_stage": stage, "path": state.checkpoint_path,
                         "bundle_hash": outcome["layer"].bundle_hash,
                         "pinned_layers": [layer.layer_id for layer in pinned_layers]})
+                    inv_count = sum(len(c.invariants) for c in contracts)
+                    await self.emit_activity(
+                        f"STAGE_{stage}_EXEC", "invariants_verified",
+                        f"All {inv_count} invariants verified by SMT shield + sandbox "
+                        f"({len(pinned_layers)} pinned layer(s)).")
+                    if stage < total:
+                        await self._save_partial_vault(state, stage)
                     verified = True
                     break
                 failure = outcome.get("failure") or outcome["status"]
@@ -523,7 +603,9 @@ class ResearchStateMachine:
             await self._emit_report(state)
         return state
 
-    async def _emit_report(self, state: ResearchRunState) -> None:
+    async def _emit_report(self, state: ResearchRunState, *,
+                           terminal_event: str = "research_completed",
+                           extra: Optional[Dict[str, Any]] = None) -> None:
         """Synthesize, persist and stream the Comprehensive Research Report."""
         await self._emit("accelerator_log", "synthesizing_report", {
             "research_stage": state.research_stage, "status": state.status})
@@ -538,6 +620,10 @@ class ResearchStateMachine:
                 checkpoint_path=state.checkpoint_path)
         except Exception as exc:  # noqa: BLE001 - report is best-effort
             state.report = f"(report synthesis failed: {str(exc)[:200]})"
+        await self.emit_activity(
+            "REPORT", "report_generated",
+            f"Synthesized comprehensive research report "
+            f"({len(state.report or '')} chars, status {state.status}).")
         # Persist: Research Vault only — research outputs never touch the
         # software codebase root (legacy root/checkpoint copies are migrated
         # into the vault at server startup).
@@ -553,25 +639,121 @@ class ResearchStateMachine:
                 if key in telemetry_all:
                     backend = str(telemetry_all[key])
                     break
+            vault_status = state.status
+            if vault_status in ("PARTIAL", "ABORTED") and state.blueprint.verified_layers:
+                vault_status = "PARTIALLY_VERIFIED"
             meta = vault.register_run(
                 run_id=state.blueprint.blueprint_id,
                 title=state.blueprint.title,
                 blueprint=state.blueprint,
                 report_md=state.report,
-                status=state.status,
+                status=vault_status,
                 telemetry=telemetry_all,
                 target_backend=backend)
             report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
             await self._emit("accelerator_log", "vault_archived", {
                 "run_id": meta.get("run_id"), "status": state.status})
+            await self.emit_activity(
+                "VAULT", "vault_saved",
+                f"Archived run `{meta.get('run_id')}` to the Research Vault "
+                f"(status {state.status}).")
         except Exception as exc:  # noqa: BLE001 - vault archival is best-effort
             await self._emit("accelerator_log", "vault_archive_error",
                              {"error": str(exc)[:200]})
-        await self._emit("accelerator_log", "research_completed", {
+        payload: Dict[str, Any] = {
             "status": state.status,
             "report": state.report,
             "run_id": state.blueprint.blueprint_id,
-            "report_path": str(report_path) if report_path else ""})
+            "report_path": str(report_path) if report_path else ""}
+        if extra:
+            payload.update(extra)
+        await self._emit("accelerator_log", terminal_event, payload)
+
+    async def _save_partial_vault(self, state: ResearchRunState, stage: int) -> None:
+        """Immediately archive verified stages as PARTIALLY_VERIFIED.
+
+        Guarantees Stage-1 (and any intermediate) verified findings survive a
+        later-stage failure in the Research Vault.
+        """
+        await self.emit_activity(
+            "VAULT", "checkpoint_save",
+            f"Stage {stage} verified — persisting intermediate vault checkpoint...")
+        try:
+            from .reporter import generate_comprehensive_research_report
+            from .vault import ResearchVaultManager
+            telemetry_all = _aggregate_telemetry(state.results)
+            report = generate_comprehensive_research_report(
+                state.blueprint, telemetry_all, state.literature,
+                results=state.results, status="PARTIALLY_VERIFIED",
+                checkpoint_path=state.checkpoint_path)
+            backend = ""
+            for key in ("backend", "target_backend", "accelerator"):
+                if key in telemetry_all:
+                    backend = str(telemetry_all[key])
+                    break
+            vault = ResearchVaultManager(self.workspace_root)
+            meta = vault.register_run(
+                run_id=state.blueprint.blueprint_id,
+                title=state.blueprint.title,
+                blueprint=state.blueprint,
+                report_md=report,
+                status="PARTIALLY_VERIFIED",
+                telemetry=telemetry_all,
+                target_backend=backend)
+            await self.emit_activity(
+                "VAULT", "checkpoint_saved",
+                f"Intermediate checkpoint persisted: `{meta.get('run_id')}` "
+                f"(PARTIALLY_VERIFIED, {len(state.blueprint.verified_layers)} "
+                "verified stage(s)).")
+        except Exception as exc:  # noqa: BLE001 - checkpointing is best-effort
+            await self.emit_activity(
+                "VAULT", "checkpoint_error",
+                f"Intermediate vault checkpoint failed: {str(exc)[:200]}",
+                level="warning")
+
+    async def _handle_loop_exception(self, state: ResearchRunState,
+                                     exc: Exception) -> ResearchRunState:
+        """Bulletproof shield: never lose verified work to an unhandled error."""
+        error_trace = traceback.format_exc()
+        logger.error("Research loop error in stage %s: %s",
+                     state.research_stage, error_trace)
+        await self.emit_activity(
+            "ERROR", "exception_caught",
+            f"Execution halted: {str(exc)[:300]}", level="error",
+            telemetry={"traceback": error_trace[-600:]})
+        verified_layers = list(state.blueprint.verified_layers or [])
+        has_baseline = bool(verified_layers)
+        if has_baseline:
+            state.status = "PARTIAL"
+            state.checkpoint_path = state.checkpoint_path or self._export_checkpoint(
+                state.blueprint, len(verified_layers))
+            # Record the halted stage so the report marks it as failed.
+            state.blueprint = state.blueprint.model_copy(update={
+                "evolution_history": list(state.blueprint.evolution_history) + [
+                    StageTelemetry(stage=state.research_stage, status="ERROR",
+                                   note=f"unhandled exception: {str(exc)[:200]}",
+                                   timestamp=time.time())]})
+        else:
+            state.status = "FAILED"
+        try:
+            await self._emit_report(
+                state, terminal_event="research_failed",
+                extra={"blueprint_id": state.blueprint.blueprint_id,
+                       "error": str(exc), "traceback": error_trace,
+                       "partial_results_available": has_baseline})
+        except Exception:  # noqa: BLE001 - last-resort: still signal failure
+            await self._emit("accelerator_log", "research_failed", {
+                "blueprint_id": state.blueprint.blueprint_id,
+                "error": str(exc), "traceback": error_trace,
+                "partial_results_available": has_baseline})
+        if has_baseline:
+            try:
+                from .vault import ResearchVaultManager
+                ResearchVaultManager(self.workspace_root).mark_status(
+                    state.blueprint.blueprint_id, "PARTIALLY_VERIFIED")
+            except Exception:  # noqa: BLE001
+                logger.warning("vault mark_status failed", exc_info=True)
+        return state
 
     # -- one round through the nine stages ------------------------------------
     async def _run_round(self, state: ResearchRunState, *, stage: int, attempt: int,
@@ -601,6 +783,11 @@ class ResearchStateMachine:
                                                     {k: v for k, v in last_telemetry.items()
                                                      if isinstance(v, (int, float))})})
             state.literature = await self._literature_search(queries, tag)
+            const_keys = list(getattr(bp, "variable_map", {}) or {})
+            await self.emit_activity(
+                "INGEST", "literature_hit",
+                f"Ingested {len(state.literature)} sources, "
+                f"extracted constants: {const_keys}")
 
         # 2. GoI_Plan: accretive synthesis for stage k > 1.
         state.stage = "GoI_Plan"
@@ -683,6 +870,10 @@ class ResearchStateMachine:
                     "failure": f"transpiler: {exc}",
                     "candidate_code": candidate_code, "contracts": contracts}
         await emit("accelerator_log", "guard_pass", {**tag, "cpp_bytes": len(cpp_code)})
+        await self.emit_activity(
+            f"STAGE_{stage}_BUILD", "cabi_compile",
+            f"Compiling RK4 trajectory kernel via Clang++ (-O3 -std=c++20) "
+            f"for {len(contracts)} contract(s)...")
 
         # 6. SMT_Concolic_Verify: Z3 consistency of every contract's invariants.
         state.stage = "SMT_Concolic_Verify"
@@ -720,6 +911,11 @@ class ResearchStateMachine:
                 "execution_time_ms": round(r.execution_time_ms, 3),
                 "telemetry": _json_safe(r.telemetry),
                 "counterexample": r.failure_counterexample})
+        verified_count = sum(1 for r in results if r.status == "VERIFIED")
+        await self.emit_activity(
+            f"STAGE_{stage}_EXEC", "sandbox_step",
+            _sandbox_step_summary(results, verified_count),
+            telemetry=_json_safe(_aggregate_telemetry(results)))
 
         # 8. Reflex_Heal is applied by the caller on failure.
         state.stage = "Reflex_Heal"
@@ -776,6 +972,8 @@ class ResearchStateMachine:
         out: List[Dict[str, Any]] = []
         for q in queries:
             await self._emit("search_log", "query", {**tag, "query": q})
+            await self.emit_activity("INGEST", "literature_query",
+                                     f"Querying arXiv/OpenAlex for '{q}'...")
             try:
                 hits = await asyncio.to_thread(self.search_client.search, q, 3)
             except Exception as exc:  # noqa: BLE001
