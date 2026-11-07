@@ -6,6 +6,9 @@
 <link rel="icon" type="image/png" href="/static/assets/logo.png">
 <title>invar-agent — Verified Agent Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<link rel="stylesheet" href="/static/vendor/xterm.min.css" />
+<script src="/static/vendor/xterm.min.js"></script>
+<script src="/static/vendor/addon-fit.min.js"></script>
 <style>
   :root { --bg:#0f1217; --bg-workspace:#0f1217; --bg-panel:#161b22; --bg-card:#1a202c; --bg-surface:#1e2430; --border:#2d3748; --text:#f8fafc; --text2:#cbd5e1; --muted:#94a3b8; --faint:#64748b; --accent:#38bdf8; --green:#34d399; --amber:#fbbf24; --red:#f87171; }
   * { box-sizing:border-box; }
@@ -25,7 +28,7 @@
   #research-cards { flex:none; max-height:38%; overflow-y:auto; padding-top:6px; }
   /* Collapsible bottom runtime drawer (replaces the fixed 3-pane log strip) */
   .runtime-drawer { flex:none; background:#12161f; border-top:1px solid #283142; display:flex; flex-direction:column; height:36px; overflow:hidden; transition:height .15s ease; }
-  .runtime-drawer.expanded { height:260px; max-height:40vh; }
+  .runtime-drawer.expanded { height:280px; max-height:45vh; }
   .drawer-header { display:flex; align-items:center; gap:12px; padding:0 12px; height:36px; cursor:pointer; user-select:none; flex:none; }
   .drawer-tabs { display:flex; gap:6px; align-items:center; }
   .drawer-tab { background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:3px 10px; font-size:11px; cursor:pointer; }
@@ -41,6 +44,16 @@
   .runtime-drawer.expanded .drawer-body { display:flex; }
   .drawer-pane { display:none; flex:1; min-width:0; overflow:auto; padding:8px 12px; font-size:11px; font-family:ui-monospace,monospace; white-space:pre-wrap; color:var(--muted); }
   .drawer-pane.active { display:block; }
+  /* Embedded workspace terminal (xterm.js) */
+  .drawer-pane.terminal-pane { display:none; flex-direction:column; padding:0; background:#0f1217; overflow:hidden; }
+  .drawer-pane.terminal-pane.active { display:flex; }
+  .terminal-bar { display:flex; align-items:center; gap:8px; padding:4px 12px; background:#12161f; border-bottom:1px solid #283142; flex:none; height:34px; }
+  .terminal-status-dot { width:8px; height:8px; border-radius:50%; background:#64748b; flex:none; }
+  .terminal-status-dot.connected { background:#34d399; }
+  .terminal-status-dot.disconnected { background:#f87171; }
+  .terminal-btn { background:#242c3d; border:1px solid #3b475d; color:#cbd5e1; border-radius:6px; padding:2px 10px; font-size:11px; cursor:pointer; }
+  .terminal-btn:hover { background:#2d374d; color:#f8fafc; }
+  #terminal-container { flex:1; min-height:0; padding:6px 10px; background:#0f1217; overflow:hidden; }
   /* Research action cards rendered inside the chat flow */
   .rcard { align-self:flex-start; width:min(760px, 92%); background:#161b24; border:1px solid #2d3748; border-radius:8px; padding:16px; margin:12px 0; box-shadow:0 4px 12px rgba(0,0,0,.3); }
   .rcard h4 { margin:0 0 8px; font-size:13px; color:var(--text); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
@@ -327,6 +340,7 @@
           <button class="drawer-tab active" data-tab="search-log" onclick="event.stopPropagation();switchDrawerTab('search-log')">🔍 Literature Search <span id="search-count" class="tab-badge">0</span></button>
           <button class="drawer-tab" data-tab="goi-stream" onclick="event.stopPropagation();switchDrawerTab('goi-stream')">⚡ GoI / HIN Stream</button>
           <button class="drawer-tab" data-tab="accelerator-log" onclick="event.stopPropagation();switchDrawerTab('accelerator-log')">⚙️ Accelerator <span id="accel-count" class="tab-badge">0</span></button>
+          <button class="drawer-tab" data-tab="terminal" onclick="event.stopPropagation();switchDrawerTab('terminal')">⌨ Terminal</button>
         </div>
         <div class="drawer-actions">
           <span id="drawer-status-summary" class="status-summary">Idle</span>
@@ -337,6 +351,16 @@
         <div id="tab-search-log" class="drawer-pane active"></div>
         <div id="tab-goi-stream" class="drawer-pane"></div>
         <div id="tab-accelerator-log" class="drawer-pane"></div>
+        <div id="tab-terminal" class="drawer-pane terminal-pane">
+          <div class="terminal-bar">
+            <span class="terminal-status-dot" id="term-dot"></span>
+            <span class="status-text" id="term-status-text">Disconnected</span>
+            <span style="flex:1"></span>
+            <button class="terminal-btn" id="btn-term-clear" title="Clear Terminal">⌫ Clear</button>
+            <button class="terminal-btn" id="btn-term-fit" title="Fit Window">⤢ Fit</button>
+          </div>
+          <div id="terminal-container"></div>
+        </div>
       </div>
     </div>
   </main>
@@ -739,11 +763,99 @@ function toggleDrawer() {
   d.classList.toggle('expanded', drawerExpanded);
   d.classList.toggle('collapsed', !drawerExpanded);
   document.getElementById('drawer-toggle-btn').textContent = drawerExpanded ? '▼' : '▲';
+  if (drawerExpanded) {
+    const active = document.querySelector('.drawer-pane.active');
+    if (active && active.id === 'tab-terminal') { initTerminal(); syncTerminalSize(); }
+  }
 }
 function switchDrawerTab(tab) {
   document.querySelectorAll('.drawer-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.drawer-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
+  if (tab === 'terminal') {
+    initTerminal();
+    // Fit after the pane becomes visible (next frame).
+    requestAnimationFrame(syncTerminalSize);
+  }
 }
+
+/* ---- embedded workspace terminal (xterm.js + PTY WebSocket) ---- */
+let term = null, fitAddon = null, termSocket = null, termReconnectTimer = null;
+let termReady = false;
+function termWsUrl() { return (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/api/v1/terminal/ws'; }
+function setTermStatus(state) {
+  const dot = document.getElementById('term-dot');
+  const txt = document.getElementById('term-status-text');
+  if (dot) dot.className = 'terminal-status-dot ' + state;
+  if (txt) txt.textContent = state === 'connected' ? 'Connected' : (state === 'connecting' ? 'Connecting…' : 'Disconnected');
+}
+function initTerminal() {
+  if (termReady || typeof Terminal === 'undefined') return;
+  termReady = true;
+  term = new Terminal({
+    cursorBlink: true,
+    theme: {
+      background: '#0f1217', foreground: '#e2e8f0', cursor: '#38bdf8',
+      selectionBackground: '#283347',
+      black: '#12161f', brightBlack: '#475569',
+      red: '#f87171', green: '#34d399', yellow: '#fbbf24',
+      blue: '#60a5fa', magenta: '#c084fc', cyan: '#38bdf8', white: '#f1f5f9'
+    },
+    fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, monospace",
+    fontSize: 13,
+    lineHeight: 1.4
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal-container'));
+  term.onData(data => {
+    if (termSocket && termSocket.readyState === WebSocket.OPEN) termSocket.send(data);
+  });
+  document.getElementById('btn-term-clear').onclick = () => term && term.clear();
+  document.getElementById('btn-term-fit').onclick = () => syncTerminalSize();
+  connectTerminal();
+}
+function connectTerminal() {
+  if (!termReady || termSocket) return;
+  setTermStatus('connecting');
+  try {
+    termSocket = new WebSocket(termWsUrl());
+  } catch (e) {
+    termSocket = null;
+    scheduleTerminalReconnect();
+    return;
+  }
+  termSocket.onopen = () => {
+    setTermStatus('connected');
+    syncTerminalSize();
+  };
+  termSocket.onmessage = event => { if (term) term.write(event.data); };
+  termSocket.onclose = () => {
+    termSocket = null;
+    setTermStatus('disconnected');
+    // Reconnect only while the drawer is open; each connection spawns an
+    // independent shell, never a research/agent process, so reconnecting can
+    // not disturb running agent work.
+    scheduleTerminalReconnect();
+  };
+  termSocket.onerror = () => { try { termSocket.close(); } catch (e) {} };
+}
+function scheduleTerminalReconnect() {
+  if (termReconnectTimer || !drawerExpanded) return;
+  termReconnectTimer = setTimeout(() => {
+    termReconnectTimer = null;
+    connectTerminal();
+  }, 2000);
+}
+function syncTerminalSize() {
+  if (!term || !drawerExpanded || !fitAddon) return;
+  const active = document.querySelector('.drawer-pane.active');
+  if (!active || active.id !== 'tab-terminal') return;
+  try { fitAddon.fit(); } catch (e) {}
+  if (termSocket && termSocket.readyState === WebSocket.OPEN) {
+    termSocket.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+  }
+}
+window.addEventListener('resize', syncTerminalSize);
 function pulseBadge(id) {
   const b = document.getElementById(id);
   if (!b) return;
