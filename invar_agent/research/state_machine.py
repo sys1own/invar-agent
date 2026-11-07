@@ -538,22 +538,39 @@ class ResearchStateMachine:
                 checkpoint_path=state.checkpoint_path)
         except Exception as exc:  # noqa: BLE001 - report is best-effort
             state.report = f"(report synthesis failed: {str(exc)[:200]})"
-        # Persist: workspace root + archived checkpoint copy.
+        # Persist: Research Vault only — research outputs never touch the
+        # software codebase root (legacy root/checkpoint copies are migrated
+        # into the vault at server startup).
         report_path: Optional[Path] = None
         try:
-            root_report = self.workspace_root / "research_report.md"
-            root_report.parent.mkdir(parents=True, exist_ok=True)
-            root_report.write_text(state.report, encoding="utf-8")
-            report_path = root_report
-            ckpt_dir = self.workspace / "checkpoints" / state.blueprint.blueprint_id
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            (ckpt_dir / "research_report.md").write_text(state.report, encoding="utf-8")
-        except OSError as exc:  # noqa: BLE001 - persistence is best-effort
-            await self._emit("accelerator_log", "report_persist_error",
+            from .vault import ResearchVaultManager
+            vault = ResearchVaultManager(self.workspace_root)
+            telemetry_all: Dict[str, Any] = {}
+            for result in state.results or []:
+                telemetry_all.update(getattr(result, "telemetry", {}) or {})
+            backend = ""
+            for key in ("backend", "target_backend", "accelerator"):
+                if key in telemetry_all:
+                    backend = str(telemetry_all[key])
+                    break
+            meta = vault.register_run(
+                run_id=state.blueprint.blueprint_id,
+                title=state.blueprint.title,
+                blueprint=state.blueprint,
+                report_md=state.report,
+                status=state.status,
+                telemetry=telemetry_all,
+                target_backend=backend)
+            report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
+            await self._emit("accelerator_log", "vault_archived", {
+                "run_id": meta.get("run_id"), "status": state.status})
+        except Exception as exc:  # noqa: BLE001 - vault archival is best-effort
+            await self._emit("accelerator_log", "vault_archive_error",
                              {"error": str(exc)[:200]})
         await self._emit("accelerator_log", "research_completed", {
             "status": state.status,
             "report": state.report,
+            "run_id": state.blueprint.blueprint_id,
             "report_path": str(report_path) if report_path else ""})
 
     # -- one round through the nine stages ------------------------------------

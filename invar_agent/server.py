@@ -70,6 +70,8 @@ class ConfigRequest(BaseModel):
 class CopilotChatRequest(BaseModel):
     message: str = ""
     history: list[dict[str, Any]] = Field(default_factory=list)
+    # Explicitly attached Research Vault items (@research:<id> chips).
+    attached_research_ids: list[str] = Field(default_factory=list)
 
 
 class CopilotRunBuildRequest(BaseModel):
@@ -78,14 +80,17 @@ class CopilotRunBuildRequest(BaseModel):
 
 class ResearchPlanRequest(BaseModel):
     question: str = Field(min_length=3, max_length=4000)
+    attached_research_ids: list[str] = Field(default_factory=list)
 
 
 class ResearchPlanPromptRequest(BaseModel):
     question: str = Field(min_length=3, max_length=4000)
+    attached_research_ids: list[str] = Field(default_factory=list)
 
 
 class ResearchRunRequest(BaseModel):
     question: str = Field(min_length=3, max_length=8000)
+    attached_research_ids: list[str] = Field(default_factory=list)
     # Feasibility verdict already approved during Plan Mode; when it is
     # OPTIMAL_DIRECT / REFORMULATED_SURROGATE the pre-flight substring
     # heuristics must not reject the approved expert prompt on execution.
@@ -373,6 +378,14 @@ async def _plan_llm_callable(state: ServerState, question: str,
 
 def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None) -> FastAPI:
     state = get_state(workspace_root, provider=provider)
+    # Auto-migrate legacy research artifacts (research/, checkpoints/,
+    # research_report.md, research/cabi scratch) into the Research Vault so
+    # the software root only ever contains real build files.
+    try:
+        from invar_agent.research.vault import migrate_legacy_research_artifacts
+        migrate_legacy_research_artifacts(state.workspace_root)
+    except Exception:  # noqa: BLE001 - migration must never block startup
+        pass
     app = FastAPI(title="invar-agent Web Console", version="0.1.0")
 
     @app.get("/")
@@ -499,7 +512,8 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     @app.post("/api/copilot/chat")
     def api_copilot_chat(req: CopilotChatRequest) -> dict[str, Any]:
         copilot = state.ensure_copilot()
-        return copilot.chat(req.message, history=req.history)
+        return copilot.chat(req.message, history=req.history,
+                            attached_research_ids=req.attached_research_ids)
 
     @app.post("/api/copilot/run-build")
     def api_copilot_run_build(req: CopilotRunBuildRequest) -> StreamingResponse:
@@ -512,19 +526,34 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         return _agent_sse_response(agent, prompt, [], {}, None)
 
     @app.get("/api/workspace/tree")
+    @app.get("/api/files")
     def api_workspace_tree(show_hidden_artifacts: bool = Query(False)) -> dict[str, Any]:
+        """Strictly software-only file tree.
+
+        Research outputs live exclusively in ``.invar/research_vault/``; legacy
+        ``research/``, ``checkpoints/`` and ``research_report.md`` are migrated
+        away at startup. Dot-directories, compiler artifacts and research
+        scratch never appear here.
+        """
         root = state.workspace_root.resolve()
 
-        # Build artifacts and internal scratch never clutter the explorer by
-        # default; dot-directories (.invar, .git, .venv) are always hidden
-        # unless the user explicitly toggles hidden artifacts on.
-        dir_skip = {"__pycache__", "target", "dist", "build", "node_modules"}
-        file_skip_suffixes = (".so", ".dylib", ".dll", ".o", ".a", ".pyc")
-        file_skip_names = {".gitignore", ".env"}
+        dir_skip = {
+            "__pycache__", "target", "dist", "build", "node_modules",
+            "research", "checkpoints",
+        }
+        file_skip_suffixes = (
+            ".so", ".dll", ".dylib", ".o", ".a", ".pyc", ".pyd", ".whl",
+        )
+        file_skip_names = {
+            ".gitignore", ".env", "research_report.md", ".gitkeep",
+        }
 
         def _hidden(name: str) -> bool:
+            # Dot entries (.invar, .git, .venv, ...) are ALWAYS excluded: the
+            # Research Vault and scratch live there and must never leak into
+            # the software explorer.
             if name.startswith("."):
-                return not show_hidden_artifacts
+                return True
             if name in dir_skip or name.endswith(".egg-info"):
                 return True
             return False
@@ -544,15 +573,43 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 if entry.is_dir():
                     node["children"].append(build(entry, depth + 1))
                 elif entry.is_file():
-                    if not show_hidden_artifacts and (
-                            name in file_skip_names or name.endswith(file_skip_suffixes)):
+                    if name in file_skip_names or name.startswith("kernel_") \
+                            or name.endswith(file_skip_suffixes):
                         continue
                     node["children"].append({"name": name, "type": "file", "size": entry.stat().st_size})
-            # Pin the comprehensive research report at the top of its folder.
-            node["children"].sort(key=lambda c: (0 if c.get("name") == "research_report.md" else 1, c["name"].lower()))
             return node
 
         return build(root)
+
+    # -- Research Vault API ---------------------------------------------------
+
+    @app.get("/api/v1/research/vault")
+    def api_research_vault_list() -> dict[str, Any]:
+        from invar_agent.research.vault import ResearchVaultManager
+        runs = ResearchVaultManager(state.workspace_root).list_runs()
+        return {"runs": runs, "count": len(runs)}
+
+    @app.get("/api/v1/research/vault/search")
+    def api_research_vault_search(q: str = Query(..., min_length=1)) -> dict[str, Any]:
+        from invar_agent.research.vault import ResearchVaultManager
+        runs = ResearchVaultManager(state.workspace_root).search(q)
+        return {"query": q, "results": runs, "count": len(runs)}
+
+    @app.get("/api/v1/research/vault/{run_id}")
+    def api_research_vault_detail(run_id: str) -> dict[str, Any]:
+        from invar_agent.research.vault import ResearchVaultManager
+        detail = ResearchVaultManager(state.workspace_root).get_run(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"research run not found: {run_id}")
+        return detail
+
+    @app.delete("/api/v1/research/vault/{run_id}")
+    def api_research_vault_delete(run_id: str) -> dict[str, Any]:
+        from invar_agent.research.vault import ResearchVaultManager
+        ok = ResearchVaultManager(state.workspace_root).delete_run(run_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"research run not found: {run_id}")
+        return {"deleted": True, "run_id": run_id}
 
     @app.get("/api/workspace/file")
     def api_workspace_file(path: str = Query(..., min_length=1)) -> dict[str, Any]:
@@ -652,6 +709,17 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
 
     # -- Research Agent endpoints -------------------------------------------
 
+    def _research_vault_context(question: str,
+                               attached_ids: Optional[list[str]] = None) -> str:
+        """Compacted dual-context (software codebase + research vault) for planners."""
+        try:
+            from invar_agent.context_compactor import build_research_vault_context
+            return build_research_vault_context(
+                state.workspace_root, referenced_ids=attached_ids or [],
+                user_query=question)
+        except Exception:  # noqa: BLE001 - context is best-effort
+            return ""
+
     @app.post("/api/v1/research/plan")
     async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
         """Feasibility gate + blueprint synthesis in a SINGLE Tier-2 call.
@@ -669,6 +737,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                 llm_complete=(
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                 fallback=not has_llm,
+                extra_context=_research_vault_context(req.question, req.attached_research_ids),
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -712,7 +781,8 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         try:
             result = await generate_expert_research_prompt(
                 req.question,
-                llm_complete=lambda q: _plan_llm_callable(state, q, max_tokens=4096))
+                llm_complete=lambda q: _plan_llm_callable(state, q, max_tokens=4096),
+                extra_context=_research_vault_context(req.question, req.attached_research_ids))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
@@ -741,6 +811,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                 fallback=not has_llm,
                 assume_feasible=assume_feasible,
+                extra_context=_research_vault_context(req.question, req.attached_research_ids),
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

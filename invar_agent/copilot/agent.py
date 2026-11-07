@@ -230,8 +230,15 @@ class CopilotAgent:
 
     # -- prompt assembly ---------------------------------------------------------
 
-    def system_prompt(self) -> str:
-        state = workspace_state(self.workspace_path)
+    def system_prompt(self, user_query: str = "",
+                      attached_research_ids: Optional[List[str]] = None) -> str:
+        from invar_agent.context_compactor import (
+            build_research_vault_context,
+            build_software_codebase_context,
+        )
+
+        software_context = build_software_codebase_context(self.workspace_path)
+        state = "draft" if "GREENFIELD_WORKSPACE" in software_context else "active"
         status = (
             "Workspace is empty/blank. Focus on understanding the user's intent and "
             "drafting an initial build prompt from scratch; do NOT reference existing "
@@ -243,9 +250,10 @@ class CopilotAgent:
         )
         prompt = COPILOT_SYSTEM_PROMPT
         prompt += f"\n\n[WORKSPACE STATE]\n{state}\n\n[WORKSPACE STATUS]\n{status}"
-        context = workspace_context_tag(self.workspace_path)
-        if context:
-            prompt += "\n\n" + context
+        prompt += "\n\n" + software_context
+        prompt += "\n\n" + build_research_vault_context(
+            self.workspace_path, referenced_ids=attached_research_ids,
+            user_query=user_query)
         return prompt
 
     def _tier_override(self) -> Optional[str]:
@@ -267,7 +275,8 @@ class CopilotAgent:
 
     # -- chat ---------------------------------------------------------------------
 
-    def chat(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    def chat(self, message: str, history: Optional[List[Dict[str, str]]] = None,
+             attached_research_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """Run one copilot turn; returns ``{"reply": markdown, "action": {...}|None}``."""
         message = (message or "").strip()
         if not message:
@@ -278,7 +287,8 @@ class CopilotAgent:
             # No provider/key at all — a different state from a failed call.
             return self._offline_reply(message, llm_state="not_configured")
 
-        messages = [{"role": "system", "content": self.system_prompt()}]
+        messages = [{"role": "system", "content": self.system_prompt(
+            user_query=message, attached_research_ids=attached_research_ids)}]
         for turn in self._sanitize_history(history):
             messages.append(turn)
         messages.append({"role": "user", "content": message})

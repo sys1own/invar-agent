@@ -657,6 +657,7 @@ async def generate_research_plan(question: str,
                                  fallback: bool = True,
                                  literature: Optional[List[Dict[str, Any]]] = None,
                                  feasibility: Any = None,
+                                 extra_context: str = "",
                                  ) -> Dict[str, Any]:
     """Tier-2 REASONING plan synthesis; falls back to a deterministic blueprint.
 
@@ -670,6 +671,8 @@ async def generate_research_plan(question: str,
                            feasibility=_feasibility_context(feasibility),
                            literature=format_literature(literature or []),
                            question=question)
+            if extra_context:
+                prompt += "\n\n" + extra_context
             raw = await llm_complete(prompt)
             data = _extract_json(str(raw))
             if isinstance(data, dict):
@@ -719,6 +722,7 @@ async def generate_plan_with_feasibility(question: str,
                                          fallback: bool = True,
                                          literature: Optional[List[Dict[str, Any]]] = None,
                                          assume_feasible: bool = False,
+                                         extra_context: str = "",
                                          ) -> Dict[str, Any]:
     """Single Tier-2 call: feasibility gate + blueprint (Task 4 latency fix).
 
@@ -747,6 +751,8 @@ async def generate_plan_with_feasibility(question: str,
     prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
                    literature=format_literature(literature or []),
                    question=question)
+    if extra_context:
+        prompt += "\n\n" + extra_context
     raw = await llm_complete(prompt)
     data = _extract_json(str(raw))
     if not isinstance(data, dict):
@@ -772,6 +778,7 @@ async def generate_plan_with_feasibility(question: str,
 async def generate_expert_research_prompt(question: str,
                                           llm_complete: Optional[Callable[[str], Any]] = None,
                                           literature: Optional[List[Dict[str, Any]]] = None,
+                                          extra_context: str = "",
                                           ) -> Dict[str, Any]:
     """Plan Mode: one Tier-2 call -> feasibility + editable expert research prompt.
 
@@ -791,6 +798,8 @@ async def generate_expert_research_prompt(question: str,
     prompt = _fill(EXPERT_PROMPT_PLANNER_PROMPT, tools="",
                    literature=format_literature(literature or []),
                    question=question)
+    if extra_context:
+        prompt += "\n\n" + extra_context
     raw = await llm_complete(prompt)
     text = _clean_prompt_text(raw)
     data = _extract_json(text)
