@@ -92,12 +92,18 @@ async def test_state_machine_persists_report_and_emits_completed(tmp_path):
     state.results = [_result()]
     await machine._emit_report(state)
 
-    root_report = tmp_path / "research_report.md"
-    ckpt_report = tmp_path / "research" / "checkpoints" / "bp-ui" / "research_report.md"
-    assert root_report.exists() and "# Quantitative Research Report" in root_report.read_text()
-    assert ckpt_report.exists()
+    # Reports are archived exclusively into the Research Vault now; the
+    # software root stays clean.
+    vault_dir = tmp_path / ".invar" / "research_vault" / "bp-ui"
+    assert (vault_dir / "report.md").exists()
+    assert "# Quantitative Research Report" in (vault_dir / "report.md").read_text()
+    assert (vault_dir / "unified_module.py").exists()
+    assert (vault_dir / "blueprint.json").exists()
+    assert (vault_dir / "metadata.json").exists()
+    assert not (tmp_path / "research_report.md").exists()
     completed = [p for c, p in events if p.get("event") == "research_completed"]
     assert completed and "# Quantitative Research Report" in completed[0]["report"]
+    assert completed[0].get("run_id") == "bp-ui"
     assert state.report and "Executive Summary" in state.report
 
 
@@ -115,7 +121,7 @@ def create_app_for_test(workspace_root: str):
     return create_app(workspace_root=workspace_root)
 
 
-def test_workspace_tree_hides_artifacts_by_default(client, tmp_path):
+def test_workspace_tree_is_strictly_software_only(tmp_path):
     (tmp_path / "research_report.md").write_text("# report")
     (tmp_path / "hello.py").write_text("print('hi')")
     scratch = tmp_path / ".invar" / "scratch" / "cabi"
@@ -124,16 +130,24 @@ def test_workspace_tree_hides_artifacts_by_default(client, tmp_path):
     (scratch / "kernel_abc.cpp").write_text("// kernel")
     (tmp_path / "research" / "cabi").mkdir(parents=True)
     (tmp_path / "research" / "cabi" / "kernel_def.so").write_bytes(b"\x7fELF")
+    (tmp_path / "checkpoints" / "mars_entry").mkdir(parents=True)
+    (tmp_path / "checkpoints" / "mars_entry" / "blueprint.json").write_text("{}")
     (tmp_path / "build").mkdir()
     (tmp_path / "build" / "out.o").write_bytes(b"obj")
 
-    data = client.get("/api/workspace/tree").json()
-    names = [c["name"] for c in data["children"]]
-    assert "research_report.md" in names and "hello.py" in names
-    assert ".invar" not in names and "build" not in names
-    # research_report.md pinned first
-    assert names[0] == "research_report.md"
+    # The app migrates legacy research artifacts into the vault at startup.
+    import invar_agent.server as server
+    server._STATE = None
+    client = TestClient(create_app_for_test(str(tmp_path)))
 
-    data_hidden = client.get("/api/workspace/tree?show_hidden_artifacts=true").json()
-    hidden_names = [c["name"] for c in data_hidden["children"]]
-    assert ".invar" in hidden_names
+    data = client.get("/api/files").json()
+    names = [c["name"] for c in data["children"]]
+    assert names == ["hello.py"]
+    assert ".invar" not in names and "build" not in names
+    assert "research_report.md" not in names and "research" not in names
+    assert "checkpoints" not in names
+
+    # The migrated research run is visible in the Research Vault instead.
+    vault = client.get("/api/v1/research/vault").json()
+    run_ids = [r["run_id"] for r in vault["runs"]]
+    assert "legacy_report" in run_ids or "mars_entry" in run_ids
