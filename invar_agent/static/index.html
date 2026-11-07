@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/static/assets/logo.png">
 <title>invar-agent — Verified Agent Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <style>
@@ -265,11 +266,6 @@
   </aside>
   <main class="main">
     <div class="plan-mode-banner" id="plan-mode-banner">📋 Plan Mode — your request is drafted as an editable Expert Deep Research Prompt card first; nothing executes until you approve it.</div>
-    <div class="hero-banner" style="display:flex;align-items:center;gap:12px;padding:14px 22px;border-bottom:1px solid var(--border);background:var(--bg-card);flex:none">
-      <img src="/static/assets/logo.png" alt="" style="height:44px;width:44px;border-radius:8px">
-      <div style="font-size:15px;font-weight:600;color:var(--text);letter-spacing:.3px"><span id="banner-title">invar-agent Verified Autonomous Research</span></div>
-      <span class="hint" id="banner-tagline">mathematically verified quantitative research, end-to-end</span>
-    </div>
     <div class="view-switcher">
       <button id="view-tab-chat" class="active" onclick="showView('chat')">💬 Chat &amp; Plan</button>
       <button id="view-tab-research" onclick="showView('research')">📖 Research Viewer</button>
@@ -724,18 +720,6 @@ function setMode(mode) {
   document.getElementById('mode-builder').classList.toggle('active', !researchMode);
   document.getElementById('mode-research').classList.toggle('active', researchMode);
   document.getElementById('research-panel').classList.toggle('active', researchMode);
-  const bannerTitle = document.getElementById('banner-title');
-  const bannerTag = document.getElementById('banner-tagline');
-  if (bannerTitle) {
-    bannerTitle.textContent = researchMode
-      ? 'invar-agent Verified Autonomous Research'
-      : 'invar-agent Verified Autonomous Builder';
-  }
-  if (bannerTag) {
-    bannerTag.textContent = researchMode
-      ? 'mathematically verified quantitative research, end-to-end'
-      : 'mathematically verified polyglot software engineering, end-to-end';
-  }
   input.placeholder = researchMode
     ? 'Describe a research question — Direct Mode runs it now, Plan Mode drafts an expert prompt…'
     : 'Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)';
