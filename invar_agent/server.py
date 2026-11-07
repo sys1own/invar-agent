@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,7 @@ from invar_agent.research.planner import (
 )
 from invar_agent.research.search import LiteratureSearchClient
 from invar_agent.schemas.research import ResearchBlueprint
+from invar_agent.terminal import TerminalSession, TerminalSessionManager
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -387,6 +388,63 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     except Exception:  # noqa: BLE001 - migration must never block startup
         pass
     app = FastAPI(title="invar-agent Web Console", version="0.1.0")
+    terminal_manager = TerminalSessionManager(state.workspace_root)
+    app.state.terminal_manager = terminal_manager
+
+    @app.on_event("shutdown")
+    async def _close_terminal_sessions() -> None:  # pragma: no cover - server stop
+        terminal_manager.close_all()
+
+    async def _terminal_pump(websocket: WebSocket, session: TerminalSession) -> None:
+        """Forward PTY output to the client as UTF-8 text frames (xterm-safe)."""
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            async for chunk in session.read_chunks():
+                await websocket.send_text(decoder.decode(chunk))
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                await websocket.send_text(tail)
+        except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError):
+            pass
+
+    @app.websocket("/api/v1/terminal/ws")
+    async def terminal_ws(websocket: WebSocket) -> None:
+        """Embedded workspace terminal: one PTY shell per connection."""
+        await websocket.accept()
+        session = terminal_manager.create_session()
+        reader_task = asyncio.create_task(_terminal_pump(websocket, session))
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                text = message.get("text")
+                data = message.get("bytes")
+                if isinstance(text, str) and text.lstrip().startswith('{"type"'):
+                    # Control message (e.g. xterm fit sync); tolerate JSON
+                    # whitespace variants from any client.
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("type") == "resize":
+                        try:
+                            session.resize(int(payload.get("cols", 80)),
+                                           int(payload.get("rows", 24)))
+                        except (TypeError, ValueError):
+                            pass
+                    continue
+                if text is not None:
+                    session.write(text.encode("utf-8"))
+                elif data:
+                    session.write(bytes(data))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            reader_task.cancel()
+            session.close()
+            terminal_manager.release(session)
 
     @app.get("/")
     def index() -> FileResponse:
