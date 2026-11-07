@@ -44,6 +44,11 @@ from invar_agent.terminal import TerminalSession, TerminalSessionManager
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# SSE keep-alive interval (seconds) for the research stream: emits a `: keep-alive`
+# comment whenever no event has been published for this long, keeping browsers and
+# proxies alive during multi-minute Tier-2 LLM re-synthesis calls.
+RESEARCH_SSE_HEARTBEAT = 15.0
+
 
 class IngestRequest(BaseModel):
     path: Optional[str] = None
@@ -932,9 +937,11 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
             try:
                 while True:
                     try:
-                        payload = q.get(timeout=15.0)
+                        payload = q.get(timeout=RESEARCH_SSE_HEARTBEAT)
                     except queue.Empty:
-                        yield "event: keep-alive\ndata: {}\n\n"
+                        # SSE comment heartbeat: keeps browsers/proxies alive
+                        # during long Tier-2 LLM re-synthesis calls.
+                        yield ": keep-alive\n\n"
                         continue
                     terminal = (payload.get("event") in terminal_events
                                 and payload.get("seq", 0) > initial_seq)

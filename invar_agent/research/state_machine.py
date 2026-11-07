@@ -547,16 +547,33 @@ class ResearchStateMachine:
                         "research_stage": stage, "path": state.checkpoint_path,
                         "bundle_hash": outcome["layer"].bundle_hash,
                         "pinned_layers": [layer.layer_id for layer in pinned_layers]})
-                    inv_count = sum(len(c.invariants) for c in contracts)
                     await self.emit_activity(
-                        f"STAGE_{stage}_EXEC", "invariants_verified",
-                        f"All {inv_count} invariants verified by SMT shield + sandbox "
-                        f"({len(pinned_layers)} pinned layer(s)).")
+                        "VERIFIED", "invariants_passed",
+                        "All invariants verified by SMT shield + sandbox.")
                     if stage < total:
                         await self._save_partial_vault(state, stage)
                     verified = True
                     break
                 failure = outcome.get("failure") or outcome["status"]
+                # Granular live healing telemetry for every retry step.
+                fail_text = str(failure).lower()
+                failed_status = str(outcome.get("failed_status") or "")
+                if "compil" in fail_text or failed_status == "ERROR":
+                    await self.emit_activity(
+                        f"STAGE_{stage}_BUILD", "compile_error",
+                        f"Attempt {attempt}: C-ABI compilation failed. "
+                        "Analyzing compiler diagnostic and re-synthesizing...")
+                elif failed_status == "FALSIFIED":
+                    cid = str(outcome.get("failed_contract") or "contract")
+                    await self.emit_activity(
+                        f"STAGE_{stage}_EXEC", "invariant_falsified",
+                        f"Attempt {attempt}: Invariant {cid} falsified "
+                        f"({str(failure)[:120]}). Feeding counterexample back to model...")
+                elif failed_status == "DIVERGED":
+                    await self.emit_activity(
+                        f"STAGE_{stage}_EXEC", "sandbox_diverged",
+                        f"Attempt {attempt}: sandbox trajectory diverged. "
+                        "Feeding counterexample back to model...")
                 failures.append(failure)
                 state.memory.append({"round": round_idx, "research_stage": stage,
                                      "outcome": outcome["status"], "counterexample": failure})
@@ -569,6 +586,10 @@ class ResearchStateMachine:
                     state.refusal = outcome.get("refusal")
                     return state
                 # Reflex_Heal + refinement feed the counterexample back to GoI_Plan.
+                await self.emit_activity(
+                    "HEALING", "reasoning_dispatch",
+                    f"Tier-2 model synthesizing correction "
+                    f"(Attempt {attempt + 1}/{blueprint.max_feedback_rounds})...")
                 candidate_code = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=outcome.get("candidate_code") or candidate_code,
@@ -653,6 +674,8 @@ class ResearchStateMachine:
             report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
             await self._emit("accelerator_log", "vault_archived", {
                 "run_id": meta.get("run_id"), "status": state.status})
+            await self._emit("accelerator_log", "vault_updated", {
+                "run_id": meta.get("run_id"), "status": vault_status})
             await self.emit_activity(
                 "VAULT", "vault_saved",
                 f"Archived run `{meta.get('run_id')}` to the Research Vault "
@@ -960,7 +983,10 @@ class ResearchStateMachine:
                    if failed else "no results")
         return {"status": (failed.status.lower() if failed else "error"),
                 "result_status": failed.status if failed else "ERROR",
-                "failure": failure, "candidate_code": candidate_code, "contracts": contracts}
+                "failure": failure, "candidate_code": candidate_code,
+                "contracts": contracts,
+                "failed_contract": failed.contract_id if failed else None,
+                "failed_status": failed.status if failed else None}
 
     # -- Ingest helpers ------------------------------------------------------
     async def _literature_search(self, queries: List[str], tag: Dict[str, Any]) -> List[Dict[str, Any]]:

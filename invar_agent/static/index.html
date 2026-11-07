@@ -121,7 +121,7 @@
   .sidebar-actions { padding:8px 12px; border-top:1px solid var(--border); display:flex; gap:6px; }
   /* Main chat */
   .main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
-  .chat { flex:1; overflow-y:auto; padding:18px 22px; display:flex; flex-direction:column; gap:12px; }
+  .chat { flex:1; overflow-y:auto; padding:16px; height:100%; min-height:0; display:flex; flex-direction:column; justify-content:flex-start; align-items:stretch; gap:12px; }
   .msg { max-width:78%; padding:10px 14px; border-radius:12px; word-break:break-word; }
   .msg.user { align-self:flex-end; background:#1e2a3d; border:1px solid #33415c; white-space:pre-wrap; }
   .msg.copilot { align-self:flex-start; background:var(--bg-card); border:1px solid var(--border); }
@@ -137,11 +137,18 @@
   .md pre code { background:none; border:0; padding:0; }
   .md blockquote { border-left:3px solid var(--border); margin:6px 0; padding:2px 12px; color:var(--muted); }
   .md a { color:var(--accent); }
-  /* Action card */
-  .action-card { align-self:flex-start; max-width:85%; background:#101b16; border:1px solid #234434; border-radius:6px; padding:10px 14px; }
-  .action-card .action-head { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
+  /* Action card: structured header / rationale / prompt box / actions — never
+     collapses or pushes the prompt off-screen. */
+  .action-card { display:flex; flex-direction:column; background:#161b24; border:1px solid #2d3748; border-radius:8px; padding:16px; margin:8px 0; width:100%; box-sizing:border-box; flex-shrink:0; }
+  .action-card-header { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
   .action-card .action-title { color:var(--green); font-weight:600; font-size:13px; }
   .action-card .action-toggle { margin-left:auto; color:var(--muted); font-size:11px; }
+  .action-card .action-rationale { font-size:12.5px; color:#cbd5e1; margin:0 0 10px; line-height:1.5; }
+  .suggested-prompt-box { width:100%; min-height:160px; max-height:320px; resize:vertical; background:#0b0e14; border:1px solid #2b3545; color:#f1f5f9; font-family:monospace; font-size:13px; line-height:1.5; padding:12px; border-radius:6px; box-sizing:border-box; margin:10px 0; }
+  .suggested-prompt-box:focus { outline:none; border-color:#3b475d; }
+  .action-card-actions { display:flex; gap:10px; margin-top:8px; }
+  /* Legacy collapsible variant (refusal cards) */
+  .action-card .action-head { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
   .action-card .action-body { margin-top:10px; }
   .action-card textarea { width:100%; min-height:90px; resize:vertical; background:#12161f; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:9px 11px; font:12.5px/1.5 ui-monospace, monospace; }
   .action-card textarea:focus { outline:none; border-color:var(--green); }
@@ -590,24 +597,19 @@ async function sendCopilot() {
 function addActionCard(action) {
   const params = action.params || {};
   const card = el(`<div class="action-card">
-    <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+    <div class="action-card-header">
       <span class="action-title">⚙ Suggested Build Prompt</span>
-      <span class="action-toggle">click to edit</span>
     </div>
-    <div class="action-body" style="display:none">
-      <textarea class="mono"></textarea>
-      <div class="row"><button class="build">Send to Builder &amp; Run</button></div>
-    </div>
+    ${params.rationale ? `<div class="action-rationale">${escapeHtml(params.rationale)}</div>` : ''}
+    <textarea class="suggested-prompt-box mono"></textarea>
+    <div class="action-card-actions"><button class="btn-approve build">Send to Builder &amp; Run</button></div>
   </div>`);
   const ta = card.querySelector('textarea');
   ta.value = params.prompt || '';
-  card.querySelector('.action-head').onclick = () => {
-    const body = card.querySelector('.action-body');
-    body.style.display = body.style.display === 'none' ? 'block' : 'none';
-  };
   card.querySelector('button.build').onclick = () => runBuild(ta.value);
   addExpandToggle(card);
-  chat.appendChild(card); scrollChat();
+  chat.appendChild(card);
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 function addResearchRefusalCard(feasibility) {
   const f = feasibility || {};
@@ -637,50 +639,46 @@ function addResearchCardAction(action) {
     const f = rp.feasibility || {};
     const verdict = f.verdict || '';
     const card = el(`<div class="action-card">
-      <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+      <div class="action-card-header">
         <span class="action-title">📋 Expert Deep Research Prompt</span>
         ${verdict ? `<span class="badge">${escapeHtml(verdict)}</span>` : ''}
-        <span class="action-toggle">click to edit</span>
       </div>
-      <div class="action-body" style="display:none">
-        <textarea class="mono" style="min-height:220px"></textarea>
-        <div class="row"><button class="build">Approve &amp; Run Deep Research</button></div>
+      ${f.rationale ? `<div class="action-rationale">${escapeHtml(f.rationale)}</div>` : ''}
+      <textarea class="suggested-prompt-box mono"></textarea>
+      <div class="action-card-actions">
+        <button class="btn-approve build">Approve &amp; Run Deep Research</button>
+        <button class="ghost dismiss">Dismiss</button>
       </div>
     </div>`);
     const ta = card.querySelector('textarea');
     ta.value = rp.expert_prompt;
-    card.querySelector('.action-head').onclick = () => {
-      const body = card.querySelector('.action-body');
-      body.style.display = body.style.display === 'none' ? 'block' : 'none';
-    };
     card.querySelector('button.build').onclick = async () => {
       const edited = ta.value.trim();
       if (!edited) { addMsg('system', 'Expert prompt is empty.'); return; }
       setMode('research');
       await runResearchDirect(edited, f);
     };
+    card.querySelector('button.dismiss').onclick = () => card.remove();
     addExpandToggle(card);
-    chat.appendChild(card); scrollChat();
+    chat.appendChild(card);
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
     return;
   }
   const bp = rp;
   const card = el(`<div class="action-card">
-    <div class="action-head" onclick="this.parentElement.classList.toggle('open')">
+    <div class="action-card-header">
       <span class="action-title">🔬 Suggested Research Plan</span>
-      <span class="action-toggle">click to review</span>
     </div>
-    <div class="action-body" style="display:none">
-      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${bp.falsifiable_hypothesis || ''}</div>
-      <textarea class="mono"></textarea>
-      <div class="row"><button class="build">Approve &amp; Run Deep Research</button></div>
+    ${bp.falsifiable_hypothesis ? `<div class="action-rationale">${escapeHtml(bp.falsifiable_hypothesis)}</div>` : ''}
+    <textarea class="suggested-prompt-box mono"></textarea>
+    <div class="action-card-actions">
+      <button class="btn-approve build">Approve &amp; Run Deep Research</button>
+      <button class="ghost dismiss">Dismiss</button>
     </div>
   </div>`);
   const ta = card.querySelector('textarea');
   ta.value = JSON.stringify(bp, null, 2);
-  card.querySelector('.action-head').onclick = () => {
-    const body = card.querySelector('.action-body');
-    body.style.display = body.style.display === 'none' ? 'block' : 'none';
-  };
+  card.querySelector('button.dismiss').onclick = () => card.remove();
   card.querySelector('button.build').onclick = async () => {
     try {
       const plan = await api('/api/v1/research/plan', {
@@ -696,7 +694,9 @@ function addResearchCardAction(action) {
       openResearchStream();
     } catch (e) { addMsg('system', 'Research plan error: ' + e); }
   };
-  chat.appendChild(card); scrollChat();
+  addExpandToggle(card);
+  chat.appendChild(card);
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 /* ---- builder streaming (SSE over POST) ---- */
 async function runBuild(prompt) {
@@ -1117,6 +1117,24 @@ function appendActivity(msg) {
   while (feed.children.length > 400) feed.removeChild(feed.firstChild);
   feed.scrollTop = feed.scrollHeight;  // auto-scroll sticks to the latest message
 }
+function renderResearchCompletion(runId, status) {
+  chat.querySelectorAll('.completion-card').forEach(n => n.remove());
+  const verified = String(status).toUpperCase() === 'VERIFIED';
+  const card = el(`<div class="rcard completion-card">
+    <div class="rcard-sub" style="font-size:13px">
+      ${verified ? '✅ Research Completed & Verified! Archived to Research Vault.' : `🏁 Research run finished (${escapeHtml(status || 'done')}) and archived to the Research Vault.`}
+    </div>
+    <div class="row">
+      <button class="btn-approve" id="btn-open-viewer">📖 Open in Research Viewer</button>
+      <button class="ghost" id="btn-dismiss-completion">Dismiss</button>
+    </div>
+  </div>`);
+  chat.appendChild(card); scrollChat();
+  card.querySelector('#btn-dismiss-completion').onclick = () => card.remove();
+  card.querySelector('#btn-open-viewer').onclick = () => {
+    if (runId) openResearchViewer(runId); else showView('research');
+  };
+}
 function renderResearchFailure(msg) {
   chat.querySelectorAll('.failure-card').forEach(n => n.remove());
   const error = String(msg.error || 'unknown error');
@@ -1137,6 +1155,12 @@ function renderResearchFailure(msg) {
 function openResearchStream() {
   if (researchSource) researchSource.close();
   researchSource = new EventSource('/api/v1/research/stream');
+  researchSource.onerror = () => {
+    // EventSource auto-reconnects; refresh the vault so a dropped connection
+    // never leaves Research Vault (0) after a run finished server-side.
+    setDrawerSummary('stream reconnecting…');
+    loadVault();
+  };
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const ch = msg.channel || 'accelerator_log';
@@ -1145,6 +1169,12 @@ function openResearchStream() {
       appendActivity(msg);
       const stepId = stepForActivity(msg.stage);
       if (stepId) { if (msg.level === 'error') failActiveStep(); else activateStep(stepId); }
+      // Live attempt counter in the status banner while self-healing.
+      if (msg.stage === 'HEALING' || ['compile_error', 'invariant_falsified', 'sandbox_diverged'].includes(msg.step)) {
+        const line = String(msg.message || '');
+        statusEl.textContent = line.slice(0, 140);
+        setDrawerSummary(line.slice(0, 90));
+      }
       return;
     }
     const pane = ch === 'search_log' ? 'tab-search-log' : ch === 'goi_stream' ? 'tab-goi-stream' : 'tab-accelerator-log';
@@ -1159,6 +1189,7 @@ function openResearchStream() {
       // A new run supersedes any previously rendered report card.
       chat.querySelectorAll('.report-card').forEach(n => n.remove());
       chat.querySelectorAll('.failure-card').forEach(n => n.remove());
+      chat.querySelectorAll('.completion-card').forEach(n => n.remove());
       resetResearchStepper();
       const feed = document.getElementById('research-activity-feed'); if (feed) feed.innerHTML = '';
       activateStep('step-feasibility');
@@ -1194,6 +1225,8 @@ function openResearchStream() {
       activateStep('step-report');
       setStepState('step-report', 'completed');
       addResearchReportCard(msg.report, msg.report_path || '', msg.run_id || '');
+      renderResearchCompletion(msg.run_id || '', msg.status || '');
+      loadVault();
     }
     if (msg.event === 'research_failed') {
       statusEl.textContent = `research halted: ${String(msg.error || '').slice(0, 120)}`;
@@ -1201,6 +1234,10 @@ function openResearchStream() {
       failActiveStep();
       renderResearchFailure(msg);
       loadVault();  // partial verified results stay visible in the Explorer
+    }
+    if (msg.event === 'vault_updated') {
+      // Vault contents changed on disk — refresh the explorer immediately.
+      loadVault();
     }
     if (msg.event === 'research_report' && msg.report) {
       // Legacy event name (older servers): same rendering path.
@@ -1554,7 +1591,7 @@ function buildFromResearch(runId) {
 }
 /* ---- action card fullscreen expand ---- */
 function addExpandToggle(card) {
-  const row = card.querySelector('.action-body .row') || card.querySelector('.row');
+  const row = card.querySelector('.action-card-actions, .action-body .row, .row');
   if (!row) return;
   const btn = el('<button class="ghost" style="font-size:11px">⤢ Expand Fullscreen</button>');
   btn.onclick = (e) => {

@@ -30,6 +30,105 @@ WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 
 USER_AGENT = "invar-agent-research/0.1 (mailto:research@invar-agent.local)"
 
+# -- query normalization -----------------------------------------------------
+# Literature APIs (arXiv/OpenAlex) return 0 hits for long natural-language
+# sentences; keep only the primary technical terms.
+_QUERY_FILLER_PHRASES = (
+    "si units", "entry interface", "mars-gram 2010", "mars-gram",
+)
+_QUERY_FILLER_TOKENS = {
+    "the", "a", "an", "and", "or", "of", "for", "with", "in", "on", "to", "at",
+    "by", "from", "is", "are", "was", "were", "be", "been", "being", "as",
+    "si", "unit", "units", "interface", "simulate", "simulates", "simulated",
+    "simulation", "model", "models", "verify", "verified", "verification",
+    "analysis", "analyse", "analyze", "study", "studies", "using", "use",
+    "used", "based", "approach", "method", "methods", "data", "set", "value",
+    "values", "calculate", "compute", "determine", "assess", "given", "into",
+    "uses", "use",
+    "that", "this", "these", "those", "their", "its", "it", "we", "our",
+}
+
+
+def _sanitize_query(q: str) -> str:
+    """Reduce a natural-language research query to 2-4 technical terms.
+
+    Strips parentheticals, punctuation and filler phrases ("SI units",
+    "entry interface", "Mars-GRAM 2010"), then keeps the highest-signal
+    tokens (hyphenated / capitalized / numeric terms first). Falls back to
+    the original query when nothing technical remains.
+    """
+    original = (q or "").strip()
+    if not original:
+        return ""
+    text = re.sub(r"\([^)]*\)", " ", original)
+    for phrase in _QUERY_FILLER_PHRASES:
+        text = re.sub(re.escape(phrase), " ", text, flags=re.IGNORECASE)
+    # Punctuation -> space, but keep intra-token hyphens (Sutton-Graves) and
+    # decimal points (5.8 km/s); stray dots are trimmed per token below.
+    cleaned = re.sub(r"(?!\w-\w)[^A-Za-z0-9\-\. ]+", " ", text)
+    tokens = [t.strip(".") for t in cleaned.split() if t.strip(".")]
+    scored: List[tuple] = []
+    for idx, tok in enumerate(tokens):
+        if tok.lower() in _QUERY_FILLER_TOKENS:
+            continue
+        score = 1
+        if any(ch.isdigit() for ch in tok):
+            score += 2
+        if "-" in tok:
+            score += 2
+        if tok[:1].isupper():  # proper noun / acronym (Mars, CO2, N2)
+            score += 2
+        if tok.isupper() and len(tok) <= 4:
+            score += 1
+        scored.append((score, -idx, tok))
+    if not scored:
+        # Nothing but filler: keep the original technical words so the API
+        # still gets a query.
+        fallback = [t.strip(".") for t in
+                    re.sub(r"[^A-Za-z0-9\-\. ]+", " ", original).split()
+                    if t.strip(".") and t.strip(".").lower() not in _QUERY_FILLER_TOKENS]
+        return " ".join(fallback[:4]) or original
+    scored.sort(reverse=True)
+    return " ".join(tok for _, _, tok in scored[:4])
+
+
+# Offline fallback: domain constants extracted from a curated aerospace /
+# physics dictionary, used only when every literature API returns 0 hits so
+# the simulation kernel never receives empty parameters.
+_FALLBACK_DOMAIN_CONSTANTS = [
+    (("mars", "aeroshell", "aerothermo", "re-entry", "reentry", "entry interface"),
+     {"martian_scale_height_km": 11.1,
+      "co2_surface_density_kg_m3": 0.020,
+      "sutton_graves_stagnation_coeff": 1.83e-4,
+      "equilibrium_temp_coefficient": 0.276}),
+    (("sutton", "graves", "stagnation", "heat flux", "heat transfer"),
+     {"sutton_graves_stagnation_coeff": 1.83e-4,
+      "stagnation_heat_flux_form": "q = k * sqrt(rho/Rn) * V^3",
+      "typical_peak_heat_flux_MW_m2": 1.0}),
+    (("kdv", "soliton", "shallow water", "nonlinear wave"),
+     {"kdv_nonlinear_coeff": 6.0,
+      "kdv_dispersion_coeff": 1.0,
+      "soliton_speed_amplitude": "c = 2A"}),
+    (("drag", "aerodynamic", "lift"),
+     {"drag_coefficient_typical": 1.0,
+      "ballistic_coefficient_form": "BC = m / (Cd * A)"}),
+]
+
+
+def _fallback_constants(query: str) -> List[LiteratureResult]:
+    """Domain-constant fallback hit for queries with zero API results."""
+    q = (query or "").lower()
+    for keywords, constants in _FALLBACK_DOMAIN_CONSTANTS:
+        if any(k in q for k in keywords):
+            rendered = "; ".join(f"{k}={v}" for k, v in constants.items())
+            return [LiteratureResult(
+                "fallback_constants",
+                "Offline domain constants (literature APIs returned 0 hits)",
+                f"Fallback aerospace constants for '{query}': {rendered}. "
+                "Use these as empirical parameters for the simulation kernel.",
+                "")]
+    return []
+
 
 @dataclass
 class LiteratureResult:
@@ -70,6 +169,7 @@ class LiteratureSearchClient:
     def search(self, query: str, max_results: Optional[int] = None,
                sources: tuple = ("arxiv", "openalex", "wikipedia")) -> List[LiteratureResult]:
         """Search all requested sources; per-source failures degrade gracefully."""
+        query = _sanitize_query(query)
         limit = max_results or self.max_results
         results: List[LiteratureResult] = []
         for source in sources:
@@ -77,7 +177,25 @@ class LiteratureSearchClient:
                 results.extend(self._search_source(source, query, limit))
             except Exception:  # noqa: BLE001 - one bad source must not kill ingest
                 continue
-        return results[: max(limit * 2, limit)]
+        results = results[: max(limit * 2, limit)]
+        if not results:
+            # Never let the kernel receive empty parameters: fall back to
+            # curated domain constants when every API returned 0 hits.
+            results = _fallback_constants(query)
+        return results
+
+    def search_literature(self, queries: List[str],
+                          max_results: Optional[int] = None) -> List[LiteratureResult]:
+        """Batch helper: sanitize each query, search, and dedupe by (source, title)."""
+        seen = set()
+        out: List[LiteratureResult] = []
+        for q in queries or []:
+            for r in self.search(q, max_results=max_results):
+                key = (r.source, r.title)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(r)
+        return out
 
     # -- source implementations -------------------------------------------
     def _search_source(self, source: str, query: str, limit: int) -> List[LiteratureResult]:
