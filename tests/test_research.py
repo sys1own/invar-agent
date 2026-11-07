@@ -290,3 +290,42 @@ def test_native_hin_arena_and_healer():
     assert hasattr(native, "GoIWavefrontScheduler")
     assert hasattr(native, "UASTGraph")
     assert hasattr(native, "GraphPolyglotMaterializer")
+
+
+@pytest.mark.asyncio
+async def test_heal_and_refine_routes_guard_failures_to_llm(tmp_path):
+    """PreWrite_Guard/transpiler rejections must skip Tier-0 (which cannot fix
+    tuples) and go straight to the Tier-2 LLM refiner."""
+    from invar_agent.research.state_machine import ResearchStateMachine
+
+    events = []
+
+    async def cb(channel, payload):
+        events.append((channel, payload))
+
+    refine_calls = []
+
+    async def fake_refine(llm_complete, *, objective, code, contracts, failure):
+        refine_calls.append(failure)
+        return "def simulation_step(buf, dt):\n    return None\n"
+
+    machine = ResearchStateMachine(tmp_path / "research", progress_cb=cb,
+                                   llm_planner=lambda prompt: "{}")
+    machine.workspace_root = tmp_path
+
+    import invar_agent.research.state_machine as sm
+    original = sm.refine_stage_code
+    sm.refine_stage_code = fake_refine
+    try:
+        out = await machine._heal_and_refine(
+            stage=1, round_idx=1, objective="obj",
+            candidate_code="def simulation_step(buf, dt):\n    a, b = 1, 2\n    return None\n",
+            contracts=[], failure="PreWrite_Guard: unsupported construct: tuples")
+    finally:
+        sm.refine_stage_code = original
+
+    assert refine_calls == ["PreWrite_Guard: unsupported construct: tuples"]
+    assert out == "def simulation_step(buf, dt):\n    return None\n"
+    heal_events = [p for c, p in events if p.get("event") == "heal"]
+    assert heal_events and heal_events[0]["tier"] == 0
+    assert heal_events[0]["applied"] is False

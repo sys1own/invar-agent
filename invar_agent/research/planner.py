@@ -94,7 +94,9 @@ research engine. Produce ONE falsifiable research blueprint for the request.
 {tools}
 
 ## Output: strict JSON object with keys
-blueprint_id (snake_case), title (5-120 chars), falsifiable_hypothesis,
+blueprint_id (lowercase snake_case, under 32 chars, e.g. 'mars_entry_probe'),
+title (concise human-readable, under 80 chars, e.g. 'Mars Atmospheric Entry &
+Stagnation Heating'), falsifiable_hypothesis,
 search_queries (3-6 concrete literature queries for arXiv/OpenAlex),
 target_research_stages (1-4; use 2-3 when the request describes a progression,
 e.g. "start by ... then integrate ..."), stage_objectives (one short objective per
@@ -168,6 +170,14 @@ No markdown fences. Output JSON only.
 REFINE_PROMPT = """Your research kernel failed verification. Fix the CODE ONLY; the contracts
 and invariants are fixed and must not be weakened.
 
+CRITICAL — v9_transpiler_friendly subset (violations are rejected by PreWrite_Guard):
+use ONLY pure module-level functions, math.* calls, if/elif/else, for/while loops,
+return statements and plain float arithmetic. FORBIDDEN: tuples (no tuple literals,
+no `a, b = ...` unpacking, no multi-value returns), classes, exceptions, dicts,
+sets, comprehensions, nested function definitions, string operations, imports
+other than `import math`. If the failure mentions "unsupported construct: tuples",
+eliminate EVERY tuple from the module.
+
 {tools}
 
 ## Stage objective
@@ -223,7 +233,9 @@ feasibility object keys: verdict, rationale, violated_boundary, reformulation.
 
 ## Part 2 — blueprint (only if NOT refused)
 Produce ONE falsifiable research blueprint:
-blueprint_id (snake_case), title (5-120 chars), falsifiable_hypothesis,
+blueprint_id (lowercase snake_case, under 32 chars, e.g. 'mars_entry_probe'),
+title (concise human-readable, under 80 chars, e.g. 'Mars Atmospheric Entry &
+Stagnation Heating'), falsifiable_hypothesis,
 search_queries (3-6 concrete literature queries for arXiv/OpenAlex),
 target_research_stages (1-4; use 2-3 when the request describes a progression),
 stage_objectives (one short objective per stage, stage 1 first), contracts
@@ -551,6 +563,37 @@ def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
     return contract
 
 
+def _sanitize_raw_blueprint_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Pre-validation normalisation of a raw LLM blueprint dict.
+
+    Handles missing optional fields, trims excessive strings and coerces
+    integer/float lists so pydantic validation never crashes on long titles,
+    unsafe identifiers or minor type drift.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    # Identifiers: slugify instead of failing on spaces/special characters.
+    for key, fallback in (("blueprint_id", "blueprint_unnamed"),):
+        if key in out:
+            from invar_agent.schemas.research import _slugify
+            out[key] = _slugify(out.get(key), fallback=fallback)
+    # Title: collapse whitespace and truncate before the schema validator runs.
+    if "title" in out and out.get("title") is not None:
+        title = " ".join(str(out["title"]).strip().split())
+        if len(title) > 120:
+            title = title[:117] + "..."
+        out["title"] = title or "Untitled Research Blueprint"
+    # Numeric list fields: coerce int/float/string entries to floats.
+    if "initial_state" in out:
+        coerced = _as_float_list(out.get("initial_state"))
+        if coerced is not None:
+            out["initial_state"] = coerced[:4096]
+        else:
+            out.pop("initial_state", None)
+    return out
+
+
 def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce minor LLM schema drift instead of discarding the whole response.
 
@@ -559,6 +602,7 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     Required fields (blueprint_id, title, hypothesis, code_template, ...) are
     left for pydantic validation to reject with a precise error.
     """
+    data = _sanitize_raw_blueprint_dict(data)
     if not isinstance(data, dict):
         return {}
     out: Dict[str, Any] = {k: data[k] for k in _BLUEPRINT_FIELDS if k in data}

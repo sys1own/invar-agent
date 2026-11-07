@@ -818,7 +818,15 @@ class ResearchStateMachine:
                                failure: str) -> Optional[str]:
         if candidate_code is None:
             return None
-        healed, notes = tier0_heal(candidate_code)
+        # PreWrite_Guard / transpiler rejections (e.g. tuples, nested defs) are
+        # syntax-level violations the Tier-0 egg healer cannot repair; routing
+        # them to it first would burn rounds on irrelevant rewrites and skip the
+        # LLM refiner, so send them straight to the Tier-2 refiner.
+        guard_failure = failure.startswith(("PreWrite_Guard", "transpiler:"))
+        if guard_failure:
+            healed, notes = candidate_code, []
+        else:
+            healed, notes = tier0_heal(candidate_code)
         await self._emit("goi_stream", "heal", {
             "round": round_idx, "research_stage": stage, "tier": 0,
             "applied": bool(notes), "notes": notes or ["no Tier-0 repair applicable"]})

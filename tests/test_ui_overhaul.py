@@ -93,8 +93,8 @@ async def test_state_machine_persists_report_and_emits_completed(tmp_path):
     await machine._emit_report(state)
 
     # Reports are archived exclusively into the Research Vault now; the
-    # software root stays clean.
-    vault_dir = tmp_path / ".invar" / "research_vault" / "bp-ui"
+    # software root stays clean. The blueprint id is slugified by the schema.
+    vault_dir = tmp_path / ".invar" / "research_vault" / "bp_ui"
     assert (vault_dir / "report.md").exists()
     assert "# Quantitative Research Report" in (vault_dir / "report.md").read_text()
     assert (vault_dir / "unified_module.py").exists()
@@ -103,7 +103,7 @@ async def test_state_machine_persists_report_and_emits_completed(tmp_path):
     assert not (tmp_path / "research_report.md").exists()
     completed = [p for c, p in events if p.get("event") == "research_completed"]
     assert completed and "# Quantitative Research Report" in completed[0]["report"]
-    assert completed[0].get("run_id") == "bp-ui"
+    assert completed[0].get("run_id") == "bp_ui"
     assert state.report and "Executive Summary" in state.report
 
 

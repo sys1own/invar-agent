@@ -94,7 +94,7 @@ async def test_generate_plan_with_feasibility_single_call():
     assert len(calls) == 1  # feasibility + blueprint in ONE Tier-2 call
     assert out["source"] == "llm"
     assert out["feasibility"].verdict == "REFORMULATED_SURROGATE"
-    assert out["blueprint"]["blueprint_id"] == "bp-combined"
+    assert out["blueprint"]["blueprint_id"] == "bp_combined"
     assert out["blueprint"]["variable_map"] == {"temperature_K": 0}
 
 
@@ -406,7 +406,7 @@ async def test_assume_feasible_bypasses_heuristic_refusal():
         "perpetual motion COP = 1.25 approved expert prompt",
         llm_complete=llm, fallback=False, assume_feasible=True)
     assert out["source"] == "llm"
-    assert out["blueprint"]["blueprint_id"] == "bp-combined"
+    assert out["blueprint"]["blueprint_id"] == "bp_combined"
 
 
 @pytest.mark.asyncio

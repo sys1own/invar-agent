@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _clean_text(value: Any, fallback: str = "") -> str:
+    """Collapse whitespace and trim; never raise on odd LLM output."""
+    if value is None:
+        return fallback
+    if not isinstance(value, str):
+        value = str(value)
+    return " ".join(value.strip().split())
+
+
+def _slugify(value: Any, fallback: str = "unnamed", max_length: int = 64) -> str:
+    """Slugify an identifier: lowercase, safe chars only, length-capped."""
+    if not value or not isinstance(value, str):
+        return fallback
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
+    return (slug[:max_length] if slug else fallback)
 
 
 class InvariantConstraint(BaseModel):
@@ -20,6 +38,11 @@ class VerificationContract(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     contract_id: str
+
+    @field_validator("contract_id", mode="before")
+    @classmethod
+    def _sanitize_contract_id(cls, value: Any) -> str:
+        return _slugify(value, fallback="contract_unnamed")
     target_backend: Literal["rust_hin", "cpp", "cuda", "multi_variant"]
     timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
     invariants: List[InvariantConstraint] = Field(min_length=1)
@@ -123,7 +146,23 @@ class ResearchBlueprint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     blueprint_id: str
-    title: str = Field(min_length=5, max_length=120)
+
+    @field_validator("blueprint_id", mode="before")
+    @classmethod
+    def _sanitize_blueprint_id(cls, value: Any) -> str:
+        return _slugify(value, fallback="blueprint_unnamed")
+
+    title: str = Field(min_length=5, max_length=256)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _normalize_title(cls, value: Any) -> str:
+        if isinstance(value, str):
+            cleaned = _clean_text(value)
+            if len(cleaned) > 120:
+                return cleaned[:117] + "..."
+            return cleaned
+        return _clean_text(value) if value is not None else "Untitled Research Blueprint"
     falsifiable_hypothesis: str
     search_queries: List[str]
     contracts: List[VerificationContract] = Field(min_length=1)
