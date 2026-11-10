@@ -940,6 +940,135 @@ def extract_clean_prompt(text: str) -> Optional[str]:
     return ActionParser().extract_clean_prompt(text)
 
 
+# ---------------------------------------------------------------------------
+# Resilient Builder Plan payload recovery
+# ---------------------------------------------------------------------------
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+# Closed JSON string value (handles escaped quotes/backslashes, may span lines).
+_JSON_STRING_RE = r'"((?:[^"\\]|\\.)*)"'
+
+_DISPLAY_TEXT_RE = re.compile(
+    r'"display_text"\s*:\s*' + _JSON_STRING_RE, re.DOTALL)
+# Prefer a properly terminated clean_prompt value...
+_CLEAN_PROMPT_CLOSED_RE = re.compile(
+    r'"(?:clean_prompt|build_prompt|expert_prompt|suggested_prompt)"\s*:\s*'
+    + _JSON_STRING_RE + r'(?=\s*[,}])', re.DOTALL)
+# ...but recover a truncated value running to EOF as well (spec recovery path).
+_CLEAN_PROMPT_OPEN_RE = re.compile(
+    r'"(?:clean_prompt|build_prompt|expert_prompt|suggested_prompt)"\s*:\s*'
+    + _JSON_STRING_RE[:-1], re.DOTALL)
+
+
+def _unescape_json_string(value: str) -> str:
+    """Unescape a JSON string body (\n, \\", \\\\ …) without requiring quotes."""
+    try:
+        return json.loads('"' + value + '"')
+    except Exception:  # noqa: BLE001
+        # Truncated escapes: decode the common sequences manually.
+        out = value.replace('\\"', '"').replace("\\n", "\n")
+        out = out.replace("\\t", "\t").replace("\\r", "\r")
+        return out.replace("\\\\", "\\")
+
+
+def _balanced_json_span(text: str) -> Optional[str]:
+    """First ``{...}`` span from ``text`` (balanced, string-aware).
+
+    Unterminated objects (truncated LLM output) extend to EOF.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+    return text[start:]
+
+
+def extract_builder_plan_payload(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Recover a Builder plan payload from raw (possibly truncated) LLM output.
+
+    Handles leading prose (e.g. ``"Architecture Overview"``), ``<think>``
+    blocks, markdown fences, and JSON truncated near EOF. Returns a normalized
+    dict with ``display_text`` / ``clean_prompt`` (+ ``expert_prompt`` /
+    ``action_obj`` aliases), or ``None`` when no build prompt can be recovered.
+    """
+    if not raw_text or not raw_text.strip():
+        return None
+    text = _THINK_BLOCK_RE.sub("", raw_text).strip()
+
+    display_text = ""
+    clean_prompt = ""
+
+    # 1. Well-formed JSON object anywhere in the response.
+    span = _balanced_json_span(text)
+    data: Optional[Dict[str, Any]] = None
+    if span:
+        try:
+            parsed = json.loads(span)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:  # noqa: BLE001
+            data = None
+    if data is not None:
+        display_text = str(data.get("display_text") or "")
+        action = data.get("action")
+        if isinstance(action, dict):
+            clean_prompt = str(action.get("clean_prompt") or action.get("prompt") or "")
+        if not clean_prompt:
+            for key in ("clean_prompt", "build_prompt", "expert_prompt", "suggested_prompt"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    clean_prompt = value
+                    break
+        # A parsed reply with action=null is plain chat, not a build plan.
+        if not clean_prompt.strip():
+            return None
+    else:
+        # 2. Truncated JSON recovery: regex-extract string fields even without
+        #    closing quotes/braces (e.g. cut off mid ``clean_prompt``).
+        match = _DISPLAY_TEXT_RE.search(text)
+        if match:
+            display_text = _unescape_json_string(match.group(1))
+        match = _CLEAN_PROMPT_CLOSED_RE.search(text)
+        if not match:
+            match = _CLEAN_PROMPT_OPEN_RE.search(text)
+        if match:
+            clean_prompt = _unescape_json_string(match.group(1))
+
+    clean_prompt = sanitize_builder_prompt(clean_prompt).strip()
+    display_text = display_text.strip()
+    if not clean_prompt:
+        return None
+
+    return {
+        "status": "success",
+        "action": "SUGGEST_BUILD_PROMPT",
+        "display_text": display_text,
+        "expert_prompt": clean_prompt,
+        "clean_prompt": clean_prompt,
+        "action_obj": {"type": "build", "clean_prompt": clean_prompt},
+    }
+
+
 def extract_action(text: str) -> Dict[str, Any]:
     """Module-level helper that returns a full structured action packet."""
     return ActionParser().parse(text)

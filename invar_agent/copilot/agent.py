@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from invar_agent.config import Tier
 from invar_agent.copilot.action_parser import (
+    extract_builder_plan_payload,
 
     ActionParser,
     _has_build_intent,
@@ -133,6 +134,17 @@ def format_copilot_response(response: str) -> Tuple[str, Optional[Dict[str, Any]
         )
 
     return display_text.strip(), legacy_action
+
+
+_RAW_PLAN_KEY_RE = re.compile(r'"?(?:display_text|clean_prompt|build_prompt|expert_prompt)"\s*:')
+
+
+def _is_raw_json_prompt(action: Dict[str, Any]) -> bool:
+    """True when the parsed action's prompt is an unparsed plan JSON blob
+    (e.g. the plain-text fallback swallowed a truncated JSON response)."""
+    params = action.get("params") or {}
+    prompt = params.get("prompt", "") if isinstance(params, dict) else ""
+    return bool(_RAW_PLAN_KEY_RE.search(prompt or ""))
 
 
 def _looks_like_json(text: str) -> bool:
@@ -294,7 +306,9 @@ class CopilotAgent:
         messages.append({"role": "user", "content": message})
 
         try:
-            raw = client.generate(messages, temperature=0.2)
+            # Planner calls get a generous budget: detailed multi-section
+            # build prompts were observed truncated mid-JSON at 4096 tokens.
+            raw = client.generate(messages, temperature=0.2, max_tokens=8192)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Copilot LLM call failed: %s", exc)
             error = self._as_provider_error(exc, client)
@@ -312,10 +326,36 @@ class CopilotAgent:
 
         reply, action = format_copilot_response(raw)
         action = self._normalize_action(action)
+        # Resilient recovery: plan-mode output may be prose-wrapped or truncated
+        # before the closing JSON braces — recover the build prompt instead of
+        # dumping raw JSON into the chat bubble.
+        if action is None or _is_raw_json_prompt(action):
+            payload = extract_builder_plan_payload(raw)
+            if payload is not None:
+                reply = payload.get("display_text") or reply
+                action = self._normalize_action({
+                    "type": "SUGGEST_BUILD_PROMPT",
+                    "params": {"prompt": payload["clean_prompt"],
+                               "rationale": payload.get("display_text", ""),
+                               "explanation": payload.get("display_text", "")},
+                })
         research_action = self._maybe_research_action(message)
         if research_action is not None:
             action = research_action
-        return {"reply": reply or "I have no further comments.", "action": action, "llm_state": "ok"}
+        result: Dict[str, Any] = {
+            "reply": reply or "I have no further comments.",
+            "action": action, "llm_state": "ok"}
+        if action is not None and action.get("type") == "SUGGEST_BUILD_PROMPT":
+            # Unified Action Card schema shared with the frontend.
+            prompt = (action.get("params") or {}).get("prompt", "")
+            result.update({
+                "status": "success",
+                "display_text": (action.get("params") or {}).get("rationale", ""),
+                "clean_prompt": prompt,
+                "expert_prompt": prompt,
+                "action_obj": {"type": "build", "clean_prompt": prompt},
+            })
+        return result
 
     # -- research planning ------------------------------------------------------
 
@@ -347,7 +387,7 @@ class CopilotAgent:
                 return None
             from invar_agent.llm.deepseek import DeepSeekChatClient
             kwargs = {"thinking": False} if isinstance(client, DeepSeekChatClient) else {}
-            resp = client.complete(question, max_tokens=4096, temperature=0.2, **kwargs)
+            resp = client.complete(question, max_tokens=8192, temperature=0.2, **kwargs)
             return resp.content if resp else None
 
         def _run(coro):
@@ -414,6 +454,7 @@ class CopilotAgent:
                 "target": params.get("target"),
                 "acceleration": params.get("acceleration"),
                 "explanation": params.get("explanation", ""),
+                "rationale": params.get("rationale") or params.get("explanation", ""),
             },
         }
 

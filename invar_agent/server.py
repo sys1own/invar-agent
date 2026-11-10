@@ -844,7 +844,7 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         try:
             result = await generate_expert_research_prompt(
                 req.question,
-                llm_complete=lambda q: _plan_llm_callable(state, q, max_tokens=4096),
+                llm_complete=lambda q: _plan_llm_callable(state, q, max_tokens=8192),
                 extra_context=_research_vault_context(req.question, req.attached_research_ids))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

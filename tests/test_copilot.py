@@ -102,7 +102,8 @@ class _FakeChatClient:
         self.reply = reply
         self.messages_seen = []
 
-    def generate(self, messages, temperature=0.2):
+    def generate(self, messages, temperature=0.2, max_tokens=None, **_):
+        self.max_tokens_seen = max_tokens
         self.messages_seen.append(messages)
         return self.reply
 
