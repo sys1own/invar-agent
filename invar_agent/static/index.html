@@ -170,6 +170,10 @@
   .action-card .action-title { color:var(--green); font-weight:600; font-size:13px; }
   .action-card .action-toggle { margin-left:auto; color:var(--muted); font-size:11px; }
   .action-card .action-rationale { font-size:12.5px; color:#cbd5e1; margin:0 0 10px; line-height:1.5; }
+  .badge-archetype { background:#1e293b; color:#7dd3fc; border:1px solid #334155; font-family:monospace; font-size:11px; padding:2px 8px; border-radius:10px; margin-left:8px; }
+  .archetype-fallback-note { color:#94a3b8; font-size:11px; margin-left:8px; font-style:italic; }
+  .archetype-selector-strip { display:flex; align-items:center; gap:8px; margin:6px 0 2px; font-size:12px; color:#94a3b8; }
+  .archetype-selector-strip select { background:#0b0e14; color:#f1f5f9; border:1px solid #2b3545; border-radius:6px; padding:3px 8px; font-family:monospace; font-size:12px; }
   .suggested-prompt-box { width:100%; min-height:160px; max-height:320px; resize:vertical; background:#0b0e14; border:1px solid #2b3545; color:#f1f5f9; font-family:monospace; font-size:13px; line-height:1.5; padding:12px; border-radius:6px; box-sizing:border-box; margin:10px 0; }
   .suggested-prompt-box:focus { outline:none; border-color:#3b475d; }
   .action-card-actions { display:flex; gap:10px; margin-top:8px; }
@@ -719,38 +723,83 @@ function recoverBuildActionFromText(text) {
 }
 /* Recognize every valid Builder Action Card shape (legacy object, string
    action, nested action_obj, or top-level clean_prompt/expert_prompt fields). */
+/* Carry Plan-Mode archetype metadata from the chat payload into card params. */
+function withArchetypeMeta(params, d) {
+  const src = d || {};
+  if (src.archetype) params.archetype = src.archetype;
+  if (src.is_fallback !== undefined) params.is_fallback = src.is_fallback;
+  if (src.archetype_rationale) params.archetype_rationale = src.archetype_rationale;
+  if (Array.isArray(src.available_archetypes) && src.available_archetypes.length) {
+    params.available_archetypes = src.available_archetypes;
+  }
+  return params;
+}
 function extractBuildAction(data, action) {
   const d = data || {};
   const a = action !== undefined ? action : d.action;
   if (a && typeof a === 'object') {
-    if (a.type === 'SUGGEST_BUILD_PROMPT') return a;
+    if (a.type === 'SUGGEST_BUILD_PROMPT') {
+      const params = a.params || {};
+      withArchetypeMeta(params, d);
+      withArchetypeMeta(params, a);
+      return a;
+    }
     if (a.type === 'build' && (a.clean_prompt || a.prompt)) {
       return {type: 'SUGGEST_BUILD_PROMPT',
-              params: {prompt: a.clean_prompt || a.prompt,
-                       rationale: d.display_text || a.display_text || ''}};
+              params: withArchetypeMeta({prompt: a.clean_prompt || a.prompt,
+                       rationale: d.display_text || a.display_text || ''}, d)};
     }
   }
   if (a === 'SUGGEST_BUILD_PROMPT') {
     const prompt = d.clean_prompt || d.expert_prompt || d.build_prompt || '';
     if (prompt) return {type: 'SUGGEST_BUILD_PROMPT',
-                        params: {prompt: prompt, rationale: d.display_text || ''}};
+                        params: withArchetypeMeta({prompt: prompt, rationale: d.display_text || ''}, d)};
   }
   const objPrompt = d.action_obj && (d.action_obj.clean_prompt || d.action_obj.prompt);
   const topPrompt = d.clean_prompt || d.expert_prompt || d.build_prompt || objPrompt || '';
   if (topPrompt && String(topPrompt).trim()) {
     return {type: 'SUGGEST_BUILD_PROMPT',
-            params: {prompt: String(topPrompt), rationale: d.display_text || ''}};
+            params: withArchetypeMeta({prompt: String(topPrompt), rationale: d.display_text || ''}, d)};
   }
   return null;
 }
+/* Update or prepend the [TARGET_ARCHETYPE: <NAME>] header tag in a build prompt. */
+function updatePromptArchetypeTag(newArchetype) {
+  const sel = document.getElementById('archetype-select');
+  const card = sel && sel.closest('.action-card');
+  const ta = card && card.querySelector('textarea.suggested-prompt-box');
+  if (!ta) return;
+  const tag = '[TARGET_ARCHETYPE: ' + newArchetype + ']';
+  const tagRe = /^\s*\[(?:TARGET_)?ARCHETYPE:\s*[A-Z_]+\]\s*\n?/;
+  let body = ta.value.replace(tagRe, '');
+  ta.value = tag + '\n\n' + body.replace(/^\n+/, '');
+  ta.dispatchEvent(new Event('input', {bubbles: true}));
+}
+const BUILDER_ARCHETYPES = [
+  'SCIENTIFIC_SDK_LIBRARY', 'CLI_SIMULATOR_SWEEP', 'MULTI_SOLVER_BENCHMARK',
+  'INVERSE_DESIGN_OPTIMIZER', 'STANDALONE_NATIVE_CRATE',
+  'INTERACTIVE_WEB_SIMULATOR', 'TELEMETRY_DIGITAL_TWIN'];
 function addActionCard(action) {
   const params = action.params || {};
   const rationaleHtml = params.rationale ? `<div class="action-rationale">${renderMarkdown(params.rationale)}</div>` : '';
+  const archetypes = (Array.isArray(params.available_archetypes) && params.available_archetypes.length)
+    ? params.available_archetypes : BUILDER_ARCHETYPES;
+  const archetype = params.archetype || 'SCIENTIFIC_SDK_LIBRARY';
+  const fallbackNote = params.is_fallback
+    ? `<span class="archetype-fallback-note">(Default Fallback Applied)</span>` : '';
+  const options = archetypes.map(a =>
+    `<option value="${escapeHtml(a)}"${a === archetype ? ' selected' : ''}>${escapeHtml(a)}</option>`).join('');
   const card = el(`<div class="action-card">
     <div class="action-card-header">
       <span class="action-title">⚙ Suggested Build Prompt</span>
+      <span class="badge badge-archetype">${escapeHtml(archetype)}</span>
+      ${fallbackNote}
     </div>
     ${rationaleHtml}
+    <div class="archetype-selector-strip">
+      <label for="archetype-select">Target Build Mode:</label>
+      <select id="archetype-select" onchange="updatePromptArchetypeTag(this.value)">${options}</select>
+    </div>
     <textarea class="suggested-prompt-box mono"></textarea>
     <div class="action-card-actions"><button class="btn-approve build">⚡ Send to Builder &amp; Run</button><button class="ghost dismiss">✕ Dismiss</button></div>
   </div>`);
