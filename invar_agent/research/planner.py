@@ -68,6 +68,14 @@ read them, e.g. slot 2 = current energy, slot 3 = initial energy (set once when
 buf.data[3] == 0.0), slot 4 = max |E - E0| / E0 so far.
 Invariants must be falsifiable and physically meaningful; never write vacuous
 invariants (like x == x) and never loosen tolerances to force a pass.
+CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper
+intervals (e.g. `15.0 <= state[7] <= 70.0`) before the ODE is integrated. Only
+write invariants for: (a) explicit bounds stated by the user (e.g.
+`state[3] < 40.0`), (b) physical positivity and finiteness (`state[i] >= 0.0`,
+`math.isfinite(state[i])`), (c) monotonic conservation laws
+(`state[1] <= initial_state[1]`), or (d) exact analytical identities within a
+generous relative tolerance (>= 15% for exponential atmosphere entry
+approximations).
 
 ## Domain observables & variable_map (MANDATORY for quantitative problems)
 - The blueprint MUST include `variable_map`: {"<metric_name_with_units>": <buf.data index>, ...}
@@ -262,6 +270,14 @@ reformulation.
    invariant must be a physically meaningful bound the simulation can violate
    (e.g. peak acceleration <= 50 g, heat flux >= 0, total heat load finite,
    energy monotonicity) with explicit tolerance values — never vacuous.
+   CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper
+   intervals (e.g. `15.0 <= state[7] <= 70.0`) before the ODE is integrated.
+   Only write invariants for: (a) explicit bounds stated by the user (e.g.
+   `state[3] < 40.0`), (b) physical positivity and finiteness
+   (`state[i] >= 0.0`, `math.isfinite(state[i])`), (c) monotonic conservation
+   laws (`state[1] <= initial_state[1]`), or (d) exact analytical identities
+   within a generous relative tolerance (>= 15% for exponential atmosphere
+   entry approximations).
 4. **Backend recommendation**: prefer "cpp" (C-ABI) for ODE/PDE time stepping
    and array workloads; use "rust_hin" for scalar recurrences/algebraic checks;
    "multi_variant" only for genuine algorithm comparisons.

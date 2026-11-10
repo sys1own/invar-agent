@@ -193,10 +193,10 @@ async def test_stage2_exception_preserves_partial_vault(tmp_path):
 
     original = machine._sandbox_execute
 
-    async def boom(bp, uast, cpp_code, contracts, pinned_layers, stage, tag):
+    async def boom(bp, uast, cpp_code, py_code, contracts, pinned_layers, stage, tag):
         if stage == 2:
             raise TimeoutError("sandbox stage 2 timed out")
-        return await original(bp, uast, cpp_code, contracts, pinned_layers,
+        return await original(bp, uast, cpp_code, py_code, contracts, pinned_layers,
                               stage, tag)
 
     machine._sandbox_execute = boom

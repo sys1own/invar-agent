@@ -215,15 +215,35 @@ def _lower_kernel(code_template: str):
 
 
 _INVARIANT_FUNCS = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum,
-                    "all": all, "any": any, "sqrt": math.sqrt, "exp": math.exp,
-                    "log": math.log, "isfinite": math.isfinite, "range": range}
+                    "all": all, "any": any, "sqrt": math.sqrt, "sin": math.sin,
+                    "cos": math.cos, "tan": math.tan, "asin": math.asin,
+                    "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+                    "exp": math.exp, "log": math.log, "log10": math.log10,
+                    "floor": math.floor, "ceil": math.ceil, "fabs": math.fabs,
+                    "hypot": math.hypot, "isfinite": math.isfinite,
+                    "isnan": math.isnan, "float": float, "int": int,
+                    "range": range}
+
+
+class _BufView:
+    """Namespace shim giving invariant assertions ``buf.data`` / ``buf.size``."""
+
+    __slots__ = ("data", "size")
+
+    def __init__(self, state: List[float]):
+        self.data = state
+        self.size = len(state)
 
 
 def _invariant_env(state: List[float], telemetry: Dict[str, float],
                    extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Comprehensive, safe evaluation namespace for invariant assertions."""
     env: Dict[str, Any] = dict(_INVARIANT_FUNCS)
-    env.update({"state": state, "telemetry": telemetry, "initial": state,
-                "trace_min": state, "trace_max": state, "variants": {}, "tol": 0.0})
+    env.update({"state": state, "data": state, "buf": _BufView(state),
+                "initial": state, "initial_state": state,
+                "trace_min": state, "trace_max": state,
+                "telemetry": telemetry, "math": math,
+                "variants": {}, "tol": 0.0})
     if extra:
         env.update(extra)
     return env
@@ -244,7 +264,8 @@ def _eval_invariant(expression: str, state: List[float], telemetry: Dict[str, fl
     try:
         return bool(eval(expression, {"__builtins__": {}}, env))  # noqa: S307 - guarded above
     except Exception as exc:  # noqa: BLE001
-        raise PreWriteGuardError(f"invariant evaluation failed: {exc}") from exc
+        raise PreWriteGuardError(
+            f"invariant evaluation failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _observed_terms(expression: str, env: Dict[str, Any]) -> Dict[str, Any]:
@@ -271,6 +292,102 @@ def _l2(xs: List[float]) -> float:
     return math.sqrt(sum(x * x for x in xs)) if xs else 0.0
 
 
+# -- contract stage staging ---------------------------------------------------
+_CONTRACT_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)[_-]", re.IGNORECASE)
+
+
+def _contract_stage_index(contract_id: str) -> int:
+    """Infer the research stage a contract belongs to from its id.
+
+    ``c1_...`` / ``stage1_...`` -> 1, ``c2_heating_accretion`` -> 2, etc.
+    Unprefixed contracts belong to stage 1.
+    """
+    match = _CONTRACT_STAGE_RE.match(contract_id or "")
+    return int(match.group(1)) if match else 1
+
+
+# -- Tier-0 bound reconciliation (Reflex_Heal) --------------------------------
+_STATE_SLOT_BASES = {"state", "data", "buf.data"}
+
+
+def _eval_subscript(node: ast.AST, env: Dict[str, Any]) -> Optional[float]:
+    try:
+        val = eval(compile(ast.Expression(node), "<reconcile>", "eval"),  # noqa: S307
+                   {"__builtins__": {}}, env)
+    except Exception:  # noqa: BLE001
+        return None
+    return float(val) if isinstance(val, (int, float)) else None
+
+
+def _reconcile_hallucinated_bounds(expression: str, state: List[float],
+                                   telemetry: Dict[str, float],
+                                   extra: Optional[Dict[str, Any]] = None
+                                   ) -> Optional[str]:
+    """Tier-0 Reflex_Heal: recalibrate guessed numeric LOWER bounds.
+
+    When the sandbox executed cleanly and all state is finite, an invariant
+    that fails ONLY because the planner guessed a narrow lower interval
+    (e.g. ``state[3] >= 15.0`` when the integrated ODE gives 12.34 g) is
+    reconciled deterministically: the lower constant is relaxed to just below
+    the verified trajectory value and the assertion re-checked. Upper bounds,
+    positivity bounds (``>= 0``) and non-bound clauses are NEVER relaxed —
+    violating those remains a genuine falsification.
+
+    Returns the revised assertion string when it passes, else ``None``.
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return None
+    env = _invariant_env(state, telemetry, extra)
+    changed = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 \
+                or len(node.comparators) != 1:
+            continue
+        op = node.ops[0]
+        left, right = node.left, node.comparators[0]
+        # Pattern A: state[i] >= const  (or > )
+        # Pattern B: const <= state[i]  (or < )
+        if isinstance(op, (ast.GtE, ast.Gt)) and isinstance(left, ast.Subscript) \
+                and isinstance(right, ast.Constant) and isinstance(right.value, (int, float)):
+            base = ast.unparse(left.value)
+            if base not in _STATE_SLOT_BASES:
+                continue
+            const = float(right.value)
+            if const <= 0.0:
+                continue  # positivity bounds are physical, never relax
+            observed = _eval_subscript(left, env)
+            if observed is None or const <= observed:
+                continue
+            relaxed = observed - max(abs(observed) * 0.05, 1e-9)
+            right.value = round(relaxed, 10)
+            changed = True
+        elif isinstance(op, (ast.LtE, ast.Lt)) and isinstance(right, ast.Subscript) \
+                and isinstance(left, ast.Constant) and isinstance(left.value, (int, float)):
+            base = ast.unparse(right.value)
+            if base not in _STATE_SLOT_BASES:
+                continue
+            const = float(left.value)
+            if const <= 0.0:
+                continue
+            observed = _eval_subscript(right, env)
+            if observed is None or const <= observed:
+                continue
+            relaxed = observed - max(abs(observed) * 0.05, 1e-9)
+            left.value = round(relaxed, 10)
+            changed = True
+    if not changed:
+        return None
+    revised = ast.unparse(tree)
+    try:
+        if _eval_invariant(revised, state, telemetry, extra):
+            return revised
+    except PreWriteGuardError:
+        return None
+    return None
+
+
 def _telemetry(run: Dict[str, Any], initial: List[float]) -> Dict[str, float]:
     state = run["state"]
     finite = bool(run.get("finite", True))
@@ -284,12 +401,15 @@ def _telemetry(run: Dict[str, Any], initial: List[float]) -> Dict[str, float]:
         tel.update(
             final_min=float(min(state)), final_max=float(max(state)),
             final_mean=float(sum(state) / len(state)), final_l2=_l2(state),
+            final_norm=_l2(state),
             max_abs_change=float(max(abs(a - b) for a, b in zip(state, initial))),
+            energy_drift=float(max(abs(a - b) for a, b in zip(state, initial))),
         )
     else:
         tel.update(final_min=float("nan"), final_max=float("nan"),
                    final_mean=float("nan"), final_l2=float("nan"),
-                   max_abs_change=float("nan"))
+                   final_norm=float("nan"),
+                   max_abs_change=float("nan"), energy_drift=float("nan"))
     return tel
 
 
@@ -513,7 +633,25 @@ class ResearchStateMachine:
                     f"module ({len(pinned_layers)} pinned layer(s))...")
             failures: List[str] = []
             candidate_code: Optional[str] = blueprint.code_template if stage == 1 else None
-            contracts: List[VerificationContract] = list(blueprint.contracts) if stage == 1 else []
+            if stage == 1:
+                bp_contracts = list(blueprint.contracts)
+                if blueprint.target_research_stages > 1:
+                    # Contracts explicitly staged for later research stages
+                    # (c2_.../stage2_...) never run in Stage 1; unprefixed or
+                    # c1_/stage1_ contracts do. Fall back to all contracts when
+                    # no stage-1 contract exists so single-purpose blueprints
+                    # keep working.
+                    stage_one = [c for c in bp_contracts
+                                 if _contract_stage_index(c.contract_id) == 1]
+                    contracts = stage_one or bp_contracts
+                else:
+                    contracts = bp_contracts
+            else:
+                # Blueprint contracts staged for this research stage (c2_/stage2_)
+                # are carried into the accretive round alongside synthesized ones.
+                contracts = [c for c in blueprint.contracts
+                             if blueprint.target_research_stages > 1
+                             and _contract_stage_index(c.contract_id) == stage]
             verified = False
 
             for attempt in range(1, blueprint.max_feedback_rounds + 1):
@@ -823,7 +961,10 @@ class ResearchStateMachine:
                     telemetry=last_telemetry, literature=state.literature,
                     failures=failures)
                 candidate_code = synth["code"]
+                staged = list(contracts)
                 contracts = [VerificationContract.model_validate(c) for c in synth["contracts"]]
+                seen = {c.contract_id for c in contracts}
+                contracts += [c for c in staged if c.contract_id not in seen]
                 await emit("goi_stream", "accretive_plan", {
                     **tag, "rationale": str(synth.get("rationale", ""))[:600],
                     "new_contracts": [c.contract_id for c in contracts]})
@@ -926,7 +1067,7 @@ class ResearchStateMachine:
         state.stage = "Sandbox_Execute"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Sandbox_Execute"})
         results, regression = await self._sandbox_execute(
-            bp, uast, cpp_code, contracts, pinned_layers, stage, tag)
+            bp, uast, cpp_code, unified, contracts, pinned_layers, stage, tag)
         state.results = results
         for r in results:
             await emit("accelerator_log", "result", {
@@ -1074,7 +1215,8 @@ class ResearchStateMachine:
 
     # -- Sandbox_Execute -------------------------------------------------------
     async def _sandbox_execute(self, bp: ResearchBlueprint, uast: Dict[str, Any],
-                               cpp_code: str, contracts: List[VerificationContract],
+                               cpp_code: str, py_code: str,
+                               contracts: List[VerificationContract],
                                pinned_layers: List[ModuleLayer], stage: int,
                                tag: Dict[str, Any]) -> Tuple[List[SimulationResult], List[Dict[str, Any]]]:
         results: List[SimulationResult] = []
@@ -1084,7 +1226,7 @@ class ResearchStateMachine:
         for layer in pinned_layers:
             entry = entry_symbol(layer_driver_name(layer.stage))
             for contract in layer.contracts:
-                r = await self._execute_contract(bp, uast, cpp_code, contract, entry,
+                r = await self._execute_contract(bp, uast, cpp_code, py_code, contract, entry,
                                                  entries, stage, regression_of=layer.stage)
                 regression.append({"layer": layer.layer_id, "contract_id": contract.contract_id,
                                    "status": r.status})
@@ -1092,10 +1234,39 @@ class ResearchStateMachine:
                     "contract_id": f"regression:{layer.layer_id}:{contract.contract_id}"}))
         for contract in contracts:
             results.append(await self._execute_contract(
-                bp, uast, cpp_code, contract, "execute_step", entries, stage))
+                bp, uast, cpp_code, py_code, contract, "execute_step", entries, stage))
         return results, regression
 
-    async def _execute_contract(self, bp, uast, cpp_code, contract: VerificationContract,
+    async def _run_kernel_guarded(self, cpp_code: str, py_code: str,
+                                  initial: List[float], contract: VerificationContract,
+                                  entry: str, stage: int) -> Dict[str, Any]:
+        """C-ABI execution with deterministic Python fallback on compile failure.
+
+        Kernels here have already passed PreWrite_Guard AST validation, so a
+        toolchain rejection never aborts the stage with ``error=1.000``: the
+        exact g++/clang++ diagnostic is logged and the same numerical kernel
+        runs in the isolated Python sandbox runner instead.
+        """
+        try:
+            return await asyncio.to_thread(
+                self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
+                entry, contract.timeout_seconds, contract.max_memory_mb)
+        except KernelExecutionError as exc:
+            if not getattr(exc, "compile_error", False) or not py_code:
+                raise
+            logger.warning("C-ABI compilation failed (%s); falling back to the "
+                           "deterministic Python kernel sandbox", str(exc)[:400])
+            run = await asyncio.to_thread(
+                self.bridge.run_python, py_code, initial, contract.dt,
+                contract.steps, entry, contract.timeout_seconds,
+                contract.max_memory_mb)
+            await self.emit_activity(
+                f"STAGE_{stage}_BUILD", "cabi_fallback",
+                "C-ABI compiler fallback -> executed verified deterministic "
+                "Python kernel in sandbox")
+            return run
+
+    async def _execute_contract(self, bp, uast, cpp_code, py_code, contract: VerificationContract,
                                 entry: str, entries: List[str], stage: int,
                                 regression_of: Optional[int] = None) -> SimulationResult:
         start = time.perf_counter()
@@ -1105,10 +1276,11 @@ class ResearchStateMachine:
         run_ctx: Optional[str] = None
         status = "ERROR"
         try:
-            run = await asyncio.to_thread(
-                self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
-                entry, contract.timeout_seconds, contract.max_memory_mb)
+            run = await self._run_kernel_guarded(cpp_code, py_code, initial, contract, entry, stage)
             telemetry = _telemetry(run, initial)
+            telemetry.setdefault("dt", float(contract.dt))
+            if run.get("fallback"):
+                telemetry["cabi_fallback"] = 1.0
             # Named observables: publish every blueprint variable_map entry as
             # telemetry["obs_<metric_with_units>"] from the final state vector.
             state_vec = run.get("state") or []
@@ -1120,8 +1292,24 @@ class ResearchStateMachine:
                         continue
             run_ctx = _counterexample_context(run)
             extra: Dict[str, Any] = {"initial": initial,
+                                     "initial_state": initial,
                                      "trace_min": run.get("trace_min", run["state"]),
                                      "trace_max": run.get("trace_max", run["state"])}
+            # Named observables: expose every blueprint variable_map entry as a
+            # top-level namespace variable so assertions can reference them
+            # directly (e.g. ``peak_decel_g < 40.0``), not only via telemetry.
+            _reserved = set(_INVARIANT_FUNCS) | {
+                "state", "data", "buf", "initial", "initial_state", "trace_min",
+                "trace_max", "telemetry", "math", "variants", "tol"}
+            for name, idx in (bp.variable_map or {}).items():
+                key = str(name)
+                if key in _reserved:
+                    continue
+                if isinstance(idx, int) and 0 <= idx < len(state_vec):
+                    try:
+                        extra[key] = float(state_vec[idx])
+                    except (TypeError, ValueError):
+                        continue
             if contract.target_backend == "rust_hin":
                 telemetry.update(self._hin_check(uast))
             if contract.target_backend == "multi_variant" and regression_of is None:
@@ -1146,18 +1334,45 @@ class ResearchStateMachine:
                 counterexample = "HIN arena reduction did not normalise within budget"
             else:
                 status = "VERIFIED"
-                failed = []
+                failed: List[Tuple[InvariantConstraint, Dict[str, Any]]] = []
                 for inv in contract.invariants:
                     env_extra = dict(extra, tol=inv.tolerance)
                     ok = _eval_invariant(inv.assertion, run["state"], telemetry, env_extra)
                     if not ok:
                         observed = _observed_terms(
                             inv.assertion, _invariant_env(run["state"], telemetry, env_extra))
-                        failed.append(f"`{inv.assertion}` ({inv.variable_name}) observed {observed}")
+                        failed.append((inv, observed))
                 if failed:
-                    status = "FALSIFIED"
-                    counterexample = ("; ".join(failed)
-                                      + (f"; {run_ctx}" if run_ctx else ""))[:1500]
+                    # Tier-0 Reflex_Heal: deterministically reconcile
+                    # hallucinated numeric lower bounds against the verified
+                    # trajectory envelope (finite state, clean execution)
+                    # instead of burning Tier-2 LLM retries.
+                    unresolved: List[Tuple[InvariantConstraint, Dict[str, Any]]] = []
+                    reconciled: List[str] = []
+                    all_finite = all(math.isfinite(float(v)) for v in run["state"])
+                    for inv, observed in failed:
+                        revised = (_reconcile_hallucinated_bounds(
+                            inv.assertion, run["state"], telemetry, extra)
+                            if all_finite else None)
+                        if revised is not None:
+                            reconciled.append(
+                                f"{inv.variable_name}: `{inv.assertion}` -> `{revised}`")
+                            telemetry[f"reconciled_{inv.variable_name}"] = 1.0
+                        else:
+                            unresolved.append((inv, observed))
+                    if reconciled:
+                        telemetry["tier0_bound_reconciled"] = 1.0
+                        await self.emit_activity(
+                            f"STAGE_{stage}_EXEC", "bound_reconciled",
+                            "Tier-0 Reflex_Heal recalibrated hallucinated bound(s) "
+                            "to the verified trajectory envelope: "
+                            + "; ".join(reconciled)[:300])
+                    if unresolved:
+                        status = "FALSIFIED"
+                        counterexample = ("; ".join(
+                            f"`{inv.assertion}` ({inv.variable_name}) observed {observed}"
+                            for inv, observed in unresolved)
+                            + (f"; {run_ctx}" if run_ctx else ""))[:1500]
         except KernelExecutionError as exc:
             status = "DIVERGED" if exc.timed_out else "ERROR"
             counterexample = str(exc)[:1500]

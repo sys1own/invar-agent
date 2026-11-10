@@ -44,10 +44,13 @@ class KernelExecutionError(RuntimeError):
     """Raised when a kernel fails, diverges, times out or exceeds memory."""
 
     def __init__(self, message: str, *, timed_out: bool = False,
-                 returncode: Optional[int] = None):
+                 returncode: Optional[int] = None, compile_error: bool = False):
         super().__init__(message)
         self.timed_out = timed_out
         self.returncode = returncode
+        # True when the C++ toolchain rejected the kernel. Kernels that already
+        # passed PreWrite_Guard may fall back to the deterministic Python runner.
+        self.compile_error = compile_error
 
 
 _RUNNER_SOURCE = r'''
@@ -92,6 +95,68 @@ print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
 '''
 
 
+# -- deterministic Python kernel fallback -------------------------------------
+# Used when the C++ toolchain rejects a kernel that already passed PreWrite_Guard
+# AST validation: the same numerical physics runs in an isolated Python
+# subprocess instead of burning Tier-2 LLM retries on a compiler diagnostic.
+_PY_RUNNER_SOURCE = r'''
+import json, math, sys, time
+
+py_path, entry, initial_json, dt, steps = (
+    sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), int(sys.argv[5]))
+
+
+class SimulationBuffer:
+    """Lightweight buf wrapper exposing .data/.size/.dt/.steps to kernels."""
+
+    def __init__(self, data, dt):
+        self.data = list(data)
+        self.size = len(self.data)
+        self.dt = dt
+        self.steps = 0
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __setitem__(self, index, value):
+        self.data[index] = value
+
+
+src = open(py_path, encoding="utf-8").read()
+namespace = {"__name__": "invar_kernel_fallback"}
+exec(compile(src, py_path, "exec"), namespace)  # noqa: S102 - guard-passed kernel
+fn = namespace.get(entry)
+if fn is None:
+    raise SystemExit(f"entry function {entry!r} not found in module")
+
+initial = [float(v) for v in json.loads(initial_json)]
+buf = SimulationBuffer(initial, dt)
+trace_min = list(initial)
+trace_max = list(initial)
+first_nonfinite = -1
+start = time.perf_counter()
+for step in range(steps):
+    fn(buf, dt)
+    for i in range(buf.size):
+        v = buf.data[i]
+        if v < trace_min[i]:
+            trace_min[i] = v
+        if v > trace_max[i]:
+            trace_max[i] = v
+        if first_nonfinite < 0 and not math.isfinite(v):
+            first_nonfinite = step
+    if first_nonfinite >= 0:
+        break
+run_ms = (time.perf_counter() - start) * 1000.0
+state = [float(v) for v in buf.data]
+finite = all(math.isfinite(v) for v in state)
+print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
+                  "trace_min": trace_min, "trace_max": trace_max,
+                  "first_nonfinite_step": first_nonfinite,
+                  "execution_time_ms": run_ms}))
+'''
+
+
 class DynamicCABIBridge:
     """Compiles C++ source to a shared library and drives entry points."""
 
@@ -129,7 +194,7 @@ class DynamicCABIBridge:
             cpp_path.unlink(missing_ok=True)
             raise KernelExecutionError(
                 f"C-ABI compilation failed ({self.compiler}):\n"
-                f"{proc.stderr.strip()[:2000]}")
+                f"{proc.stderr.strip()[:2000]}", compile_error=True)
         self._cache[key] = so_path
         return so_path
 
@@ -278,6 +343,93 @@ class DynamicCABIBridge:
             "execution_time_ms": run_ms,
             "run_ms": wall_ms,
             "compile_ms": compile_ms,
+            "bundle_hash": key,
+        }
+
+    # -- deterministic Python fallback (Sandbox_Execute) ----------------------
+    @staticmethod
+    def python_entry_name(entry: str) -> str:
+        """Map a C-ABI entry symbol back to the module-level Python function."""
+        if entry == "execute_step":
+            return "simulation_step"
+        if entry.startswith("execute_"):
+            return entry[len("execute_"):]
+        return entry
+
+    def run_python(self, python_code: str, initial_state: List[float], dt: float,
+                   steps: int, entry: str = "execute_step",
+                   timeout_seconds: float = 30.0,
+                   max_memory_mb: int = 1024) -> Dict[str, object]:
+        """Execute the guard-passed Python kernel in an isolated subprocess.
+
+        Deterministic fallback for C-ABI compilation failures: runs
+        ``simulation_step(buf, dt)`` (or the mapped entry function) for exactly
+        ``steps`` iterations against a :class:`SimulationBuffer` wrapper and
+        returns the same result shape as :meth:`run`.
+        """
+        start = time.perf_counter()
+        func_name = self.python_entry_name(entry)
+        key = hashlib.blake2b(python_code.encode(), digest_size=16).hexdigest()
+        run_dir = Path(tempfile.mkdtemp(prefix="invar-pykernel-"))
+        try:
+            kernel_path = run_dir / "kernel.py"
+            kernel_path.write_text(python_code)
+            runner = run_dir / "runner.py"
+            runner.write_text(_PY_RUNNER_SOURCE)
+            cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
+            mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
+
+            def _limits() -> None:
+                if resource is not None:
+                    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+
+            preexec = _limits if (sys.platform != "win32" and resource is not None) else None
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(runner), str(kernel_path), func_name,
+                     json.dumps([float(v) for v in initial_state]),
+                     str(float(dt)), str(int(steps))],
+                    capture_output=True, text=True, timeout=timeout_seconds + 10,
+                    preexec_fn=preexec, cwd=str(run_dir))
+            except subprocess.TimeoutExpired as exc:
+                raise KernelExecutionError(
+                    f"python kernel fallback timed out after {timeout_seconds:.1f}s",
+                    timed_out=True) from exc
+            wall_ms = (time.perf_counter() - start) * 1000.0
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip()[-1500:]
+            lowered = tail.lower()
+            if "memoryerror" in lowered or "cannot allocate" in lowered:
+                raise KernelExecutionError(
+                    f"python kernel fallback exceeded memory budget "
+                    f"({max_memory_mb} MB):\n{tail}")
+            raise KernelExecutionError(
+                f"python kernel fallback failed (rc={proc.returncode}):\n{tail}",
+                returncode=proc.returncode)
+        try:
+            payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError) as exc:
+            raise KernelExecutionError(
+                f"python kernel fallback produced no valid result: "
+                f"{(proc.stdout or '')[-500:]}") from exc
+        state = [float(v) for v in payload["state"]]
+        finite = bool(payload.get("finite", True)) and all(
+            math.isfinite(v) for v in state)
+        run_ms = float(payload.get("execution_time_ms", 0.0))
+        return {
+            "state": state,
+            "steps": int(payload.get("steps", steps)),
+            "finite": finite,
+            "trace_min": [float(v) for v in payload.get("trace_min", state)],
+            "trace_max": [float(v) for v in payload.get("trace_max", state)],
+            "first_nonfinite_step": int(payload.get("first_nonfinite_step", -1)),
+            "execution_time_ms": run_ms,
+            "run_ms": wall_ms,
+            "compile_ms": 0.0,
+            "fallback": "python",
             "bundle_hash": key,
         }
 

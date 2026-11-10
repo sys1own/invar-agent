@@ -109,6 +109,9 @@ class CppEmitter:
         self.returns: Dict[str, str] = {}
         self.globals: Dict[str, str] = {}
         self.types: Dict[str, str] = {}
+        # Simple names bound to ``buf.data`` (e.g. ``state = buf.data``) are
+        # pointer aliases, never scalar locals.
+        self._aliases: Dict[str, str] = {}
 
     # -- type inference --------------------------------------------------
     def _type_of(self, node: Optional[Dict[str, Any]]) -> str:
@@ -173,10 +176,19 @@ class CppEmitter:
             return INT if a == INT and b == INT else FLOAT
         return FLOAT
 
+    def _is_buf_data_ref(self, node: Optional[Dict[str, Any]]) -> bool:
+        """True for ``buf.data`` / ``buf->data``-style value references."""
+        if isinstance(node, dict) and node.get("type") == "reference":
+            return node.get("name") == "buf.data"
+        if isinstance(node, dict) and node.get("type") == "attribute":
+            return _ref_name(node.get("value")) == "buf" and node.get("attr") == "data"
+        return False
+
     def _collect_locals(self, fn: Dict[str, Any]) -> Dict[str, str]:
         """Fixed-point type inference over every local bound in the function."""
         params = fn.get("params") or []
         self.types = {p: (BUF if p == "buf" else FLOAT) for p in params}
+        self._aliases = {}
         loop_vars: Set[str] = set()
         assigns: List[tuple] = []
 
@@ -186,7 +198,10 @@ class CppEmitter:
                     continue
                 t = s.get("type")
                 if t == "binding" and isinstance(s.get("name"), str) and s.get("target") is None:
-                    assigns.append((s["name"], s.get("value")))
+                    if self._is_buf_data_ref(s.get("value")):
+                        self._aliases[s["name"]] = "buf->data"
+                    else:
+                        assigns.append((s["name"], s.get("value")))
                 elif t == "multi_binding":
                     for n, v in zip(s.get("names") or [], s.get("values") or []):
                         assigns.append((n, v))
@@ -241,6 +256,8 @@ class CppEmitter:
             return render_literal(v, "cpp")
         if t == "reference":
             name = str(node.get("name", ""))
+            if name in self._aliases:
+                return self._aliases[name]
             if name.startswith("buf."):
                 attr = name.split(".", 1)[1]
                 if attr not in ("data", "size", "dt", "steps"):
@@ -284,7 +301,12 @@ class CppEmitter:
         if t == "subscript":
             value = node.get("value")
             slice_node = node.get("slice")
-            base = self.emit_expr(value)
+            # ``buf[i]`` is shorthand for ``buf.data[i]`` inside kernels.
+            if isinstance(value, dict) and value.get("type") == "reference" \
+                    and value.get("name") == "buf":
+                base = "buf->data"
+            else:
+                base = self.emit_expr(value)
             # Python negative indexing (x[-k] == x[size - k]) is UB in C++;
             # lower it to a bounds-safe size-relative calculation.
             if (isinstance(slice_node, dict) and slice_node.get("type") == "unaryop"
@@ -376,6 +398,13 @@ class CppEmitter:
             return f"static_cast<long>({self.emit_expr(args[0])})"
         if name == "float" and len(args) == 1:
             return self._num(args[0])
+        if name in ("math.radians", "math.degrees"):
+            if len(args) != 1:
+                raise EmitterError(f"{name}() expects 1 argument")
+            x = self._num(args[0])
+            if name == "math.radians":
+                return f"(({x}) * 3.14159265358979323846 / 180.0)"
+            return f"(({x}) * 180.0 / 3.14159265358979323846)"
         if name.startswith("math."):
             fn = name.split(".", 1)[1]
             if fn not in _MATH_FUNCS:
@@ -412,6 +441,10 @@ class CppEmitter:
             name = node.get("name")
             if not isinstance(name, str):
                 raise EmitterError("unsupported binding target")
+            if name in self._aliases:
+                # ``state = buf.data`` is a no-op: the alias is bound at the
+                # top of the function and always points at the live buffer.
+                return ""
             ty = self.types.get(name, FLOAT)
             if ty in (VEC, VEC2, INT, BOOL):
                 rendered = self.emit_expr(value)
@@ -537,6 +570,11 @@ class CppEmitter:
                    VEC2: "std::vector<std::vector<double>>"}.get(ty, "double")
             init = "{}" if ty in (VEC, VEC2) else ("0" if ty == INT else "0.0")
             lines.append(f"    {cty} {local} = {init}; (void){local};")
+        # ``state[i]`` alias: kernels may index the trajectory through a bare
+        # ``state`` name (``state = buf.data`` or direct use). Bind it to the
+        # live buffer unless the function declares its own scalar ``state``.
+        if "buf" in params and "state" not in local_types and "state" not in params:
+            lines.append("    double* state = buf->data; (void)state;")
         body = self._emit_body(fn.get("body"), 1)
         lines.append(body.rstrip("\n") if body.strip() else "")
         if ret != "void" and not any(
