@@ -551,6 +551,7 @@ _BLUEPRINT_FIELDS = {
     "contracts", "code_template", "max_feedback_rounds", "verified_layers",
     "target_research_stages", "stage_objectives", "current_stage",
     "evolution_history", "unified_module_code", "feasibility", "variable_map",
+    "structured_evidence", "extracted_constants",
 }
 _CONTRACT_FIELDS = {
     "contract_id", "target_backend", "timeout_seconds", "invariants",
@@ -761,24 +762,30 @@ async def generate_research_plan(question: str,
     KdV stub is restricted to explicit offline (no-key) unit-test mode.
     """
     error: Optional[str] = None
+    evidence = _compute_structured_evidence(question, literature)
     if llm_complete is not None:
         try:
             prompt = _fill(PLANNER_PROMPT, tools=TOOLS_CONTEXT,
                            feasibility=_feasibility_context(feasibility),
                            literature=format_literature(literature or []),
                            question=question)
+            prompt += _evidence_prompt_block(evidence)
             if extra_context:
                 prompt += "\n\n" + extra_context
             raw = await llm_complete(prompt)
             data = _extract_json(str(raw))
             if isinstance(data, dict):
                 bp = parse_blueprint(data)
-                return {"blueprint": bp.model_dump(), "source": "llm"}
+                return {"blueprint": _attach_evidence(bp.model_dump(), evidence),
+                        "source": "llm", "structured_evidence": evidence.model_dump() if evidence else None}
             error = "planner returned no JSON object"
         except Exception as exc:  # noqa: BLE001 - fall through to fallback
             error = f"{type(exc).__name__}: {str(exc)[:300]}"
     if fallback:
-        out: Dict[str, Any] = {"blueprint": _FALLBACK_BLUEPRINT, "source": "fallback"}
+        out: Dict[str, Any] = {"blueprint": _attach_evidence(dict(_FALLBACK_BLUEPRINT), evidence),
+                               "source": "fallback"}
+        if evidence is not None:
+            out["structured_evidence"] = evidence.model_dump()
         if error:
             out["planner_error"] = error
         return out
@@ -847,6 +854,8 @@ async def generate_plan_with_feasibility(question: str,
     prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
                    literature=format_literature(literature or []),
                    question=question)
+    evidence = _compute_structured_evidence(question, literature)
+    prompt += _evidence_prompt_block(evidence)
     if extra_context:
         prompt += "\n\n" + extra_context
     raw = await llm_complete(prompt)
@@ -868,7 +877,10 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no blueprint object"}
         raise RuntimeError("research plan synthesis failed: no blueprint object in response")
     bp = parse_blueprint(bp_raw)
-    return {"feasibility": feasibility, "blueprint": bp.model_dump(), "source": "llm"}
+    return {"feasibility": feasibility,
+            "blueprint": _attach_evidence(bp.model_dump(), evidence),
+            "source": "llm",
+            "structured_evidence": evidence.model_dump() if evidence else None}
 
 
 async def generate_expert_research_prompt(question: str,
@@ -955,6 +967,40 @@ async def refine_stage_code(llm_complete: Callable[[str], Any], *, objective: st
     if isinstance(data, dict) and isinstance(data.get("code"), str) and data["code"].strip():
         return data["code"]
     return None
+
+
+def _compute_structured_evidence(question: str,
+                                 literature: Optional[List[Dict[str, Any]]]
+                                 ) -> Optional[Any]:
+    """Zero-LLM deterministic extraction over the question + literature hits."""
+    try:
+        from .extractor import QuantitativeInsightExtractor
+        return QuantitativeInsightExtractor().extract(question, literature or [])
+    except Exception:  # noqa: BLE001 - evidence is best-effort
+        return None
+
+
+def _evidence_prompt_block(evidence: Any) -> str:
+    table = getattr(evidence, "summary_markdown_table", "") or ""
+    if not table:
+        return ""
+    return ("\n\n## Extracted Literature Evidence (SI-normalized, deterministic)\n"
+            + table
+            + "\n\nUse these EXACT SI-normalized constants and Python-ready equations. "
+              "Never invent dummy [1, 1, 1] initial states or guess units: bind every "
+              "physical constant from the table above (or state it as a named "
+              "assumption in the hypothesis).")
+
+
+def _attach_evidence(bp_dict: Dict[str, Any], evidence: Any) -> Dict[str, Any]:
+    """Attach structured_evidence + extracted_constants onto a blueprint dict."""
+    if evidence is None or not isinstance(bp_dict, dict):
+        return bp_dict
+    from .extractor import evidence_si_constants
+    out = dict(bp_dict)
+    out["structured_evidence"] = evidence.model_dump()
+    out["extracted_constants"] = evidence_si_constants(evidence)
+    return out
 
 
 def heuristic_guided_queries(objective: str, hypothesis: str,

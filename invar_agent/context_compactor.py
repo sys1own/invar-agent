@@ -224,6 +224,19 @@ def build_research_vault_context(workspace_dir: str | Path,
         if equations:
             digest_lines.append("  governing_equations:")
             digest_lines.extend(f"  - {e}" for e in equations[:8])
+        evidence = run.get("structured_evidence") or {}
+        evidence_params = evidence.get("parameters") or {}
+        if evidence_params:
+            digest_lines.append("  structured_evidence_si_constants:")
+            for name, p in list(evidence_params.items())[:12]:
+                digest_lines.append(
+                    f"  - {name} = {p.get('si_value')} {p.get('si_unit') or ''}".rstrip())
+        evidence_eqs = evidence.get("equations") or []
+        if evidence_eqs:
+            digest_lines.append("  structured_evidence_equations (python hints):")
+            for e in evidence_eqs[:6]:
+                hint = e.get("rhs_python_hint") or e.get("rhs_latex") or ""
+                digest_lines.append(f"  - {e.get('lhs', '')} = {hint}")
         functions = run.get("verified_functions") or []
         if functions:
             digest_lines.append(f"  verified_functions: {', '.join(functions[:10])}")

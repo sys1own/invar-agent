@@ -388,6 +388,217 @@ def _reconcile_hallucinated_bounds(expression: str, state: List[float],
     return None
 
 
+def validate_blueprint_grounding(blueprint: ResearchBlueprint) -> List[str]:
+    """Tier-0 Evidence-to-AST grounding validator (invoked before Sandbox_Execute).
+
+    Returns a list of grounding warnings (empty = grounded). Never raises:
+    warnings are surfaced as activity events and used to nudge healing.
+    """
+    warnings: List[str] = []
+    evidence = getattr(blueprint, "structured_evidence", None)
+    constants = getattr(blueprint, "extracted_constants", None) or {}
+    has_real_params = bool(constants) or bool(
+        getattr(evidence, "parameters", None) if evidence is not None else {})
+    # 1. Lazy uniform dummy initial states ([1.0, 1.0, ...] with real domain
+    #    parameters available) are a grounding smell: the kernel never binds
+    #    the extracted SI constants.
+    for contract in blueprint.contracts or []:
+        initial = list(getattr(contract, "initial_state", None) or [])
+        if (has_real_params and len(initial) >= 4
+                and all(abs(v - 1.0) < 1e-12 for v in initial)):
+            warnings.append(
+                f"contract {contract.contract_id}: initial_state is a lazy "
+                "uniform dummy array while extracted_constants carries real "
+                "domain parameters — seed physics-based initial conditions")
+            break
+    # 2. unified_module_code must define pure simulation_step and bind SI constants.
+    code = blueprint.unified_module_code or blueprint.code_template or ""
+    if code.strip():
+        try:
+            tree = ast.parse(code)
+            has_step = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and n.name == "simulation_step" for n in ast.walk(tree))
+            if not has_step:
+                warnings.append("unified module does not define simulation_step(buf, dt)")
+        except SyntaxError as exc:
+            warnings.append(f"unified module is not parseable Python: {exc}")
+        if has_real_params:
+            missing = [name for name, value in list(constants.items())[:24]
+                       if isinstance(value, (int, float))
+                       and abs(float(value)) > 1e-9
+                       and not _literal_present(code, float(value))]
+            if len(missing) > max(2, len(constants) // 2):
+                warnings.append(
+                    "most extracted SI constants are not bound as literals in "
+                    f"the unified module (e.g. {', '.join(missing[:4])})")
+    return warnings
+
+
+def _literal_present(code: str, value: float) -> bool:
+    """True when ``value`` (or a rounded repr) appears as a numeric literal."""
+    candidates = {repr(value), f"{value:.6g}", f"{value:.10g}"}
+    for cand in candidates:
+        if not cand or cand in ("0", "0.0"):
+            continue
+        if cand.rstrip("0").rstrip(".") in code or cand in code:
+            return True
+    return False
+
+
+_UNIT_SCALE_FACTORS = (1e-9, 1e-6, 1e-3, 1e3, 1e6, 1e9, 180.0 / math.pi, 9.80665)
+
+
+def _detect_unit_scaling(observed: float, bound: float) -> Optional[Dict[str, Any]]:
+    """Detect a common SI unit-conversion factor between observed and bound.
+
+    Returns {"factor": f, "direction": "divide"|"multiply", "observed": o,
+    "bound": b} when dividing/multiplying the observed value by a common
+    factor makes it consistent with the invariant bound.
+    """
+    if not (math.isfinite(observed) and math.isfinite(bound)) or bound == 0.0:
+        return None
+    if observed == 0.0:
+        return None
+    # The unscaled observed value must actually violate the bound, otherwise
+    # there is no unit-scaling story to tell.
+    if abs(observed) <= abs(bound):
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_score = float("inf")
+    for factor in _UNIT_SCALE_FACTORS:
+        for direction, scaled in (("divide", observed / factor),
+                                  ("multiply", observed * factor)):
+            if scaled == 0.0 or not math.isfinite(scaled):
+                continue
+            if abs(scaled) > abs(bound):
+                continue
+            # Prefer the conversion that lands closest to the bound on a
+            # log scale: 2.84e6 / 1e6 = 2.84 (near bound 10) beats
+            # 2.84e6 * 1e-9 = 0.00284 (absurdly far below it).
+            score = abs(math.log10(abs(scaled / bound)))
+            # Tie-break toward "divide": observed * 1e-6 == observed / 1e6,
+            # but the divide form names the canonical SI prefix factor.
+            better = score < best_score or (
+                score == best_score and direction == "divide"
+                and (best is None or best["direction"] != "divide"))
+            if better:
+                best_score = score
+                best = {"factor": factor, "direction": direction,
+                        "observed": observed, "bound": bound, "scaled": scaled}
+    return best
+
+
+def formulate_diagnostic_search_query(blueprint: ResearchBlueprint,
+                                      failure_result: Any) -> List[str]:
+    """Closed-loop telemetry-guided re-search queries for DIVERGED/FALSIFIED.
+
+    Returns a list of targeted literature queries (strings). Unit-scaling
+    diagnostics are exposed via :func:`unit_scaling_diagnostic` on the same
+    failure payload.
+    """
+    topic = re.sub(r"\s+", " ",
+                   blueprint.falsifiable_hypothesis or blueprint.title or "").strip()[:90]
+    status = ""
+    telemetry: Dict[str, Any] = {}
+    counterexample = ""
+    if isinstance(failure_result, dict):
+        status = str(failure_result.get("status") or "")
+        telemetry = failure_result.get("telemetry") or {}
+        counterexample = str(failure_result.get("counterexample") or
+                             failure_result.get("failure") or "")
+    else:
+        status = str(getattr(failure_result, "status", "") or "")
+        telemetry = getattr(failure_result, "telemetry", None) or {}
+        counterexample = str(getattr(failure_result, "failure_counterexample", "") or "")
+    status = status.upper()
+    queries: List[str] = []
+    if status == "DIVERGED" or "non-finite" in counterexample.lower() \
+            or "diverged" in counterexample.lower():
+        queries.append(f"{topic} numerical stability CFL step size damping closure")
+        queries.append(f"{topic} stiff integrator substepping implicit damping")
+    if status == "FALSIFIED":
+        # Unit-scaling diagnostic: observed metric vs invariant bound.
+        diag = unit_scaling_diagnostic(blueprint, telemetry, counterexample)
+        if diag:
+            queries.append(
+                f"{topic} {'MW/m^2' if diag.get('si_unit') == 'W/m^2' else diag.get('si_unit', 'unit')} "
+                "conversion factor heat flux unit scaling")
+        queries.append(f"{topic} counterexample regime breakdown governing equations")
+        queries.append(f"{topic} empirical parameter uncertainty bounds")
+    if not queries:
+        queries.append(f"{topic} governing equations parameters verification")
+    seen, out = set(), []
+    for q in queries:
+        if q and q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out[:4]
+
+
+def unit_scaling_diagnostic(blueprint: ResearchBlueprint,
+                            telemetry: Dict[str, Any],
+                            counterexample: str = "") -> Optional[Dict[str, Any]]:
+    """Detect whether a FALSIFIED invariant is a pure SI unit-scaling issue.
+
+    Compares the observed metric (from telemetry or the counterexample text)
+    against the invariant bound and checks for common conversion factors
+    (10^3, 10^6, 180/pi, 9.80665). Returns a diagnostic dict or None.
+    """
+    # Find the first violated invariant bound from the counterexample text.
+    # Counterexample format: `assertion` (variable_name) observed {...}
+    bound: Optional[float] = None
+    variable: str = ""
+    m = re.search(r"`([^`]+)`\s*\(([^)]+)\)\s*observed", counterexample or "")
+    if m:
+        assertion, variable = m.group(1), m.group(2)
+        bm = re.search(r"(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", assertion)
+        if bm:
+            try:
+                bound = float(bm.group(2))
+            except ValueError:
+                bound = None
+    observed: Optional[float] = None
+    # Prefer telemetry obs_<variable> or obs_* entries.
+    for key, val in (telemetry or {}).items():
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            continue
+        k = key.lower()
+        if variable and (variable.lower() in k or k.endswith(variable.lower())):
+            observed = float(val)
+            break
+    if observed is None:
+        # Fall back to the first numeric value inside the observed {...} dict.
+        om = re.search(r"observed\s*\{([^}]*)\}", counterexample or "")
+        if om:
+            nums = re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", om.group(1))
+            if nums:
+                try:
+                    observed = float(nums[0])
+                except ValueError:
+                    observed = None
+    if observed is None or bound is None:
+        return None
+    diag = _detect_unit_scaling(observed, bound)
+    if diag is None:
+        return None
+    # Infer the likely SI unit from the variable name for the healing hint.
+    name = (variable or "").lower()
+    si_unit = ""
+    if "heat_flux" in name or "flux" in name:
+        si_unit = "W/m^2"
+    elif "heat_load" in name or "load" in name:
+        si_unit = "J/m^2"
+    elif "decel" in name or "accel" in name or name.endswith("_g"):
+        si_unit = "m/s^2"
+    elif "altitude" in name or name.endswith("_km") or "height" in name:
+        si_unit = "m"
+    elif "velocity" in name or name.endswith("_ms") or "_v_" in name:
+        si_unit = "m/s"
+    diag["si_unit"] = si_unit
+    diag["variable"] = variable
+    return diag
+
+
 def _telemetry(run: Dict[str, Any], initial: List[float]) -> Dict[str, float]:
     state = run["state"]
     finite = bool(run.get("finite", True))
@@ -723,6 +934,11 @@ class ResearchStateMachine:
                     state.status = "REFUSED"
                     state.refusal = outcome.get("refusal")
                     return state
+                # Closed-loop telemetry-guided re-search on DIVERGED/FALSIFIED.
+                diagnostic_context = await self._diagnostic_research(
+                    state, stage=stage, outcome=outcome)
+                if diagnostic_context:
+                    failure = f"{failure}\n{diagnostic_context}"
                 # Reflex_Heal + refinement feed the counterexample back to GoI_Plan.
                 await self.emit_activity(
                     "HEALING", "reasoning_dispatch",
@@ -1063,6 +1279,15 @@ class ResearchStateMachine:
                         "failure": "contradictory invariants: " + " AND ".join(report.unsat_core),
                         "refusal": refusal}
 
+        # 6b. Tier-0 Evidence-to-AST Grounding: warn (never block) when the
+        # blueprint ignores extracted SI evidence or binds dummy initial states.
+        grounding_warnings = validate_blueprint_grounding(bp)
+        if grounding_warnings:
+            await self.emit_activity(
+                f"STAGE_{stage}_EXEC", "grounding_warning",
+                "Evidence grounding check: " + "; ".join(grounding_warnings)[:400],
+                level="warning")
+
         # 7. Sandbox_Execute: regression of pinned layers + new contracts.
         state.stage = "Sandbox_Execute"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Sandbox_Execute"})
@@ -1140,9 +1365,18 @@ class ResearchStateMachine:
         for q in queries:
             await self._emit("search_log", "query", {**tag, "query": q})
             await self.emit_activity("INGEST", "literature_query",
-                                     f"Querying arXiv/OpenAlex for '{q}'...")
+                                     f"Querying multi-channel literature for '{q}'...")
             try:
-                hits = await asyncio.to_thread(self.search_client.search, q, 3)
+                hits = await asyncio.to_thread(
+                    self.search_client.search, q, 3, None, q)
+            except TypeError:
+                # Legacy/custom clients without prompt_or_query routing.
+                try:
+                    hits = await asyncio.to_thread(self.search_client.search, q, 3)
+                except Exception as exc:  # noqa: BLE001
+                    await self._emit("search_log", "search_error", {**tag, "query": q,
+                                                                    "error": str(exc)[:200]})
+                    continue
             except Exception as exc:  # noqa: BLE001
                 await self._emit("search_log", "search_error", {**tag, "query": q,
                                                                 "error": str(exc)[:200]})
@@ -1150,12 +1384,32 @@ class ResearchStateMachine:
             for h in hits:
                 item = dict(h.__dict__)
                 out.append(item)
+                badge = getattr(h, "badge", "") or h.source
                 await self._emit("search_log", "paper", {
-                    **tag, "query": q, "source": h.source, "title": h.title[:200],
-                    "year": h.year, "url": h.url})
+                    **tag, "query": q, "source": h.source, "badge": badge,
+                    "title": h.title[:200], "year": h.year, "url": h.url,
+                    "citation_count": getattr(h, "citation_count", None)})
+                if getattr(h, "tldr", ""):
+                    await self._emit("search_log", "insight", {
+                        **tag, "source": h.source, "badge": badge,
+                        "title": h.title[:120], "insight": h.tldr[:400]})
+                for eq in (getattr(h, "equations", None) or [])[:4]:
+                    await self._emit("search_log", "equation", {
+                        **tag, "source": h.source, "badge": badge,
+                        "title": h.title[:120], "latex": str(eq)[:400]})
+                for cname, cval in (getattr(h, "constants", None) or {}).items():
+                    await self._emit("search_log", "constant", {
+                        **tag, "source": h.source, "badge": badge,
+                        "name": str(cname)[:80], "value": cval})
+                for b in (getattr(h, "benchmarks", None) or [])[:2]:
+                    await self._emit("search_log", "benchmark", {
+                        **tag, "source": h.source, "badge": badge,
+                        "name": str((b or {}).get("name", ""))[:120],
+                        "expected": (b or {}).get("expected_value")})
                 for insight in _extract_insights(h.summary):
                     await self._emit("search_log", "insight", {
-                        **tag, "source": h.source, "title": h.title[:120], "insight": insight})
+                        **tag, "source": h.source, "badge": badge,
+                        "title": h.title[:120], "insight": insight})
             await self._emit("search_log", "query_done", {**tag, "query": q, "results": len(hits)})
         return out
 
@@ -1212,6 +1466,90 @@ class ResearchStateMachine:
                     "module_hash": code_hash(refined)})
                 return refined
         return candidate_code
+
+    async def _diagnostic_research(self, state: ResearchRunState, *, stage: int,
+                                   outcome: Dict[str, Any]) -> str:
+        """Closed-loop re-search on FALSIFIED/DIVERGED outcomes.
+
+        Formulates targeted diagnostic queries, runs a bounded literature
+        re-search, detects SI unit-scaling mismatches, and returns extra
+        healing context (unit correction + fresh evidence summary). Emits a
+        ``HEALING_SEARCH`` activity event. Never raises.
+        """
+        failed_status = str(outcome.get("failed_status") or "").upper()
+        if failed_status not in ("FALSIFIED", "DIVERGED"):
+            return ""
+        blueprint = state.blueprint
+        failure_text = str(outcome.get("failure") or "")
+        # Build a failure payload for the diagnostic helpers.
+        last_result = next((r for r in reversed(state.results)
+                            if r.status == failed_status), None)
+        failure_result: Dict[str, Any] = {
+            "status": failed_status,
+            "telemetry": dict(last_result.telemetry) if last_result else {},
+            "counterexample": (last_result.failure_counterexample if last_result
+                               else failure_text),
+        }
+        queries = formulate_diagnostic_search_query(blueprint, failure_result)
+        await self.emit_activity(
+            "HEALING_SEARCH", "diagnostic_query",
+            f"Triggered targeted re-search for stability/unit closure: "
+            f"{queries}")
+        context_parts: List[str] = []
+        # Unit-scaling diagnostic: exact conversion correction for the healer.
+        diag = unit_scaling_diagnostic(
+            blueprint, failure_result.get("telemetry") or {},
+            str(failure_result.get("counterexample") or ""))
+        if diag:
+            factor = diag.get("factor")
+            direction = diag.get("direction")
+            si_unit = diag.get("si_unit") or ""
+            if factor and direction:
+                op = "divide" if direction == "divide" else "multiply"
+                by = {1e-3: "1e3", 1e3: "1e-3", 1e-6: "1e6", 1e6: "1e-6",
+                      1e-9: "1e9", 1e9: "1e-9", 180.0 / math.pi: "180/pi",
+                      9.80665: "9.80665"}.get(float(factor), str(factor))
+                context_parts.append(
+                    "UNIT SCALING DIAGNOSTIC: the observed metric "
+                    f"'{diag.get('variable', 'value')}' appears to be in {si_unit or 'raw SI'} "
+                    f"while the invariant bound expects a scaled unit. "
+                    f"{op.upper()} the observed value by {by} before comparing "
+                    f"(observed={diag.get('observed'):.6g}, bound={diag.get('bound'):.6g}, "
+                    f"scaled={diag.get('scaled'):.6g}). Fix the kernel's unit "
+                    "conversion (e.g. W/m^2 -> MW/m^2 divides by 1e6) rather than "
+                    "the invariant.")
+        # Fresh evidence from the targeted re-search (offline-safe).
+        if self.search_client is not None and queries:
+            try:
+                hits = await asyncio.to_thread(
+                    self.search_client.search, queries[0], 3, None, queries[0])
+            except TypeError:
+                try:
+                    hits = await asyncio.to_thread(
+                        self.search_client.search, queries[0], 3)
+                except Exception:  # noqa: BLE001
+                    hits = []
+            except Exception:  # noqa: BLE001
+                hits = []
+            if hits:
+                from .extractor import QuantitativeInsightExtractor, merge_evidence
+                evidence = QuantitativeInsightExtractor().extract(
+                    blueprint.falsifiable_hypothesis, hits)
+                merged = merge_evidence(
+                    getattr(blueprint, "structured_evidence", None), evidence)
+                if merged is not None:
+                    state.blueprint = blueprint.model_copy(update={
+                        "structured_evidence": merged,
+                        "extracted_constants": {
+                            **(getattr(blueprint, "extracted_constants", None) or {}),
+                            **{n: float(p.si_value)
+                               for n, p in evidence.parameters.items()}}})
+                top = "; ".join(f"{h.title[:60]}" for h in hits[:3])
+                context_parts.append(
+                    f"DIAGNOSTIC RE-SEARCH ({len(hits)} hits): {top}. "
+                    "Prefer stabilizing step bounds / damping closures and "
+                    "SI unit conversions from these sources.")
+        return "\n".join(context_parts)
 
     # -- Sandbox_Execute -------------------------------------------------------
     async def _sandbox_execute(self, bp: ResearchBlueprint, uast: Dict[str, Any],

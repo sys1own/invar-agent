@@ -62,14 +62,75 @@ def _key_metrics(blueprint: ResearchBlueprint, telemetry: Dict[str, Any]) -> Dic
 
 
 def _extracted_constants(blueprint: ResearchBlueprint) -> Dict[str, Any]:
-    """Best-effort constants digest from the blueprint initial state."""
+    """SI-normalized constants: blueprint.extracted_constants first, then the
+    structured_evidence parameter table, then the legacy initial-state digest."""
     constants: Dict[str, Any] = {}
+    explicit = getattr(blueprint, "extracted_constants", None) or {}
+    if isinstance(explicit, dict):
+        for key, value in list(explicit.items())[:48]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                constants[str(key)] = value
+    evidence = getattr(blueprint, "structured_evidence", None)
+    if evidence is not None:
+        for name, p in (getattr(evidence, "parameters", None) or {}).items():
+            if name not in constants and getattr(p, "si_value", None) is not None:
+                try:
+                    constants[str(name)] = float(p.si_value)
+                except (TypeError, ValueError):
+                    continue
+    if constants:
+        return constants
     initial = getattr(blueprint, "initial_state", None)
     if isinstance(initial, dict):
         for key, value in list(initial.items())[:24]:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 constants[str(key)] = value
     return constants
+
+
+def _structured_evidence_summary(blueprint: ResearchBlueprint) -> Dict[str, Any]:
+    """Compact, JSON-safe digest of StructuredResearchEvidence for metadata."""
+    evidence = getattr(blueprint, "structured_evidence", None)
+    if evidence is None:
+        return {}
+    try:
+        data = evidence.model_dump()
+    except Exception:  # noqa: BLE001
+        return {}
+    params = {}
+    for name, p in (data.get("parameters") or {}).items():
+        params[name] = {"si_value": p.get("si_value"), "si_unit": p.get("si_unit"),
+                        "raw_value": p.get("raw_value"), "raw_unit": p.get("raw_unit"),
+                        "source": p.get("source")}
+    equations = [{"lhs": e.get("lhs"), "rhs_latex": e.get("rhs_latex"),
+                  "rhs_python_hint": e.get("rhs_python_hint"),
+                  "variables": e.get("variables") or [], "source": e.get("source")}
+                 for e in (data.get("equations") or [])[:24]]
+    benchmarks = data.get("benchmarks") or []
+    return {
+        "domains": data.get("domains") or [],
+        "recommended_backend": data.get("recommended_backend"),
+        "recommended_stepper": data.get("recommended_stepper"),
+        "parameters": params,
+        "equations": equations,
+        "benchmarks": benchmarks[:12],
+        "suggested_invariants": data.get("suggested_invariants") or [],
+    }
+
+
+def _evidence_report_section(blueprint: ResearchBlueprint) -> str:
+    """Markdown section: Extracted Literature Equations & SI Constants."""
+    evidence = getattr(blueprint, "structured_evidence", None)
+    if evidence is None:
+        return ""
+    table = getattr(evidence, "summary_markdown_table", "") or ""
+    if not table:
+        return ""
+    return ("\n\n## Extracted Literature Equations & SI Constants\n\n"
+            + table
+            + "\n\n*Deterministic zero-LLM extraction from the ingested literature "
+              "and the curated reference registry. SI-normalized; Python hints "
+              "are `v9_transpiler_friendly`.*\n")
 
 
 def _contracts_summary(blueprint: ResearchBlueprint) -> List[Dict[str, Any]]:
@@ -133,8 +194,10 @@ class ResearchVaultManager:
         directory = self.run_dir(run_id)
         directory.mkdir(parents=True, exist_ok=True)
         module_code = blueprint.unified_module_code or blueprint.code_template or ""
+        evidence_section = _evidence_report_section(blueprint)
         (directory / "unified_module.py").write_text(module_code, encoding="utf-8")
-        (directory / "report.md").write_text(report_md or "", encoding="utf-8")
+        (directory / "report.md").write_text(
+            (report_md or "") + evidence_section, encoding="utf-8")
         (directory / "blueprint.json").write_text(
             blueprint.model_dump_json(indent=2), encoding="utf-8")
         feasibility = blueprint.feasibility
@@ -154,6 +217,7 @@ class ResearchVaultManager:
             "governing_equations": _governing_equations(blueprint),
             "contracts_summary": _contracts_summary(blueprint),
             "verified_functions": _verified_functions(module_code),
+            "structured_evidence": _structured_evidence_summary(blueprint),
         }
         self._metadata_path(run_id).write_text(
             json.dumps(metadata, indent=2, default=str), encoding="utf-8")
