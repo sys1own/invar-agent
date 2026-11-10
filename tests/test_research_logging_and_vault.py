@@ -150,7 +150,7 @@ async def test_full_activity_stream_and_stepper_progress(tmp_path):
 
     messages = _activity_messages(events)
     joined = "\n".join(messages)
-    assert "Querying arXiv/OpenAlex for 'nonlinear oscillator damping'" in joined
+    assert "Querying multi-channel literature for 'nonlinear oscillator damping'" in joined
     assert "Ingested 2 sources" in joined
     assert "Compiling RK4 trajectory kernel via Clang++" in joined
     assert "invariants verified by SMT shield" in joined
