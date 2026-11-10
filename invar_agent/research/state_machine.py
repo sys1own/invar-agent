@@ -37,7 +37,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..schemas.research import (InvariantConstraint, ModuleLayer, ResearchBlueprint,
                                 SimulationResult, StageTelemetry, VerificationContract)
@@ -757,6 +757,26 @@ class ResearchStateMachine:
         self.bridge = DynamicCABIBridge(root / ".invar" / "scratch" / "cabi")
         self.overlay_dir = Path(tempfile.mkdtemp(prefix="invar-research-"))
         self.scheduler = GoIContractScheduler()
+        # Deduplicated literature sources retrieved so far this run; surfaced
+        # live as `literature_count` on every activity/terminal event.
+        self.retrieved_sources: List[Dict[str, Any]] = []
+        self._retrieved_source_keys: set = set()
+
+    def _record_literature(self, items: Iterable[Dict[str, Any]]) -> int:
+        """Merge newly retrieved sources (deduped) into the run ledger."""
+        added = 0
+        for item in items or []:
+            key = "|".join(str((item or {}).get(k) or "")
+                           for k in ("source", "title", "url"))
+            if not key.strip("|") or key in self._retrieved_source_keys:
+                continue
+            self._retrieved_source_keys.add(key)
+            self.retrieved_sources.append(dict(item))
+            added += 1
+        return added
+
+    def _literature_count(self) -> int:
+        return len(self.retrieved_sources)
 
     async def _emit(self, channel: str, event: str, data: Dict[str, Any]) -> None:
         if self.progress_cb is not None:
@@ -772,6 +792,7 @@ class ResearchStateMachine:
             "step": step,
             "message": message,
             "level": level,
+            "literature_count": self._literature_count(),
             "telemetry": telemetry or {},
         }
         await self._emit("activity_log", "activity", payload)
@@ -1058,7 +1079,9 @@ class ResearchStateMachine:
                 report_md=state.report,
                 status=vault_status,
                 telemetry=telemetry_all,
-                target_backend=backend)
+                target_backend=backend,
+                literature_count=(self._literature_count()
+                                  or len(state.literature)))
             report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
             await self._emit("accelerator_log", "vault_archived", {
                 "run_id": meta.get("run_id"), "status": state.status})
@@ -1080,7 +1103,9 @@ class ResearchStateMachine:
             "status": terminal_status,
             "report": state.report,
             "run_id": state.blueprint.blueprint_id,
-            "report_path": str(report_path) if report_path else ""}
+            "report_path": str(report_path) if report_path else "",
+            "literature_count": (self._literature_count()
+                                 or len(getattr(state.blueprint, "retrieved_sources", []) or []))}
         if extra:
             payload.update(extra)
         await self._emit("accelerator_log", terminal_event, payload)
@@ -1115,7 +1140,9 @@ class ResearchStateMachine:
                 report_md=report,
                 status="PARTIALLY_VERIFIED",
                 telemetry=telemetry_all,
-                target_backend=backend)
+                target_backend=backend,
+                literature_count=(self._literature_count()
+                                  or len(state.literature)))
             await self.emit_activity(
                 "VAULT", "checkpoint_saved",
                 f"Intermediate checkpoint persisted: `{meta.get('run_id')}` "
@@ -1450,6 +1477,7 @@ class ResearchStateMachine:
                         **tag, "source": h.source, "badge": badge,
                         "title": h.title[:120], "insight": insight})
             await self._emit("search_log", "query_done", {**tag, "query": q, "results": len(hits)})
+        self._record_literature(out)
         return out
 
     # -- GoI_Plan helpers ------------------------------------------------------

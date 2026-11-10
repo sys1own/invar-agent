@@ -233,6 +233,8 @@
   .sidebar-tab.active { color:#f8fafc; border-bottom-color:var(--accent); background:var(--bg-card); }
   .sidebar-badge { background:#12161f; border:1px solid var(--border); border-radius:999px; padding:0 7px; font-size:10px; color:var(--muted); margin-left:4px; }
   .sidebar-badge.badge-accent { background:#1e293b; color:#7dd3fc; border-color:#334155; }
+  .btn-sidebar-action { background:transparent; border:1px solid #2b3545; color:#94a3b8; border-radius:4px; padding:2px 8px; font-size:11px; cursor:pointer; transition:all 0.15s ease; }
+  .btn-sidebar-action:hover { background:#1e2430; border-color:#ef4444; color:#f87171; }
   .sidebar-pane { display:none; flex:1; min-height:0; flex-direction:column; }
   .sidebar-pane.active { display:flex; }
   .vault-search { padding:8px; border-bottom:1px solid var(--border); flex:none; }
@@ -333,6 +335,7 @@
       <div class="sidebar-toolbar" id="code-toolbar">
         <button id="btn-export-workspace" onclick="exportWorkspaceZip()" title="Download the software codebase as a .zip">📦 Export .zip</button>
         <button id="btn-import-workspace" onclick="document.getElementById('import-workspace-input').click()" title="Import a software codebase .zip">📥 Import .zip</button>
+        <button class="btn-sidebar-action" id="btn-clear-workspace" title="Clear Codebase Workspace" onclick="confirmClearWorkspace()">🗑️ Clear</button>
         <input type="file" id="import-workspace-input" accept=".zip" style="display:none" onchange="importWorkspaceZip(this)">
       </div>
       <div class="tree" id="tree"><div class="tree-item">Loading…</div></div>
@@ -359,7 +362,7 @@
         <div id="research-stepper" class="research-stepper">
           <div class="step" id="step-feasibility"><span class="step-icon">⚖️</span> Feasibility</div>
           <div class="step-line"></div>
-          <div class="step" id="step-ingest"><span class="step-icon">📚</span> Literature (<span id="ingest-count">0</span>)</div>
+          <div class="step" id="step-ingest"><span class="step-icon">📚</span> Literature (<span id="stepper-lit-count">0</span>)</div>
           <div class="step-line"></div>
           <div class="step" id="step-stage1"><span class="step-icon">🚀</span> Stage 1: Kinematics</div>
           <div class="step-line"></div>
@@ -1298,7 +1301,21 @@ function activateStep(id) {
 function resetResearchStepper() {
   stepperMax = -1;
   STEPPER_STEPS.forEach(id => setStepState(id, ''));
-  const c = document.getElementById('ingest-count'); if (c) c.textContent = '0';
+  const c = document.getElementById('stepper-lit-count'); if (c) c.textContent = '0';
+  resetLiteratureCount();
+}
+/* Reactive literature counter: stepper badge + drawer badge stay in sync. */
+let currentLiteratureCount = 0;
+function updateLiteratureCount(count) {
+  currentLiteratureCount = Math.max(currentLiteratureCount, Number(count) || 0);
+  const stepperBadge = document.getElementById('stepper-lit-count');
+  if (stepperBadge) stepperBadge.textContent = currentLiteratureCount;
+  const drawerBadge = document.getElementById('search-count');
+  if (drawerBadge) drawerBadge.textContent = currentLiteratureCount;
+}
+function resetLiteratureCount() {
+  currentLiteratureCount = 0;
+  updateLiteratureCount(0);
 }
 function failActiveStep() {
   const active = document.querySelector('#research-stepper .step.active');
@@ -1428,6 +1445,8 @@ function openResearchStream() {
     if (ch === 'activity_log' && msg.event === 'activity') {
       // Dedicated live activity feed + stepper; not duplicated into the drawer logs.
       appendActivity(msg);
+      const litCount = (msg.telemetry && msg.telemetry.literature_count) || msg.literature_count;
+      if (litCount) updateLiteratureCount(litCount);
       const stepId = stepForActivity(msg.stage);
       if (stepId) { if (msg.level === 'error') failActiveStep(); else activateStep(stepId); }
       // Live attempt counter in the status banner while self-healing.
@@ -1442,9 +1461,8 @@ function openResearchStream() {
     logTo(pane, `[${ch}] ${msg.event || 'log'} ${JSON.stringify(msg).slice(0, 300)}`);
     if (ch === 'search_log') pulseBadge('search-count');
     if (ch !== 'search_log') pulseBadge('accel-count');
-    if (msg.event === 'paper') {
-      const c = document.getElementById('ingest-count');
-      if (c) c.textContent = String((parseInt(c.textContent, 10) || 0) + 1);
+    if ((msg.event === 'paper' || msg.event === 'hit') && ch === 'search_log') {
+      updateLiteratureCount(currentLiteratureCount + 1);
     }
     if (msg.event === 'run_start') {
       // A new run supersedes any previously rendered report card.
@@ -1452,6 +1470,7 @@ function openResearchStream() {
       chat.querySelectorAll('.failure-card').forEach(n => n.remove());
       chat.querySelectorAll('.completion-card').forEach(n => n.remove());
       resetResearchStepper();
+      resetLiteratureCount();
       resetRunLogCard();
       activateStep('step-feasibility');
     }
@@ -1482,6 +1501,7 @@ function openResearchStream() {
     if (msg.event === 'research_completed' && msg.report) {
       statusEl.textContent = '';
       setDrawerSummary(`Report ready — run ${msg.status || ''}`);
+      if (msg.literature_count) updateLiteratureCount(msg.literature_count);
       chat.querySelectorAll('.report-card').forEach(n => n.remove());  // reconnect replay dedupe
       activateStep('step-report');
       setStepState('step-report', 'completed');
@@ -1758,6 +1778,29 @@ function toggleAttachMenu(ev) {
 }
 /* ---- center-stage Research Viewer ---- */
 let currentResearch = null;
+async function confirmClearWorkspace() {
+  const confirmed = window.confirm(
+    "Are you sure you want to clear the workspace codebase?\n\n" +
+    "This will delete all generated software files (src/, cpp_core/, tests/, Cargo.toml, pyproject.toml, etc.).\n\n" +
+    "Your Research Vault runs will NOT be deleted."
+  );
+  if (!confirmed) return;
+  try {
+    const res = await fetch("/api/v1/workspace/clear", { method: "POST" });
+    const data = await res.json();
+    if (res.ok) {
+      if (typeof appendSystemNotification === 'function') appendSystemNotification("🧹 Workspace codebase cleared. Greenfield state restored.");
+      else addMsg('system', '🧹 Workspace codebase cleared. Greenfield state restored.');
+      if (typeof loadWorkspaceFiles === "function") loadWorkspaceFiles();
+      if (typeof loadTree === "function") loadTree();
+      if (typeof closeActiveEditorTab === "function") closeActiveEditorTab();
+    } else {
+      alert("Failed to clear workspace: " + (data.detail || data.message));
+    }
+  } catch (err) {
+    alert("Error clearing workspace: " + err.message);
+  }
+}
 async function openResearchViewer(runId) {
   showView('research');
   document.getElementById('rv-title').textContent = 'Loading @research:' + runId + '…';
@@ -1786,6 +1829,8 @@ function onResearchSearchInput() {
 }
 function renderResearchViewer(detail) {
   const meta = detail.metadata || {};
+  const litCount = meta.literature_count || (meta.sources || []).length || 0;
+  if (litCount) updateLiteratureCount(litCount);
   document.getElementById('rv-title').textContent = meta.title || meta.run_id || 'Research Run';
   document.getElementById('rv-sub').textContent =
     `@research:${meta.run_id || ''} · ${meta.status || ''} · ${meta.verdict || ''}` +

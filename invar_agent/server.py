@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import zipfile
@@ -797,6 +798,38 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     def api_workspace_export_zip() -> Response:
         buf = _software_export_zip(state.workspace_root)
         return _zip_response(buf, "invar_software_workspace.zip")
+
+    @app.post("/api/v1/workspace/clear")
+    async def api_workspace_clear() -> dict[str, Any]:
+        """Safely wipe generated software files, preserving the Research Vault.
+
+        Removes every workspace entry except ``.invar`` (research vault),
+        ``.git`` and ``.venv``, then clears compiler scratch under
+        ``.invar/scratch`` without touching ``.invar/research_vault``.
+        """
+        workspace = state.workspace_root
+        protected = {".invar", ".git", ".venv"}
+        cleared: list[str] = []
+        for entry in sorted(workspace.iterdir()):
+            if entry.name in protected:
+                continue
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                cleared.append(entry.name)
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                logger.warning("Could not remove %s: %s", entry.name, exc)
+        scratch_dir = workspace / ".invar" / "scratch"
+        if scratch_dir.exists():
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+        return {
+            "status": "success",
+            "message": "Workspace codebase cleared successfully.",
+            "cleared_items": cleared,
+            "preserved": [".invar/research_vault"],
+        }
 
     @app.post("/api/v1/workspace/import-zip")
     async def api_workspace_import_zip(file: Optional[UploadFile] = None,

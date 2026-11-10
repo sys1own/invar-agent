@@ -189,7 +189,8 @@ class ResearchVaultManager:
     # -- write ----------------------------------------------------------------
     def register_run(self, *, run_id: str, title: str, blueprint: ResearchBlueprint,
                      report_md: str, status: str, telemetry: Optional[Dict[str, Any]] = None,
-                     target_backend: str = "") -> Dict[str, Any]:
+                     target_backend: str = "",
+                     literature_count: Optional[int] = None) -> Dict[str, Any]:
         """Archive one completed research run into the vault."""
         telemetry = dict(telemetry or {})
         directory = self.run_dir(run_id)
@@ -219,6 +220,7 @@ class ResearchVaultManager:
             "contracts_summary": _contracts_summary(blueprint),
             "verified_functions": _verified_functions(module_code),
             "structured_evidence": _structured_evidence_summary(blueprint),
+            "literature_count": int(literature_count) if literature_count is not None else 0,
         }
         self._metadata_path(run_id).write_text(
             json.dumps(metadata, indent=2, default=str), encoding="utf-8")
