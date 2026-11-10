@@ -623,9 +623,28 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
             logger.warning("research context binding failed: %s", exc)
         objective = prompt
         pre_events: list[dict[str, Any]] = []
+        # Archetype handling: explicit [TARGET_ARCHETYPE: ...] tags win, otherwise
+        # deterministic keyword classification with a safe SCIENTIFIC_SDK_LIBRARY
+        # fallback for ambiguous prompts (never abort the build).
+        from invar_agent.builder.archetypes import (
+            SoftwareArchetype, classify_software_archetype, ensure_archetype_tag,
+        )
+        classification = classify_software_archetype(
+            prompt, has_research=packet is not None or bool(req.attached_research_ids))
+        archetype_id = classification.archetype_id
+        if classification.is_fallback:
+            pre_events.append({
+                "type": "activity", "stage": "BUILDER",
+                "step": "archetype_fallback",
+                "message": ("ℹ️ Build archetype not explicitly specified; "
+                            "proceeding with SCIENTIFIC_SDK_LIBRARY."),
+                "archetype": archetype_id,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+        objective = ensure_archetype_tag(objective, SoftwareArchetype(archetype_id))
         if packet is not None:
             artifacts = write_research_build_artifacts(state.workspace_root, packet)
-            objective = prompt + "\n\n" + packet.prompt_block
+            objective = objective + "\n\n" + packet.prompt_block
             pre_events.append({
                 "type": "activity", "stage": "BUILDER",
                 "step": "research_context_bound",

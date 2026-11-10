@@ -34,6 +34,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..research.vault import ResearchVaultManager
+from .archetypes import (ARCHETYPE_REGISTRY, ArchetypeClassificationResult,
+                         SoftwareArchetype, archetype_scaffold_text,
+                         classify_software_archetype as _classify_archetype)
 
 RESEARCH_REF_RE = re.compile(r"@research:([a-zA-Z0-9_\-]+)")
 PARITY_TEST_RELPATH = "tests/test_research_parity.py"
@@ -202,20 +205,17 @@ _ARCHETYPE_PATTERNS: List[tuple] = [
 
 
 def classify_software_archetype(prompt: str,
-                                research_runs: Optional[List[Dict[str, Any]]] = None
-                                ) -> SoftwareArchetypeSpec:
-    """Deterministic archetype classification (default: SCIENTIFIC_SDK_LIBRARY)."""
-    text = (prompt or "").lower()
-    for archetype_id in ARCHETYPES:
-        # Explicit archetype id (e.g. from the UI selector) wins outright.
-        if archetype_id.lower() in text:
-            return ARCHETYPES[archetype_id]
-    best_id, best_score = "SCIENTIFIC_SDK_LIBRARY", 0
-    for archetype_id, patterns in _ARCHETYPE_PATTERNS:
-        score = sum(1 for p in patterns if re.search(p, text))
-        if score > best_score:
-            best_id, best_score = archetype_id, score
-    return ARCHETYPES[best_id]
+                                research_runs: Optional[List[Dict[str, Any]]] = None,
+                                has_research: bool = False
+                                ) -> ArchetypeClassificationResult:
+    """Deterministic archetype classification with safe fallback.
+
+    Delegates to :mod:`invar_agent.builder.archetypes`: explicit
+    ``[TARGET_ARCHETYPE: <NAME>]`` tags win, weighted keyword scoring handles
+    the rest, and ambiguous prompts fall back to SCIENTIFIC_SDK_LIBRARY.
+    """
+    del research_runs  # retained for backward compatibility
+    return _classify_archetype(prompt, has_research=has_research)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +350,7 @@ class ResearchToBuildPacket(BaseModel):
     titles: Dict[str, str] = Field(default_factory=dict)
     origins: Dict[str, str] = Field(default_factory=dict)
     archetype: SoftwareArchetypeSpec
+    classification_result: Optional[Dict[str, Any]] = None
     package_name: str = "research_software"
     constants: List[ResearchConstant] = Field(default_factory=list)
     governing_equations: List[str] = Field(default_factory=list)
@@ -450,7 +451,23 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
                                   ) -> ResearchToBuildPacket:
     """Compile the structured research-to-software specification."""
     vault = ResearchVaultManager(workspace_dir) if workspace_dir is not None else None
-    archetype = archetype or classify_software_archetype(prompt, research_runs)
+    classification = archetype or classify_software_archetype(
+        prompt, research_runs, has_research=bool(research_runs))
+    if isinstance(classification, ArchetypeClassificationResult):
+        archetype_spec = ARCHETYPES[classification.archetype_id]
+        classification_result: Optional[Dict[str, Any]] = {
+            "archetype": classification.archetype_id,
+            "confidence": classification.confidence,
+            "is_fallback": classification.is_fallback,
+            "rationale": classification.rationale,
+            "recommended_manifest": list(classification.recommended_manifest),
+            "toolchains": list(classification.toolchains),
+        }
+    else:
+        # Backward compatibility: a raw SoftwareArchetypeSpec was passed.
+        archetype_spec = classification
+        classification_result = None
+    archetype = archetype_spec
     run_ids: List[str] = []
     titles: Dict[str, str] = {}
     origins: Dict[str, str] = {}
@@ -543,6 +560,7 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
         package_name=_package_name(titles.get(primary, ""), primary),
         constants=list(constants.values()), governing_equations=equations,
         equation_hints=hints, reference_kernels=kernels,
+        classification_result=classification_result,
         variable_map=variable_map, contracts=contracts, key_metrics=metrics,
         metric_contract_id=metric_contract_id)
     return packet.model_copy(update={"prompt_block": render_packet_prompt_block(packet)})
@@ -565,6 +583,9 @@ def render_packet_prompt_block(packet: ResearchToBuildPacket,
     lines.append("")
     lines.append("## Architecture Guidelines")
     lines.extend(f"- {g}" for g in arch.architecture_guidelines)
+    lines.append("")
+    lines.append("## Archetype Scaffold")
+    lines.append(archetype_scaffold_text(SoftwareArchetype(arch.archetype_id)))
     lines.append("")
     lines.append("## Exact SI Constants & Parameters (use VERBATIM — never guess or alter)")
     if packet.constants:
