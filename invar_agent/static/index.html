@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/static/assets/logo.png">
 <title>invar-agent — Verified Agent Chat</title>
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="/static/vendor/marked.min.js"></script>
 <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
 <script src="/static/vendor/xterm.min.js"></script>
 <script src="/static/vendor/addon-fit.min.js"></script>
@@ -34,10 +34,26 @@
   .research-stepper .step-line { flex:1; min-width:10px; height:1px; background:var(--border); }
   @keyframes stepPulse { 0%,100% { box-shadow:0 0 0 0 rgba(56,189,248,.4); } 50% { box-shadow:0 0 0 4px rgba(56,189,248,0); } }
   /* Inline agent process log card (rendered inside #chat-messages) */
-  .chat-process-log-card { align-self:stretch; background:#0f1217; border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-family:ui-monospace,monospace; font-size:11px; }
+  .chat-process-log-card { align-self:stretch; background:#0f1217; border:1px solid #2b3545; border-radius:8px; padding:10px 12px; font-family:ui-monospace,monospace; font-size:11px; transition:border-color 0.4s ease, box-shadow 0.4s ease; }
+  @keyframes log-box-edge-pulse {
+    0%, 100% {
+      border-color: #2b3545;
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.08), 0 4px 12px rgba(0, 0, 0, 0.25);
+    }
+    50% {
+      border-color: #2dd4bf;
+      box-shadow: 0 0 10px 1px rgba(45, 212, 191, 0.22), inset 0 0 6px rgba(45, 212, 191, 0.06);
+    }
+  }
+  .process-log-card {
+    border: 1px solid #2b3545;
+    border-radius: 8px;
+    transition: border-color 0.4s ease, box-shadow 0.4s ease;
+  }
+  .process-log-card.is-processing {
+    animation: log-box-edge-pulse 2.4s ease-in-out infinite;
+  }
   .process-log-header { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
-  .process-log-spinner { color:#38bdf8; animation:stepPulse 1.2s ease-in-out infinite; }
-  .process-log-spinner.stopped { animation:none; color:#34d399; }
   .process-log-title { color:#cbd5e1; font-weight:600; }
   .process-log-status { margin-left:auto; }
   .process-log-status.VERIFIED { background:#064e3b; color:#34d399; border:1px solid #059669; }
@@ -580,13 +596,30 @@ async function sendCopilot() {
                             attached_research_ids: attachedResearchIds()})
     });
     thinking.remove();
-    addCopilotMsg(data.reply || '(empty reply)');
-    copilotHistory.push({role: 'assistant', content: data.reply || ''});
-    if (data.action && data.action.type === 'SUGGEST_BUILD_PROMPT') {
-      addActionCard(data.action);
+    // Defense-in-depth: recover a Builder Action Card even when the backend
+    // reply dumped raw (possibly truncated) plan JSON into the chat text.
+    let replyText = data.reply || '(empty reply)';
+    let action = data.action;
+    const rawPlanKeys = /"?(display_text|clean_prompt|build_prompt|expert_prompt)"\s*:/;
+    const actionPrompt = action && action.params && typeof action.params.prompt === 'string'
+      ? action.params.prompt : '';
+    if (!action || rawPlanKeys.test(actionPrompt)) {
+      const fromReply = recoverBuildActionFromText(replyText);
+      const recovered = fromReply || recoverBuildActionFromText(actionPrompt);
+      if (recovered) {
+        replyText = fromReply ? recovered.reply
+          : (recovered.action.params.rationale || replyText);
+        action = recovered.action;
+      }
     }
-    if (data.action && data.action.type === 'SUGGEST_RESEARCH_PLAN') {
-      addResearchCardAction(data.action);
+    addCopilotMsg(replyText);
+    copilotHistory.push({role: 'assistant', content: replyText});
+    const buildAction = extractBuildAction(data, action);
+    if (buildAction) {
+      addActionCard(buildAction);
+    } else if (action && (action.type === 'SUGGEST_RESEARCH_PLAN' ||
+                         action.type === 'SUGGEST_RESEARCH_PROMPT')) {
+      addResearchCardAction(action);
     }
     if (data.llm_state === 'provider_error') {
       const err = data.llm_error || '';
@@ -603,19 +636,103 @@ async function sendCopilot() {
     input.focus();
   }
 }
+function unescapeJsonString(s) {
+  try { return JSON.parse('"' + s + '"'); }
+  catch (e) {
+    return String(s).replace(/\\"/g, '"').replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t').replace(/\\r/g, '\r').replace(/\\\\/g, '\\');
+  }
+}
+function balancedJsonSpan(text) {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return text.slice(start);
+}
+/* Client-side recovery: find display_text + clean_prompt inside a JSON dump
+   (even truncated) and turn it into a Builder Action Card instead of showing
+   raw JSON in the chat bubble. */
+function recoverBuildActionFromText(text) {
+  if (!text) return null;
+  const cleaned = String(text).replace(/<think>[\s\S]*?<\/think>/gi, '');
+  if (!/"?display_text"\s*:/.test(cleaned) ||
+      !/"?(?:clean_prompt|build_prompt|expert_prompt|suggested_prompt)"\s*:/.test(cleaned)) {
+    return null;
+  }
+  const dm = cleaned.match(/"?display_text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  let pm = cleaned.match(/"(?:clean_prompt|build_prompt|expert_prompt|suggested_prompt)"\s*:\s*"((?:[^"\\]|\\.)*)"(?:\s*[,}])/);
+  if (!pm) pm = cleaned.match(/"(?:clean_prompt|build_prompt|expert_prompt|suggested_prompt)"\s*:\s*"((?:[^"\\]|\\.)*)$/s);
+  const prompt = pm ? unescapeJsonString(pm[1]).trim() : '';
+  if (!prompt) return null;
+  const display = dm ? unescapeJsonString(dm[1]).trim() : '';
+  // Remove the raw JSON dump from the visible reply.
+  let reply = cleaned;
+  const span = balancedJsonSpan(cleaned);
+  if (span && span.length > 20) {
+    reply = (cleaned.slice(0, cleaned.indexOf(span)) + cleaned.slice(cleaned.indexOf(span) + span.length)).trim();
+  }
+  if (!reply || reply === cleaned) reply = display || 'I drafted a build prompt for your request.';
+  return {
+    reply: reply,
+    action: {type: 'SUGGEST_BUILD_PROMPT',
+             params: {prompt: prompt, rationale: display, explanation: display}}
+  };
+}
+/* Recognize every valid Builder Action Card shape (legacy object, string
+   action, nested action_obj, or top-level clean_prompt/expert_prompt fields). */
+function extractBuildAction(data, action) {
+  const d = data || {};
+  const a = action !== undefined ? action : d.action;
+  if (a && typeof a === 'object') {
+    if (a.type === 'SUGGEST_BUILD_PROMPT') return a;
+    if (a.type === 'build' && (a.clean_prompt || a.prompt)) {
+      return {type: 'SUGGEST_BUILD_PROMPT',
+              params: {prompt: a.clean_prompt || a.prompt,
+                       rationale: d.display_text || a.display_text || ''}};
+    }
+  }
+  if (a === 'SUGGEST_BUILD_PROMPT') {
+    const prompt = d.clean_prompt || d.expert_prompt || d.build_prompt || '';
+    if (prompt) return {type: 'SUGGEST_BUILD_PROMPT',
+                        params: {prompt: prompt, rationale: d.display_text || ''}};
+  }
+  const objPrompt = d.action_obj && (d.action_obj.clean_prompt || d.action_obj.prompt);
+  const topPrompt = d.clean_prompt || d.expert_prompt || d.build_prompt || objPrompt || '';
+  if (topPrompt && String(topPrompt).trim()) {
+    return {type: 'SUGGEST_BUILD_PROMPT',
+            params: {prompt: String(topPrompt), rationale: d.display_text || ''}};
+  }
+  return null;
+}
 function addActionCard(action) {
   const params = action.params || {};
+  const rationaleHtml = params.rationale ? `<div class="action-rationale">${renderMarkdown(params.rationale)}</div>` : '';
   const card = el(`<div class="action-card">
     <div class="action-card-header">
       <span class="action-title">⚙ Suggested Build Prompt</span>
     </div>
-    ${params.rationale ? `<div class="action-rationale">${escapeHtml(params.rationale)}</div>` : ''}
+    ${rationaleHtml}
     <textarea class="suggested-prompt-box mono"></textarea>
-    <div class="action-card-actions"><button class="btn-approve build">Send to Builder &amp; Run</button></div>
+    <div class="action-card-actions"><button class="btn-approve build">⚡ Send to Builder &amp; Run</button><button class="ghost dismiss">✕ Dismiss</button></div>
   </div>`);
   const ta = card.querySelector('textarea');
   ta.value = params.prompt || '';
-  card.querySelector('button.build').onclick = () => runBuild(ta.value);
+  card.querySelector('button.build').onclick = () => {
+    // Direct Build execution with the (possibly edited) card prompt.
+    if (typeof setExecMode === 'function') setExecMode('direct');
+    runBuild(ta.value);
+  };
+  card.querySelector('button.dismiss').onclick = () => card.remove();
   addExpandToggle(card);
   chat.appendChild(card);
   card.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -629,9 +746,9 @@ function addResearchRefusalCard(feasibility) {
       <span class="action-toggle">why?</span>
     </div>
     <div class="action-body" style="display:none">
-      <p><b>Why:</b> ${f.rationale || ''}</p>
-      <p><b>Epistemic boundary:</b> ${f.violated_boundary || 'n/a'}</p>
-      ${f.reformulation ? `<p><b>How to reformulate:</b> ${f.reformulation}</p>` : ''}
+      <p><b>Why:</b></p><div>${renderMarkdown(f.rationale || '')}</div>
+      <p><b>Epistemic boundary:</b> ${escapeHtml(f.violated_boundary || 'n/a')}</p>
+      ${f.reformulation ? `<p><b>How to reformulate:</b></p><div>${renderMarkdown(f.reformulation)}</div>` : ''}
     </div>
   </div>`);
   card.querySelector('.action-head').onclick = () => {
@@ -652,7 +769,7 @@ function addResearchCardAction(action) {
         <span class="action-title">📋 Expert Deep Research Prompt</span>
         ${verdict ? `<span class="badge">${escapeHtml(verdict)}</span>` : ''}
       </div>
-      ${f.rationale ? `<div class="action-rationale">${escapeHtml(f.rationale)}</div>` : ''}
+      ${f.rationale ? `<div class="action-rationale">${renderMarkdown(f.rationale)}</div>` : ''}
       <textarea class="suggested-prompt-box mono"></textarea>
       <div class="action-card-actions">
         <button class="btn-approve build">Approve &amp; Run Deep Research</button>
@@ -678,7 +795,7 @@ function addResearchCardAction(action) {
     <div class="action-card-header">
       <span class="action-title">🔬 Suggested Research Plan</span>
     </div>
-    ${bp.falsifiable_hypothesis ? `<div class="action-rationale">${escapeHtml(bp.falsifiable_hypothesis)}</div>` : ''}
+    ${bp.falsifiable_hypothesis ? `<div class="action-rationale">${renderMarkdown(bp.falsifiable_hypothesis)}</div>` : ''}
     <textarea class="suggested-prompt-box mono"></textarea>
     <div class="action-card-actions">
       <button class="btn-approve build">Approve &amp; Run Deep Research</button>
@@ -715,7 +832,10 @@ async function runBuild(prompt) {
   builderRunning = true;
   setComposerEnabled(false);
   statusEl.textContent = 'builder running…';
+  resetRunLogCard('Builder Agent Execution Log');
+  appendActivity({stage: 'BUILDER', step: 'run_build', message: 'Builder run started: ' + text.slice(0, 120), timestamp: new Date().toISOString()});
   addMsg('system', '▶ Builder run started: ' + text.slice(0, 120));
+  let buildFailed = false;
   try {
     const resp = await fetch('/api/copilot/run-build', {
       method: 'POST',
@@ -741,8 +861,10 @@ async function runBuild(prompt) {
       }
     }
   } catch (e) {
+    buildFailed = true;
     addMsg('system', 'Builder stream error: ' + e);
   } finally {
+    finishRunLogCard(buildFailed ? 'HALTED' : 'COMPLETED');
     builderRunning = false;
     setComposerEnabled(true);
     statusEl.textContent = '';
@@ -987,7 +1109,7 @@ function renderExpertPromptCard(feasibility, expertPrompt, question) {
   const f = feasibility || {};
   const card = el(`<div class="rcard">
     <h4>📋 Expert Deep Research Prompt ${verdictBadge(f.verdict)}</h4>
-    <div class="rcard-sub">${f.rationale ? escapeHtml(String(f.rationale).slice(0, 260)) : 'Edit the prompt below, then approve to dispatch the full verified research loop.'}</div>
+    <div class="rcard-sub">${f.rationale ? renderMarkdown(f.rationale) : 'Edit the prompt below, then approve to dispatch the full verified research loop.'}</div>
     <textarea class="rcard-ta"></textarea>
     <div class="row">
       <button class="btn-approve" id="approve-expert">⚡ Approve &amp; Run Deep Research</button>
@@ -1015,9 +1137,9 @@ function renderResearchRefusal(feasibility) {
   clearResearchCards();
   const card = el(`<div class="rcard" style="border-color:#f85149">
     <h4>⛔ Epistemic Feasibility Gate: ${escapeHtml(f.verdict || 'REFUSED')}</h4>
-    <div class="rcard-sub"><b>Why:</b> ${escapeHtml(f.rationale || '')}</div>
+    <div class="rcard-sub"><b>Why:</b></div><div>${renderMarkdown(f.rationale || '')}</div>
     <div class="rcard-sub"><b>Boundary:</b> ${escapeHtml(f.violated_boundary || 'n/a')}</div>
-    ${f.reformulation ? `<div class="rcard-sub"><b>Reformulate:</b> ${escapeHtml(f.reformulation)}</div>` : ''}
+    ${f.reformulation ? `<div class="rcard-sub"><b>Reformulate:</b></div><div>${renderMarkdown(f.reformulation)}</div>` : ''}
     <div class="row"><button class="btn-dismiss" onclick="this.closest('.rcard').remove()">✕ Dismiss</button></div>
   </div>`);
   chat.appendChild(card); scrollChat();
@@ -1121,9 +1243,8 @@ function activityTagClass(stage) {
 let activeRunCard = null;
 function ensureRunLogCard() {
   if (activeRunCard && document.body.contains(activeRunCard)) return activeRunCard;
-  activeRunCard = el(`<div id="active-run-log-card" class="chat-message agent-message chat-process-log-card">
+  activeRunCard = el(`<div id="active-run-log-card" class="chat-message agent-message chat-process-log-card process-log-card is-processing">
     <div class="process-log-header" title="Click to collapse/expand">
-      <span class="process-log-spinner" id="active-run-spinner">⟳</span>
       <span class="process-log-title" id="active-run-title">Research Agent Execution Log</span>
       <span class="process-log-status badge RUNNING" id="active-run-badge">RUNNING</span>
     </div>
@@ -1136,9 +1257,10 @@ function ensureRunLogCard() {
   };
   return activeRunCard;
 }
-function resetRunLogCard() {
+function resetRunLogCard(title) {
   const card = ensureRunLogCard();
-  card.querySelector('#active-run-spinner').classList.remove('stopped');
+  if (title) card.querySelector('#active-run-title').textContent = title;
+  card.classList.add('is-processing');
   const badge = card.querySelector('#active-run-badge');
   badge.textContent = 'RUNNING';
   badge.className = 'process-log-status badge RUNNING';
@@ -1149,12 +1271,10 @@ function resetRunLogCard() {
 }
 function finishRunLogCard(status) {
   const card = ensureRunLogCard();
-  const spinner = card.querySelector('#active-run-spinner');
-  spinner.classList.add('stopped');
-  spinner.textContent = '✓';
+  card.classList.remove('is-processing');
   const badge = card.querySelector('#active-run-badge');
   const s = String(status || '').toUpperCase();
-  const ok = s === 'VERIFIED';
+  const ok = s === 'VERIFIED' || s === 'COMPLETED';
   badge.textContent = ok ? 'VERIFIED' : 'PARTIAL / HALTED';
   badge.className = 'process-log-status badge ' + (ok ? 'VERIFIED' : 'HALTED');
 }
@@ -1492,11 +1612,11 @@ function renderVaultList(runs, query) {
       return escapeHtml(k) + ' = ' + escapeHtml(String(val)) + (unit ? ' ' + escapeHtml(unit) : '');
     });
     const card = el(`<div class="vault-card">
-      <div class="vc-title">${escapeHtml(run.title || run.run_id)}</div>
+      <div class="vc-title">${renderMarkdown(run.title || run.run_id)}</div>
       <div class="vc-id">@research:${escapeHtml(run.run_id)}</div>
       <div class="vc-meta">${verdictPill(run.verdict, run.status)}${run.target_backend ? `<span class="badge">${escapeHtml(run.target_backend)}</span>` : ''}</div>
       ${metricItems.length ? `<div class="vc-metrics">${metricItems.join('<br>')}</div>` : ''}
-      ${run.snippet ? `<div class="hint" style="font-size:11px">${escapeHtml(run.snippet)}</div>` : ''}
+      ${run.snippet ? `<div class="hint" style="font-size:11px">${renderMarkdown(run.snippet)}</div>` : ''}
       <div class="vc-actions">
         <button class="vc-view">📖 View Research</button>
         <button class="vc-attach">📎 Attach to Prompt</button>
@@ -1611,7 +1731,7 @@ function renderResearchViewer(detail) {
   }
   if (equations.length) {
     html += '<div class="rv-card"><h4>📐 Governing Equations &amp; Contracts</h4><ul style="margin:0;padding-left:18px;font-size:12.5px">' +
-      equations.map(e => `<li>${escapeHtml(String(e))}</li>`).join('') + '</ul></div>';
+      equations.map(e => `<li>${renderMarkdown(String(e))}</li>`).join('') + '</ul></div>';
   }
   const functions = meta.verified_functions || [];
   if (functions.length) {
