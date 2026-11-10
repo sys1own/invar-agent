@@ -1,270 +1,204 @@
 # invar-agent
 
-**Mathematically Verified Autonomous Agent Kernel and Web Console.**
+Formally Grounded Autonomous Software Engineering Kernel and Computational Research Platform.
 
-`invar-agent` is a formally grounded autonomous software-engineering kernel. Every mutation an agent proposes passes through a nine-stage verified state machine before it can touch disk:
+invar-agent is an autonomous engineering and scientific discovery system. Every mutation proposed by an agent passes through a 9-stage formal verification state machine before touching disk or entering source control. The platform combines a high-performance native core written in Rust (PyO3) with an extensible Python kernel, providing dual operational modes: a polyglot software engineering Builder Agent and an accretive computational Research Agent.
+
+---
+
+## Architectural Overview
+
+invar-agent enforces transactional correctness and mathematical consistency across three coordinated subsystems:
+
+* Native Acceleration Core (`invar_agent/_native`): High-throughput Rust engine implementing Girard Geometry of Interaction (GoI) nilpotency solving, an arena-allocated Lafont-style Hierarchical Interaction Net (HIN) engine, zero-token deterministic rewrite heuristics, and content-addressed BLAKE3 state registers.
+* Kernel and Verification Substrate (`invar_agent/`): Python runtime managing Pydantic v2 schemas, transactional Copy-on-Write (CoW) overlays, algebraic adjoint rollbacks, a three-tier cognitive router, and the Precision Shield.
+* Interactive Web Platform (`invar_agent/server.py` + `static/index.html`): FastAPI and Server-Sent Events (SSE) single-page application featuring partitioned codebase and research explorers, center-stage research inspection, plan-approval action cards, and an integrated xterm.js workspace terminal drawer.
+
+---
+
+## The 9-Stage Verified State Machine
+
+Every task progresses through an invariant-preserving lifecycle:
 
 ```
-Ingest -> GoI_Plan -> Wavefront_Schedule -> Overlay_Mutate -> PreWrite_Guard
-       -> SMT_Concolic_Verify -> Sandbox_Execute -> Reflex_Heal
-       -> Adjoint_Commit_or_Rollback
+[ Ingest ]
+  |
+  v
+[ GoI_Plan ]
+  |
+  v
+[ Wavefront_Schedule ] ----- (Nilpotency Check: rho(U * M) < 1)
+  |
+  v
+[ Overlay_Mutate ] ------- (Transactional Copy-on-Write Scratch)
+  |
+  v
+[ PreWrite_Guard ] ------- (AST Policy Firewall & Import Checks)
+  |
+  v
+[ SMT_Concolic_Verify ] -- (Z3 Constraint & Boundary Validation)
+  |
+  v
+[ Sandbox_Execute ] ------ (Resource-Limited Isolated Subprocess: RLIMIT_CPU / RLIMIT_AS)
+  |
+  v
+[ Reflex_Heal ] ---------- (Tier-0 In-Memory Structural Repair)
+  |
+  v
+[ Adjoint_Commit_or_Rollback ]
 ```
 
-## Architecture
+1. Ingest: Validates user specifications, empirical data, or literature findings into strictly typed Pydantic schemas.
+2. GoI_Plan: Formulates task dependencies, causal contracts, and execution assertions as a directed proof net.
+3. Wavefront_Schedule: Solves the linear execution system `EX(M, U) = (I - U * M)^(-1) * U`. Enforces the spectral radius nilpotency invariant `rho(U * M) < 1` to guarantee acyclic execution and absence of deadlocks.
+4. Overlay_Mutate: Mounts an isolated tmpfs Copy-on-Write directory, ensuring baseline project files remain untouched during compilation and execution.
+5. PreWrite_Guard: Performs static AST analysis enforcing `v9_transpiler_friendly` constraints, rejecting unauthorized system imports, network socket allocations, and unbounded iteration.
+6. SMT_Concolic_Verify: Z3 SMT solver validates concrete types, structural invariant contracts, and numerical boundary conditions.
+7. Sandbox_Execute: Executes compiled artifacts (`rust_hin`, C-ABI C++, or Python) within short-lived isolated subprocesses constrained by CPU and memory rlimits (`RLIMIT_CPU`, `RLIMIT_AS`).
+8. Reflex_Heal: Applies deterministic E-graph equality saturation and syntactic rewrites without consuming LLM tokens when recoverable errors occur.
+9. Adjoint_Commit_or_Rollback: If all verification contracts pass, changes commit transactionally to the active workspace. If verification fails, an algebraic adjoint rollback cleanly unlinks scratch directories and restores the last verified state.
 
-- **Rust PyO3 native core** (`invar_agent/_native`): Girard Geometry-of-Interaction nilpotency solver, arena-allocated Lafont Interaction Net engine, zero-token deterministic healer transducers, and the 256-bit BLAKE3 Holographic Boundary Register — all exposed as `invar_agent._native` with a pure-Python fallback.
-- **Python kernel** (`invar_agent/`): pydantic v2 contracts, transactional Copy-on-Write overlay with algebraic adjoint rollback, Precision Shield (FOGE + Z3 SMT + concolic execution + Chiasmus symmetry + holographic parity + Rust shield), hermetic sandbox with command inspection, three-tier cognitive router (Tier-0 Reflex / Tier-1 Flash / Tier-2 Pro), and curated exports.
-- **Web console** (`invar_agent/server.py` + `static/index.html`): FastAPI + SSE-style single-page console with live stage visualization, overlay/shield inspector, and export menu.
+---
+
+## Dual Agent Modalities
+
+### 1. Research Agent
+
+The Research Agent conducts computational scientific research where findings are validated through native simulation:
+
+* Epistemic Feasibility Gate: Evaluates research requests prior to execution, classifying tasks into four operational regimes:
+  * `OPTIMAL_DIRECT`: Quantitative problems with explicit governing equations and testable invariants.
+  * `REFORMULATED_SURROGATE`: High-dimensional or macro-scale systems downscaled into rigorous 0D/1D asymptotic models.
+  * `REFUSED_IMPOSSIBLE`: Problems violating axiomatic physical laws (such as net-positive energy with closed-loop Hamiltonian invariants). Execution halts immediately without generating ungrounded simulations.
+  * `REFUSED_UNSUITABLE`: Subjective or non-computational questions lacking formal state variables, prevented to avoid synthetic math-washing.
+* Multi-Channel Literature Federation: Retrieves domain equations, parameters, and benchmark values across arXiv, ar5iv (HTML5 equation extraction), OpenAlex, Semantic Scholar (TLDR extraction), Wikipedia wikitext (`<math>` and infobox extraction), Wikidata quantities, OEIS (integer sequences and recurrence relations), and PubChem (molecular properties).
+* Zero-Token SI Normalization: Deterministically converts mixed physical units to standard SI base units (m, kg, s, K, Pa, W/m^2, J) prior to code generation, preventing parameter scaling errors.
+* Multi-Variant Pareto Benchmarking: Compiles and evaluates competing numerical integrators and closures concurrently (e.g., standard explicit RK4 versus semi-implicit Euler on stiff kinetics), selecting optimal formulations along Pareto frontiers of execution latency versus invariant residual error.
+* Cumulative Blueprint Evolution: Verified computational kernels are checkpointed as pinned module layers. Follow-up research rounds integrate higher-order terms into the same unified computation module (`unified_module.py`).
+* Adjoint Delta Rollback: If an added physical term causes divergence or invariant falsification, an adjoint rollback unlinks the active delta, preserves the verified baseline checkpoint, and feeds the numerical counterexample to the planner.
+* User-Uploaded Research Ingestion: Ingests external research documents (`.md`, `.tex`, `.txt`, `.py`, `.json`, `.csv`, `.zip`) into `.invar/research_vault/<run_id>/`, extracting governing equations and SI constants via the `QuantitativeInsightExtractor`.
+
+### 2. Builder Agent
+
+The Builder Agent generates, verifies, and packages multi-file software projects:
+
+* Polyglot Compilation: Synthesizes and tests code across Rust (Cargo crates with PyO3 bindings), C++ (C-ABI zero-copy shared libraries compiled via Clang++ with `-O3 -std=c++20 -fPIC -shared`), and Python.
+* Research-to-Software Bridge: Ingests completed or uploaded research runs from the Research Vault and classifies build intent into one of seven software archetypes:
+  1. `SCIENTIFIC_SDK_LIBRARY`: Reusable Python package with optional native C++ or Rust accelerators, typed interfaces, and test suites.
+  2. `CLI_SIMULATOR_SWEEP`: Standalone command-line application supporting parameter sweeps, invariant guards, and structured export.
+  3. `INTERACTIVE_WEB_SIMULATOR`: FastAPI and HTML5/JS dashboard exposing simulation steppers with real-time controls.
+  4. `INVERSE_DESIGN_OPTIMIZER`: Constrained parameter optimization harness wrapping the verified forward research kernel.
+  5. `MULTI_SOLVER_BENCHMARK`: Benchmarking harness comparing accuracy, convergence, and execution latency across parameter regimes.
+  6. `TELEMETRY_DIGITAL_TWIN`: Streaming data processor and real-time invariant anomaly detector grounded in research equations.
+  7. `STANDALONE_NATIVE_CRATE`: Zero-Python C++20 or Rust standalone library and binary.
+* Three-Tier Research Resolution: Resolves research context in both Direct Build and Plan modes via explicit `@research:<id>` tags, semantic keyword matching, or implicit reference to the most recently completed research run.
+* Automated Research-Parity Verification: Compiles and executes `tests/test_research_parity.py` during builds, asserting that the synthesized software preserves all SI constants and reproduces verified research metrics within tolerance.
+* Precision Shield: Enforces boundary verification via Fock-Space Graph Encoding (FoGE), concolic Z3 checks, and the Chiasmus firewall.
+
+---
+
+## Workspace Platform and Web Console
+
+The web interface (`http://localhost:8000`) provides an integrated development and research environment:
+
+* Partitioned File Explorers: Strict separation between the Software Codebase (`[Codebase]`) and the Research Vault (`[Research Vault]`). Research runs are isolated under `.invar/research_vault/<run_id>/`, keeping the codebase root clean.
+* Center-Stage Research Viewer: Dedicated inspector interface providing full-text search across research runs, executive metric summaries, governing equation and constant cards, and verified `unified_module.py` kernels. Includes one-click context forwarding (`Build Software from this Research`) to the Builder Agent.
+* One-Click Software and Vault Archive Management:
+  * Export Software Codebase: Generates a sanitized `.zip` containing project source files, test suites, and build manifests while excluding scratch directories and virtual environments.
+  * Import Software Codebase: Extracts uploaded `.zip` archives with integrated Zip-Slip path-traversal validation.
+  * Export/Import Research Vault: Exports individual research runs or entire vault bundles as portable `.zip` archives, and ingests user research archives directly into the vault.
+* Integrated Workspace Terminal: Full-featured interactive terminal drawer powered by xterm.js, connected via WebSocket (`/api/v1/terminal/ws`) to a non-blocking asynchronous PTY process anchored in the active workspace directory.
+
+---
+
+## Native Core Implementation Details
+
+The native core (`invar_agent._native`) executes performance-critical verification algorithms:
+
+* Girard GoI Wavefront Solver: Solves `EX(M, U) = (I - U * M)^(-1) * U`. When task graphs update incrementally, rank-k updates are evaluated via the Sherman-Morrison-Woodbury formula:
+  `K' = K + K * U * P * (I - Q^T * K * U * P)^(-1) * Q^T * K`
+  where `K = (I - U * M)^(-1)` and `Delta M = P * Q^T`. Includes condition number validation (kappa > 1e8 triggers a full recomputation) to protect against numerical instability.
+* Hierarchical Interaction Net (HIN) Arena: Slab-allocated, zero-heap interaction-net arena supporting active-pair reduction with the Python GIL released and no dynamic heap allocations.
+* MELL Linear Typing: Wires carry Multiplicative-Exponential Linear Logic types (`I`, `Tensor`, `Implication`, `Bang`), tracking resource consumption and preserving linearity.
+* Reflex Healer: Employs equality saturation (E-graphs) via the `egg` framework to simplify arithmetic expressions and repair ASTs deterministically without invoking LLMs.
+
+---
+
+## Cognitive Router
+
+Operations are routed across a three-tier cognitive hierarchy:
+
+| Tier | Engine | Responsibilities |
+|---|---|---|
+| Tier-2 Pro | LLM (Reasoning) | Upfront planning, research hypothesis synthesis, final report formulation, and complex software scaffolding. |
+| Tier-1 Flash | LLM (Fast) | Search query formulation, parameter extraction, and bounded AST hole completion. |
+| Tier-0 Reflex | Rust Native & Z3 | 0-token operations: AST parsing, SMT checks, C-ABI/HIN compilation, execution, and E-graph repair. |
+
+Supported LLM providers include Gemini, OpenAI, DeepSeek, and OpenRouter.
+
+---
 
 ## Quickstart
 
+### Prerequisites
+
+* Python 3.10+
+* Rust toolchain (Cargo)
+* Clang++ with C++20 support
+* `uv` (recommended) or `pip`
+
+### Installation
+
 ```bash
+# Clone the repository
+git clone https://github.com/sys1own/invar-agent.git
+cd invar-agent
+
+# Set up virtual environment
 uv venv .venv --python 3.10
 source .venv/bin/activate
+
+# Install dependencies and build native extension
 uv pip install -e .
-maturin develop --release   # builds invar_agent._native
+maturin develop --release
+```
+
+### Launching the Workspace
+
+```bash
+# Start the web console serving a workspace directory
 invar-agent serve ./my-workspace
-pytest -v                   # full verification suite
+
+# Start with a specific provider preselected
+invar-agent serve ./my-workspace --provider deepseek
+```
+
+Open `http://localhost:8000` in a browser. Configure API keys in the settings modal or export them in your shell environment:
+
+```bash
+export DEEPSEEK_API_KEY="your-api-key"
+export INVAR_LLM_PROVIDER="deepseek"
+```
+
+---
+
+## Verification Suite
+
+Run the formal verification and integration test suite:
+
+```bash
+# Run Rust native unit tests
 cargo test --manifest-path invar_agent/_native/Cargo.toml
+
+# Run Python kernel and verification tests
+pytest -v -m "not live"
+
+# Run live provider end-to-end smoke test (requires API key)
+pytest -v -m live tests/test_llm_live.py
 ```
 
-## LLM providers
+---
 
-The copilot chat and the builder (Tier-1 repairs, Tier-2 code generation) call an
-OpenAI-compatible chat API. Supported providers: **Gemini**, **OpenAI**, **DeepSeek**,
-**OpenRouter**.
+## License
 
-### Setup
-
-1. Start the console: `invar-agent serve ./my-workspace` (add `--provider gemini|openai|deepseek|openrouter`
-   to force a provider).
-2. Open the web UI, click the **gear** icon and paste the API key. On save the server calls
-   `GET {base}/models` for every provider, checks the resolved fast/reasoning models against the
-   live list (auto-picking a fallback when the default is unavailable), and shows the resolved
-   models, the model count and any warnings. Use **Test connection** for a one-token FAST-tier check.
-3. Keys and the chosen provider are saved in memory for the server session. To persist them across
-   restarts the server writes `~/.invar-agent/config.json` (mode `0600`, path overridable with
-   `INVAR_CONFIG_PATH`) — the API key itself is only written when `INVAR_PERSIST_KEY=1`.
-
-### Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `GEMINI_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | Per-provider keys |
-| `INVAR_API_KEY` | Generic key when `INVAR_LLM_PROVIDER` is set |
-| `INVAR_LLM_PROVIDER` | Provider to use when several keys are present (also `--provider`) |
-| `INVAR_CONFIG_PATH` | Location of the persisted config file |
-| `INVAR_PERSIST_KEY` | `1` to persist the API key in the config file |
-| `GEMINI_MODEL_FAST` / `GEMINI_MODEL_REASONING` (etc. per provider) | Tier model override |
-| `INVAR_LLM_TIER_FAST` / `INVAR_LLM_TIER_REASONING` | Generic tier overrides (JSON mapping or model name) |
-
-At startup the server auto-detects the key from the environment (`INVAR_LLM_PROVIDER` picks the
-provider; otherwise exactly one provider key present selects it) and falls back to the persisted file.
-Precedence for model selection: explicit override > provider env > generic env > config file > defaults
-(`DEFAULT_TIER_MODELS` in `invar_agent/config.py`, verified against the live `/models` listings).
-
-### Google Colab
-
-Add the key to **Colab Secrets** (key icon, left sidebar) with the exact variable name
-(e.g. `GEMINI_API_KEY` or `DEEPSEEK_API_KEY`), then, before starting the server, export it into the
-environment from the secrets:
-
-```python
-from google.colab import userdata
-import os
-os.environ["GEMINI_API_KEY"] = userdata.get("GEMINI_API_KEY")
-# or: os.environ["DEEPSEEK_API_KEY"] = userdata.get("DEEPSEEK_API_KEY")
-```
-
-Run the server afterwards (`!invar-agent serve ./workspace`). Colab secrets are injected into
-`os.environ` only through this call, so the export must happen in the same notebook cell or earlier.
-
-### Default models
-
-| Provider | Fast tier | Reasoning tier |
-| --- | --- | --- |
-| Gemini | `gemini-3.8-flash` | `gemini-3.1-pro-preview` |
-| OpenAI | `gpt-5.4-mini` | `gpt-5.5-pro` |
-| DeepSeek | `deepseek-flash` | `deepseek-v4-pro` |
-| OpenRouter | `openrouter/auto` | `openrouter/auto` |
-
-Gemini `gemini-2.5-*` IDs are legacy (access-limited for new projects per
-https://ai.google.dev/gemini-api/docs/deprecations) and are kept only as last-resort preference
-fallbacks, never as defaults. DeepSeek retired `deepseek-chat` / `deepseek-reasoner` on 2026-07-24.
-
-### Troubleshooting
-
-- **400 Bad Request** — usually a model that does not exist for your key/project. Open the gear
-  modal: validation lists the provider's live models and auto-selects an available fallback for
-  defaults; explicit overrides are kept but flagged with suggestions. Some models reject sampling
-  parameters (`temperature`/`top_p`); the client retries once without them and remembers the
-  provider/model pair.
-- **401 Unauthorized / API key not valid** — wrong key for the provider selected (each provider has
-  its own key format: Gemini `AIza…`, OpenAI/DeepSeek `sk-…`, OpenRouter `sk-or-…`). The settings
-  modal shows a soft warning on prefix mismatch.
-- **403 Forbidden / permission denied** — the key is valid but lacks access to the model (e.g. a
-  preview model not enabled for the project, or a region-restricted provider). Pick another model via
-  the tier env vars or the provider's model list shown in the modal.
-- **404 Not Found** — the endpoint or model path is wrong (e.g. an outdated base URL); not retried.
-- **429 Too Many Requests / 5xx** — retried automatically up to 2 times with exponential backoff and
-  jitter; other 4xx are never retried. Use a provider with a paid quota or lower request rate.
-- Every failed provider call is recorded in `/api/status` under `llm.last_error` with a timestamp,
-  and the chat shows a banner with the provider, model, HTTP status and the provider's own message
-  (API keys are redacted before anything is logged, returned, or shown).
-
-### Live smoke tests
-
-`tests/test_llm_live.py` is opt-in and skipped by default: run `pytest -m live` with
-`GEMINI_API_KEY` or `DEEPSEEK_API_KEY` set to validate the key, list models and complete one token
-per fast tier.
-
-## Research Agent
-
-invar-agent ships a second, selectable **Research Agent** alongside the Builder Agent. It runs the
-same nine-stage verified kernel as a *cyclic* research loop: Ingest (question + falsifiable
-hypothesis + search queries) → GoI_Plan → Wavefront_Schedule (nilpotency ρ(UM) < 1, with
-Sherman-Morrison-Woodbury rank-k incremental updates) → Overlay_Mutate (CoW scratch) →
-PreWrite_Guard (SHACL/Chiasmus firewall + v9 transpiler compliance) →
-SMT_Concolic_Verify (real Z3 consistency check via `research/smt.py`) → Sandbox_Execute
-(isolated subprocess C-ABI with rlimits; `rust_hin`, `cpp`, or `multi_variant` Pareto
-benchmarks) → Reflex_Heal (deterministic Tier-0 source repair + egg simplification) →
-Adjoint_Commit_or_Rollback.
-
-### Cumulative Blueprint Evolution
-
-A `ResearchBlueprint` can target **multiple research stages** (`target_research_stages`, default 1).
-Stage 1 synthesises and verifies a foundation module, then pins it as a checkpoint layer
-(`ModuleLayer` with BLAKE3 bundle hash, contracts, and baseline invariants). Stage k > 1 re-enters
-Ingest → GoI_Plan in **accretive mode**: telemetry from stage k-1 (residuals, energy drift,
-finite/divergence flags) steers targeted literature queries; the Tier-2 LLM receives the exact
-verified code and contracts of the previous stages and must *extend and couple* into the same
-unified module; the GoI wavefront scheduler is updated incrementally via Sherman-Morrison-Woodbury
-ΔM = P·Qᵀ (`PyGoIWavefrontScheduler.apply_incremental_update`); and Sandbox_Execute re-verifies
-every pinned layer inside the same compiled artefact as the new logic (regression contracts are
-prefixed `regression:<layer>:<contract>`). Rollback is **delta-scoped**: a failed stage k rolls back
-only its delta to the stage k-1 checkpoint, feeds the counterexample back into GoI_Plan, and when
-retries are exhausted the last verified unified checkpoint is preserved and exported under
-`<workspace>/checkpoints/<blueprint_id>/stage_k_unified_module.py` + `blueprint.json` rather than
-losing verified work. The accretion validator (`research/accretion.py`) makes pinned functions
-immutable (redefinitions are reverted, not rejected), restores deleted pinned functions, requires
-the new driver to call at least one pinned function, and extracts the stage delta for rollback.
-
-### Live Literature Search
-
-`research/search.py` provides `LiteratureSearchClient` with three sources: arXiv
-(`export.arxiv.org/api/query`), OpenAlex (`api.openalex.org/works`, with Crossref fallback) and a
-Wikipedia opensearch+summary fallback. It has clean timeout handling, rate-limit backoff
-(0s/1.5s/4s), and deterministic BLAKE2b-keyed caching so offline unit tests stay hermetic
-(`offline=True` serves only the cache; network failure falls back to cache). Search runs strictly
-during Ingest/GoI_Plan — Sandbox_Execute stays network-isolated (subprocess with rlimits). Every
-query, retrieved paper and extracted mathematical insight (equations/coefficients/scaling laws) is
-emitted as structured `search_log` SSE events (`query` / `paper` / `insight` / `query_done`).
-Live fetching is opt-in via `INVAR_RESEARCH_SEARCH_LIVE=1`; otherwise the offline cache is used.
-
-### Epistemic Feasibility Guardrails
-
-Before any blueprint is synthesised or simulated, `research/feasibility.py` classifies the request
-into one of four verdicts (`FeasibilityAssessment` on the blueprint):
-
-- `OPTIMAL_DIRECT` — quantitative research suited for literature + deterministic native verify.
-- `REFORMULATED_SURROGATE` — too large for local execution (3D DNS turbulence, ab-initio,
-  macro-scale); the engine must define a reduced-order surrogate and justify the reduction.
-- `REFUSED_IMPOSSIBLE` — axiomatic impossibility (net positive energy with conservation
-  invariants, perpetual motion, undecidable/contradictory constraints). Also enforced *during*
-  execution: if Z3 proves a contract's invariants mutually unsatisfiable, the run halts as
-  REFUSED before any simulation.
-- `REFUSED_UNSUITABLE` — subjective/historical/literary/clinical tasks without falsifiable
-  governing equations ("math-washing").
-
-A deterministic heuristic gate runs first (and is authoritative for refusals); the Tier-2 REASONING
-model may escalate or refine the verdict. The gate runs in `POST /api/v1/research/plan`, in Copilot
-`SUGGEST_RESEARCH_PLAN` (which returns a `RESEARCH_REFUSED` card), and defensively inside the state
-machine. Refusals never reach compilation or simulation; the API returns
-`{"status": "refused", "feasibility": {...}}` and the Web Console renders a red refusal card
-explaining **why**, **which epistemic boundary** was violated, and **how to reformulate**.
-
-### Prompt Optimisation
-
-The planner prompts (`research/planner.py`) encode tool mastery heuristics: `cpp` C-ABI for
-RK4 ODE/PDE, matrix ops and heavy loops; `rust_hin` for scalar/vector recurrences, discrete math
-and algebraic invariants (HIN structural normalisation telemetry `hin_steps`/`hin_stalled_pairs`);
-`multi_variant` for Pareto comparison of candidate algorithms (residual vs wall-time frontier).
-All synthesis prompts enforce the strict v9_transpiler_friendly subset: primitive
-int/float/bool/`list[float]`/`list[list[float]]`, for/while with guards, `range`, `math.*`,
-deterministic intrinsics (`prng_uniform`, `clamp`, `sign`) and top-level pure functions — with
-classes, try/except, with, yield, async, `import os/sys/socket/random/re/json`, nested closures
-and unbounded loops forbidden (enforced both in the prompt and by the PreWrite_Guard AST check).
-Accretive prompts receive the exact verified code + contracts of stage k-1 plus sandbox observables
-(`state`, `initial`, `trace_min`, `trace_max`, `telemetry`, `variants`) and instruct the model to
-extend and couple rather than overwrite.
-
-- **Cognitive routing**: Tier-2 REASONING synthesises blueprints and accretive stages; Tier-1 FAST
-  formulates telemetry-guided literature queries; Tier-0 Reflex handles SMT/Z3/concolic checks,
-  the security firewall, compilation and egg-based repair.
-- **Web console**: a `[ Builder Agent | Research Agent ]` toggle in the navbar switches the main
-  pane. Research mode shows a plan card (editable blueprint JSON with **Approve & Run Deep
-  Research** / **Edit Plan** / **Abort**), three live log panes (`SEARCH LOG`, `GoI/HIN STREAM`,
-  `ACCELERATOR LOG`), and a telemetry strip (contract, status, execution time, residuals).
-  Copilot answers to research questions render a `SUGGEST_RESEARCH_PLAN` action card.
-- **API**: `POST /api/v1/research/plan` (synthesise a `ResearchBlueprint`),
-  `POST /api/v1/research/action` (`approve_plan` / `edit_plan` / `abort`),
-  `GET /api/v1/research/status`, and `GET /api/v1/research/stream` (SSE across the three channels).
-- **Native acceleration**: `invar_agent._native` exposes `PyUASTGraph`, `PyHINArenaEngine`,
-  `PyGoIWavefrontScheduler` (with Sherman-Morrison incremental updates), `GoIProofNet`,
-  `GoIWavefrontSolverNative`, `PyGraphPolyglotMaterializer` and the egg-based
-  `PyProofTheoreticHealer` / `repair_uast_expression`.
-
-## Research-to-Software Builder Bridge
-
-`invar_agent/builder/research_bridge.py` turns Research Vault runs into build specifications for
-the Builder Agent in both Direct and Plan Mode.
-
-- **Resolution** (`resolve_relevant_research_runs`): explicit `@research:<id>` tags and
-  `attached_research_ids` first, then keyword/symbol overlap with run titles, constants and
-  equations, then implicit phrases ("from our research", "turn this into", "uploaded research")
-  bound to the most recent run. Unrelated greenfield prompts bind no research.
-- **Archetypes** (`classify_software_archetype`): `SCIENTIFIC_SDK_LIBRARY` (default),
-  `CLI_SIMULATOR_SWEEP`, `INTERACTIVE_WEB_SIMULATOR`, `INVERSE_DESIGN_OPTIMIZER`,
-  `MULTI_SOLVER_BENCHMARK`, `TELEMETRY_DIGITAL_TWIN`, `STANDALONE_NATIVE_CRATE`, each with a
-  file layout, architecture guidelines and verification requirements.
-- **Build packet** (`compile_research_build_packet`): SI constants, governing equations, the
-  verified `simulation_step(buf, dt)` kernel, contracts and key metrics, rendered as a
-  `<research_to_software_specification>` block injected into Builder prompts.
-- **Research-Parity tests**: Direct-Mode builds write `tests/test_research_parity.py` and
-  `.invar_research_provenance.json`, emit a `research_context_bound` activity event and execute
-  the parity tests after the build. The test checks that every research constant is preserved
-  (relative tolerance $10^{-12}$), that the built solver stays finite under the baseline initial
-  conditions, satisfies every `VerificationContract` invariant, and reproduces each key metric
-  $m$ within $|m_{\text{built}} - m_{\text{research}}| \le 10^{-6}\,|m_{\text{research}}| + 10^{-9}$.
-
-### User research uploads
-
-`POST /api/v1/research/vault/upload` (alias `/import`) accepts multipart files or JSON
-`{"files": [{"filename", "content", "encoding"}], "title"}` with `.md .tex .txt .py .json .csv
-.zip` sources. A `.invar-research.zip` bundle is restored as-is; anything else is stored under
-`uploaded_sources/` and mined by the zero-token `QuantitativeInsightExtractor` (LaTeX and plain
-equations, SI-normalised parameters such as `rho = 15.6 g/cm^3` to `15600 kg/m^3`, benchmark tables
-from Markdown/JSON/CSV). An uploaded `.py` with `simulation_step` becomes `unified_module.py`;
-otherwise a baseline module is synthesised. Uploads are tagged `origin="user_upload"`,
-`status="UPLOADED_READY"` and are usable by both agents; a Research Agent run with the upload
-attached is pre-seeded with its constants and evidence and flips it to `VERIFIED` on success.
-
-### Zip export / import
-
-| Endpoint | Result |
-|---|---|
-| `GET /api/v1/workspace/export-zip` | `invar_software_workspace.zip` with `INVAR_BUILD_MANIFEST.json`; excludes `.invar/`, `.git/`, `.venv/`, caches and build scratch |
-| `POST /api/v1/workspace/import-zip` | extracts a codebase zip; absolute or `..` members are rejected with HTTP 400, `.git/` and `.invar/` are ignored |
-| `GET /api/v1/research/vault/{run_id}/export-zip` | `<run_id>.invar-research.zip` |
-| `GET /api/v1/research/vault/export-all-zip` | `invar_research_vault_bundle.zip` |
-
-The web console exposes these as Export/Import buttons on the Codebase pane, Upload/Export on the
-Research Vault pane, per-run export, origin badges, and a Research Viewer archetype selector with
-**Build Software from this Research** and **Verify / Extend** actions.
-
-## Verification
-
-- `cargo test` — Rust core unit tests (GoI nilpotency, HIN reduction, reflex healer, HIS register,
-  GoI wavefront Sherman-Morrison updates).
-- `pytest` — kernel, overlay/adjoint, precision shield, reflex/router, end-to-end agent, web server/export,
-  and research suites (schemas, transpiler/emitters, C-ABI bridge, algorithms, state machine, API).
+This project is licensed under the MIT License. See LICENSE for details.
