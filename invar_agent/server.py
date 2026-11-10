@@ -4,15 +4,17 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import queue
+import re
 import threading
 import time
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -41,6 +43,8 @@ from invar_agent.research.planner import (
 from invar_agent.research.search import LiteratureSearchClient
 from invar_agent.schemas.research import ResearchBlueprint
 from invar_agent.terminal import TerminalSession, TerminalSessionManager
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -82,6 +86,27 @@ class CopilotChatRequest(BaseModel):
 
 class CopilotRunBuildRequest(BaseModel):
     prompt: str = ""
+    # Research Vault runs bound to this Direct-Mode build (Research-to-Builder
+    # Bridge); @research:<id> tokens in the prompt are resolved too.
+    attached_research_ids: list[str] = Field(default_factory=list)
+    execution_mode: str = "direct"
+
+
+class ResearchUploadFile(BaseModel):
+    filename: str
+    content: str = ""
+    encoding: str = "utf-8"  # "utf-8" | "base64"
+
+
+class ResearchUploadRequest(BaseModel):
+    files: list[ResearchUploadFile] = Field(default_factory=list)
+    title: Optional[str] = None
+    notes: str = ""
+
+
+class ZipImportRequest(BaseModel):
+    content_base64: str = ""
+    filename: str = "workspace.zip"
 
 
 class ResearchPlanRequest(BaseModel):
@@ -584,9 +609,39 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
         agent = state.ensure_agent()
+        # Research-to-Builder Bridge: bind resolved vault research (explicit,
+        # keyword or implicit) before synthesis, generate the parity test and
+        # provenance manifest, and run the parity test during verification.
+        from invar_agent.builder.research_bridge import (
+            bind_research_context, write_research_build_artifacts,
+        )
+        packet = None
+        try:
+            packet = bind_research_context(
+                state.workspace_root, prompt, req.attached_research_ids)
+        except Exception as exc:  # noqa: BLE001 - research binding is best-effort
+            logger.warning("research context binding failed: %s", exc)
+        objective = prompt
+        pre_events: list[dict[str, Any]] = []
+        if packet is not None:
+            artifacts = write_research_build_artifacts(state.workspace_root, packet)
+            objective = prompt + "\n\n" + packet.prompt_block
+            pre_events.append({
+                "type": "activity", "stage": "BUILDER",
+                "step": "research_context_bound",
+                "message": (f"Bound research context {packet.run_ids} "
+                            f"(Archetype: {packet.archetype.archetype_id})"),
+                "run_ids": packet.run_ids,
+                "archetype": packet.archetype.archetype_id,
+                "parity_test": artifacts["parity_test"],
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
         # Forward the copilot-approved prompt to the verified builder and stream
         # the same SSE progress events as /api/agent/stream.
-        return _agent_sse_response(agent, prompt, [], {}, None)
+        return _agent_sse_response(agent, objective, [], {}, None,
+                                   pre_events=pre_events,
+                                   research_packet=packet,
+                                   workspace_root=state.workspace_root)
 
     @app.get("/api/workspace/tree")
     @app.get("/api/files")
@@ -658,6 +713,11 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         runs = ResearchVaultManager(state.workspace_root).search(q)
         return {"query": q, "results": runs, "count": len(runs)}
 
+    @app.get("/api/v1/research/vault/export-all-zip")
+    # Registered before /{run_id} so the static path is not captured as an id.
+    def api_research_vault_export_all() -> Response:
+        return _zip_response(_vault_zip_bytes(), "invar_research_vault_bundle.zip")
+
     @app.get("/api/v1/research/vault/{run_id}")
     def api_research_vault_detail(run_id: str) -> dict[str, Any]:
         from invar_agent.research.vault import ResearchVaultManager
@@ -673,6 +733,178 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         if not ok:
             raise HTTPException(status_code=404, detail=f"research run not found: {run_id}")
         return {"deleted": True, "run_id": run_id}
+
+    # -- zip export / import (software workspace + research vault) ------------
+
+    def _zip_response(buf: "io.BytesIO", filename: str) -> Response:
+        return Response(
+            content=buf.getvalue(), media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    def _iter_software_workspace_files(root: Path, limit: int = 2000):
+        from invar_agent.context_compactor import _iter_software_files
+        for path in _iter_software_files(root, limit=limit):
+            yield path
+
+    def _software_export_zip(root: Path) -> "io.BytesIO":
+        buf = io.BytesIO()
+        manifest_files: list[str] = []
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in _iter_software_workspace_files(root):
+                rel = path.relative_to(root).as_posix()
+                manifest_files.append(rel)
+                zf.write(path, rel)
+            manifest = {
+                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "file_count": len(manifest_files),
+                "files": sorted(manifest_files),
+                "research_provenance": _research_provenance(root),
+            }
+            zf.writestr("INVAR_BUILD_MANIFEST.json",
+                        json.dumps(manifest, indent=2, default=str))
+        buf.seek(0)
+        return buf
+
+    def _research_provenance(root: Path) -> list[str]:
+        prov = root / ".invar_research_provenance.json"
+        try:
+            data = json.loads(prov.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [f"@research:{r.get('run_id')}" for r in (data.get("research_runs") or [])
+                if r.get("run_id")]
+
+    @app.get("/api/v1/workspace/export-zip")
+    def api_workspace_export_zip() -> Response:
+        buf = _software_export_zip(state.workspace_root)
+        return _zip_response(buf, "invar_software_workspace.zip")
+
+    @app.post("/api/v1/workspace/import-zip")
+    async def api_workspace_import_zip(file: Optional[UploadFile] = None,
+                                       payload: Optional[ZipImportRequest] = None) -> dict[str, Any]:
+        data = b""
+        filename = "workspace.zip"
+        if file is not None:
+            data = await file.read()
+            filename = file.filename or filename
+        elif payload is not None and payload.content_base64:
+            import base64
+            try:
+                data = base64.b64decode(payload.content_base64, validate=True)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail="invalid base64 zip payload") from exc
+            filename = payload.filename or filename
+        if not data:
+            raise HTTPException(status_code=400, detail="no zip file provided")
+        if len(data) > 100 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="zip exceeds 100 MB")
+        root = state.workspace_root
+        imported: list[str] = []
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="uploaded file is not a valid zip") from exc
+        with zf:
+            for info in zf.infolist()[:5000]:
+                name = info.filename.replace("\\", "/")
+                if not name or info.is_dir():
+                    continue
+                parts = Path(name).parts
+                if (name.startswith("/") or ".." in parts
+                        or re.match(r"^[A-Za-z]:", name)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"unsafe zip member rejected (zip-slip): {info.filename}")
+                top = parts[0] if parts else ""
+                if top in (".git", ".invar") or top.startswith("."):
+                    continue
+                if top == "INVAR_BUILD_MANIFEST.json":
+                    continue
+                if info.file_size > 20 * 1024 * 1024:
+                    continue
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(info))
+                imported.append(name)
+        state.last_ingest = state.agent.ingest_workspace() if state.agent else {}
+        return {"status": "imported", "filename": filename,
+                "files_imported": imported, "file_count": len(imported)}
+
+    def _vault_zip_bytes(run_ids: Optional[list[str]] = None) -> "io.BytesIO":
+        from invar_agent.research.vault import ResearchVaultManager
+        vault = ResearchVaultManager(state.workspace_root)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            dirs = []
+            if run_ids:
+                for rid in run_ids:
+                    d = vault.run_dir(rid)
+                    if d.is_dir():
+                        dirs.append(d)
+            else:
+                dirs = sorted((vault.root / d.name for d in vault.root.iterdir()
+                               if d.is_dir()), key=lambda p: p.name) \
+                    if vault.root.is_dir() else []
+            if not dirs:
+                raise HTTPException(status_code=404, detail="no research runs to export")
+            for directory in dirs:
+                for path in sorted(directory.rglob("*")):
+                    if path.is_dir():
+                        continue
+                    rel = path.relative_to(directory).as_posix()
+                    zf.write(path, f"{directory.name}/{rel}")
+        buf.seek(0)
+        return buf
+
+    @app.get("/api/v1/research/vault/{run_id}/export-zip")
+    def api_research_vault_export_zip(run_id: str) -> Response:
+        from invar_agent.research.vault import ResearchVaultManager, _safe_run_id
+        safe = _safe_run_id(run_id)
+        if not ResearchVaultManager(state.workspace_root).run_dir(safe).is_dir():
+            raise HTTPException(status_code=404, detail=f"research run not found: {run_id}")
+        return _zip_response(_vault_zip_bytes([safe]), f"{safe}.invar-research.zip")
+
+    @app.post("/api/v1/research/vault/upload")
+    @app.post("/api/v1/research/vault/import")
+    async def api_research_vault_upload(request: Request,
+                                        file: Optional[list[UploadFile]] = None,
+                                        title: Optional[str] = Query(None),
+                                        notes: str = Query("")) -> dict[str, Any]:
+        from invar_agent.research.vault import ResearchVaultManager
+
+        payload_files: list[dict[str, Any]] = []
+        title_value = title
+        notes_value = notes
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            payload_files = list(body.get("files") or [])
+            title_value = title_value or body.get("title")
+            notes_value = notes_value or str(body.get("notes") or "")
+        elif file:
+            for upload in file:
+                raw = await upload.read()
+                import base64
+                payload_files.append({"filename": upload.filename or "upload.bin",
+                                      "content": base64.b64encode(raw).decode("ascii"),
+                                      "encoding": "base64"})
+        else:
+            # multipart/form-data without the FastAPI `file` binding
+            form = await request.form()
+            payload_files = [{"filename": k, "content": base64.b64encode(
+                await v.read() if hasattr(v, "read") else v.encode()).decode("ascii"),
+                "encoding": "base64"} for k, v in form.multi_items() if k != "title"]
+            title_value = title_value or str(form.get("title") or "") or None
+            notes_value = notes_value or str(form.get("notes") or "")
+        if not payload_files:
+            raise HTTPException(status_code=400, detail="no research files uploaded")
+        try:
+            meta = ResearchVaultManager(state.workspace_root).ingest_uploaded_research(
+                payload_files, title=title_value, custom_notes=notes_value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"status": "success", "run_id": meta.get("run_id"),
+                "restored": bool(meta.get("restored")), "metadata": meta}
 
     @app.get("/api/workspace/file")
     def api_workspace_file(path: str = Query(..., min_length=1)) -> dict[str, Any]:
@@ -779,9 +1011,72 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
             from invar_agent.context_compactor import build_research_vault_context
             return build_research_vault_context(
                 state.workspace_root, referenced_ids=attached_ids or [],
-                user_query=question)
+                user_query=question, agent_mode="research")
         except Exception:  # noqa: BLE001 - context is best-effort
             return ""
+
+    def _seed_blueprint_from_uploads(bp: ResearchBlueprint,
+                                     attached_ids: Optional[list[str]]
+                                     ) -> tuple[ResearchBlueprint, list[str]]:
+        """Pre-seed a blueprint from attached user-uploaded research runs:
+        SI constants + structured evidence are merged so Stage 1 verifies the
+        uploaded baseline and accretes extensions in Stage 2+."""
+        seeded: list[str] = []
+        try:
+            from invar_agent.research.vault import ResearchVaultManager
+            from invar_agent.schemas.research import (
+                BenchmarkAnchor, ExtractedEquation, ExtractedParameter,
+                StructuredResearchEvidence,
+            )
+            vault = ResearchVaultManager(state.workspace_root)
+            for rid in attached_ids or []:
+                detail = vault.get_run(rid)
+                if not detail:
+                    continue
+                meta = detail.get("metadata") or {}
+                if meta.get("origin") != "user_upload":
+                    continue
+                seeded.append(rid)
+                constants = dict(getattr(bp, "extracted_constants", None) or {})
+                for k, v in (meta.get("extracted_constants") or {}).items():
+                    if isinstance(v, (int, float)):
+                        constants.setdefault(str(k), float(v))
+                updates: Dict[str, Any] = {"extracted_constants": constants}
+                se_raw = meta.get("structured_evidence") or {}
+                if getattr(bp, "structured_evidence", None) is None and se_raw:
+                    try:
+                        params = {}
+                        for n, p in (se_raw.get("parameters") or {}).items():
+                            if p.get("si_value") is None:
+                                continue
+                            params[n] = ExtractedParameter(
+                                name=n, si_value=float(p["si_value"]),
+                                si_unit=str(p.get("si_unit") or ""),
+                                raw_value=float(p.get("raw_value", p["si_value"])),
+                                raw_unit=str(p.get("raw_unit") or ""),
+                                source=str(p.get("source") or "user_upload"))
+                        eqs = [ExtractedEquation(
+                            lhs=str(e.get("lhs") or ""),
+                            rhs_latex=str(e.get("rhs_latex") or ""),
+                            rhs_python_hint=str(e.get("rhs_python_hint") or ""),
+                            variables=list(e.get("variables") or []),
+                            source=str(e.get("source") or "user_upload"))
+                            for e in (se_raw.get("equations") or [])]
+                        benches = [BenchmarkAnchor.model_validate(b)
+                                   for b in (se_raw.get("benchmarks") or [])]
+                        updates["structured_evidence"] = StructuredResearchEvidence(
+                            domains=list(se_raw.get("domains") or []),
+                            parameters=params, equations=eqs, benchmarks=benches,
+                            recommended_backend=se_raw.get("recommended_backend") or "cpp",
+                            recommended_stepper=se_raw.get("recommended_stepper") or "rk4",
+                            suggested_invariants=list(se_raw.get("suggested_invariants") or []))
+                    except Exception:  # noqa: BLE001 - evidence is best-effort
+                        pass
+                bp = bp.model_copy(update=updates)
+        except Exception:  # noqa: BLE001 - seeding is best-effort
+            seeded = []
+        return bp, seeded
+
 
     @app.post("/api/v1/research/plan")
     async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
@@ -817,6 +1112,8 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         bp = ResearchBlueprint.model_validate(blueprint_dict)
         if feasibility is not None:
             bp = bp.model_copy(update={"feasibility": feasibility})
+        bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
+        manager.seeded_upload_ids = seeded
         manager.request_plan(bp)
         return {"status": "pending_approval", "blueprint": bp.model_dump(),
                 "source": outcome.get("source"),
@@ -891,6 +1188,8 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         bp = ResearchBlueprint.model_validate(blueprint_dict)
         if feasibility is not None:
             bp = bp.model_copy(update={"feasibility": feasibility})
+        bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
+        manager.seeded_upload_ids = seeded
         manager.request_plan(bp)
         if not manager.approve():
             raise HTTPException(status_code=409, detail="could not start research run")
@@ -964,9 +1263,15 @@ def _agent_sse_response(
     node_list: list[TaskWavefrontNode],
     patches_by_node: dict[str, list[ASTSurgicalPatch]],
     sandbox_cmd: Optional[list[str]],
+    *,
+    pre_events: Optional[list[dict[str, Any]]] = None,
+    research_packet: Any = None,
+    workspace_root: Optional[Path] = None,
 ) -> StreamingResponse:
     """Run the synchronous agent in a worker thread and stream progress as SSE."""
     events: "queue.Queue[dict[str, Any]]" = queue.Queue()
+    for item in pre_events or []:
+        events.put(item)
 
     def progress_cb(payload: dict[str, Any]) -> None:
         events.put(payload)
@@ -980,7 +1285,25 @@ def _agent_sse_response(
                 sandbox_cmd=sandbox_cmd,
                 progress_cb=progress_cb,
             )
-            events.put({"type": "done", "report": _report_to_dict(report)})
+            report_dict = _report_to_dict(report)
+            if research_packet is not None and workspace_root is not None:
+                from invar_agent.builder.research_bridge import run_research_parity_tests
+                events.put({"type": "activity", "stage": "SANDBOX",
+                            "step": "research_parity_test",
+                            "message": "Executing tests/test_research_parity.py "
+                                       "in Sandbox_Execute..."})
+                parity = run_research_parity_tests(workspace_root)
+                report_dict["research_parity"] = {
+                    "passed": parity["passed"], "returncode": parity["returncode"],
+                    "run_ids": research_packet.run_ids,
+                    "output_tail": parity["output"][-1500:]}
+                events.put({"type": "activity", "stage": "SANDBOX",
+                            "step": "research_parity_result",
+                            "level": "info" if parity["passed"] else "error",
+                            "message": ("Research-parity tests PASSED" if parity["passed"]
+                                        else "Research-parity tests FAILED"),
+                            "passed": parity["passed"]})
+            events.put({"type": "done", "report": report_dict})
         except Exception as e:  # noqa: BLE001
             events.put({"type": "error", "message": str(e)})
         finally:

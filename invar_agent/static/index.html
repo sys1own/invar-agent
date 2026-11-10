@@ -235,6 +235,13 @@
   .vault-search input { width:100%; background:#12161f; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 10px; font-size:12px; }
   .vault-search input:focus { outline:none; border-color:var(--accent); }
   .vault-list { flex:1; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:8px; }
+  .sidebar-toolbar { display:flex; gap:6px; padding:6px 8px; border-bottom:1px solid var(--border); flex:none; flex-wrap:wrap; }
+  .sidebar-toolbar button { flex:1; font-size:11px; padding:5px 6px; background:#12161f; border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer; white-space:nowrap; }
+  .sidebar-toolbar button:hover { border-color:var(--accent); }
+  .origin-badge { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+  .origin-badge.upload { color:#f5b84d; border-color:#7a5a1f; }
+  .origin-badge.agent { color:#5ad1a0; border-color:#1f6a4c; }
+  .archetype-select { background:#12161f; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12px; }
   .vault-card { background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
   .vault-card .vc-title { font-size:12.5px; font-weight:600; color:var(--text); }
   .vault-card .vc-id { font-size:10.5px; color:var(--accent); font-family:ui-monospace,monospace; }
@@ -319,9 +326,19 @@
       <button id="sidebar-tab-research" class="sidebar-tab" onclick="switchSidebarTab('research')">🔬 Research Vault <span id="research-vault-count" class="sidebar-badge badge-accent">0</span></button>
     </div>
     <div id="code-pane" class="sidebar-pane active">
+      <div class="sidebar-toolbar" id="code-toolbar">
+        <button id="btn-export-workspace" onclick="exportWorkspaceZip()" title="Download the software codebase as a .zip">📦 Export .zip</button>
+        <button id="btn-import-workspace" onclick="document.getElementById('import-workspace-input').click()" title="Import a software codebase .zip">📥 Import .zip</button>
+        <input type="file" id="import-workspace-input" accept=".zip" style="display:none" onchange="importWorkspaceZip(this)">
+      </div>
       <div class="tree" id="tree"><div class="tree-item">Loading…</div></div>
     </div>
     <div id="vault-pane" class="sidebar-pane">
+      <div class="sidebar-toolbar" id="vault-toolbar">
+        <button id="btn-upload-research" onclick="document.getElementById('upload-research-input').click()" title="Upload research files (.md .tex .txt .py .json .csv .zip)">⬆ Upload Research</button>
+        <button id="btn-export-vault" onclick="exportVaultZip()" title="Download the whole Research Vault as a .zip">📦 Export Vault</button>
+        <input type="file" id="upload-research-input" multiple accept=".md,.tex,.txt,.py,.json,.csv,.zip" style="display:none" onchange="uploadResearchFiles(this)">
+      </div>
       <div class="vault-search"><input id="vault-search" placeholder="🔍 Search research runs, equations, constants..." oninput="onVaultSearchInput()"></div>
       <div class="vault-list" id="vault-list"><div class="vault-empty">Loading…</div></div>
     </div>
@@ -368,7 +385,19 @@
         <div class="rv-title" id="rv-title">Research Viewer</div>
         <span class="hint" id="rv-sub"></span>
         <span style="flex:1"></span>
+        <select class="archetype-select" id="rv-archetype" title="Software archetype">
+          <option value="">Auto archetype</option>
+          <option value="SCIENTIFIC_SDK_LIBRARY">Scientific SDK library</option>
+          <option value="CLI_SIMULATOR_SWEEP">CLI simulator &amp; sweep</option>
+          <option value="INTERACTIVE_WEB_SIMULATOR">Interactive web simulator</option>
+          <option value="INVERSE_DESIGN_OPTIMIZER">Inverse design optimizer</option>
+          <option value="MULTI_SOLVER_BENCHMARK">Multi-solver benchmark</option>
+          <option value="TELEMETRY_DIGITAL_TWIN">Telemetry digital twin</option>
+          <option value="STANDALONE_NATIVE_CRATE">Standalone native crate</option>
+        </select>
         <button class="btn-approve" id="rv-build-cta" onclick="buildFromCurrentResearch()">🛠️ Build Software from this Research</button>
+        <button class="ghost" id="rv-verify-cta" onclick="verifyCurrentResearch()" title="Run the Research Agent to verify and extend this research">🔬 Verify / Extend</button>
+        <button class="ghost" id="rv-export-cta" onclick="exportCurrentResearchZip()" title="Download this run as .invar-research.zip">📦 Export</button>
       </div>
       <div class="rv-search"><input id="rv-search" placeholder="🔍 Find in report, metrics, equations, or code..." oninput="onResearchSearchInput()"></div>
       <div class="rv-tabs">
@@ -730,7 +759,8 @@ function addActionCard(action) {
   card.querySelector('button.build').onclick = () => {
     // Direct Build execution with the (possibly edited) card prompt.
     if (typeof setExecMode === 'function') setExecMode('direct');
-    runBuild(ta.value);
+    (params.attached_research_ids || []).forEach(id => attachResearch(id));
+    runBuild(ta.value, params.attached_research_ids || []);
   };
   card.querySelector('button.dismiss').onclick = () => card.remove();
   addExpandToggle(card);
@@ -809,7 +839,8 @@ function addResearchCardAction(action) {
     try {
       const plan = await api('/api/v1/research/plan', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({question: (action.params && action.params.question) || bp.title || ''})
+        body: JSON.stringify({question: (action.params && action.params.question) || bp.title || '',
+                              attached_research_ids: attachedResearchIds()})
       });
       setMode('research');
       if (plan.status === 'refused' || !plan.blueprint) {
@@ -825,7 +856,7 @@ function addResearchCardAction(action) {
   card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 /* ---- builder streaming (SSE over POST) ---- */
-async function runBuild(prompt) {
+async function runBuild(prompt, extraResearchIds) {
   if (builderRunning) return;
   const text = (prompt || '').trim();
   if (!text) { addMsg('system', 'Build prompt is empty.'); return; }
@@ -840,7 +871,8 @@ async function runBuild(prompt) {
     const resp = await fetch('/api/copilot/run-build', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prompt: text})
+      body: JSON.stringify({prompt: text, execution_mode: 'direct',
+        attached_research_ids: Array.from(new Set([...(attachedResearchIds() || []), ...(extraResearchIds || [])]))})
     });
     if (!resp.ok || !resp.body) throw new Error('run-build -> ' + resp.status);
     const reader = resp.body.getReader();
@@ -1614,17 +1646,19 @@ function renderVaultList(runs, query) {
     const card = el(`<div class="vault-card">
       <div class="vc-title">${renderMarkdown(run.title || run.run_id)}</div>
       <div class="vc-id">@research:${escapeHtml(run.run_id)}</div>
-      <div class="vc-meta">${verdictPill(run.verdict, run.status)}${run.target_backend ? `<span class="badge">${escapeHtml(run.target_backend)}</span>` : ''}</div>
+      <div class="vc-meta">${verdictPill(run.verdict, run.status)}${run.origin === 'user_upload' ? '<span class="origin-badge upload">⬆ Uploaded</span>' : '<span class="origin-badge agent">🤖 Research Agent</span>'}${run.target_backend ? `<span class="badge">${escapeHtml(run.target_backend)}</span>` : ''}</div>
       ${metricItems.length ? `<div class="vc-metrics">${metricItems.join('<br>')}</div>` : ''}
       ${run.snippet ? `<div class="hint" style="font-size:11px">${renderMarkdown(run.snippet)}</div>` : ''}
       <div class="vc-actions">
         <button class="vc-view">📖 View Research</button>
         <button class="vc-attach">📎 Attach to Prompt</button>
+        <button class="vc-export" title="Export .invar-research.zip">📦</button>
         <button class="vc-delete" style="margin-left:auto">🗑</button>
       </div>
     </div>`);
     card.querySelector('.vc-view').onclick = () => openResearchViewer(run.run_id);
     card.querySelector('.vc-attach').onclick = () => { attachResearch(run.run_id); showView('chat'); };
+    card.querySelector('.vc-export').onclick = () => downloadUrl('/api/v1/research/vault/' + encodeURIComponent(run.run_id) + '/export-zip');
     card.querySelector('.vc-delete').onclick = async () => {
       if (!confirm('Delete research run @research:' + run.run_id + ' from the vault?')) return;
       try { await api('/api/v1/research/vault/' + encodeURIComponent(run.run_id), {method: 'DELETE'}); } catch (e) {}
@@ -1761,8 +1795,57 @@ function buildFromCurrentResearch() {
   attachResearch(runId);
   setMode('builder');
   showView('chat');
-  input.value = `Using our verified research @research:${runId}, build a production software package that implements the verified unified module, governing equations, empirical constants and invariant bounds from that research run.`;
+  const archetype = (document.getElementById('rv-archetype') || {}).value || '';
+  const archetypeText = archetype ? ` Target software archetype: ${archetype}.` : '';
+  input.value = `Using our verified research @research:${runId}, build a production software package that implements the verified unified module, governing equations, empirical constants and invariant bounds from that research run.${archetypeText}`;
   input.focus();
+}
+function verifyCurrentResearch() {
+  if (!currentResearch || !currentResearch.metadata) return;
+  const runId = currentResearch.metadata.run_id;
+  attachResearch(runId);
+  setMode('research');
+  showView('chat');
+  input.value = `Verify and extend @research:${runId}: computationally confirm its governing equations, SI constants and unified_module.py baseline in Stage 1, then accrete extensions in Stage 2.`;
+  input.focus();
+}
+function downloadUrl(url) {
+  const a = document.createElement('a');
+  a.href = url; a.download = ''; document.body.appendChild(a); a.click(); a.remove();
+}
+function exportCurrentResearchZip() {
+  if (!currentResearch || !currentResearch.metadata) return;
+  downloadUrl('/api/v1/research/vault/' + encodeURIComponent(currentResearch.metadata.run_id) + '/export-zip');
+}
+function exportVaultZip() { downloadUrl('/api/v1/research/vault/export-all-zip'); }
+function exportWorkspaceZip() { downloadUrl('/api/v1/workspace/export-zip'); }
+async function importWorkspaceZip(inputEl) {
+  const f = inputEl.files && inputEl.files[0];
+  if (!f) return;
+  const fd = new FormData(); fd.append('file', f, f.name);
+  try {
+    const resp = await fetch('/api/v1/workspace/import-zip', {method: 'POST', body: fd});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.status);
+    addMsg('system', `Imported ${data.file_count} file(s) from ${f.name} into the codebase.`);
+    loadTree();
+  } catch (e) { addMsg('system', 'Workspace import failed: ' + e.message); }
+  inputEl.value = '';
+}
+async function uploadResearchFiles(inputEl) {
+  const files = Array.from(inputEl.files || []);
+  if (!files.length) return;
+  const fd = new FormData();
+  files.forEach(f => fd.append('file', f, f.name));
+  try {
+    const resp = await fetch('/api/v1/research/vault/upload', {method: 'POST', body: fd});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.status);
+    const verb = data.restored ? 'Restored' : 'Uploaded';
+    addMsg('system', `${verb} research @research:${data.run_id} (${(data.metadata || {}).status || ''}). Attach it to a Builder or Research prompt.`);
+    loadVault();
+  } catch (e) { addMsg('system', 'Research upload failed: ' + e.message); }
+  inputEl.value = '';
 }
 function buildFromResearch(runId) {
   attachResearch(runId);

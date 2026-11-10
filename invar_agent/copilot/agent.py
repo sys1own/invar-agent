@@ -297,7 +297,8 @@ class CopilotAgent:
         client = self._llm_client()
         if client is None:
             # No provider/key at all — a different state from a failed call.
-            return self._offline_reply(message, llm_state="not_configured")
+            return self._offline_reply(message, llm_state="not_configured",
+                                       attached_research_ids=attached_research_ids)
 
         messages = [{"role": "system", "content": self.system_prompt(
             user_query=message, attached_research_ids=attached_research_ids)}]
@@ -346,6 +347,7 @@ class CopilotAgent:
             "reply": reply or "I have no further comments.",
             "action": action, "llm_state": "ok"}
         if action is not None and action.get("type") == "SUGGEST_BUILD_PROMPT":
+            self._bind_research_to_card(action, message, attached_research_ids, result)
             # Unified Action Card schema shared with the frontend.
             prompt = (action.get("params") or {}).get("prompt", "")
             result.update({
@@ -356,6 +358,39 @@ class CopilotAgent:
                 "action_obj": {"type": "build", "clean_prompt": prompt},
             })
         return result
+
+    def _bind_research_to_card(self, action: Dict[str, Any], message: str,
+                               attached_research_ids: Optional[List[str]],
+                               result: Dict[str, Any]) -> None:
+        """Plan Mode: make the build card carry the archetype, SI constants,
+        equations, kernel-porting instructions and parity assertions, and the
+        research ids to forward to Direct execution on approval."""
+        from invar_agent.builder.research_bridge import (
+            bind_research_context, render_packet_prompt_block,
+        )
+
+        try:
+            packet = bind_research_context(self.workspace_path, message,
+                                           attached_research_ids or [])
+        except Exception as exc:  # noqa: BLE001 - research binding is best-effort
+            logger.warning("Plan-mode research binding failed: %s", exc)
+            return
+        if packet is None:
+            return
+        params = action.setdefault("params", {})
+        prompt = str(params.get("prompt") or "")
+        if "<research_to_software_specification>" not in prompt:
+            prompt = (prompt.rstrip() + "\n\n"
+                      + render_packet_prompt_block(packet, max_kernel_chars=4000))
+        refs = " ".join(f"@research:{r}" for r in packet.run_ids
+                        if f"@research:{r}" not in prompt)
+        if refs:
+            prompt = prompt.rstrip() + "\n\nBound research: " + refs
+        params["prompt"] = prompt
+        params["attached_research_ids"] = list(packet.run_ids)
+        params["archetype"] = packet.archetype.archetype_id
+        result["attached_research_ids"] = list(packet.run_ids)
+        result["archetype"] = packet.archetype.archetype_id
 
     # -- research planning ------------------------------------------------------
 
@@ -510,7 +545,8 @@ class CopilotAgent:
             }
         return result
 
-    def _offline_reply(self, message: str, llm_state: str = "not_configured") -> Dict[str, Any]:
+    def _offline_reply(self, message: str, llm_state: str = "not_configured",
+                       attached_research_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """Deterministic offline fallback when no LLM provider is configured."""
         if _has_build_intent(message):
             prompt = sanitize_builder_prompt(message) or message.strip()
@@ -520,7 +556,7 @@ class CopilotAgent:
                 "from your request. Review it in the Action Card before sending it to "
                 "the Builder."
             )
-            return {
+            result: Dict[str, Any] = {
                 "reply": reply,
                 "action": {
                     "type": "SUGGEST_BUILD_PROMPT",
@@ -533,6 +569,9 @@ class CopilotAgent:
                 },
                 "llm_state": llm_state,
             }
+            self._bind_research_to_card(result["action"], message,
+                                        attached_research_ids, result)
+            return result
         reply = (
             "I'm running in offline mode — no LLM provider is configured. "
             "Add an API key via the settings (gear) icon to enable full copilot "

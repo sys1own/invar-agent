@@ -188,11 +188,36 @@ def _contracts_digest_lines(contracts: List[Dict[str, Any]],
     return lines
 
 
+def build_research_to_software_block(workspace_dir: str | Path,
+                                     referenced_ids: Optional[List[str]] = None,
+                                     user_query: str = "",
+                                     max_chars: int = 16000) -> str:
+    """``<research_to_software_specification>`` for resolved research runs,
+    or ``""`` for greenfield prompts (Research-to-Builder Bridge)."""
+    from .builder.research_bridge import bind_research_context
+
+    try:
+        packet = bind_research_context(workspace_dir, user_query, referenced_ids or [])
+    except Exception:  # noqa: BLE001 - context is best-effort
+        return ""
+    if packet is None:
+        return ""
+    block = packet.prompt_block
+    if len(block) > max_chars:
+        block = block[:max_chars] + "\n…(truncated)\n</research_to_software_specification>"
+    return block
+
+
 def build_research_vault_context(workspace_dir: str | Path,
                                  referenced_ids: Optional[List[str]] = None,
                                  user_query: str = "",
-                                 max_chars: int = 8000) -> str:
-    """Compacted digest of all vault runs + full code for referenced runs."""
+                                 max_chars: int = 8000,
+                                 agent_mode: str = "builder") -> str:
+    """Compacted digest of all vault runs + full code for referenced runs.
+
+    In ``builder`` mode (Direct and Plan) the resolved research runs are also
+    compiled into a ``<research_to_software_specification>`` block.
+    """
     vault = ResearchVaultManager(workspace_dir)
     runs = vault.list_runs()
     if not runs:
@@ -208,9 +233,11 @@ def build_research_vault_context(workspace_dir: str | Path,
         verdict = run.get("verdict", "")
         status = run.get("status", "")
         backend = run.get("target_backend", "")
+        origin = run.get("origin") or ""
         digest_lines.append(
             f"- @research:{run_id} | {title} | verdict={verdict or 'n/a'} | "
-            f"status={status} | backend={backend or 'n/a'}")
+            f"status={status} | backend={backend or 'n/a'}"
+            + (f" | origin={origin}" if origin else ""))
         metrics = _metric_lines(run.get("key_metrics") or {})
         if metrics:
             digest_lines.append("  key_metrics:")
@@ -279,7 +306,29 @@ def build_research_vault_context(workspace_dir: str | Path,
     body += "\n</research_vault_context>"
     if len(body) > max_chars:
         body = body[:max_chars] + "\n…(truncated)\n</research_vault_context>"
+    if agent_mode == "builder":
+        packet_block = build_research_to_software_block(
+            workspace_dir, referenced_ids, user_query)
+        if packet_block:
+            body += "\n\n" + packet_block
+    elif agent_mode == "research":
+        uploaded = [r for r in runs if r.get("origin") == "user_upload"
+                    and str(r.get("run_id")) in explicit]
+        if uploaded:
+            body += "\n\n" + _uploaded_research_directive(uploaded)
     return body
+
+
+def _uploaded_research_directive(runs: List[Dict[str, Any]]) -> str:
+    ids = ", ".join("@research:" + str(r.get("run_id")) for r in runs)
+    return (
+        "<uploaded_research_verification_directive>\n"
+        f"The user attached USER-UPLOADED research ({ids}). Stage 1 MUST "
+        "computationally verify the uploaded equations, constants and baseline "
+        "unified_module.py exactly as provided (Sandbox_Execute + "
+        "SMT_Concolic_Verify), reusing the extracted SI constants verbatim. "
+        "Accrete any requested extensions or literature comparisons in Stage 2+.\n"
+        "</uploaded_research_verification_directive>")
 
 
 def dual_context(workspace_dir: str | Path,

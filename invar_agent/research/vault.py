@@ -10,6 +10,7 @@ confuses research artifacts with real project files.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
@@ -442,6 +443,597 @@ class ResearchVaultManager:
             return False
         shutil.rmtree(directory, ignore_errors=True)
         return True
+
+    def set_metadata_fields(self, run_id: str, **fields: Any) -> bool:
+        """Merge scalar fields into an existing run's metadata.json."""
+        path = self._metadata_path(run_id)
+        meta = self._read_metadata(self.run_dir(run_id))
+        if meta is None:
+            return False
+        meta.update({k: v for k, v in fields.items() if isinstance(v, (str, int, float, bool))
+                     or v is None})
+        try:
+            path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+            return True
+        except OSError:
+            return False
+
+    # -- user uploads ---------------------------------------------------------
+
+    def restore_research_bundle(self, files: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        """Restore an exported ``.invar-research.zip`` bundle (metadata.json +
+        report.md at the zip root or one level down) into the vault.
+
+        Returns the restored run_id, or None when the files are not a bundle.
+        """
+        by_path = {f.get("filename", "").replace("\\", "/").lstrip("/"): f
+                   for f in files if f.get("filename")}
+        base = ""
+        if "metadata.json" not in by_path and "report.md" not in by_path:
+            dirs = {p.split("/", 1)[0] for p in by_path if "/" in p}
+            if len(dirs) == 1:
+                candidate = next(iter(dirs)) + "/"
+                if candidate + "metadata.json" in by_path:
+                    base = candidate
+        if base + "metadata.json" not in by_path or base + "report.md" not in by_path:
+            return None
+        meta_file = by_path.get(base + "metadata.json")
+        try:
+            meta = json.loads(_decode_content(meta_file))
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(meta, dict) or not meta.get("run_id"):
+            return None
+        run_id = _safe_run_id(str(meta["run_id"]))
+        directory = self.run_dir(run_id)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        restored: List[str] = []
+        for path, item in by_path.items():
+            if not path.startswith(base):
+                continue
+            rel = path[len(base):]
+            if _unsafe_member_name(rel):
+                continue
+            target = directory / rel
+            if rel.endswith("/"):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.write_bytes(_decode_bytes(item))
+                restored.append(rel)
+            except (OSError, ValueError):
+                continue
+        meta["run_id"] = run_id
+        meta["origin"] = meta.get("origin") or "research_agent"
+        (directory / "metadata.json").write_text(
+            json.dumps(meta, indent=2, default=str), encoding="utf-8")
+        return {"run_id": run_id, "restored": True, "files": restored,
+                "title": meta.get("title", run_id)}
+
+    def ingest_uploaded_research(self, files: List[Dict[str, Any]],
+                                 title: Optional[str] = None,
+                                 custom_notes: str = "") -> Dict[str, Any]:
+        """First-class vault entry for user-uploaded research.
+
+        ``files`` are ``{"filename", "content", "encoding"}`` dicts (UTF-8 or
+        base64). A portable ``.invar-research.zip`` bundle is restored
+        directly; any other ``.md``/``.tex``/``.txt``/``.py``/``.json``/``.csv``
+        files (or a general ``.zip`` of them) are extracted deterministically
+        by :class:`QuantitativeInsightExtractor` into a ``UPLOADED_READY`` run.
+        """
+        normalized = [_normalize_upload_file(f) for f in (files or [])]
+        if not normalized:
+            raise ValueError("no research files uploaded")
+        total = sum(len(n["content"]) for n in normalized)
+        if total > _UPLOAD_MAX_TOTAL_BYTES:
+            raise ValueError("uploaded research exceeds the 20 MB limit")
+
+        if len(normalized) == 1 and normalized[0]["filename"].lower().endswith(".zip"):
+            members = _zip_members(normalized[0]["content"])
+            restored = self.restore_research_bundle(members)
+            if restored is not None:
+                restored["uploaded_files"] = [normalized[0]["filename"]]
+                return restored
+            normalized = members or normalized
+
+        base_id = "upload_" + time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        run_id, n = base_id, 1
+        while self.run_dir(run_id).exists():
+            n += 1
+            run_id = f"{base_id}_{n}"
+        meta = self._ingest_research_files(run_id, normalized, title=title,
+                                           custom_notes=custom_notes)
+        return meta
+
+    def _ingest_research_files(self, run_id: str,
+                               files: List[Dict[str, Any]],
+                               title: Optional[str], custom_notes: str) -> Dict[str, Any]:
+        from .extractor import QuantitativeInsightExtractor, parse_equation
+
+        directory = self.run_dir(run_id)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+        sources_dir = directory / "uploaded_sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+
+        documents: List[tuple] = []  # (filename, text)
+        python_sources: List[str] = []
+        saved: List[str] = []
+        for item in files:
+            name = item["filename"]
+            rel = _safe_source_name(name)
+            if rel is None:
+                continue
+            target = sources_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(item["content"])
+            saved.append(f"uploaded_sources/{rel.as_posix()}")
+            suffix = rel.suffix.lower()
+            if suffix == ".py":
+                text = _decode_text(item)
+                if "simulation_step" in text or "def " in text:
+                    python_sources.append(text)
+            if suffix in (".md", ".tex", ".txt"):
+                documents.append((name, _decode_text(item)))
+            elif suffix == ".json":
+                documents.append((name, _decode_text(item)))
+            elif suffix == ".csv":
+                documents.append((name, _decode_text(item)))
+
+        corpus_text = "\n\n".join(f"# {n}\n{t}" for n, t in documents)
+        title = (title or "").strip() or _upload_title(documents, custom_notes, run_id)
+        extractor = QuantitativeInsightExtractor()
+        evidence = extractor.extract(" ".join([title, custom_notes, corpus_text])[:20000])
+
+        # LaTeX / <math> equations from the uploaded documents themselves.
+        from .extractor import extract_wikitext_math
+        latex_equations = []
+        for doc_name, doc_text in documents:
+            suffix = _path_suffix(doc_name)
+            if suffix in (".md", ".tex", ".txt", ".html"):
+                for tex in extract_wikitext_math(doc_text):
+                    eq = parse_equation(tex, source=f"user_upload:{doc_name}")
+                    if eq is not None:
+                        latex_equations.append(eq)
+            latex_equations.extend(extractor.equations_from_text(
+                doc_text, source=f"user_upload:{doc_name}"))
+        if latex_equations:
+            merged = list(evidence.equations)
+            known = {e.rhs_python_hint for e in merged}
+            for eq in latex_equations:
+                if eq.rhs_python_hint not in known:
+                    merged.append(eq)
+                    known.add(eq.rhs_python_hint)
+            evidence = evidence.model_copy(update={
+                "equations": merged[: extractor.max_equations]})
+
+        # Plain-text (non-LaTeX) equations such as ``dT/dt = -k*(T - T_amb)``.
+        extra_equations = []
+        for line in corpus_text.splitlines():
+            line = line.strip().lstrip("-*># ").strip()
+            if "=" not in line or len(line) > 240:
+                continue
+            lhs, _, rhs = line.partition("=")
+            lhs = lhs.strip()
+            rhs = rhs.strip().rstrip(".")
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\s*/\s*d[A-Za-z0-9_]*)?|[A-Za-z][A-Za-z0-9_]*", lhs):
+                continue
+            eq = parse_equation(f"${lhs} = {rhs}$", source="user_upload")
+            if eq is not None:
+                extra_equations.append(eq)
+        if extra_equations:
+            merged = list(evidence.equations)
+            for eq in extra_equations:
+                if eq.rhs_python_hint not in {e.rhs_python_hint for e in merged}:
+                    merged.append(eq)
+            evidence = evidence.model_copy(update={
+                "equations": merged[: extractor.max_equations]})
+
+        constants = {name: float(p.si_value) for name, p in evidence.parameters.items()
+                     if p.si_value is not None}
+        benchmarks = _benchmarks_from_uploads(documents, evidence)
+        key_metrics = {}
+        for i, b in enumerate(benchmarks[:12]):
+            try:
+                value = float(b.get("expected_value"))
+            except (TypeError, ValueError):
+                continue
+            key_metrics[f"benchmark_{i}_{b.get('name', 'metric')}"] = {
+                "value": value, "unit": b.get("unit", ""), "verified": False}
+
+        module_code = _select_upload_kernel(python_sources, constants, evidence, title)
+        for name, value in _module_constants(module_code).items():
+            constants.setdefault(name.lower(), value)
+        (directory / "unified_module.py").write_text(module_code, encoding="utf-8")
+        (directory / "report.md").write_text(
+            _upload_report(title, custom_notes, evidence, benchmarks, saved, run_id),
+            encoding="utf-8")
+
+        metadata = {
+            "run_id": run_id,
+            "title": title,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "verdict": "OPTIMAL_DIRECT",
+            "status": "UPLOADED_READY",
+            "target_backend": evidence.recommended_backend,
+            "origin": "user_upload",
+            "stages_completed": 0,
+            "key_metrics": key_metrics,
+            "extracted_constants": constants,
+            "governing_equations": [
+                f"{e.lhs} = {e.rhs_python_hint or e.rhs_latex}"
+                for e in evidence.equations[:24]],
+            "contracts_summary": [],
+            "verified_functions": _verified_functions(module_code),
+            "structured_evidence": _structured_evidence_summary(
+                type("_B", (), {"structured_evidence": evidence})()),
+            "uploaded_sources": saved,
+            "source_file_count": len(saved),
+            "recommended_stepper": evidence.recommended_stepper,
+        }
+        self._metadata_path(run_id).write_text(
+            json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+        return metadata
+
+
+# ---------------------------------------------------------------------------
+# User research upload helpers
+# ---------------------------------------------------------------------------
+
+_UPLOAD_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+_UPLOAD_MAX_FILE_BYTES = 10 * 1024 * 1024
+_UPLOAD_TEXT_SUFFIXES = {".md", ".tex", ".txt", ".py", ".json", ".csv"}
+
+
+def _decode_bytes(item: Dict[str, Any]) -> bytes:
+    content = item.get("content", b"")
+    if isinstance(content, str):
+        if str(item.get("encoding", "utf-8")).lower() == "base64":
+            try:
+                return base64.b64decode(content, validate=True)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError("uploaded file content is not valid base64") from exc
+        return content.encode("utf-8", errors="replace")
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    return b""
+
+
+def _decode_content(item: Dict[str, Any]) -> bytes:
+    return _decode_bytes(item)
+
+
+def _decode_text(item: Dict[str, Any]) -> str:
+    return _decode_bytes(item).decode("utf-8", errors="replace")
+
+
+def _member_key(name: str) -> str:
+    """Zip-Slip-safe relative path (posix, no absolute/``..`` segments)."""
+    parts = [p for p in str(name or "").replace("\\", "/").split("/")
+             if p not in ("", ".", "..")]
+    if str(name or "").startswith(("/", "\\")) or ":" in (parts[0] if parts else ""):
+        return ""
+    if not parts:
+        return ""
+    safe = [re.sub(r"[^A-Za-z0-9_.@+\- ]", "_", p)[:80] for p in parts]
+    return "/".join(safe)[:200]
+
+
+def _normalize_upload_file(raw: Dict[str, Any]) -> Dict[str, Any]:
+    name = _member_key(str(raw.get("filename") or raw.get("name") or "upload.bin")) \
+        or "upload.bin"
+    content = raw.get("content", raw.get("content_base64", ""))
+    encoding = str(raw.get("encoding") or "").lower()
+    if not encoding and raw.get("content_base64"):
+        encoding = "base64"
+    data = _decode_bytes({"content": content, "encoding": encoding or "utf-8"})
+    if len(data) > _UPLOAD_MAX_FILE_BYTES:
+        raise ValueError(f"uploaded file {name!r} exceeds the 10 MB limit")
+    return {"filename": name or "upload.bin", "content": data,
+            "encoding": encoding or "utf-8"}
+
+
+def _unsafe_member_name(name: str) -> bool:
+    """Zip-Slip guard: reject absolute paths and ``..`` traversal."""
+    if not name or name.endswith("/"):
+        return False
+    p = Path(name.replace("\\", "/"))
+    return p.is_absolute() or ".." in p.parts
+
+
+def _safe_source_name(name: str) -> Optional[Path]:
+    key = _member_key(name)
+    if not key or _path_suffix(key) not in _UPLOAD_TEXT_SUFFIXES:
+        return None
+    return Path(*key.split("/"))
+
+
+def _zip_members(data: bytes, *, max_entries: int = 200) -> List[Dict[str, Any]]:
+    import io
+    import zipfile
+
+    out: List[Dict[str, Any]] = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return out
+    with zf:
+        for info in zf.infolist()[:max_entries]:
+            if info.is_dir() or _unsafe_member_name(info.filename):
+                continue
+            if info.file_size > _UPLOAD_MAX_FILE_BYTES:
+                continue
+            if _path_suffix(info.filename) not in _UPLOAD_TEXT_SUFFIXES:
+                continue
+            raw = zf.read(info)
+            out.append({"filename": info.filename,
+                        "content": base64.b64encode(raw).decode("ascii"),
+                        "encoding": "base64"})
+    return out
+
+
+def _path_suffix(name: str) -> str:
+    return Path(str(name).replace("\\", "/")).suffix.lower()
+
+
+def _upload_title(documents: List[tuple], custom_notes: str, run_id: str) -> str:
+    for _, text in documents:
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                return line.lstrip("#").strip()[:160] or run_id
+    if custom_notes.strip():
+        return custom_notes.strip().splitlines()[0][:160]
+    return run_id
+
+
+def _benchmarks_from_uploads(documents: List[tuple], evidence: Any) -> List[Dict[str, Any]]:
+    """Benchmark rows from Markdown tables, JSON objects and CSV headers."""
+    rows: List[Dict[str, Any]] = [b.model_dump() for b in (evidence.benchmarks or [])]
+    for name, text in documents:
+        suffix = _path_suffix(name)
+        if suffix == ".md" or suffix == ".tex" or suffix == ".txt":
+            rows.extend(_markdown_table_benchmarks(text))
+        elif suffix == ".json":
+            rows.extend(_json_benchmarks(text))
+        elif suffix == ".csv":
+            rows.extend(_csv_benchmarks(text))
+    # De-duplicate by (name, expected_value).
+    seen = set()
+    unique = []
+    for row in rows:
+        key = (str(row.get("name", "")), str(row.get("expected_value", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique[:24]
+
+
+def _markdown_table_benchmarks(text: str) -> List[Dict[str, Any]]:
+    rows = []
+    for line in (text or "").splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or all(set(c) <= {"-", ":", " "} for c in cells):
+            continue
+        numeric_idx = next((i for i, c in enumerate(cells)
+                            if re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", c)),
+                           None)
+        if numeric_idx is None or numeric_idx == 0:
+            continue
+        name = cells[0]
+        if name.lower() in ("name", "metric", "quantity", "parameter"):
+            continue
+        unit = ""
+        for cand in cells[numeric_idx + 1:]:
+            if cand and not re.fullmatch(
+                    r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", cand):
+                unit = cand
+                break
+        rows.append({"name": name, "expected_value": cells[numeric_idx],
+                     "unit": unit, "source": "user_upload_markdown",
+                     "input_regime": "uploaded research", "tolerance": 0.05})
+    return rows[:12]
+
+
+def _json_benchmarks(text: str) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    rows: List[Dict[str, Any]] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 5 or len(rows) >= 12:
+            return
+        if isinstance(node, dict):
+            name = node.get("name") or node.get("metric")
+            value = node.get("expected_value", node.get("value"))
+            if name is not None and value is not None \
+                    and isinstance(value, (int, float)) and not isinstance(value, bool):
+                rows.append({"name": str(name), "expected_value": float(value),
+                             "unit": str(node.get("unit", "") or ""),
+                             "source": "user_upload_json",
+                             "input_regime": str(node.get("regime", "") or ""),
+                             "tolerance": float(node.get("tolerance", 0.05) or 0.05)})
+                return
+            for v in node.values():
+                walk(v, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:50]:
+                walk(item, depth + 1)
+
+    walk(data)
+    return rows
+
+
+def _csv_benchmarks(text: str) -> List[Dict[str, Any]]:
+    import csv
+    import io
+
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except Exception:  # noqa: BLE001
+        return []
+    if len(rows) < 2:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    name_col = next((i for i, h in enumerate(header) if h in ("name", "metric")), None)
+    value_col = next((i for i, h in enumerate(header)
+                      if h in ("value", "expected_value", "expected")), None)
+    if name_col is None or value_col is None:
+        return []
+    unit_col = next((i for i, h in enumerate(header) if h == "unit"), None)
+    out = []
+    for row in rows[1:12]:
+        try:
+            value = float(row[value_col])
+        except (TypeError, ValueError, IndexError):
+            continue
+        out.append({"name": row[name_col].strip(), "expected_value": value,
+                    "unit": row[unit_col].strip() if unit_col is not None
+                    and unit_col < len(row) else "",
+                    "source": "user_upload_csv", "input_regime": "",
+                    "tolerance": 0.05})
+    return out
+
+
+def _module_constants(code: str) -> Dict[str, float]:
+    """Top-level ``UPPER_NAME = <number>`` assignments of an uploaded kernel."""
+    import ast
+    out: Dict[str, float] = {}
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return out
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.isupper()):
+            value = node.value
+            sign = 1.0
+            if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
+                value, sign = value.operand, -1.0
+            if (isinstance(value, ast.Constant) and isinstance(value.value, (int, float))
+                    and not isinstance(value.value, bool)):
+                out[node.targets[0].id] = sign * float(value.value)
+    return out
+
+
+def _select_upload_kernel(python_sources: List[str], constants: Dict[str, float],
+                          evidence: Any, title: str) -> str:
+    """Preserve an uploaded kernel that defines ``simulation_step``; otherwise
+    synthesize a deterministic baseline module seeded with the extracted
+    constants and equation hints."""
+    for src in sorted(python_sources, key=len, reverse=True):
+        if "simulation_step" not in src:
+            continue
+        try:
+            compile(src, "<uploaded_kernel>", "exec")
+        except SyntaxError:
+            continue
+        header = (f'"""Verified kernel uploaded by the user (title: {title})."""\n\n'
+                  "# invar-agent: preserved verbatim from uploaded_sources.\n\n")
+        return header + src.strip() + "\n"
+
+    lines = [
+        '"""Baseline unified module synthesized by invar-agent from user-uploaded research."""',
+        "",
+        "# Extracted SI constants (normalized by the zero-token extractor; use verbatim).",
+    ]
+    for name, value in sorted(constants.items()):
+        py_name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper() or "CONST"
+        if py_name[0].isdigit():
+            py_name = "C_" + py_name
+        lines.append(f"{py_name} = {value!r}")
+    lines.append("")
+    lines.append("# Governing equations (v9_transpiler_friendly Python hints):")
+    for eq in (evidence.equations or [])[:12]:
+        hint = eq.rhs_python_hint or eq.rhs_latex
+        lines.append(f"#   {eq.lhs} = {hint}")
+    lines += [
+        "",
+        "# Placeholder dynamics: the Research Agent (Verify & Extend) or the",
+        "# Builder must replace this with the verified numerical integration of",
+        "# the governing equations above. The buffer layout follows v9.",
+        "",
+        "class SimulationBuffer:",
+        "    def __init__(self, data, dt):",
+        "        self.data = list(data)",
+        "        self.size = len(self.data)",
+        "        self.dt = dt",
+        "        self.steps = 0",
+        "",
+        "    def __getitem__(self, index):",
+        "        return self.data[index]",
+        "",
+        "    def __setitem__(self, index, value):",
+        "        self.data[index] = value",
+        "",
+        "",
+        "def simulation_step(buf, dt):",
+        "    # TODO(research): implement d(state)/dt from the governing equations.",
+        "    buf.steps += 1",
+        "",
+        "",
+        "def run_simulation(initial_state=None, dt=0.01, steps=1000):",
+        "    state = [float(v) for v in (initial_state or [0.0])]",
+        "    buf = SimulationBuffer(state, dt)",
+        "    for _ in range(int(steps)):",
+        "        simulation_step(buf, dt)",
+        "    final = [float(v) for v in buf.data]",
+        "    telemetry = {\"steps\": float(buf.steps), \"finite\": 1.0,",
+        "                  \"final_l2\": sum(v * v for v in final) ** 0.5}",
+        "    return {\"state\": final, \"steps\": int(buf.steps), \"finite\": True,",
+        "            \"telemetry\": telemetry}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _upload_report(title: str, custom_notes: str, evidence: Any,
+                   benchmarks: List[Dict[str, Any]], saved: List[str],
+                   run_id: str) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        "> **Origin:** user-uploaded research (zero-token extraction).",
+        "> **Status:** UPLOADED_READY — not yet computationally verified.",
+        "",
+    ]
+    if custom_notes.strip():
+        lines += ["## Researcher Notes", "", custom_notes.strip(), ""]
+    lines += ["## Uploaded Sources", ""]
+    lines.extend(f"- `{p}`" for p in saved) or ["- (none)"]
+    lines.append("")
+    table = getattr(evidence, "summary_markdown_table", "") or ""
+    if table:
+        lines += ["## Extracted Literature Equations & SI Constants", "", table, ""]
+    if evidence.equations:
+        lines += ["## Governing Equations", ""]
+        for eq in evidence.equations[:16]:
+            lines.append(f"- `{eq.lhs} = {eq.rhs_python_hint or eq.rhs_latex}`")
+        lines.append("")
+    if benchmarks:
+        lines += ["## Benchmark Anchors", "", "| name | expected | unit |", "|---|---|---|"]
+        for b in benchmarks[:12]:
+            lines.append(f"| {b.get('name', '')} | {b.get('expected_value', '')} "
+                         f"| {b.get('unit', '')} |")
+        lines.append("")
+    lines += [
+        "## Next Steps",
+        "",
+        f"- Attach `@research:{run_id}` in the Research Agent to computationally "
+        "verify and accrete this research (status becomes VERIFIED).",
+        f"- Use `[Build Software from this Research]` (`@research:{run_id}`) to "
+        "generate a software archetype with Research-Parity tests.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -100,11 +100,12 @@ class ResearchRunManager:
             abort_flag=self._abort.is_set,
             workspace_root=self.workspace_root)
         self.active_state = ResearchRunState(blueprint=bp)
+        seeded = list(getattr(self, "seeded_upload_ids", None) or [])
 
         def _run() -> None:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._execute(machine, bp))
+                loop.run_until_complete(self._execute(machine, bp, seeded))
             finally:
                 loop.close()
 
@@ -112,11 +113,22 @@ class ResearchRunManager:
         self._thread.start()
         return True
 
-    async def _execute(self, machine: ResearchStateMachine, bp: ResearchBlueprint) -> None:
+    async def _execute(self, machine: ResearchStateMachine, bp: ResearchBlueprint,
+                       seeded: Optional[List[str]] = None) -> None:
         self.broadcaster.publish("accelerator_log", "run_start",
                                  {"blueprint_id": bp.blueprint_id})
         state = await machine.run(bp)
         self.active_state = state
+        # Attached user-uploaded research runs flip from UPLOADED_READY once
+        # the verified loop has computationally confirmed the baseline.
+        if seeded:
+            from .vault import ResearchVaultManager
+            vault = ResearchVaultManager(self.workspace_root)
+            for rid in seeded:
+                if state.status == "VERIFIED":
+                    vault.mark_status(rid, "VERIFIED")
+                elif state.status == "PARTIAL":
+                    vault.mark_status(rid, "PARTIALLY_VERIFIED")
         if state.aborted:
             self.broadcaster.publish("accelerator_log", "aborted", {})
         else:

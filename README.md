@@ -214,6 +214,54 @@ extend and couple rather than overwrite.
   `GoIWavefrontSolverNative`, `PyGraphPolyglotMaterializer` and the egg-based
   `PyProofTheoreticHealer` / `repair_uast_expression`.
 
+## Research-to-Software Builder Bridge
+
+`invar_agent/builder/research_bridge.py` turns Research Vault runs into build specifications for
+the Builder Agent in both Direct and Plan Mode.
+
+- **Resolution** (`resolve_relevant_research_runs`): explicit `@research:<id>` tags and
+  `attached_research_ids` first, then keyword/symbol overlap with run titles, constants and
+  equations, then implicit phrases ("from our research", "turn this into", "uploaded research")
+  bound to the most recent run. Unrelated greenfield prompts bind no research.
+- **Archetypes** (`classify_software_archetype`): `SCIENTIFIC_SDK_LIBRARY` (default),
+  `CLI_SIMULATOR_SWEEP`, `INTERACTIVE_WEB_SIMULATOR`, `INVERSE_DESIGN_OPTIMIZER`,
+  `MULTI_SOLVER_BENCHMARK`, `TELEMETRY_DIGITAL_TWIN`, `STANDALONE_NATIVE_CRATE`, each with a
+  file layout, architecture guidelines and verification requirements.
+- **Build packet** (`compile_research_build_packet`): SI constants, governing equations, the
+  verified `simulation_step(buf, dt)` kernel, contracts and key metrics, rendered as a
+  `<research_to_software_specification>` block injected into Builder prompts.
+- **Research-Parity tests**: Direct-Mode builds write `tests/test_research_parity.py` and
+  `.invar_research_provenance.json`, emit a `research_context_bound` activity event and execute
+  the parity tests after the build. The test checks that every research constant is preserved
+  (relative tolerance $10^{-12}$), that the built solver stays finite under the baseline initial
+  conditions, satisfies every `VerificationContract` invariant, and reproduces each key metric
+  $m$ within $|m_{\text{built}} - m_{\text{research}}| \le 10^{-6}\,|m_{\text{research}}| + 10^{-9}$.
+
+### User research uploads
+
+`POST /api/v1/research/vault/upload` (alias `/import`) accepts multipart files or JSON
+`{"files": [{"filename", "content", "encoding"}], "title"}` with `.md .tex .txt .py .json .csv
+.zip` sources. A `.invar-research.zip` bundle is restored as-is; anything else is stored under
+`uploaded_sources/` and mined by the zero-token `QuantitativeInsightExtractor` (LaTeX and plain
+equations, SI-normalised parameters such as `rho = 15.6 g/cm^3` to `15600 kg/m^3`, benchmark tables
+from Markdown/JSON/CSV). An uploaded `.py` with `simulation_step` becomes `unified_module.py`;
+otherwise a baseline module is synthesised. Uploads are tagged `origin="user_upload"`,
+`status="UPLOADED_READY"` and are usable by both agents; a Research Agent run with the upload
+attached is pre-seeded with its constants and evidence and flips it to `VERIFIED` on success.
+
+### Zip export / import
+
+| Endpoint | Result |
+|---|---|
+| `GET /api/v1/workspace/export-zip` | `invar_software_workspace.zip` with `INVAR_BUILD_MANIFEST.json`; excludes `.invar/`, `.git/`, `.venv/`, caches and build scratch |
+| `POST /api/v1/workspace/import-zip` | extracts a codebase zip; absolute or `..` members are rejected with HTTP 400, `.git/` and `.invar/` are ignored |
+| `GET /api/v1/research/vault/{run_id}/export-zip` | `<run_id>.invar-research.zip` |
+| `GET /api/v1/research/vault/export-all-zip` | `invar_research_vault_bundle.zip` |
+
+The web console exposes these as Export/Import buttons on the Codebase pane, Upload/Export on the
+Research Vault pane, per-run export, origin badges, and a Research Viewer archetype selector with
+**Build Software from this Research** and **Verify / Extend** actions.
+
 ## Verification
 
 - `cargo test` — Rust core unit tests (GoI nilpotency, HIN reduction, reflex healer, HIS register,

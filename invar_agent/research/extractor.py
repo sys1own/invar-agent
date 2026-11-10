@@ -87,6 +87,12 @@ _UNIT_TABLE: Dict[str, Tuple[float, str]] = {
     # temperature / molar
     "K": (1.0, "K"), "g/mol": (1e-3, "kg/mol"), "kg/mol": (1.0, "kg/mol"),
     "mol": (1.0, "mol"),
+    # thermal conductivity / specific heat / rates
+    "W/(m*K)": (1.0, "W/(m*K)"), "W/(m K)": (1.0, "W/(m*K)"),
+    "W/m/K": (1.0, "W/(m*K)"), "mW/(m*K)": (1e-3, "W/(m*K)"),
+    "J/(kg*K)": (1.0, "J/(kg*K)"), "J/(kg K)": (1.0, "J/(kg*K)"),
+    "J/kg/K": (1.0, "J/(kg*K)"), "kJ/(kg*K)": (1e3, "J/(kg*K)"),
+    "1/s": (1.0, "1/s"), "s^-1": (1.0, "1/s"), "Hz": (1.0, "1/s"),
 }
 
 # Units that are safe to match case-insensitively (no SI-prefix ambiguity).
@@ -103,6 +109,8 @@ def _canonical_unit(unit_str: str) -> str:
           .replace("¹", "").replace("μ", "u").replace("µ", "u")
           .replace("−", "-").replace("·", " ").replace("⋅", " "))
     u = re.sub(r"\s*/\s*", "/", u).strip()
+    # "W/(m·K)" / "W/(m . K)" -> "W/(m*K)"
+    u = re.sub(r"\(\s*(\w+)\s*[*.\s]\s*(\w+)\s*\)", r"(\1*\2)", u)
     u = re.sub(r"\^\{(-?\d)\}", r"^\1", u)
     # m2 / m3 / cm3 -> m^2 / m^3 / cm^3 (unit tokens only, never CO2)
     u = re.sub(r"(?<![A-Za-z])((?:k|c|m|M)?m)([23])\b", r"\1^\2", u)
@@ -495,7 +503,9 @@ _INLINE_TEX = re.compile(r"\$\$?([^$]{3,400}?)\$\$?")
 
 _NUMBER = (r"[-+−]?\d+(?:[.,]\d+)?(?:[eE][-+−]?\d+)?"
            r"(?:\s*(?:×|x|\*|\\times)\s*10\s*\^?\s*\{?\s*[-+−]?\d+\s*\}?)?")
-_UNIT_TOKEN = r"(?:[A-Za-zμµ°]+(?:\^?-?[0-9²³])?(?:\s*/\s*[A-Za-zμµ]+(?:\^?-?[0-9²³])?)?|°)"
+_UNIT_TOKEN = (r"(?:[A-Za-zμµ°]+(?:\^?-?[0-9²³])?"
+               r"(?:\s*/\s*\(\s*[A-Za-z]+\s*[*·.\s]\s*[A-Za-z]+\s*\)"
+               r"|\s*/\s*[A-Za-zμµ]+(?:\^?-?[0-9²³])?)?|°)")
 _PARAM_ASSIGN = re.compile(
     r"(?P<name>[A-Za-z][A-Za-z0-9_\- ]{0,48}?)\s*(?:=|≈|~|:|\bof\b|\bis\b)\s*"
     r"(?P<num>" + _NUMBER + r")\s*(?P<unit>" + _UNIT_TOKEN + r")?")
@@ -777,9 +787,8 @@ DOMAIN_REFERENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "materials_thermophysics": {
         "keywords": ("tungsten", "carbide", "pica", "phenolic", "titanium", "sic",
-                     "silicon carbide", "ablat", "ablator", "thermal conductivity",
-                     "specific heat", "melting", "material", "shield material",
-                     "stopping power", "thermal protection", "tps"),
+                     "silicon carbide", "ablat", "ablator", "shield material",
+                     "thermal protection", "tps"),
         "parameters": [
             _p("tungsten_density", "rho_W", 19.3, "g/cm^3", "CRC Handbook"),
             _p("tungsten_melting_point", "T_m_W", 3695.0, "K", "CRC Handbook"),
