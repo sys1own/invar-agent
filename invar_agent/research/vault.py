@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..schemas.research import ResearchBlueprint
+from .reporter import _unit_for
 
 VAULT_DIRNAME = ".invar"
 VAULT_SUBDIR = "research_vault"
@@ -69,6 +70,32 @@ def _extracted_constants(blueprint: ResearchBlueprint) -> Dict[str, Any]:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 constants[str(key)] = value
     return constants
+
+
+def _contracts_summary(blueprint: ResearchBlueprint) -> List[Dict[str, Any]]:
+    """Per-contract boundary conditions so the Builder never bisects ICs.
+
+    Each entry carries the FULL ``initial_state`` (never truncated), ``dt``,
+    ``steps`` and the blueprint ``variable_map`` inverted to a slot-to-name
+    mapping (``"3": {"name": "peak_alt_km", "unit": "km"}``).
+    """
+    slot_map: Dict[str, Dict[str, str]] = {}
+    variable_map = getattr(blueprint, "variable_map", {}) or {}
+    for name, idx in variable_map.items():
+        if isinstance(idx, int) and idx >= 0:
+            slot_map[str(idx)] = {"name": str(name), "unit": _unit_for(str(name))}
+    summary: List[Dict[str, Any]] = []
+    for contract in getattr(blueprint, "contracts", []) or []:
+        initial = getattr(contract, "initial_state", None) or []
+        summary.append({
+            "contract_id": str(getattr(contract, "contract_id", "")),
+            "target_backend": str(getattr(contract, "target_backend", "")),
+            "dt": float(getattr(contract, "dt", 0.0) or 0.0),
+            "steps": int(getattr(contract, "steps", 0) or 0),
+            "initial_state": [float(v) for v in initial],
+            "variable_map": dict(slot_map),
+        })
+    return summary
 
 
 def _governing_equations(blueprint: ResearchBlueprint) -> List[str]:
@@ -125,6 +152,7 @@ class ResearchVaultManager:
             "key_metrics": _key_metrics(blueprint, telemetry),
             "extracted_constants": _extracted_constants(blueprint),
             "governing_equations": _governing_equations(blueprint),
+            "contracts_summary": _contracts_summary(blueprint),
             "verified_functions": _verified_functions(module_code),
         }
         self._metadata_path(run_id).write_text(

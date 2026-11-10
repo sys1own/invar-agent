@@ -170,6 +170,24 @@ def _metric_lines(metrics: Dict[str, Any], limit: int = 8) -> List[str]:
     return lines
 
 
+def _contracts_digest_lines(contracts: List[Dict[str, Any]],
+                            indent: str = "  ") -> List[str]:
+    """Render contracts_summary (initial_state / dt / steps / variable_map)."""
+    lines: List[str] = []
+    for contract in contracts[:4]:
+        cid = contract.get("contract_id") or "contract"
+        initial = contract.get("initial_state") or []
+        lines.append(
+            f"{indent}- {cid}: dt={contract.get('dt')} steps={contract.get('steps')}")
+        lines.append(f"{indent}  initial_state={initial}")
+        variable_map = contract.get("variable_map") or {}
+        if variable_map:
+            compact = {slot: (entry.get("name") if isinstance(entry, dict) else entry)
+                       for slot, entry in variable_map.items()}
+            lines.append(f"{indent}  variable_map={compact}")
+    return lines
+
+
 def build_research_vault_context(workspace_dir: str | Path,
                                  referenced_ids: Optional[List[str]] = None,
                                  user_query: str = "",
@@ -209,6 +227,7 @@ def build_research_vault_context(workspace_dir: str | Path,
         functions = run.get("verified_functions") or []
         if functions:
             digest_lines.append(f"  verified_functions: {', '.join(functions[:10])}")
+        digest_lines.extend(_contracts_digest_lines(run.get("contracts_summary") or []))
 
         referenced = run_id in explicit or _keyword_match(run, user_query)
         if referenced:
@@ -227,6 +246,12 @@ def build_research_vault_context(workspace_dir: str | Path,
                 equations_block = "\n".join(f"- {e}" for e in equations[:16])
                 if equations_block:
                     spec_parts.append("governing_equations:\n" + equations_block)
+                contracts_block = "\n".join(
+                    _contracts_digest_lines(run.get("contracts_summary") or [], indent="  "))
+                if contracts_block:
+                    spec_parts.append("simulation_contracts (initial_state, "
+                                      "dt, steps, variable_map — reproduce these "
+                                      "EXACTLY, never bisect):\n" + contracts_block)
                 details.append(
                     f'<referenced_research_detail id="{run_id}">\n'
                     + "\n".join(spec_parts)

@@ -13,6 +13,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional
 
 from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict, ResearchBlueprint
+from .feasibility import truncate_at_sentence
 
 # -- shared tool-mastery context ----------------------------------------------
 
@@ -94,7 +95,35 @@ approximations).
 - For REFORMULATED_SURROGATE verdicts, implement exactly the surrogate
   equations named in the feasibility reformulation (0D/1D reductions, scaling
   laws, boundary conditions) and record the surrogate assumptions in the
-  hypothesis and contract rationales."""
+  hypothesis and contract rationales.
+
+## Observable accuracy rules (MANDATORY — unit and peak-tracking bugs falsify reports)
+- RUNNING MAXIMUM for peaks: any observable named `max_*` or `peak_*` (e.g.
+  `max_heat_flux_mw_m2`, `peak_g_gE`) MUST be updated inside simulation_step
+  with a running-maximum guard — `if q > buf.data[idx]: buf.data[idx] = q` —
+  NEVER by overwriting `buf.data[idx] = q` unconditionally every step (that
+  replaces the true peak with the final ground-impact value).
+- EXPLICIT SI PREFIX CONVERSIONS: the correlation you integrate produces SI
+  base units (W/m², J/m², m/s, m/s², m). The observable NAME declares the
+  display unit, so convert BEFORE writing the slot:
+  * `_mw_m2` (MW/m²): divide W/m² by `1e6` (`q_w_m2 / 1e6`);
+  * `_mj_m2` (MJ/m²): divide J/m² by `1e6`;
+  * `_km` / `_km_s`: multiply m / (m/s) by `0.001` to km / (km/s);
+  * `_g` / `_ge` / `_gE` (Earth g): divide m/s² by `9.80665`;
+  * `_m_s`: already m/s, no conversion.
+  Sanity bound: peak convective heat flux in MW/m² must stay below the
+  free-stream kinetic-energy flux 0.5 * rho0 * v0^3 / 1e6 (≈ a few hundred
+  MW/m² for planetary entry) — add an invariant enforcing it.
+- VERBATIM USER PARAMETERS: preserve every numerical parameter from the user's
+  prompt exactly. If the user says "5.75 km/s", initial_state velocity MUST be
+  `5750.0` (m/s) — convert units exactly once, never round (5.75 km/s is NOT
+  5800 m/s). Same for masses, altitudes, radii, densities and angles.
+- MULTI-STAGE ACCRETION: when the request or expert prompt describes a staged
+  model (e.g. "Stage 1 baseline, then Stage 2 accretion"), set
+  `target_research_stages >= 2` with one `stage_objectives` entry per stage,
+  and name each contract's stage clearly (prefix contract_ids with `c1_` /
+  `c2_` or `stage1_` / `stage2_`) so Stage 2 builds on the pinned Stage 1
+  layer instead of silently collapsing into one stage."""
 
 PLANNER_PROMPT = """You are the Research Agent planner of a mathematically verified computational
 research engine. Produce ONE falsifiable research blueprint for the request.
@@ -381,6 +410,11 @@ the style exemplar):
 6. **v9_transpiler_friendly synthesis** — pure functions + simulation_step(buf,
    dt) only; NO classes, exceptions, dynamic imports, dicts/sets/tuples/comprehensions
    or non-math imports.
+7. **Verbatim parameter preservation** — copy every numerical parameter from
+   the user's prompt EXACTLY (e.g. "5.75 km/s" stays 5.75 km/s = 5750.0 m/s,
+   never rounded to 5800 m/s), and state each peak/maximum observable
+   (`max_*`/`peak_*`) as a RUNNING MAXIMUM tracked inside simulation_step with
+   explicit SI-prefix unit conversion (W/m² -> MW/m² divides by 1e6, etc.).
 
 ## Few-shot exemplar (aerothermodynamics entry)
 User: "Research the aerothermodynamic entry environment for a 600 kg planetary
@@ -566,7 +600,9 @@ def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
             continue
         cleaned = {k: inv[k] for k in _INVARIANT_FIELDS if k in inv}
         cleaned["variable_name"] = str(cleaned.get("variable_name") or "value")[:120]
-        cleaned["assertion"] = str(cleaned.get("assertion") or "")[:500]
+        # Assertions are executable expressions: never slice them mid-token
+        # (a [:500] cut produced `state[12] <= initial[12] + 1e-06 * initial[`).
+        cleaned["assertion"] = str(cleaned.get("assertion") or "")[:2000]
         try:
             cleaned["tolerance"] = float(cleaned.get("tolerance", 1e-6))
         except (TypeError, ValueError):
@@ -769,7 +805,7 @@ def _coerce_feasibility(data: Any) -> Optional[FeasibilityAssessment]:
     try:
         return FeasibilityAssessment(
             verdict=verdict,
-            rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
+            rationale=truncate_at_sentence(str(data.get("rationale") or ""), 1200) or "LLM assessment",
             violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
             reformulation=reformulation[:600] or None,
             assessed_by="llm")

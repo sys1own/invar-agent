@@ -185,6 +185,27 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def truncate_at_sentence(text: str, limit: int = 1200) -> str:
+    """Bound ``text`` to ``limit`` chars, cutting at a complete sentence boundary.
+
+    Mid-word/mid-sentence slicing produced truncated rationales like
+    "...Sutton-Graves stagnation heating correlation. No" in reports; this
+    prefers the last sentence end within the window, then a word boundary.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "),
+              window.rfind(".\n"), window.rfind("!\n"), window.rfind("?\n"))
+    if cut > limit // 3:
+        return window[:cut + 1].strip()
+    space = window.rfind(" ")
+    if space > limit // 3:
+        return window[:space].strip()
+    return window.strip()
+
+
 def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment]:
     try:
         verdict = FeasibilityVerdict(str(data.get("verdict") or ""))
@@ -198,7 +219,7 @@ def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment
     try:
         return FeasibilityAssessment(
             verdict=verdict,
-            rationale=str(data.get("rationale") or "")[:1000] or "LLM assessment",
+            rationale=truncate_at_sentence(str(data.get("rationale") or ""), 1200) or "LLM assessment",
             violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
             reformulation=reformulation[:600] or None,
             assessed_by="llm")

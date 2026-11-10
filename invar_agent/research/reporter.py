@@ -15,17 +15,32 @@ from ..schemas.research import ResearchBlueprint, SimulationResult
 from .report import _fmt_value, extract_observables
 
 # Map common unit suffixes embedded in observable names to display units.
-_UNIT_SUFFIXES = [
-    ("mw_m2", "MW/m²"), ("mj_m2", "MJ/m²"), ("w_m2", "W/m²"),
-    ("km", "km"), ("_g", "Earth g"), ("_j", "J"), ("_t", "t"),
-    ("_kg", "kg"), ("_s", "s"), ("_ms", "ms"), ("_t_s", "T"),
-    ("_pa", "Pa"), ("_k", "k"),
+# LONGEST compound suffixes are checked first so `impact_velocity_m_s` maps
+# to `m/s` (never `s`) and `peak_g_gE` maps to `g_E` (never `—`).
+UNIT_SUFFIX_MAP = [
+    ("_mw_m2", "MW/m²"),
+    ("_mj_m2", "MJ/m²"),
+    ("_w_m2", "W/m²"),
+    ("_j_m2", "J/m²"),
+    ("_kg_m3", "kg/m³"),
+    ("_m_s2", "m/s²"),
+    ("_m_s", "m/s"),
+    ("_ms", "m/s"),
+    ("_km_s", "km/s"),
+    ("_ge", "g_E"),
+    ("_g", "g_E"),
+    ("_km", "km"),
+    ("_kg", "kg"),
+    ("_deg", "deg"),
+    ("_rad", "rad"),
+    ("_m", "m"),
+    ("_s", "s"),
 ]
 
 
 def _unit_for(name: str) -> str:
     lowered = name.lower()
-    for suffix, unit in _UNIT_SUFFIXES:
+    for suffix, unit in UNIT_SUFFIX_MAP:
         if lowered.endswith(suffix):
             return unit
     return "—"
@@ -110,7 +125,7 @@ def generate_comprehensive_research_report(
             if isinstance(v, (int, float))
         )
         if tel_bits:
-            lines.append(f"**Final telemetry:** {tel_bits[:600]}")
+            lines.append(f"**Final telemetry:** {tel_bits}")
             lines.append("")
 
     # -- 2. Epistemic feasibility & governing modeling regime ---------------
@@ -144,12 +159,21 @@ def generate_comprehensive_research_report(
     if search_history:
         lines.append("| Source | Title | Year | URL |")
         lines.append("| :--- | :--- | :--- | :--- |")
-        for item in search_history[:12]:
-            title = str(item.get("title") or "untitled")[:90]
+        seen_rows = set()
+        for item in search_history:
+            title = str(item.get("title") or "untitled")
+            source = str(item.get("source") or "?")
+            # Collapse duplicate rows (multiple queries hitting the offline
+            # fallback_constants dictionary print one clean row, not four).
+            row_key = (source, title)
+            if row_key in seen_rows:
+                continue
+            seen_rows.add(row_key)
             year = item.get("year") or "n/d"
-            source = item.get("source") or "?"
-            url = str(item.get("url") or "")[:80]
+            url = str(item.get("url") or "")
             lines.append(f"| {source} | {title} | {year} | {url} |")
+            if len(seen_rows) >= 12:
+                break
         lines.append("")
     else:
         lines.append("_No literature hits retrieved (offline cache or no hits)._")
@@ -189,7 +213,8 @@ def generate_comprehensive_research_report(
         lines.append("| Stage | Status | Bundle hash | Note |")
         lines.append("| :--- | :--- | :--- | :--- |")
         for h in bp.evolution_history:
-            note = f" — {h.note[:80]}" if h.note else ""
+            # Full note text: mid-word slicing corrupted accretion records.
+            note = f" — {h.note}" if h.note else ""
             lines.append(f"| {h.stage} | {h.status} | `{h.bundle_hash[:16]}` |{note} |")
         lines.append("")
 
@@ -220,7 +245,7 @@ def generate_comprehensive_research_report(
                 if isinstance(v, (int, float)) and k.startswith(("final_", "obs_"))
             ) or "n/a"
             lines.append(f"| `{r.contract_id}` | {r.status} | "
-                         f"{r.execution_time_ms:.1f} | {tel[:220]} |")
+                         f"{r.execution_time_ms:.1f} | {tel} |")
         lines.append("")
 
     # -- 6. Process notes & execution log ------------------------------------
