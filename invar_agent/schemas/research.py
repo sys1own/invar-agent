@@ -180,6 +180,70 @@ class ResearchBlueprint(BaseModel):
     # "magnetic_field_B_tesla") -> index into the final buf.data state vector.
     # Sandbox_Execute publishes each mapping as telemetry["obs_<name>"].
     variable_map: Dict[str, int] = Field(default_factory=dict, max_length=64)
+    # Zero-LLM deterministic extraction of quantitative literature evidence
+    # (SI-normalized constants, LaTeX equations, benchmarks) attached by the
+    # planner before blueprint synthesis and persisted into the vault.
+    structured_evidence: Optional[StructuredResearchEvidence] = None
+    # SI-normalized parameter dictionary derived from structured_evidence
+    # (name -> si_value); consumed by the vault and the Builder context.
+    extracted_constants: Dict[str, float] = Field(default_factory=dict, max_length=128)
+
+
+class ExtractedParameter(BaseModel):
+    """A literature-derived physical/empirical constant, SI-normalized."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    symbol: str = ""
+    raw_value: float
+    raw_unit: str = ""
+    si_value: float
+    si_unit: str = ""
+    uncertainty: Optional[float] = None
+    source: str = ""
+    confidence: float = 1.0
+
+
+class ExtractedEquation(BaseModel):
+    """A quantitative equation extracted verbatim from a literature source."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lhs: str
+    rhs_latex: str
+    rhs_python_hint: str = ""
+    variables: List[str] = Field(default_factory=list)
+    description: str = ""
+    source: str = ""
+
+
+class BenchmarkAnchor(BaseModel):
+    """An external quantitative benchmark to validate the simulation against."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    input_regime: str = ""
+    expected_value: Any = None  # float or list[float]
+    unit: str = ""
+    tolerance: float = 0.05
+    source: str = ""
+
+
+class StructuredResearchEvidence(BaseModel):
+    """Deterministic, zero-LLM extraction of quantitative literature knowledge."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domains: List[str] = Field(default_factory=list)
+    equations: List[ExtractedEquation] = Field(default_factory=list)
+    parameters: Dict[str, ExtractedParameter] = Field(default_factory=dict)
+    benchmarks: List[BenchmarkAnchor] = Field(default_factory=list)
+    recommended_backend: Literal["rust_hin", "cpp", "multi_variant"] = "cpp"
+    recommended_stepper: str = "rk4"
+    suggested_invariants: List[str] = Field(default_factory=list)
+    summary_markdown_table: str = ""
 
 
 class SimulationResult(BaseModel):
@@ -193,3 +257,8 @@ class SimulationResult(BaseModel):
     bundle_hash: str
     failure_counterexample: Optional[str] = None
     stage: Optional[int] = None
+
+
+# ResearchBlueprint.structured_evidence is a forward reference resolved here
+# (evidence models are defined above SimulationResult).
+ResearchBlueprint.model_rebuild()

@@ -23,10 +23,17 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 ARXIV_API = "http://export.arxiv.org/api/query"
+AR5IV_HTML = "https://ar5iv.labs.arxiv.org/html/"
 OPENALEX_API = "https://api.openalex.org/works"
 CROSSREF_API = "https://api.crossref.org/works"
 WIKIPEDIA_OPENSEARCH = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+WIKIPEDIA_WIKITEXT = "https://en.wikipedia.org/w/api.php"
+SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+WIKIDATA_SEARCH = "https://www.wikidata.org/w/api.php"
+WIKIDATA_ENTITIES = "https://www.wikidata.org/w/api.php"
+OEIS_SEARCH = "https://oeis.org/search"
+PUBCHEM_PROPERTIES = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
 
 USER_AGENT = "invar-agent-research/0.1 (mailto:research@invar-agent.local)"
 
@@ -126,8 +133,82 @@ def _fallback_constants(query: str) -> List[LiteratureResult]:
                 "Offline domain constants (literature APIs returned 0 hits)",
                 f"Fallback aerospace constants for '{query}': {rendered}. "
                 "Use these as empirical parameters for the simulation kernel.",
-                "")]
+                "", badge="ReferenceRegistry")]
     return []
+
+
+def _sanitize_key(text: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"\W+", "_", (text or "").strip().lower())).strip("_")
+
+
+# Common compound names accepted by PubChem PUG REST.
+_COMPOUND_ALIASES = {
+    "carbon dioxide": "carbon dioxide", "co2": "carbon dioxide",
+    "carbon monoxide": "carbon monoxide", "co": "carbon monoxide",
+    "nitrogen": "nitrogen", "n2": "nitrogen", "oxygen": "oxygen", "o2": "oxygen",
+    "methane": "methane", "ch4": "methane", "ammonia": "ammonia", "nh3": "ammonia",
+    "water": "water", "h2o": "water", "hydrogen": "hydrogen", "h2": "hydrogen",
+    "helium": "helium", "argon": "argon", "neon": "neon",
+    "ethanol": "ethanol", "methanol": "methanol", "acetone": "acetone",
+    "benzene": "benzene", "titanium": "titanium", "aluminum": "aluminium",
+    "iron": "iron", "copper": "copper", "silicon": "silicon", "carbon": "carbon",
+}
+
+
+# -- research-domain routing -------------------------------------------------
+_DOMAIN_KEYWORDS = {
+    "discrete_oeis": ("fibonacci", "catalan", "prime", "recurrence", "combinator",
+                      "integer sequence", "number theory", "partition", "oeis",
+                      "binomial", "permutation", "graph", "lattice path",
+                      "discrete", "sequence", "modular", "black-scholes", "heston",
+                      "fft", "cooley", "finance", "option"),
+    "chemical_pubchem": ("chemical", "chemistry", "compound", "molecule", "molecular",
+                         "kinetic", "reaction", "combustion", "arrhenius", "enzyme",
+                         "fuel", "gas", "methane", "hydrogen", "oxygen", "nitrogen",
+                         "polymer", "thermodynamic", "fuel", "propellant", "oxidizer"),
+}
+_CHANNEL_BY_DOMAIN = {
+    "equations": ("arxiv", "openalex", "semantic_scholar", "wikipedia"),
+    "peer_reviewed": ("arxiv", "openalex", "semantic_scholar", "crossref"),
+    "constants": ("wikipedia", "wikidata", "openalex"),
+    "discrete_oeis": ("oeis", "arxiv"),
+    "chemical_pubchem": ("pubchem", "semantic_scholar"),
+}
+
+
+def classify_research_domain(prompt_or_query: str) -> set:
+    """Route a prompt to research channels.
+
+    Returns a subset of ``{"equations", "peer_reviewed", "constants",
+    "discrete_oeis", "chemical_pubchem"}``. Every prompt gets
+    ``peer_reviewed`` + ``equations`` + ``constants`` unless it is clearly
+    discrete or chemical, in which case the dedicated channels are added.
+    """
+    t = (prompt_or_query or "").lower()
+    channels = {"equations", "peer_reviewed", "constants"}
+    padded = f" {t} "
+    for domain, keywords in _DOMAIN_KEYWORDS.items():
+        for k in keywords:
+            # Word-boundary match so "aerothermodynamics" does not hit
+            # the chemical keyword "thermodynamic".
+            if re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", padded):
+                channels.add(domain)
+                break
+    # Pure discrete/chemical prompts keep the core channels too (equations
+    # still apply), but skip nothing: OEIS/PubChem are additive.
+    return channels
+
+
+def _channels_for_prompt(prompt_or_query: str) -> List[str]:
+    channels = classify_research_domain(prompt_or_query)
+    sources: List[str] = []
+    for channel in ("peer_reviewed", "equations", "constants",
+                    "discrete_oeis", "chemical_pubchem"):
+        if channel in channels:
+            for src in _CHANNEL_BY_DOMAIN[channel]:
+                if src not in sources:
+                    sources.append(src)
+    return sources
 
 
 @dataclass
@@ -138,6 +219,13 @@ class LiteratureResult:
     url: str
     year: Optional[int] = None
     categories: List[str] = field(default_factory=list)
+    # Quantitative payload (all optional, connector-populated):
+    equations: List[str] = field(default_factory=list)       # raw LaTeX strings
+    constants: Dict[str, Any] = field(default_factory=dict)  # name -> value|{value,unit}
+    benchmarks: List[Dict[str, Any]] = field(default_factory=list)
+    badge: str = ""                                           # arXiv | OEIS | PubChem | ...
+    citation_count: Optional[int] = None
+    tldr: str = ""
 
 
 FetchFn = Callable[[str, float], str]
@@ -167,22 +255,52 @@ class LiteratureSearchClient:
 
     # -- public API -------------------------------------------------------
     def search(self, query: str, max_results: Optional[int] = None,
-               sources: tuple = ("arxiv", "openalex", "wikipedia")) -> List[LiteratureResult]:
-        """Search all requested sources; per-source failures degrade gracefully."""
+               sources: Optional[tuple] = None,
+               prompt_or_query: Optional[str] = None) -> List[LiteratureResult]:
+        """Multi-channel quantitative literature search.
+
+        Active connectors (routed by :func:`classify_research_domain`) run
+        concurrently with strict per-connector timeouts; per-source failures
+        degrade gracefully to cached results. ``sources`` may still pin an
+        explicit legacy tuple (arxiv/openalex/wikipedia/...).
+        """
         query = _sanitize_query(query)
         limit = max_results or self.max_results
+        if sources is None:
+            sources = tuple(_channels_for_prompt(prompt_or_query or query))
         results: List[LiteratureResult] = []
-        for source in sources:
-            try:
-                results.extend(self._search_source(source, query, limit))
-            except Exception:  # noqa: BLE001 - one bad source must not kill ingest
-                continue
+        if self.offline or len(sources) <= 1:
+            for source in sources:
+                try:
+                    results.extend(self._search_source(source, query, limit))
+                except Exception:  # noqa: BLE001 - one bad source must not kill ingest
+                    continue
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
+                futures = {pool.submit(self._search_source_safe, source, query,
+                                       limit): source for source in sources}
+                for fut in as_completed(futures):
+                    try:
+                        results.extend(fut.result())
+                    except Exception:  # noqa: BLE001
+                        continue
+        # Stable order: keep connector grouping deterministic for caching/tests.
+        order = {s: i for i, s in enumerate(sources)}
+        results.sort(key=lambda r: order.get(r.source, 99))
         results = results[: max(limit * 2, limit)]
         if not results:
             # Never let the kernel receive empty parameters: fall back to
             # curated domain constants when every API returned 0 hits.
             results = _fallback_constants(query)
         return results
+
+    def _search_source_safe(self, source: str, query: str,
+                            limit: int) -> List[LiteratureResult]:
+        try:
+            return self._search_source(source, query, limit)
+        except Exception:  # noqa: BLE001
+            return []
 
     def search_literature(self, queries: List[str],
                           max_results: Optional[int] = None) -> List[LiteratureResult]:
@@ -214,6 +332,14 @@ class LiteratureSearchClient:
                 results = self._parse_crossref(payload)
             elif source == "wikipedia":
                 results = self._search_wikipedia(query, limit)
+            elif source == "semantic_scholar":
+                results = self._search_semantic_scholar(query, limit)
+            elif source == "wikidata":
+                results = self._search_wikidata_constants(query, limit)
+            elif source == "oeis":
+                results = self._search_oeis(query, limit)
+            elif source == "pubchem":
+                results = self._search_pubchem(query, limit)
             else:
                 return cached or []
         except Exception:  # noqa: BLE001 - fall back to cache on network failure
@@ -319,13 +445,210 @@ class LiteratureSearchClient:
                 summary = json.loads(self._fetch_with_backoff(
                     WIKIPEDIA_SUMMARY + urllib.parse.quote(title.replace(" ", "_"))))
                 extract = summary.get("extract") or ""
-                out.append(LiteratureResult(
+                result = LiteratureResult(
                     "wikipedia", summary.get("title") or title, extract[:1200],
                     summary.get("content_urls", {}).get("desktop", {}).get("page", url)
-                    or url))
+                    or url, badge="Wikipedia")
+                # High-mathematical-density upgrade: wikitext <math> blocks,
+                # {{math|...}} templates and infobox numerical pairs (4s budget).
+                # Enrichment is best-effort: a wikitext failure must NOT drop
+                # the summary result itself.
+                try:
+                    wikitext = self._fetch_wikitext(title)
+                except Exception:  # noqa: BLE001
+                    wikitext = ""
+                if wikitext:
+                    from .extractor import (extract_infobox_parameters,
+                                            extract_wikitext_math)
+                    result.equations = extract_wikitext_math(wikitext)[:8]
+                    for p in extract_infobox_parameters(wikitext,
+                                                         source="Wikipedia-Math")[:12]:
+                        result.constants[p.name] = {
+                            "value": p.si_value, "unit": p.si_unit,
+                            "raw_value": p.raw_value, "raw_unit": p.raw_unit}
+                out.append(result)
             except Exception:  # noqa: BLE001 - skip failed summaries
                 continue
         return out
+
+    def _fetch_wikitext(self, title: str) -> str:
+        """MediaWiki revisions API: full wikitext for <math>/infobox mining."""
+        url = (f"{WIKIPEDIA_WIKITEXT}?action=query&prop=revisions&rvprop=content"
+               f"&rvslots=main&titles={urllib.parse.quote(title)}"
+               f"&format=json&origin=*")
+        payload = self._fetch(url, 4.0)
+        data = json.loads(payload)
+        pages = (data.get("query") or {}).get("pages") or {}
+        for page in pages.values():
+            revisions = page.get("revisions") or []
+            if revisions:
+                slots = revisions[0].get("slots") or {}
+                return (slots.get("main") or {}).get("content") or ""
+        return ""
+
+    def _search_semantic_scholar(self, query: str, limit: int) -> List[LiteratureResult]:
+        q = urllib.parse.quote(query)
+        url = (f"{SEMANTIC_SCHOLAR_API}?query={q}&limit={min(limit, 5)}"
+               f"&fields=title,abstract,tldr,year,citationCount,externalIds")
+        data = json.loads(self._fetch_with_backoff(url))
+        out: List[LiteratureResult] = []
+        for paper in data.get("data") or []:
+            tldr = ((paper.get("tldr") or {}).get("text") or "").strip()
+            abstract = (paper.get("abstract") or "").strip()
+            summary = (tldr + "\n\n" + abstract).strip()[:1200]
+            ext = paper.get("externalIds") or {}
+            arxiv_id = ext.get("ArXiv") or ""
+            out.append(LiteratureResult(
+                "semanticscholar",
+                (paper.get("title") or "").strip(), summary,
+                (f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id
+                 else ext.get("DOI") or paper.get("paperId") or ""),
+                year=paper.get("year"), badge="SemanticScholar",
+                citation_count=paper.get("citationCount"), tldr=tldr))
+            # ar5iv equation upgrade for arXiv-identified papers (live only).
+            if arxiv_id and not self.offline:
+                eqs = self._fetch_ar5iv_equations(arxiv_id)
+                if eqs:
+                    out[-1].equations = eqs
+        return [r for r in out if r.title]
+
+    def _fetch_ar5iv_equations(self, arxiv_id: str, max_equations: int = 8) -> List[str]:
+        """Display equations from the ar5iv HTML rendering (no PDF download)."""
+        try:
+            payload = self._fetch(f"{AR5IV_HTML}{urllib.parse.quote(arxiv_id)}", 3.0)
+        except Exception:  # noqa: BLE001 - 404/timeout is graceful
+            return []
+        from .extractor import extract_ar5iv_equations
+        return extract_ar5iv_equations(payload, max_equations=max_equations)
+
+    def _search_wikidata_constants(self, query: str, limit: int) -> List[LiteratureResult]:
+        search_url = (f"{WIKIDATA_SEARCH}?action=wbsearchentities&search="
+                      f"{urllib.parse.quote(query)}&language=en&limit=3&format=json")
+        data = json.loads(self._fetch_with_backoff(search_url))
+        entity_ids = [e.get("id") for e in (data.get("search") or [])
+                      if e.get("id")]
+        if not entity_ids:
+            return []
+        ent_url = (f"{WIKIDATA_ENTITIES}?action=wbgetentities&ids="
+                   f"{urllib.parse.quote('|'.join(entity_ids))}&props=claims|labels"
+                   f"&languages=en&format=json&origin=*")
+        ents = json.loads(self._fetch_with_backoff(ent_url)).get("entities") or {}
+        out: List[LiteratureResult] = []
+        for ent_id, entity in ents.items():
+            label = ((entity.get("labels") or {}).get("en") or {}).get("value") or ent_id
+            constants: Dict[str, Any] = {}
+            snippets: List[str] = []
+            for prop_id, claims in (entity.get("claims") or {}).items():
+                for claim in claims or []:
+                    dv = ((claim.get("mainsnak") or {}).get("datavalue") or {})
+                    if dv.get("type") != "quantity":
+                        continue
+                    amount = dv.get("value") or {}
+                    value = amount.get("amount")
+                    try:
+                        num = float(str(value).replace("+", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    unit_qid = (amount.get("unit") or "").rsplit("/", 1)[-1]
+                    unit_label = self._wikidata_unit_label(unit_qid) if unit_qid else ""
+                    pname = self._wikidata_property_label(prop_id)
+                    key = _sanitize_key(pname or prop_id)
+                    constants[key] = {"value": num, "unit": unit_label or ""}
+                    snippets.append(f"{pname or prop_id}: {num} {unit_label}")
+                    break
+                if len(snippets) >= 8:
+                    break
+            if constants:
+                out.append(LiteratureResult(
+                    "wikidata", label, "; ".join(snippets)[:1200],
+                    f"https://www.wikidata.org/wiki/{ent_id}",
+                    badge="Wikidata", constants=constants))
+        return out
+
+    def _wikidata_unit_label(self, unit_qid: str) -> str:
+        try:
+            url = (f"{WIKIDATA_ENTITIES}?action=wbgetentities&ids={unit_qid}"
+                   f"&props=labels&languages=en&format=json&origin=*")
+            data = json.loads(self._fetch(url, 4.0))
+            entity = (data.get("entities") or {}).get(unit_qid) or {}
+            return (((entity.get("labels") or {}).get("en") or {}).get("value") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _wikidata_property_label(self, prop_id: str) -> str:
+        try:
+            url = (f"{WIKIDATA_ENTITIES}?action=wbgetentities&ids={prop_id}"
+                   f"&props=labels&languages=en&format=json&origin=*")
+            data = json.loads(self._fetch(url, 4.0))
+            entity = (data.get("entities") or {}).get(prop_id) or {}
+            return (((entity.get("labels") or {}).get("en") or {}).get("value") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _search_oeis(self, query: str, limit: int) -> List[LiteratureResult]:
+        url = (f"{OEIS_SEARCH}?q={urllib.parse.quote(query)}&fmt=json")
+        data = json.loads(self._fetch_with_backoff(url))
+        out: List[LiteratureResult] = []
+        for seq in (data.get("results") or [])[:limit]:
+            number = str(seq.get("number") or "")
+            name = seq.get("name") or ""
+            data_str = seq.get("data") or ""
+            terms = [int(t) for t in re.findall(r"-?\d+", data_str)][:32]
+            formula = seq.get("formula") or ""
+            constants: Dict[str, Any] = {}
+            benchmarks: List[Dict[str, Any]] = []
+            if terms:
+                benchmarks.append({
+                    "name": f"OEIS {number} initial terms",
+                    "input_regime": name[:200], "expected_value": terms,
+                    "unit": "", "tolerance": 0.0,
+                    "source": f"https://oeis.org/{number}"})
+                constants["initial_terms"] = terms
+            if formula:
+                constants["formula"] = formula
+            summary = f"{name}\nData: {data_str}\nFormula: {formula}"
+            out.append(LiteratureResult(
+                "oeis", f"OEIS A{number}: {name}", summary[:1200],
+                f"https://oeis.org/{number}", badge="OEIS",
+                constants=constants, benchmarks=benchmarks))
+        return out
+
+    def _search_pubchem(self, query: str, limit: int) -> List[LiteratureResult]:
+        # PubChem PUG REST needs a compound identifier; extract the most
+        # chemical-looking token (gas/formula names like "CO2", "methane").
+        candidates = [t for t in re.split(r"[^A-Za-z0-9]+", query or "")
+                      if len(t) >= 2 and (t[:1].isupper() or t.isupper()
+                                          or t in _COMPOUND_ALIASES)]
+        if not candidates:
+            return []
+        compound = candidates[0]
+        compound = _COMPOUND_ALIASES.get(compound.lower(), compound)
+        props = "MolecularWeight,ExactMass,XLogP,TPSA,Complexity,IUPACName"
+        url = f"{PUBCHEM_PROPERTIES}{urllib.parse.quote(compound)}/property/{props}/JSON"
+        try:
+            data = json.loads(self._fetch_with_backoff(url))
+        except Exception:  # noqa: BLE001 - unknown compound name -> 404
+            return []
+        table = ((data.get("PropertyTable") or {}).get("Properties") or [])
+        if not table:
+            return []
+        row = table[0]
+        constants: Dict[str, Any] = {}
+        snippets: List[str] = []
+        for prop, unit, si_unit in (
+                ("MolecularWeight", "g/mol", "kg/mol"),
+                ("ExactMass", "g/mol", "kg/mol"),
+                ("XLogP", "", ""), ("TPSA", "A^2", ""),
+                ("Complexity", "", "")):
+            if row.get(prop) is not None:
+                constants[prop] = {"value": float(row[prop]), "unit": unit}
+                snippets.append(f"{prop}={row[prop]} {unit}".strip())
+        cid = row.get("CID")
+        title = row.get("IUPACName") or f"CID {cid} ({compound})"
+        return [LiteratureResult(
+            "pubchem", f"PubChem: {title}", "; ".join(snippets)[:1200],
+            f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}", badge="PubChem",
+            constants=constants)]
 
     # -- deterministic disk cache -----------------------------------------
     def _cache_path(self, source: str, query: str) -> Optional[Path]:
