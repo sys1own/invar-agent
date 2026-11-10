@@ -365,32 +365,64 @@ class CopilotAgent:
         """Plan Mode: make the build card carry the archetype, SI constants,
         equations, kernel-porting instructions and parity assertions, and the
         research ids to forward to Direct execution on approval."""
+        from invar_agent.builder.archetypes import (
+            SoftwareArchetype, archetype_scaffold_text,
+            classify_software_archetype, ensure_archetype_tag,
+            has_explicit_archetype_tag,
+        )
         from invar_agent.builder.research_bridge import (
             bind_research_context, render_packet_prompt_block,
         )
 
+        packet = None
         try:
             packet = bind_research_context(self.workspace_path, message,
                                            attached_research_ids or [])
         except Exception as exc:  # noqa: BLE001 - research binding is best-effort
             logger.warning("Plan-mode research binding failed: %s", exc)
-            return
-        if packet is None:
-            return
+        has_research = packet is not None or bool(attached_research_ids)
+
         params = action.setdefault("params", {})
         prompt = str(params.get("prompt") or "")
-        if "<research_to_software_specification>" not in prompt:
+        if packet is not None and "<research_to_software_specification>" not in prompt:
             prompt = (prompt.rstrip() + "\n\n"
                       + render_packet_prompt_block(packet, max_kernel_chars=4000))
-        refs = " ".join(f"@research:{r}" for r in packet.run_ids
-                        if f"@research:{r}" not in prompt)
-        if refs:
-            prompt = prompt.rstrip() + "\n\nBound research: " + refs
+        if packet is not None:
+            refs = " ".join(f"@research:{r}" for r in packet.run_ids
+                            if f"@research:{r}" not in prompt)
+            if refs:
+                prompt = prompt.rstrip() + "\n\nBound research: " + refs
+
+        # Archetype-aware synthesis: classify the user's request; an explicit
+        # [TARGET_ARCHETYPE: ...] tag in the generated prompt overrides it.
+        # Ambiguous prompts fall back safely to SCIENTIFIC_SDK_LIBRARY.
+        classification = classify_software_archetype(message, has_research=has_research)
+        if has_explicit_archetype_tag(prompt):
+            # An explicit [TARGET_ARCHETYPE: ...] tag in the generated prompt
+            # (or a user dropdown edit) always wins over keyword scoring.
+            prompt_classification = classify_software_archetype(
+                prompt, has_research=has_research)
+            if prompt_classification.confidence >= 1.0:
+                classification = prompt_classification
+        archetype = classification.archetype
+        prompt = ensure_archetype_tag(prompt, archetype)
+        scaffold = archetype_scaffold_text(archetype)
+        if "## Archetype Scaffold" not in prompt and "Target archetype:" not in prompt:
+            prompt = prompt.rstrip() + "\n\n## Archetype Scaffold\n" + scaffold
+
+        available = [a.value for a in SoftwareArchetype]
         params["prompt"] = prompt
-        params["attached_research_ids"] = list(packet.run_ids)
-        params["archetype"] = packet.archetype.archetype_id
-        result["attached_research_ids"] = list(packet.run_ids)
-        result["archetype"] = packet.archetype.archetype_id
+        params["archetype"] = archetype.value
+        params["is_fallback"] = classification.is_fallback
+        params["archetype_rationale"] = classification.rationale
+        params["available_archetypes"] = available
+        if packet is not None:
+            params["attached_research_ids"] = list(packet.run_ids)
+            result["attached_research_ids"] = list(packet.run_ids)
+        result["archetype"] = archetype.value
+        result["is_fallback"] = classification.is_fallback
+        result["archetype_rationale"] = classification.rationale
+        result["available_archetypes"] = available
 
     # -- research planning ------------------------------------------------------
 
@@ -571,6 +603,16 @@ class CopilotAgent:
             }
             self._bind_research_to_card(result["action"], message,
                                         attached_research_ids, result)
+            # Unified Action Card schema shared with the frontend.
+            params = result["action"].get("params") or {}
+            prompt = str(params.get("prompt") or "")
+            result.update({
+                "status": "success",
+                "display_text": params.get("rationale") or params.get("explanation", ""),
+                "clean_prompt": prompt,
+                "expert_prompt": prompt,
+                "action_obj": {"type": "build", "clean_prompt": prompt},
+            })
             return result
         reply = (
             "I'm running in offline mode — no LLM provider is configured. "

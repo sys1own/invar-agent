@@ -109,10 +109,18 @@ def test_builder_plan_truncated_json_recovery_and_action_card(tmp_path, monkeypa
     assert fake.calls and fake.calls[0]["max_tokens"] >= 8192
     assert data["status"] == "success"
     assert data["action"]["type"] == "SUGGEST_BUILD_PROMPT"
-    assert data["action"]["params"]["prompt"] == CLEAN_PROMPT_HEAD
-    assert data["clean_prompt"] == CLEAN_PROMPT_HEAD
-    assert data["expert_prompt"] == CLEAN_PROMPT_HEAD
-    assert data["action_obj"] == {"type": "build", "clean_prompt": CLEAN_PROMPT_HEAD}
+    # Plan Mode prepends the explicit archetype tag and appends the archetype
+    # scaffold; the recovered build instructions remain intact inside.
+    card_prompt = data["action"]["params"]["prompt"]
+    assert card_prompt.startswith("[TARGET_ARCHETYPE: ")
+    assert CLEAN_PROMPT_HEAD in card_prompt
+    assert "## Archetype Scaffold" in card_prompt
+    assert data["clean_prompt"] == card_prompt
+    assert data["expert_prompt"] == card_prompt
+    assert data["action_obj"] == {"type": "build", "clean_prompt": card_prompt}
+    assert data["archetype"] in {
+        "SCIENTIFIC_SDK_LIBRARY", "CLI_SIMULATOR_SWEEP"}
+    assert "available_archetypes" in data
     assert data["display_text"].startswith("## Architecture Overview")
     # No raw JSON dumped into the chat bubble.
     assert '"clean_prompt"' not in data["reply"]

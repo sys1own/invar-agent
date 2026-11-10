@@ -133,7 +133,10 @@ def test_copilot_agent_uses_fast_tier(monkeypatch, tmp_path):
     assert calls[0]["tier"] == Tier.FAST
     assert result["action"] is not None
     assert result["action"]["type"] == "SUGGEST_BUILD_PROMPT"
-    assert result["action"]["params"]["prompt"].startswith("Add subtract")
+    # Plan Mode prepends the explicit [TARGET_ARCHETYPE: ...] tag.
+    assert result["action"]["params"]["prompt"].startswith("[TARGET_ARCHETYPE: ")
+    assert "Add subtract(a, b) to calc.py returning a - b." in \
+        result["action"]["params"]["prompt"]
 
 
 def test_builder_defaults_to_reasoning_tier(tmp_path):
