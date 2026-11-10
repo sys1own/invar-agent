@@ -67,6 +67,11 @@ all/any/sqrt/exp/log. Store derived diagnostics (energy, drift, amplitude,
 residual) in dedicated buffer slots inside simulation_step so invariants can
 read them, e.g. slot 2 = current energy, slot 3 = initial energy (set once when
 buf.data[3] == 0.0), slot 4 = max |E - E0| / E0 so far.
+LIMIT-CYCLE / EXTREMA / PERIOD TRACKING: when tracking limit cycles, extrema, or
+periods, use scalar state variables inside `buf.data` (e.g., `prev_val =
+buf.data[0]`, `cycle_count = buf.data[10]`, `last_peak_t = buf.data[11]`). NEVER
+use dynamic Python lists (`list.append`), `while` searches across history, or
+variable-length arrays, as they cannot lower to C++ C-ABI.
 Invariants must be falsifiable and physically meaningful; never write vacuous
 invariants (like x == x) and never loosen tolerances to force a pass.
 CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper
@@ -176,6 +181,11 @@ blueprint evolution, stage {stage} of {total}).
 - Add cross-coupling invariants that test the combined system (e.g. bounded
   limit cycle amplitude, phase-space bounds, reduction to the verified model when
   the new coupling is zero).
+- When tracking limit cycles, extrema, or periods, use scalar state variables
+  inside `buf.data` (e.g., `prev_val = buf.data[0]`, `cycle_count = buf.data[10]`,
+  `last_peak_t = buf.data[11]`). NEVER use dynamic Python lists (`list.append`),
+  `while` searches across history, or variable-length arrays, as they cannot
+  lower to C++ C-ABI.
 
 ## Stage objective
 {objective}

@@ -865,9 +865,15 @@ class ResearchStateMachine:
                              and _contract_stage_index(c.contract_id) == stage]
             verified = False
 
-            for attempt in range(1, blueprint.max_feedback_rounds + 1):
+            # HARD BOUND: exactly max_feedback_rounds attempts, never more.
+            # A failed final attempt breaks immediately — no "Attempt N+1"
+            # healing dispatch and no further adjoint rollback can be queued.
+            max_attempts = max(1, int(getattr(blueprint, "max_feedback_rounds", 3) or 3))
+            attempt = 0
+            while attempt < max_attempts:
                 if self._aborted(state):
                     break
+                attempt += 1
                 round_idx += 1
                 outcome = await self._run_round(
                     state, stage=stage, attempt=attempt, round_idx=round_idx,
@@ -934,16 +940,22 @@ class ResearchStateMachine:
                     state.status = "REFUSED"
                     state.refusal = outcome.get("refusal")
                     return state
+                # Retry bound reached: stop BEFORE dispatching another heal.
+                # No "Attempt {max+1}/{max}" synthesis and no further adjoint
+                # rollback events may follow the final attempt.
+                if attempt >= max_attempts:
+                    break
                 # Closed-loop telemetry-guided re-search on DIVERGED/FALSIFIED.
                 diagnostic_context = await self._diagnostic_research(
                     state, stage=stage, outcome=outcome)
                 if diagnostic_context:
                     failure = f"{failure}\n{diagnostic_context}"
                 # Reflex_Heal + refinement feed the counterexample back to GoI_Plan.
+                # (attempt < max_attempts here, so attempt + 1 is a real next round)
                 await self.emit_activity(
                     "HEALING", "reasoning_dispatch",
                     f"Tier-2 model synthesizing correction "
-                    f"(Attempt {attempt + 1}/{blueprint.max_feedback_rounds})...")
+                    f"(Attempt {attempt + 1}/{max_attempts})...")
                 candidate_code = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=outcome.get("candidate_code") or candidate_code,
@@ -959,10 +971,27 @@ class ResearchStateMachine:
                         "verified_stages": len(pinned_layers),
                         "note": "stage retries exhausted; last verified unified "
                                 "checkpoint preserved and exported"})
+                    # Graceful partial-success finalization: the verified
+                    # baseline (Stage k-1) is archived as PARTIALLY_VERIFIED
+                    # and the run terminates with ONE terminal event.
+                    await self.emit_activity(
+                        "VAULT", "partial_finalization",
+                        f"Stage {stage} retries exhausted after {max_attempts} "
+                        f"attempts. Finalizing run with verified baseline from "
+                        f"Stage {max(1, stage - 1)}...")
                 else:
                     state.status = "ABORTED" if state.aborted else "FAILED"
                 if state.status in ("PARTIAL", "FAILED"):
-                    await self._emit_report(state)
+                    extra: Optional[Dict[str, Any]] = None
+                    if pinned_layers:
+                        extra = {
+                            "verified_stages": len(pinned_layers),
+                            "total_stages": total,
+                            "message": (
+                                f"{len(pinned_layers)} stage(s) verified. "
+                                f"Stage {stage} halted after {max_attempts} "
+                                "retry attempts.")}
+                    await self._emit_report(state, extra=extra)
                 return state
             stage += 1
 
@@ -987,7 +1016,12 @@ class ResearchStateMachine:
         try:
             from .reporter import generate_comprehensive_research_report
             telemetry: Dict[str, Any] = {}
-            if state.results:
+            verified_layers = list(state.blueprint.verified_layers or [])
+            if verified_layers and state.status in ("PARTIAL", "ABORTED"):
+                # Partial finalization reports on the last PASSING stage's
+                # verified telemetry, never on the exhausted stage's failures.
+                telemetry = dict(verified_layers[-1].telemetry or {})
+            elif state.results:
                 telemetry = dict(state.results[-1].telemetry)
             state.report = generate_comprehensive_research_report(
                 state.blueprint, telemetry, state.literature,
@@ -1037,8 +1071,13 @@ class ResearchStateMachine:
         except Exception as exc:  # noqa: BLE001 - vault archival is best-effort
             await self._emit("accelerator_log", "vault_archive_error",
                              {"error": str(exc)[:200]})
+        terminal_status = state.status
+        if terminal_status in ("PARTIAL", "ABORTED") \
+                and state.blueprint.verified_layers:
+            # A halted run with a verified baseline is PARTIALLY_VERIFIED.
+            terminal_status = "PARTIALLY_VERIFIED"
         payload: Dict[str, Any] = {
-            "status": state.status,
+            "status": terminal_status,
             "report": state.report,
             "run_id": state.blueprint.blueprint_id,
             "report_path": str(report_path) if report_path else ""}

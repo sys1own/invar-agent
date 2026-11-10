@@ -47,22 +47,38 @@ _QUERY_FILLER_TOKENS = {
     "the", "a", "an", "and", "or", "of", "for", "with", "in", "on", "to", "at",
     "by", "from", "is", "are", "was", "were", "be", "been", "being", "as",
     "si", "unit", "units", "interface", "simulate", "simulates", "simulated",
-    "simulation", "model", "models", "verify", "verified", "verification",
-    "analysis", "analyse", "analyze", "study", "studies", "using", "use",
-    "used", "based", "approach", "method", "methods", "data", "set", "value",
-    "values", "calculate", "compute", "determine", "assess", "given", "into",
+    "simulation", "model", "models", "parameter", "parameters", "equation",
+    "equations", "closed", "form", "forms", "value", "values", "numerical",
+    "integration", "integrate", "stoichiometric", "verify", "verified",
+    "verification", "analysis", "analyse", "analyze", "study", "studies",
+    "using", "use", "used", "based", "approach", "method", "methods", "data",
+    "set", "calculate", "compute", "determine", "assess", "given", "into",
     "uses", "use",
     "that", "this", "these", "those", "their", "its", "it", "we", "our",
 }
 
 
-def _sanitize_query(q: str) -> str:
-    """Reduce a natural-language research query to 2-4 technical terms.
+def _token_score(tok: str) -> int:
+    score = 1
+    if any(ch.isdigit() for ch in tok):
+        score += 2
+    if "-" in tok:
+        score += 2
+    if tok[:1].isupper():  # proper noun / acronym (Mars, CO2, N2)
+        score += 2
+    if tok.isupper() and len(tok) <= 4:
+        score += 1
+    return score
 
-    Strips parentheticals, punctuation and filler phrases ("SI units",
-    "entry interface", "Mars-GRAM 2010"), then keeps the highest-signal
-    tokens (hyphenated / capitalized / numeric terms first). Falls back to
-    the original query when nothing technical remains.
+
+def _sanitize_query(q: str) -> str:
+    """Reduce a sentence-like research query to <=3 substantive entities.
+
+    Aggressively strips filler (``model``, ``parameters``, ``equations``,
+    ``values``, ``closed``, ``form``, ``simulation``, ``numerical``,
+    ``integration``, ``units``, ...) and single-letter tokens (``s``, ``q``,
+    ``w``, ``f``), merges consecutive capitalized tokens into multi-word
+    entities (``Field Noyes``), then keeps the top 3 by signal score.
     """
     original = (q or "").strip()
     if not original:
@@ -74,29 +90,41 @@ def _sanitize_query(q: str) -> str:
     # decimal points (5.8 km/s); stray dots are trimmed per token below.
     cleaned = re.sub(r"(?!\w-\w)[^A-Za-z0-9\-\. ]+", " ", text)
     tokens = [t.strip(".") for t in cleaned.split() if t.strip(".")]
-    scored: List[tuple] = []
-    for idx, tok in enumerate(tokens):
-        if tok.lower() in _QUERY_FILLER_TOKENS:
+    kept: List[Tuple[int, str]] = []  # (score, tok) in original order
+    for tok in tokens:
+        low = tok.lower()
+        if low in _QUERY_FILLER_TOKENS:
             continue
-        score = 1
-        if any(ch.isdigit() for ch in tok):
-            score += 2
-        if "-" in tok:
-            score += 2
-        if tok[:1].isupper():  # proper noun / acronym (Mars, CO2, N2)
-            score += 2
-        if tok.isupper() and len(tok) <= 4:
-            score += 1
-        scored.append((score, -idx, tok))
-    if not scored:
+        if len(tok) == 1 and tok.isalpha():  # single-letter stoichiometric params
+            continue
+        kept.append((_token_score(tok), tok))
+    if not kept:
         # Nothing but filler: keep the original technical words so the API
         # still gets a query.
         fallback = [t.strip(".") for t in
                     re.sub(r"[^A-Za-z0-9\-\. ]+", " ", original).split()
-                    if t.strip(".") and t.strip(".").lower() not in _QUERY_FILLER_TOKENS]
+                    if t.strip(".") and len(t.strip(".")) > 1
+                    and t.strip(".").lower() not in _QUERY_FILLER_TOKENS]
         return " ".join(fallback[:4]) or original
-    scored.sort(reverse=True)
-    return " ".join(tok for _, _, tok in scored[:4])
+    # Merge consecutive capitalized tokens into one entity ("Field Noyes",
+    # "Mars CO2 N2") so proper-noun phrases survive truncation as a unit.
+    entities: List[Tuple[int, int, str]] = []  # (score, -first_idx, words)
+    idx = 0
+    while idx < len(kept):
+        score, tok = kept[idx]
+        if tok[:1].isupper():
+            words = [tok]
+            first_idx = idx
+            while idx + 1 < len(kept) and kept[idx + 1][1][:1].isupper():
+                idx += 1
+                words.append(kept[idx][1])
+                score = max(score, kept[idx][0])
+            entities.append((score, -first_idx, " ".join(words)))
+        else:
+            entities.append((score, -idx, tok))
+        idx += 1
+    entities.sort(reverse=True)
+    return " ".join(words for _, _, words in entities[:3])
 
 
 # Offline fallback: domain constants extracted from a curated aerospace /
