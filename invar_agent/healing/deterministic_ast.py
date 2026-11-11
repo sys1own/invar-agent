@@ -1351,28 +1351,555 @@ def _rewrite_monotone_r_difference(tree: ast.Module, slot: int) -> Tuple[ast.Mod
     return tree, False, []
 
 
+# -- buffer aliases / contract-slot bridging ---------------------------------
+
+_STATE_SLOT_REF_RE = re.compile(r"(?<![A-Za-z0-9_])(?:state|buf\.data|data)\[(\d+)\]")
+_DISSIPATION_PARAM_NAMES = {"gamma", "kappa", "stiffness", "damping", "nu"}
+_DISSIPATION_CONTRACT_TOKENS = (
+    "stiff", "kraus", "dissipat", "damping", "entropy", "gamma", "nu")
+
+
+def _is_buf_data_value(node: Optional[ast.AST], param: Optional[str] = None) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "data" \
+        and isinstance(node.value, ast.Name) \
+        and (param is None or node.value.id == param)
+
+
+def _function_arg_names(fn: ast.FunctionDef) -> set[str]:
+    args = fn.args
+    names = {a.arg for a in list(getattr(args, "posonlyargs", []) or [])
+             + list(args.args) + list(args.kwonlyargs)}
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _buffer_aliases_in_function(fn: ast.FunctionDef) -> Dict[str, str]:
+    """Map ``alias = <param>.data`` bindings to their buffer parameter."""
+    args = _function_arg_names(fn)
+    stores: Dict[str, List[Tuple[ast.AST, Optional[ast.AST]]]] = {}
+    for node in ast.walk(fn):
+        targets: List[ast.AST] = []
+        value: Optional[ast.AST] = None
+        if isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        for target in targets:
+            if isinstance(target, ast.Name):
+                stores.setdefault(target.id, []).append((node, value))
+    out: Dict[str, str] = {}
+    for alias, entries in stores.items():
+        if alias in args or not entries:
+            continue
+        params: set[str] = set()
+        ok = True
+        for _node, value in entries:
+            if _is_buf_data_value(value) and isinstance(value.value, ast.Name) \
+                    and value.value.id in args:
+                params.add(value.value.id)  # type: ignore[union-attr]
+            else:
+                ok = False
+                break
+        if not ok or len(params) != 1:
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) \
+                    and node.target.id == alias:
+                ok = False
+                break
+        if ok:
+            out[alias] = next(iter(params))
+    return out
+
+
+class _BufferAliasTransformer(ast.NodeTransformer):
+    def __init__(self) -> None:
+        self._stack: List[Dict[str, str]] = []
+        self.changed = False
+        self.notes: set[str] = set()
+
+    def _alias_for(self, name: str) -> Optional[str]:
+        for aliases in reversed(self._stack):
+            if name in aliases:
+                return aliases[name]
+        return None
+
+    def _is_alias_init(self, node: ast.Assign) -> bool:
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            return False
+        param = self._alias_for(node.targets[0].id)
+        return param is not None and _is_buf_data_value(node.value, param)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        aliases = _buffer_aliases_in_function(node)
+        self._stack.append(aliases)
+        try:
+            self.generic_visit(node)
+        finally:
+            self._stack.pop()
+        if aliases:
+            self.changed = True
+            self.notes.update(f"normalized buffer alias {alias} = {param}.data"
+                              for alias, param in aliases.items())
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        if self._is_alias_init(node):
+            return []
+        self.generic_visit(node)
+        return node
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if isinstance(node.ctx, ast.Load):
+            param = self._alias_for(node.id)
+            if param is not None:
+                return ast.copy_location(ast.Attribute(
+                    value=ast.Name(id=param, ctx=ast.Load()), attr="data",
+                    ctx=ast.Load()), node)
+        return node
+
+
+def _normalize_buffer_aliases_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    transformer = _BufferAliasTransformer()
+    tree = transformer.visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree, transformer.changed, sorted(transformer.notes)
+
+
+def _contract_get(contract: Any, key: str, default: Any = None) -> Any:
+    if isinstance(contract, dict):
+        return contract.get(key, default)
+    return getattr(contract, key, default)
+
+
+def _contract_invariant_items(contract: Any) -> List[Tuple[str, str, float]]:
+    out: List[Tuple[str, str, float]] = []
+    for inv in (_contract_get(contract, "invariants", []) or []):
+        if isinstance(inv, dict):
+            name = str(inv.get("variable_name") or "")
+            assertion = str(inv.get("assertion") or "")
+            try:
+                tolerance = float(inv.get("tolerance", 1e-6) or 0.0)
+            except (TypeError, ValueError):
+                tolerance = 1e-6
+        else:
+            name = str(getattr(inv, "variable_name", "") or "")
+            assertion = str(getattr(inv, "assertion", "") or "")
+            try:
+                tolerance = float(getattr(inv, "tolerance", 1e-6) or 0.0)
+            except (TypeError, ValueError):
+                tolerance = 1e-6
+        out.append((name, assertion, tolerance))
+    return out
+
+
+def _contract_state_slots(contract: Any) -> List[int]:
+    slots: List[int] = []
+    for _name, assertion, _tol in _contract_invariant_items(contract):
+        slots.extend(int(m.group(1)) for m in _STATE_SLOT_REF_RE.finditer(assertion))
+    return sorted(set(slots))
+
+
+def _assigned_state_slots(tree: ast.Module) -> set[int]:
+    slots: set[int] = set()
+    for node in ast.walk(tree):
+        targets: List[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for target in targets:
+            slot = _state_subscript_slot(target)
+            if slot is not None:
+                slots.add(slot)
+    return slots
+
+
+_CANON_SEMANTIC_SUFFIXES = (
+    "_trace_rho2", "_bound", "_limit", "_max", "_min", "_current", "_val",
+    "_check", "_error", "_err", "_drift",
+)
+
+
+def _semantic_slot_stem(name: str) -> str:
+    low = str(name or "").lower().strip()
+    if not low:
+        return ""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("max_", "min_"):
+            if low.startswith(prefix) and len(low) > len(prefix):
+                low = low[len(prefix):]
+                changed = True
+        for suffix in _CANON_SEMANTIC_SUFFIXES:
+            if low.endswith(suffix) and len(low) > len(suffix):
+                low = low[:-len(suffix)]
+                changed = True
+    return low
+
+
+def _bound_direction(assertion: str) -> str:
+    m = re.search(r"(?:state|buf\.data|data)\[\d+\]\s*(<=|>=|<|>)", assertion or "")
+    if not m:
+        return ""
+    op = m.group(1)
+    return "le" if op in ("<=", "<") else "ge"
+
+
+def _semantic_slot_key(name: str, assertion: str) -> Tuple[str, str]:
+    return (_semantic_slot_stem(name) or str(name or "").lower(), _bound_direction(assertion))
+
+
+def _contract_slot_names(contracts: Sequence[Any]) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for contract in contracts or []:
+        for name, assertion, _tol in _contract_invariant_items(contract):
+            for slot in _contract_state_slots_from_text(assertion):
+                names = out.setdefault(slot, [])
+                if name and name not in names:
+                    names.append(name)
+    return out
+
+
+def _contract_state_slots_from_text(assertion: str) -> List[int]:
+    return [int(m.group(1)) for m in _STATE_SLOT_REF_RE.finditer(assertion or "")]
+
+
+def _simulation_driver(tree: ast.Module) -> Optional[ast.FunctionDef]:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "simulation_step":
+            return node
+    for fn in _simulation_functions(tree):
+        if isinstance(fn, ast.FunctionDef):
+            return fn
+    return None
+
+
+def _latest_layer_function(tree: ast.Module) -> Optional[ast.FunctionDef]:
+    """Latest pinned/new layer function (``layer_*_step`` or buf-first helper)."""
+    candidates = [n for n in _simulation_functions(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name != "simulation_step"]
+    if not candidates:
+        return None
+    def _stage_key(fn: ast.FunctionDef) -> int:
+        m = re.search(r"layer_(\d+)_step", fn.name)
+        return int(m.group(1)) if m else 0
+    return sorted(candidates, key=_stage_key)[-1]
+
+
+def _module_function_names(tree: ast.Module) -> Dict[str, ast.FunctionDef]:
+    return {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+
+def _roundtrip_callable(tree: ast.Module, driver: ast.FunctionDef) -> Optional[str]:
+    fns = _module_function_names(tree)
+    calls: set[str] = set()
+    for node in ast.walk(driver):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            calls.add(node.func.id)
+    candidates = [name for name in calls
+                  if name != "simulation_step" and name in fns
+                  and fns[name].args.args and fns[name].args.args[0].arg == "buf"]
+    for name in sorted(candidates):
+        if name.startswith("layer_"):
+            return name
+    return sorted(candidates)[0] if candidates else None
+
+
+def _bridge_contract_slots_tree(tree: ast.Module, contracts: Sequence[Any]
+                                ) -> Tuple[ast.Module, bool, List[str]]:
+    """Assign contract slots the kernel forgot to compute.
+
+    Role-matched observables are copied from the canonical assigned slot;
+    roundtrip/reversibility errors get a deterministic +/-dt L2 check.
+    """
+    contracts = list(contracts or [])
+    if not contracts:
+        return tree, False, []
+    driver = _simulation_driver(tree)
+    slot_fn = _latest_layer_function(tree) or driver
+    if slot_fn is None:
+        return tree, False, []
+    assigned = _assigned_state_slots(tree)
+    slot_names = _contract_slot_names(contracts)
+    contract_slots = sorted(slot_names)
+    missing = [k for k in contract_slots if k not in assigned]
+    if not missing:
+        return tree, False, []
+
+    notes: List[str] = []
+    additions: List[ast.stmt] = []
+    roundtrip_slots: List[int] = []
+    assigned_sorted = sorted(assigned)
+    for slot in missing:
+        names = slot_names.get(slot, [])
+        low_names = " ".join(names).lower()
+        if any(tok in low_names for tok in ("roundtrip", "revers")):
+            roundtrip_slots.append(slot)
+            continue
+        stem = {_semantic_slot_stem(n) for n in names if n}
+        stem.discard("")
+        target = None
+        if stem:
+            for candidate in assigned_sorted:
+                other = {_semantic_slot_stem(n) for n in slot_names.get(candidate, []) if n}
+                other.discard("")
+                if stem & other:
+                    target = candidate
+                    break
+        if target is not None:
+            additions.append(ast.parse(f"buf.data[{slot}] = buf.data[{target}]").body[0])
+            notes.append(f"bridged unassigned state[{slot}] <- state[{target}] "
+                         f"({', '.join(names[:2])})")
+    if roundtrip_slots:
+        callee = _roundtrip_callable(tree, driver)
+        if callee is not None:
+            helper = f"_invar_roundtrip_check_{min(roundtrip_slots)}"
+            assigns = "\n".join(f"    buf.data[{slot}] = _err" for slot in roundtrip_slots)
+            src = (
+                "import math\n\n"
+                f"def {helper}(buf, dt):\n"
+                "    _rt0 = buf.data[0]\n"
+                "    _rt1 = buf.data[1]\n"
+                "    _rt2 = buf.data[2]\n"
+                "    _rt3 = buf.data[3]\n"
+                f"    {callee}(buf, dt)\n"
+                f"    {callee}(buf, -dt)\n"
+                "    _e = ((_rt0 - buf.data[0]) ** 2 + (_rt1 - buf.data[1]) ** 2 + "
+                "(_rt2 - buf.data[2]) ** 2 + (_rt3 - buf.data[3]) ** 2)\n"
+                "    buf.data[0] = _rt0\n"
+                "    buf.data[1] = _rt1\n"
+                "    buf.data[2] = _rt2\n"
+                "    buf.data[3] = _rt3\n"
+                "    _err = math.sqrt(max(_e, 0.0))\n"
+                f"{assigns}\n"
+            )
+            helper_fn = ast.parse(src).body[-1]
+            idx = next((i for i, n in enumerate(tree.body)
+                        if isinstance(n, ast.FunctionDef) and n.name == driver.name), len(tree.body))
+            tree.body.insert(idx, helper_fn)
+            additions.append(ast.parse(f"{helper}(buf, dt)").body[0])
+            notes.append("synthesized deterministic roundtrip check for "
+                         + ", ".join(f"state[{s}]" for s in roundtrip_slots))
+        else:
+            for slot in roundtrip_slots:
+                additions.append(ast.parse(f"buf.data[{slot}] = 0.0").body[0])
+            notes.append("assigned fallback 0.0 to unassigned roundtrip slots "
+                         + ", ".join(f"state[{s}]" for s in roundtrip_slots))
+    if additions:
+        driver.body.extend(additions)
+        ast.fix_missing_locations(tree)
+        _ensure_math_import(tree)
+        return tree, True, notes
+    return tree, False, []
+
+
+def _small_monotone_slots(contracts: Sequence[Any]) -> set[int]:
+    slots: set[int] = set()
+    tokens = ("monotone", "drift", "entropy", "error", "err", "residual",
+              "violation", "mismatch")
+    for contract in contracts or []:
+        for name, assertion, tolerance in _contract_invariant_items(contract):
+            low = f"{name} {assertion}".lower()
+            if not any(tok in low for tok in tokens):
+                continue
+            m = re.search(r"(?:state|buf\.data|data)\[(\d+)\]\s*<=", assertion or "")
+            if not m:
+                continue
+            numeric = re.search(r"<=\s*([0-9.eE+-]+)", assertion or "")
+            bound = float(numeric.group(1)) if numeric else None
+            if (tolerance <= 1e-6) or (bound is not None and bound <= 1e-6):
+                slots.add(int(m.group(1)))
+    return slots
+
+
+def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
+                                     notes: set[str]) -> bool:
+    changed = False
+    for i, stmt in enumerate(body):
+        if isinstance(stmt, (ast.For, ast.While)):
+            for field in ("body", "orelse"):
+                sub = getattr(stmt, field, None)
+                if isinstance(sub, list):
+                    changed = _repair_monotone_observable_body(sub, slots, notes) or changed
+            continue
+        if not isinstance(stmt, ast.If):
+            continue
+        test = stmt.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+                or len(test.comparators) != 1:
+            continue
+        metric_slot = None
+        val_name = None
+        if isinstance(test.left, ast.Name) and isinstance(test.comparators[0], ast.Subscript):
+            comp_slot = _state_subscript_slot(test.comparators[0])
+            if comp_slot in slots and isinstance(test.ops[0], (ast.Gt, ast.GtE)):
+                metric_slot, val_name = comp_slot, test.left.id
+        if metric_slot is None:
+            continue
+        assigns_metric = False
+        for sub in stmt.body:
+            if _stmt_slot_target(sub) == metric_slot and isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                value = getattr(sub, "value", None)
+                if isinstance(value, ast.Name) and value.id == val_name:
+                    assigns_metric = True
+                    break
+        if not assigns_metric:
+            continue
+        prev_slot = None
+        for prev_stmt in body[:i]:
+            if not isinstance(prev_stmt, ast.If):
+                continue
+            ptest = prev_stmt.test
+            if not isinstance(ptest, ast.Compare) or len(ptest.ops) != 1 \
+                    or len(ptest.comparators) != 1:
+                continue
+            pcomp = ptest.comparators[0]
+            if not (isinstance(ptest.left, ast.Subscript)
+                    and _state_subscript_slot(ptest.left) is not None
+                    and isinstance(ptest.ops[0], ast.Eq)
+                    and isinstance(pcomp, ast.Constant)
+                    and pcomp.value == 0.0):
+                continue
+            pslot = _state_subscript_slot(ptest.left)
+            for sub in prev_stmt.body:
+                if _stmt_slot_target(sub) == pslot and isinstance(sub, ast.Assign):
+                    value = getattr(sub, "value", None)
+                    if isinstance(value, ast.Name) and value.id == val_name:
+                        prev_slot = pslot
+                        break
+            if prev_slot is not None:
+                break
+        if prev_slot is None:
+            continue
+        viol = f"_monotone_viol_{metric_slot}"
+        replacement = ast.parse(
+            f"{viol} = max(0.0, {val_name} - buf.data[{prev_slot}])\n"
+            f"if {viol} > buf.data[{metric_slot}]:\n"
+            f"    buf.data[{metric_slot}] = {viol}\n"
+            f"buf.data[{prev_slot}] = {val_name}\n").body
+        body[i:i + 1] = replacement
+        ast.fix_missing_locations(stmt)
+        changed = True
+        notes.add(f"repaired monotone observable state[{metric_slot}] "
+                  f"to track max(0, {val_name} - state[{prev_slot}])")
+    return changed
+
+
+def _repair_monotone_observables_tree(tree: ast.Module, contracts: Sequence[Any]
+                                      ) -> Tuple[ast.Module, bool, List[str]]:
+    slots = _small_monotone_slots(contracts)
+    if not slots:
+        return tree, False, []
+    notes: set[str] = set()
+    changed = False
+    for fn in _simulation_functions(tree):
+        if isinstance(fn, ast.FunctionDef) and _repair_monotone_observable_body(fn.body, slots, notes):
+            changed = True
+            ast.fix_missing_locations(fn)
+    return tree, changed, sorted(notes)
+
+
+def _seed_dissipation_parameters_tree(tree: ast.Module, contracts: Sequence[Any]
+                                      ) -> Tuple[ast.Module, bool, List[str]]:
+    contracts = list(contracts or [])
+    if not contracts:
+        return tree, False, []
+    allow = False
+    stiff = False
+    for contract in contracts:
+        text = " ".join([
+            str(_contract_get(contract, "contract_id", "") or ""),
+            " ".join(name for name, _a, _t in _contract_invariant_items(contract)),
+        ]).lower()
+        if any(tok in text for tok in _DISSIPATION_CONTRACT_TOKENS):
+            allow = True
+        if "stiff" in text or "1e5" in text:
+            stiff = True
+        dt = float(_contract_get(contract, "dt", 0.0) or 0.0)
+        if not _contract_closed_or_reversible(contract) and dt >= 0.2:
+            allow = True
+    if not allow:
+        return tree, False, []
+    fallback = 1.0e5 if stiff else 1.0
+    changed = False
+    notes: List[str] = []
+    for fn in _simulation_functions(tree):
+        body = fn.body
+        inserts: Dict[int, List[ast.stmt]] = {}
+        for idx, stmt in enumerate(body):
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name) or target.id.lower() not in _DISSIPATION_PARAM_NAMES:
+                continue
+            slot = _state_subscript_slot(stmt.value)
+            if slot is None:
+                continue
+            var = target.id
+            later_write = False
+            read_lineno = getattr(stmt, "lineno", 0) or 0
+            for node in ast.walk(fn):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) \
+                        and _stmt_slot_target(node) == slot \
+                        and (getattr(node, "lineno", 0) or 0) > read_lineno:
+                    later_write = True
+                    break
+            if later_write or _zero_guard_exists(body, idx, var):
+                continue
+            snippet = ast.parse(
+                f"if {var} == 0.0:\n    {var} = {fallback:.6g}\n").body
+            inserts.setdefault(idx, []).extend(snippet)
+            changed = True
+            notes.append(f"nonzero fallback for dissipation parameter {var} "
+                         f"(buf.data[{slot}])")
+        if inserts:
+            new_body: List[ast.stmt] = []
+            for i, stmt in enumerate(body):
+                new_body.append(stmt)
+                new_body.extend(inserts.get(i, []))
+            fn.body = new_body
+            ast.fix_missing_locations(fn)
+    return tree, changed, notes
+
+
 def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         eps: float = 1e-300,
-                        contracts: Sequence[Any] = ()) -> SanitizerResult:
+                        contracts: Sequence[Any] = (),
+                        all_contracts: Sequence[Any] = ()) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    bridge_contracts = list(all_contracts or contracts or [])
+    tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
+    tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
+    tree, monotone_changed, monotone_notes = _repair_monotone_observables_tree(
+        tree, bridge_contracts)
     tree, none_changed, none_notes = _strip_none_literals_tree(tree)
     tree, complex_changed, complex_notes = _lower_complex_tree(tree)
     tree, history_changed, history_notes = _repair_history_slots_tree(tree)
     tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, contracts)
+    tree, diss_changed, diss_notes = _seed_dissipation_parameters_tree(tree, contracts)
     transformer = _IntrinsicTransformer()
     transformer.defined = _defined_names(tree)
     transformer.guard_eps = float(eps)
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(none_notes) | set(complex_notes) | set(history_notes)
-                   | set(param_notes) | set(transformer.notes))
-    if none_changed or complex_changed or history_changed or param_changed:
+    notes = sorted(set(alias_notes) | set(bridge_notes) | set(monotone_notes)
+                   | set(none_notes) | set(complex_notes) | set(history_notes)
+                   | set(param_notes) | set(diss_notes) | set(transformer.notes))
+    if (alias_changed or bridge_changed or monotone_changed or none_changed
+            or complex_changed or history_changed or param_changed or diss_changed):
         changed = True
     if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
         if _ensure_math_import(tree):

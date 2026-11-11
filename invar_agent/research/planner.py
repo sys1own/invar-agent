@@ -755,6 +755,68 @@ def _canon_alloc_slot(assigned: set, reserved: set) -> int:
     return max(assigned | reserved | {15}) + 1
 
 
+_CANON_SEMANTIC_SUFFIXES = (
+    "_trace_rho2", "_bound", "_limit", "_max", "_min", "_current", "_val",
+    "_check", "_error", "_err", "_drift",
+)
+_CANON_INITIAL_STATE_RE = re.compile(r"\binitial_state\[(\d+)\]")
+
+
+def _canon_semantic_stem(name: str) -> str:
+    low = str(name or "").lower().strip()
+    if not low:
+        return ""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("max_", "min_"):
+            if low.startswith(prefix) and len(low) > len(prefix):
+                low = low[len(prefix):]
+                changed = True
+        for suffix in _CANON_SEMANTIC_SUFFIXES:
+            if low.endswith(suffix) and len(low) > len(suffix):
+                low = low[:-len(suffix)]
+                changed = True
+    return low
+
+
+def _canon_bound_direction(assertion: str) -> str:
+    m = re.search(r"(?:state|buf\.data|data)\[\d+\]\s*(<=|>=|<|>)", assertion or "")
+    if not m:
+        return ""
+    return "le" if m.group(1) in ("<=", "<") else "ge"
+
+
+def _canon_semantic_key(name: str, assertion: str) -> tuple[str, str]:
+    return (_canon_semantic_stem(name) or str(name or "").lower(),
+            _canon_bound_direction(assertion))
+
+
+def _materialize_initial_state_bounds(contracts: List[Dict[str, Any]]) -> None:
+    """Replace ``initial_state[k]`` in assertions with its numeric literal."""
+    for contract in contracts or []:
+        if not isinstance(contract, dict):
+            continue
+        initial = contract.get("initial_state") or []
+        for inv in contract.get("invariants") or []:
+            if not isinstance(inv, dict):
+                continue
+            assertion = str(inv.get("assertion") or "")
+            if "initial_state[" not in assertion:
+                continue
+
+            def repl(match: "re.Match[str]") -> str:
+                idx = int(match.group(1))
+                if 0 <= idx < len(initial):
+                    try:
+                        return format(float(initial[idx]), ".12g")
+                    except (TypeError, ValueError):
+                        pass
+                return match.group(0)
+
+            inv["assertion"] = _CANON_INITIAL_STATE_RE.sub(repl, assertion)
+
+
 def canonicalize_contract_dicts(
         contracts: List[Dict[str, Any]],
         variable_map: Optional[Dict[str, int]] = None,
@@ -771,6 +833,7 @@ def canonicalize_contract_dicts(
     vm = {str(k): int(v) for k, v in (variable_map or {}).items() if str(k).strip()}
     prior = copy.deepcopy(prior_contracts or [])
     all_contracts = prior + contracts
+    _materialize_initial_state_bounds(all_contracts)
     order = sorted(range(len(all_contracts)),
                    key=lambda i: (_canon_stage_index(str(all_contracts[i].get("contract_id") or "")), i))
 
@@ -782,6 +845,8 @@ def canonicalize_contract_dicts(
     reserved.update(int(v) for v in vm.values())
 
     name_slot: Dict[str, int] = {}
+    name_semantic: Dict[str, Tuple[str, str]] = {}
+    semantic_slot: Dict[Tuple[str, str], int] = {}
     slot_owner: Dict[int, str] = {}
     name_order: List[str] = []
     remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
@@ -790,23 +855,27 @@ def canonicalize_contract_dicts(
         name = str(inv.get("variable_name") or "").strip()
         if not _canon_observable_name(name, vm):
             return
-        slots = _canon_slots_in_text(str(inv.get("assertion") or ""))
+        assertion = str(inv.get("assertion") or "")
+        slots = _canon_slots_in_text(assertion)
         desired = slots[0] if slots else vm.get(name)
         if desired is None:
             return
         desired = int(desired)
-        canonical = name_slot.get(name)
+        key = _canon_semantic_key(name, assertion)
+        name_semantic.setdefault(name, key)
+        canonical = semantic_slot.get(key)
         if canonical is None:
             owner = slot_owner.get(desired)
             if owner is not None and owner != name:
-                canonical = _canon_alloc_slot(set(name_slot.values()), reserved)
+                canonical = _canon_alloc_slot(set(name_slot.values()) | set(semantic_slot.values()), reserved)
                 notes.append(f"canonical slot conflict: {name} state[{desired}] -> state[{canonical}]")
             else:
                 canonical = desired
-            name_slot[name] = canonical
+            semantic_slot[key] = canonical
             slot_owner[canonical] = name
             if name not in name_order:
                 name_order.append(name)
+        name_slot.setdefault(name, int(canonical))
         if desired != canonical and record:
             remaps.append((c, inv, desired, canonical))
 
@@ -823,10 +892,15 @@ def canonicalize_contract_dicts(
 
     # Canonicalize explicit variable_map entries against contract-owned names.
     assigned_names = set(name_slot)
-    assigned_slots = set(name_slot.values())
+    assigned_slots = set(name_slot.values()) | set(semantic_slot.values())
     new_vm: Dict[str, int] = {}
     for name, idx in vm.items():
-        canonical = name_slot.get(name)
+        canonical = None
+        key = name_semantic.get(name)
+        if key is not None:
+            canonical = semantic_slot.get(key)
+        if canonical is None:
+            canonical = name_slot.get(name)
         if canonical is None:
             owner = slot_owner.get(int(idx))
             if owner is not None and owner != name:
@@ -836,11 +910,12 @@ def canonicalize_contract_dicts(
                 canonical = _canon_alloc_slot(assigned_slots, reserved)
             else:
                 canonical = int(idx)
-            name_slot[name] = canonical
-            slot_owner[canonical] = name
+            slot_owner[int(canonical)] = name
             assigned_names.add(name)
-        new_vm[name] = int(canonical)
-        assigned_slots.add(int(canonical))
+        canonical = int(canonical)
+        name_slot.setdefault(name, canonical)
+        new_vm[name] = canonical
+        assigned_slots.add(canonical)
     vm = new_vm
 
     if not vm:

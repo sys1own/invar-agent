@@ -500,7 +500,14 @@ async function api(path, opts) {
 function el(html) { const d = document.createElement('div'); d.innerHTML = html; return d.firstElementChild; }
 function scrollChat() { chat.scrollTop = chat.scrollHeight; }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+let lastSystemMsg = '';
 function addMsg(cls, text) {
+  if (cls === 'system') {
+    if (text === lastSystemMsg) return null;  // finalization banners are once-per-run
+    lastSystemMsg = text;
+  } else {
+    lastSystemMsg = '';
+  }
   const m = el(`<div class="msg ${cls}"></div>`);
   m.textContent = text; chat.appendChild(m); scrollChat(); return m;
 }

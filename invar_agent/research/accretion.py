@@ -91,9 +91,23 @@ class _Rename(ast.NodeTransformer):
 
 
 def pin_layer_code(candidate_layer_code: str, stage: int) -> str:
-    """Rename the stage driver ``simulation_step`` -> ``layer_<stage>_step``."""
+    """Pin the stage driver as ``layer_<stage>_step``.
+
+    Candidates already structured as ``layer_<stage>_step`` + a thin
+    ``simulation_step`` delegate are pinned by dropping the delegate; renaming
+    the delegate onto the existing layer name would create a recursive stub.
+    """
     tree = ast.parse(candidate_layer_code)
-    tree = _Rename(DRIVER, layer_driver_name(stage)).visit(tree)
+    target = layer_driver_name(stage)
+    has_target = any(isinstance(n, ast.FunctionDef) and n.name == target
+                     for n in tree.body)
+    has_driver = any(isinstance(n, ast.FunctionDef) and n.name == DRIVER
+                     for n in tree.body)
+    if has_target and has_driver:
+        tree.body = [n for n in tree.body
+                     if not (isinstance(n, ast.FunctionDef) and n.name == DRIVER)]
+    else:
+        tree = _Rename(DRIVER, target).visit(tree)
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
 

@@ -1173,3 +1173,173 @@ def test_cayley_step0_history_parameter_and_monotone_native(tmp_path):
         assert state[11] == pytest.approx(initial[11])  # omega not overwritten by roundtrip
         if contract.contract_id == "c3_closed_limit_reversibility":
             assert state[10] <= 1e-13
+
+
+ALIAS_KERNEL = '''
+import math
+
+def layer_1_step(buf, dt):
+    D = buf.data
+    rho00, rho0r, rho0i, rho11 = (D[0], D[1], D[2], D[3])
+    omega = D[8]
+    gamma = D[9]
+    theta = omega * dt
+    c = math.cos(theta)
+    s = math.sin(theta)
+    rho0r2 = c * rho0r - s * rho0i
+    rho0i2 = s * rho0r + c * rho0i
+    a = gamma * dt
+    denom = 1.0 + 0.5 * a
+    g_amp = a / denom
+    g_max = 0.9995
+    if g_amp > g_max:
+        g_amp = g_max
+    if g_amp < 0.0:
+        g_amp = 0.0
+    sq = math.sqrt(max(1.0 - g_amp, 0.0))
+    rho0r3 = sq * rho0r2
+    rho0i3 = sq * rho0i2
+    p_abs = 1.0 - sq * sq
+    rho11_new = rho11 + p_abs * rho00
+    rho00_new = rho00 * sq * sq
+    tr = rho00_new + rho11_new
+    rho00_new = rho00_new / tr
+    rho11_new = rho11_new / tr
+    rho0r3 = rho0r3 / tr
+    rho0i3 = rho0i3 / tr
+    D[0] = rho00_new
+    D[1] = rho0r3
+    D[2] = rho0i3
+    D[3] = rho11_new
+    tr_db = D[0] + D[3]
+    disc = (D[0] - D[3]) * (D[0] - D[3]) + 4.0 * (D[1] * D[1] + D[2] * D[2])
+    lam = 0.5 * (tr_db - math.sqrt(max(disc, 0.0)))
+    D[12] = lam
+    D[13] = D[0] * D[0] + D[3] * D[3] + 2.0 * (D[1] * D[1] + D[2] * D[2])
+    terr = D[0] + D[3] - 1.0
+    if terr < 0.0:
+        terr = -terr
+    if terr > D[14]:
+        D[14] = terr
+    p_now = D[13]
+    if D[10] == 0.0:
+        D[10] = p_now
+    if p_now > D[11]:
+        D[11] = p_now
+    D[11] = D[11]
+
+def simulation_step(buf, dt):
+    layer_1_step(buf, dt)
+'''
+
+
+def _alias_contracts():
+    init = [0.5, 0.0, 0.0, 0.5] + [0.0] * 13
+    init[8] = 1.0
+    common = dict(target_backend="cpp", timeout_seconds=30.0, max_memory_mb=1024,
+                  initial_state=init, dt=0.05, steps=8)
+    return [
+        VerificationContract(contract_id="c1_closed_cayley_reversibility",
+            invariants=[
+                InvariantConstraint(variable_name="min_eigenvalue", assertion="state[12] >= -1e-9", tolerance=1e-9),
+                InvariantConstraint(variable_name="purity_bound", assertion="0.0 < state[13] <= 1.0 + 1e-13", tolerance=1e-13),
+                InvariantConstraint(variable_name="trace_error", assertion="state[14] <= 1e-12", tolerance=1e-12),
+                InvariantConstraint(variable_name="roundtrip_error", assertion="state[15] <= 1e-12", tolerance=1e-12),
+            ], **common),
+        VerificationContract(contract_id="c2_kraus_positivity_stiff",
+            invariants=[
+                InvariantConstraint(variable_name="min_eigenvalue", assertion="state[12] >= -1e-6", tolerance=1e-6),
+                InvariantConstraint(variable_name="purity", assertion="0.0 < state[16] <= 1.0 + 1e-13", tolerance=1e-13),
+                InvariantConstraint(variable_name="trace_error", assertion="state[14] <= 1e-10", tolerance=1e-10),
+                InvariantConstraint(variable_name="roundtrip_error", assertion="state[15] <= 1e-8", tolerance=1e-8),
+            ], **{**common, "dt": 0.02, "steps": 6}),
+        VerificationContract(contract_id="c3_driven_entropy_benchmark",
+            invariants=[
+                InvariantConstraint(variable_name="entropy_monotone", assertion="state[11] <= initial_state[11] + 1e-12", tolerance=1e-12),
+                InvariantConstraint(variable_name="purity_bound", assertion="0.0 < state[13] <= 1.0 + 1e-12", tolerance=1e-12),
+            ], **{**common, "dt": 0.1, "steps": 5}),
+    ]
+
+
+def test_buffer_alias_semantic_bridge_and_monotone_repair():
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    contracts = _alias_contracts()
+    san = sanitize_intrinsics(ALIAS_KERNEL, contracts=contracts[:1],
+                              all_contracts=[c.model_dump() for c in contracts])
+    assert san.changed
+    assert "D = buf.data" not in san.code
+    assert "D[13]" not in san.code
+    assert "buf.data[13]" in san.code
+    assert "buf.data[16] = buf.data[13]" in san.code
+    assert "_invar_roundtrip_check_15" in san.code
+    assert "_monotone_viol_11 = max(0.0, p_now - buf.data[10])" in san.code
+    assert not any("NEVER assigned" in n for n in san.notes)
+
+
+@pytest.mark.asyncio
+async def test_alias_kernel_native_stage1_and_slot_guards(tmp_path):
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.research.state_machine import _guard_contract_initial_state, _kernel_assigns_slots
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.research.state_machine import _eval_invariant
+    contract = _alias_contracts()[0]
+    san = sanitize_intrinsics(ALIAS_KERNEL, contracts=[contract], all_contracts=[contract.model_dump()])
+    slots = [12, 13, 14, 15]
+    assert _kernel_assigns_slots(san.code, slots) == []
+    initial, warnings = _guard_contract_initial_state(san.code, contract)
+    assert initial[0] == pytest.approx(0.7)
+    assert initial[1] == pytest.approx(0.2)
+    assert initial[2] == pytest.approx(0.1)
+    assert initial[3] == pytest.approx(0.3)
+    assert initial[8] == pytest.approx(1.0)
+    assert initial[9] == pytest.approx(0.0)  # closed/reversible stage stays reversible
+    cpp = CppEmitter().emit_module(python_source_to_uast(san.code))
+    bridge = DynamicCABIBridge(tmp_path / "cabi")
+    run = bridge.run(cpp, initial, dt=contract.dt, steps=contract.steps,
+                     entry="execute_step", isolated=True)
+    assert run.get("fallback") != "python"
+    assert run["finite"] is True
+    state = run["state"]
+    telemetry = {"execution_time_ms": run["execution_time_ms"], "cabi_fallback": 0.0}
+    for inv in contract.invariants:
+        assert _eval_invariant(inv.assertion, state, telemetry), (inv.assertion, state)
+
+
+SIMPLE_STAGE1 = '''
+import math
+
+def simulation_step(buf, dt):
+    buf.data[0] = buf.data[0] + dt * buf.data[1]
+    buf.data[1] = buf.data[1] - dt * buf.data[0] * 0.01
+'''
+
+
+@pytest.mark.asyncio
+async def test_accretion_timeout_fallback_is_named_and_uses_pinned(tmp_path):
+    from invar_agent.research.state_machine import _format_accretion_exception
+    assert _format_accretion_exception(TimeoutError("")) == "TimeoutError: "
+
+    async def synth_timeout(**kwargs):
+        raise TimeoutError("")
+
+    contract = VerificationContract(
+        contract_id="c1", target_backend="cpp", timeout_seconds=5.0,
+        invariants=[InvariantConstraint(variable_name="bounded",
+                                        assertion="telemetry['final_max'] < 1e6")],
+        initial_state=[1.0, 0.0], dt=0.01, steps=2, max_memory_mb=256)
+    bp = ResearchBlueprint(
+        blueprint_id="bp_timeout_fallback", title="timeout fallback",
+        falsifiable_hypothesis="H", search_queries=["q"], contracts=[contract],
+        code_template=SIMPLE_STAGE1, max_feedback_rounds=1,
+        target_research_stages=2, stage_objectives=["one", "two"])
+    machine = ResearchStateMachine(tmp_path, stage_synthesizer=synth_timeout)
+    events = []
+    async def cb(channel, payload):
+        events.append((channel, payload))
+    machine.progress_cb = cb
+    state = await machine.run(bp)
+    assert state.status != "ERROR"
+    assert any("TimeoutError" in str(p.get("message", "")) + str(p.get("note", ""))
+               for _c, p in events if isinstance(p, dict))

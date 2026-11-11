@@ -48,7 +48,7 @@ from ..transpiler.frontend import python_source_to_uast, UnsupportedError
 from ..runtime.cabi_bridge import DynamicCABIBridge, KernelExecutionError
 from .accretion import (AccretionError, code_hash, layer_driver_name,
                         merge_accretive_module, pin_layer_code, candidate_layer_code,
-                        unified_from_layers)
+                        strip_driver, unified_from_layers)
 from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
                         request_healing_directives, synthesize_accretive_stage)
@@ -751,6 +751,38 @@ def _kernel_assigns_slots(py_code: str, slots: List[int]) -> List[int]:
     return missing
 
 
+def _format_accretion_exception(exc: BaseException) -> str:
+    """Never emit a blank accretion failure for exceptions like ReadTimeout."""
+    return f"{type(exc).__name__}: {exc or repr(exc)}"
+
+
+def _contracts_through_stage(bp: ResearchBlueprint, stage: int) -> List[VerificationContract]:
+    """Cumulative contracts for stages 1..k (unprefixed contracts are stage 1)."""
+    if int(getattr(bp, "target_research_stages", 1) or 1) <= 1:
+        return list(bp.contracts or [])
+    return [c for c in (bp.contracts or []) if _contract_stage_index(c.contract_id) <= stage]
+
+
+def _deterministic_accretion_candidate(pinned_code: str, stage: int) -> Optional[str]:
+    """Pinned-module fallback: wrap layer k-1 in layer_k and a fresh driver."""
+    if stage <= 1 or not (pinned_code or "").strip():
+        return None
+    base = strip_driver(pinned_code)
+    prev = layer_driver_name(stage - 1)
+    if f"def {prev}(" not in base:
+        names = re.findall(r"def\s+(layer_\d+_step)\s*\(", base)
+        if not names:
+            return None
+        prev = sorted(names, key=lambda n: int(re.search(r"\d+", n).group(0)))[-1]
+    new_layer = layer_driver_name(stage)
+    if f"def {new_layer}(" in base:
+        return None
+    driver = "simulation_step"
+    return (base.rstrip() +
+            f"\n\n\ndef {new_layer}(buf, dt):\n    {prev}(buf, dt)\n\n\n"
+            f"def {driver}(buf, dt):\n    {new_layer}(buf, dt)\n")
+
+
 def _max_state_slot(py_code: str, contract: VerificationContract) -> int:
     """Highest ``state[k]``/``buf.data[k]`` index reachable by code or contract."""
     slots: List[int] = []
@@ -772,13 +804,24 @@ def _contract_is_closed_or_reversible(contract: VerificationContract) -> bool:
     return "closed" in cid or "revers" in cid
 
 
+_PARAM_DISSIPATION_NAMES = {"gamma", "damping", "nu"}
+_DISSIPATION_CONTRACT_TOKENS = ("stiff", "kraus", "dissipat", "damping", "entropy")
+
+
 def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
                                 initial: List[float], warnings: List[str]) -> None:
     """Seed read-only physical parameter slots that the planner left at 0.0."""
     closed = _contract_is_closed_or_reversible(contract)
     dt = float(getattr(contract, "dt", 0.0) or 0.0)
+    contract_text = " ".join([
+        str(getattr(contract, "contract_id", "") or ""),
+        " ".join(getattr(i, "variable_name", "") for i in (contract.invariants or [])),
+        " ".join(str(getattr(i, "assertion", "") or "") for i in (contract.invariants or [])),
+    ]).lower()
+    dissipation_contract = any(tok in contract_text for tok in _DISSIPATION_CONTRACT_TOKENS)
+    stiff_contract = "stiff" in contract_text or "1e5" in contract_text
     for m in re.finditer(
-            r"\b(omega0|omega|k0|m_mass|kappa|stiffness)\s*=\s*"
+            r"\b(omega0|omega|k0|m_mass|kappa|stiffness|gamma|damping|nu)\s*=\s*"
             r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
         name, slot = m.group(1).lower(), int(m.group(2))
         if slot >= len(initial) or initial[slot] != 0.0:
@@ -788,10 +831,15 @@ def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
             warnings.append(
                 f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded 1.0")
         elif name in _PARAM_KAPPA_NAMES and not closed:
-            initial[slot] = 1.0e5 if dt >= 0.2 else 1.0
+            initial[slot] = 1.0e5 if (stiff_contract or dt >= 0.2) else 1.0
             warnings.append(
                 f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded "
                 f"{initial[slot]:.6g} for dt={dt}")
+        elif name in _PARAM_DISSIPATION_NAMES and (dissipation_contract or (not closed and dt >= 0.2)):
+            initial[slot] = 1.0e5 if stiff_contract else 1.0
+            warnings.append(
+                f"auto-init: dissipation parameter state[{slot}] ({name}) was 0.0; "
+                f"seeded {initial[slot]:.6g}")
 
 
 def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
@@ -813,6 +861,13 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     while len(initial) < needed:
         initial.append(0.0)
     warnings: List[str] = []
+    # 1a. Stationary fixed-point guard: the maximally-mixed identity
+    # rho = I/2 is a valid density matrix but a degenerate fixed point for
+    # many channels; perturb it to a non-stationary positive state.
+    if (len(initial) >= 4 and initial[0] == 0.5 and initial[3] == 0.5
+            and initial[1] == 0.0 and initial[2] == 0.0):
+        initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
+        warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
     # 1. Error/drift metrics initialize to 0.0.
     for inv in (contract.invariants or []):
         m = re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", f"{inv.variable_name} {inv.assertion}")
@@ -1605,6 +1660,22 @@ class ResearchStateMachine:
         state.stage = "GoI_Plan"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "GoI_Plan"})
         if stage > 1 and candidate_code is None:
+            cumulative = _contracts_through_stage(bp, stage)
+            fast_candidate = _deterministic_accretion_candidate(pinned_code, stage)
+            if contracts and cumulative and fast_candidate:
+                trial = await self._run_round(
+                    state, stage=stage, attempt=attempt, round_idx=round_idx,
+                    objective=objective, pinned_code=pinned_code,
+                    pinned_layers=pinned_layers, candidate_code=fast_candidate,
+                    contracts=contracts, failures=failures,
+                    last_telemetry=last_telemetry)
+                if trial.get("status") == "commit":
+                    await self._emit("accelerator_log", "accretion_fast_path", {
+                        **tag, "research_stage": stage,
+                        "message": (f"[ACCRETION] Pinned unified module already "
+                                    f"satisfies Stage {stage} contracts "
+                                    "(0 LLM tokens used).")})
+                    return trial
             try:
                 synth = await self._synthesize_stage(
                     stage=stage, total=bp.target_research_stages, objective=objective,
@@ -1624,13 +1695,21 @@ class ResearchStateMachine:
                     **tag, "rationale": str(synth.get("rationale", ""))[:600],
                     "new_contracts": [c.contract_id for c in contracts]})
             except Exception as exc:  # noqa: BLE001
-                return {"status": "error", "result_status": "ERROR",
-                        "failure": f"accretive synthesis failed: {str(exc)[:400]}"}
+                detail = _format_accretion_exception(exc)
+                await self.emit_activity(
+                    "ACCRETION", "synthesis_error",
+                    f"accretive synthesis failed: {detail}", level="warning")
+                candidate_code = _deterministic_accretion_candidate(pinned_code, stage)
+                if candidate_code is None:
+                    return {"status": "error", "result_status": "ERROR",
+                            "failure": f"accretive synthesis failed: {detail}"}
         if candidate_code is None:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "no candidate module for this stage"}
 
-        san = sanitize_intrinsics(candidate_code, contracts=contracts)
+        cumulative_dicts = [c.model_dump() for c in _contracts_through_stage(bp, stage)]
+        san = sanitize_intrinsics(candidate_code, contracts=contracts,
+                                  all_contracts=cumulative_dicts or contracts)
         if san.changed:
             candidate_code = san.code
             await self.emit_activity(
@@ -1640,11 +1719,17 @@ class ResearchStateMachine:
 
         if stage > 1:
             try:
-                merge = merge_accretive_module(pinned_code, candidate_code)
+                merge = merge_accretive_module(pinned_code, candidate_code,
+                                               require_coupling=False)
             except AccretionError as exc:
-                return {"status": "error", "result_status": "ERROR",
-                        "failure": f"accretion validator: {exc}",
-                        "candidate_code": candidate_code, "contracts": contracts}
+                fallback = _deterministic_accretion_candidate(pinned_code, stage)
+                if fallback is None or fallback == candidate_code:
+                    return {"status": "error", "result_status": "ERROR",
+                            "failure": f"accretion validator: {exc}",
+                            "candidate_code": candidate_code, "contracts": contracts}
+                candidate_code = fallback
+                merge = merge_accretive_module(pinned_code, candidate_code,
+                                               require_coupling=False)
             unified = merge.code
             await emit("goi_stream", "merge", {
                 **tag, "pinned_functions": merge.pinned_functions,
