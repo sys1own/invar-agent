@@ -72,6 +72,10 @@ periods, use scalar state variables inside `buf.data` (e.g., `prev_val =
 buf.data[0]`, `cycle_count = buf.data[10]`, `last_peak_t = buf.data[11]`). NEVER
 use dynamic Python lists (`list.append`), `while` searches across history, or
 variable-length arrays, as they cannot lower to C++ C-ABI.
+VARIABLE STYLE: prefer plain scalar variables and indexable arrays over
+nested Python tuples. Tuple unpacking (`a, b = b, a`), sequence unpacking
+(`q, p, s = state`) and tuple literals are supported by the transpiler, but
+simple scalars keep kernels readable and portable.
 Invariants must be falsifiable and physically meaningful; never write vacuous
 invariants (like x == x) and never loosen tolerances to force a pass.
 CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper

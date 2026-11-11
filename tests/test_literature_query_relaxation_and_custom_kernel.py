@@ -365,3 +365,79 @@ def test_live_public_literature_smoke():
     elapsed = time.perf_counter() - start
     assert total > 0, "expected >0 ingested sources from public APIs"
     assert elapsed < 30.0  # 3 queries with relaxation well under budget
+
+
+# -- 6. live-by-default literature mode --------------------------------------
+def test_state_machine_defaults_to_live_network_outside_pytest(monkeypatch, tmp_path):
+    """Without PYTEST_CURRENT_TEST, ResearchStateMachine() builds a LIVE client."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("INVAR_OFFLINE", raising=False)
+    monkeypatch.delenv("INVAR_RESEARCH_SEARCH_LIVE", raising=False)
+    from invar_agent.research.state_machine import ResearchStateMachine
+    machine = ResearchStateMachine(tmp_path / "research")
+    assert machine.search_client.offline is False
+
+
+def test_literature_health_endpoint_live(monkeypatch, tmp_path):
+    """GET /api/research/literature/health runs a real free public query."""
+    import os
+    from fastapi.testclient import TestClient
+    import invar_agent.server as server
+    monkeypatch.setattr(server, "_STATE", None)
+    monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "1")
+    monkeypatch.delenv("INVAR_OFFLINE", raising=False)
+    app = server.create_app(tmp_path)
+    client = TestClient(app)
+    resp = client.get("/api/research/literature/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["offline"] is False
+    assert data["elapsed_ms"] > 0
+    assert data["results"] > 0
+    assert sum((data.get("raw_counts") or {}).values()) > 0
+
+
+# -- 7. transpiler tuple support ----------------------------------------------
+TUPLE_KERNEL = (
+    "def simulation_step(buf, t, dt):\n"
+    "    state = buf.data\n"
+    "    a, b = 1.0, 2.0\n"
+    "    a, b = b, a\n"
+    "    q, p, s = state\n"
+    "    t2 = (a, b)\n"
+    "    buf.data[0] = t2[0] + q + p + s\n"
+    "    return buf.data[0]\n"
+)
+
+
+def test_transpiler_tuple_unpacking_and_literals():
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    uast = python_source_to_uast(TUPLE_KERNEL)  # must not raise
+    kinds = [n.get("type") for n in uast["children"][0]["body"]]
+    assert "multi_binding" in kinds
+
+
+def test_transpiler_tuple_emits_cpp_and_rust():
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.emitters.rust_emitter import RustEmitter
+    uast = python_source_to_uast(TUPLE_KERNEL)
+    cpp = CppEmitter().emit_module(uast)
+    rs = RustEmitter().emit_module(uast)
+    assert "__tmp" in cpp
+    assert "__tmp" in rs
+
+
+def test_tuple_kernel_compiles_with_clangxx(tmp_path):
+    import subprocess
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    cpp = CppEmitter().emit_module(python_source_to_uast(TUPLE_KERNEL))
+    harness = tmp_path / "harness.cpp"
+    harness.write_text(cpp + "\n", encoding="utf-8")
+    compiler = next((c for c in ("clang++", "g++", "c++")
+                     if __import__("shutil").which(c)), "c++")
+    proc = subprocess.run(
+        [compiler, "-O3", "-std=c++20", "-fsyntax-only", str(harness)],
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-2000:]

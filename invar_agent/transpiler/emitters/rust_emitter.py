@@ -46,6 +46,9 @@ class RustEmitter:
                     f"{self.emit_expr(node.get('right'))})")
         if t == "subscript":
             return f"{self.emit_expr(node.get('value'))}[{self.emit_expr(node.get('slice'))}]"
+        if t == "list":
+            elems = node.get("elements") or []
+            return "vec![" + ", ".join(self.emit_expr(e) for e in elems) + "]"
         if t == "attribute":
             return f"{self.emit_expr(node.get('value'))}.{node.get('attr')}"
         raise EmitterError(f"unsupported rust expression {t!r}")
@@ -69,6 +72,16 @@ class RustEmitter:
         t = node.get("type")
         if t == "binding":
             return f"let {node.get('name')} = {self.emit_expr(node.get('value'))};"
+        if t == "multi_binding":
+            # Tuple unpacking / simultaneous assignment via temporaries so
+            # swaps like `a, b = b, a` stay correct.
+            names = node.get("names") or []
+            values = node.get("values") or []
+            tmps = [f"__tmp{i}" for i in range(len(names))]
+            lines = [f"let {tmp} = {self.emit_expr(v)};"
+                     for tmp, v in zip(tmps, values)]
+            lines += [f"let {n} = {tmp};" for n, tmp in zip(names, tmps)]
+            return " ".join(lines)
         if t == "return":
             val = node.get("value", node)
             return f"return {self.emit_expr(val)};"

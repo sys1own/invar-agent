@@ -83,12 +83,24 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
                     "value": _lower_expr(stmt.value)}
         if isinstance(target, (ast.Tuple, ast.List)) and all(
                 isinstance(e, ast.Name) for e in target.elts):
+            names = [e.id for e in target.elts]
             if (isinstance(stmt.value, (ast.Tuple, ast.List))
-                    and len(stmt.value.elts) == len(target.elts)):
+                    and len(stmt.value.elts) == len(target.elts)
+                    and not any(isinstance(v, ast.Starred) for v in stmt.value.elts)):
                 # Simultaneous assignment: a, b = x, y
-                return {"type": "multi_binding",
-                        "names": [e.id for e in target.elts],
+                # (emitters lower this through temporaries, so a, b = b, a
+                # swaps are 100% safe).
+                return {"type": "multi_binding", "names": names,
                         "values": [_lower_expr(v) for v in stmt.value.elts]}
+            if not isinstance(stmt.value, (ast.Tuple, ast.List)):
+                # Unpacking from an array/indexable: q, p, s = state
+                # -> q = state[0]; p = state[1]; s = state[2] (via temps).
+                value = _lower_expr(stmt.value)
+                if value is not None:
+                    return {"type": "multi_binding", "names": names,
+                            "values": [{"type": "subscript", "value": value,
+                                        "slice": {"type": "literal", "value": i}}
+                                       for i in range(len(names))]}
             raise UnsupportedError("tuple unpacking of non-tuple values", node=stmt)
         # Subscript/attribute targets: buf.data[i] = ...
         lowered_target = _lower_expr(target)
@@ -236,8 +248,13 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
                     "cols": _lower_expr(elt.right),
                     "fill": _lower_expr(elt.left.elts[0])}
         raise UnsupportedError("list comprehensions", node=expr)
-    if isinstance(expr, ast.Tuple):
-        raise UnsupportedError("tuples", node=expr)
+    if isinstance(expr, (ast.Tuple, ast.List)):
+        # Tuple literals are lowered to the emitter's list/array dialect;
+        # indexing t[0] then works through the normal subscript node.
+        if any(isinstance(e, ast.Starred) for e in expr.elts):
+            raise UnsupportedError("starred expressions", node=expr)
+        return {"type": "list",
+                "elements": [_lower_expr(e) for e in expr.elts]}
     if isinstance(expr, ast.Lambda):
         raise UnsupportedError("lambda expressions", node=expr)
     return None

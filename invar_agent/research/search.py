@@ -551,6 +551,7 @@ class LiteratureSearchClient:
         ``self.last_query_meta`` for ``search_log`` telemetry.
         """
         raw_query = (query or "").strip()
+        started = time.perf_counter()
         # Pass 1: cleaned, de-pluralized, hyphen-normalized FULL query.
         # Short planner queries (<=5 terms) keep every technical token;
         # sentence-like input still goes through the <=3-entity sanitizer.
@@ -664,6 +665,8 @@ class LiteratureSearchClient:
             "channel_errors": channel_errors,
             "relaxed_query": relaxed_query,
             "error": error_note,
+            "offline": self.offline,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
         }
         if not results:
             # Never let the kernel receive empty parameters: fall back to
@@ -746,7 +749,9 @@ class LiteratureSearchClient:
         if results:
             self._write_cache(source, query, [r.__dict__ for r in results])
             return results
-        return cached or []
+        # NEVER cache a 0-result response: an empty answer must be retried
+        # live on the next call instead of poisoning the disk cache.
+        return []
 
     def _fetch_with_backoff(self, url: str) -> str:
         last_exc: Optional[Exception] = None
@@ -1050,6 +1055,19 @@ class LiteratureSearchClient:
             constants=constants)]
 
     # -- deterministic disk cache -----------------------------------------
+    def clear_cache(self) -> int:
+        """Delete every cached literature response; returns files removed."""
+        removed = 0
+        if self.cache_dir is None or not self.cache_dir.exists():
+            return 0
+        for path in self.cache_dir.glob("*.json"):
+            try:
+                path.unlink()
+                removed += 1
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                continue
+        return removed
+
     def _cache_path(self, source: str, query: str) -> Optional[Path]:
         if self.cache_dir is None:
             return None

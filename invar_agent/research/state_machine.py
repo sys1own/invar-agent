@@ -789,6 +789,15 @@ class ResearchStateMachine:
         self.progress_cb = progress_cb
         self.llm_planner = llm_planner
         self.llm_fast = llm_fast
+        if search_client is None:
+            # Live network by default in production/server/CLI; offline only
+            # when explicitly requested (INVAR_OFFLINE=1) or under pytest
+            # without INVAR_RESEARCH_SEARCH_LIVE=1 (hermetic unit tests).
+            import os
+            offline = os.environ.get("INVAR_OFFLINE") == "1" or (
+                "PYTEST_CURRENT_TEST" in os.environ
+                and os.environ.get("INVAR_RESEARCH_SEARCH_LIVE") != "1")
+            search_client = LiteratureSearchClient(offline=offline)
         self.search_client = search_client
         self.stage_synthesizer = stage_synthesizer
         self.abort_flag = abort_flag
@@ -1556,7 +1565,9 @@ class ResearchStateMachine:
                 "raw_counts": meta.get("raw_counts") or {},
                 "channel_errors": meta.get("channel_errors") or {},
                 "relaxed_query": meta.get("relaxed_query") or "",
-                "error": meta.get("error") or ""})
+                "error": meta.get("error") or "",
+                "offline": bool(meta.get("offline", getattr(self.search_client, "offline", True))),
+                "elapsed_ms": meta.get("elapsed_ms", 0)})
         self._record_literature(out)
         return out
 

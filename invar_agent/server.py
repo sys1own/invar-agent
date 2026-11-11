@@ -270,13 +270,17 @@ class ServerState:
                     # Tier-1 FAST: telemetry-guided query formulation is cheap.
                     return await _planner(question, Tier.FAST, 2048)
 
-                # Literature search is live only when explicitly enabled; unit
-                # tests stay hermetic via the offline deterministic cache.
+                # Literature search is LIVE by default in the server/CLI.
+                # Offline only when explicitly requested: INVAR_OFFLINE=1, or
+                # under pytest without INVAR_RESEARCH_SEARCH_LIVE=1 (keeps
+                # unit tests hermetic; live literature tests opt in).
                 import os
-                search_live = os.environ.get("INVAR_RESEARCH_SEARCH_LIVE") == "1"
+                offline = os.environ.get("INVAR_OFFLINE") == "1" or (
+                    "PYTEST_CURRENT_TEST" in os.environ
+                    and os.environ.get("INVAR_RESEARCH_SEARCH_LIVE") != "1")
                 search_client = LiteratureSearchClient(
                     self.workspace_root / "research" / "literature_cache",
-                    offline=not search_live)
+                    offline=offline)
 
                 self.research_manager = ResearchRunManager(
                     self.workspace_root, self.research_broadcaster,
@@ -1272,6 +1276,33 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
     @app.get("/api/v1/research/status")
     def api_research_status() -> dict[str, Any]:
         return state.ensure_research_manager().status()
+
+    @app.get("/api/research/literature/health")
+    def api_literature_health() -> dict[str, Any]:
+        """Zero-token live literature health check (free public APIs only)."""
+        import time as _time
+        from invar_agent.research.search import LiteratureSearchClient
+        import os
+        offline = os.environ.get("INVAR_OFFLINE") == "1" or (
+            "PYTEST_CURRENT_TEST" in os.environ
+            and os.environ.get("INVAR_RESEARCH_SEARCH_LIVE") != "1")
+        client = LiteratureSearchClient(offline=offline)
+        started = _time.perf_counter()
+        try:
+            sources = client.search("discrete gradient", 5)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "offline": client.offline,
+                    "results": 0, "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_ms": round((_time.perf_counter() - started) * 1000.0, 2)}
+        meta = getattr(client, "last_query_meta", {}) or {}
+        return {
+            "ok": len(sources) > 0,
+            "offline": client.offline,
+            "results": len(sources),
+            "raw_counts": meta.get("raw_counts") or {},
+            "channel_errors": meta.get("channel_errors") or {},
+            "elapsed_ms": round((_time.perf_counter() - started) * 1000.0, 2),
+        }
 
     @app.get("/api/v1/research/stream")
     def api_research_stream() -> StreamingResponse:
