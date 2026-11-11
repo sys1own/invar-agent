@@ -405,3 +405,14 @@ async def test_end_to_end_evidence_grounded_vault_commit(tmp_path):
     # Blueprint grounding validator is clean for this grounded blueprint.
     warnings = validate_blueprint_grounding(state.blueprint)
     assert isinstance(warnings, list)
+
+
+def test_planner_prompts_request_concise_2_to_4_term_queries():
+    from invar_agent.research.planner import PLANNER_PROMPT
+    import invar_agent.research.planner as planner_mod
+    prompts = [PLANNER_PROMPT]
+    src = Path(planner_mod.__file__).read_text()
+    # Both planner prompt variants demand concise keyword queries, never sentences.
+    assert "2-4 terms" in src
+    assert "NEVER full sentences" in src or "no full sentences" in src
+    assert "vs" in src and "versus" in src  # filler words explicitly banned

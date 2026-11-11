@@ -139,7 +139,9 @@ research engine. Produce ONE falsifiable research blueprint for the request.
 blueprint_id (lowercase snake_case, under 32 chars, e.g. 'mars_entry_probe'),
 title (concise human-readable, under 80 chars, e.g. 'Mars Atmospheric Entry &
 Stagnation Heating'), falsifiable_hypothesis,
-search_queries (3-6 concrete literature queries for arXiv/OpenAlex),
+search_queries (3-6 concise technical keyword queries of 2-4 terms each for
+arXiv/OpenAlex; NEVER full sentences, and never use filler words like
+'vs', 'versus', 'exact', 'using', 'between' or 'comparison'),
 target_research_stages (1-4; use 2-3 when the request describes a progression,
 e.g. "start by ... then integrate ..."), stage_objectives (one short objective per
 stage, stage 1 first), contracts (stage-1 contracts: list of {{contract_id,
@@ -283,7 +285,8 @@ Produce ONE falsifiable research blueprint:
 blueprint_id (lowercase snake_case, under 32 chars, e.g. 'mars_entry_probe'),
 title (concise human-readable, under 80 chars, e.g. 'Mars Atmospheric Entry &
 Stagnation Heating'), falsifiable_hypothesis,
-search_queries (3-6 concrete literature queries for arXiv/OpenAlex),
+search_queries (3-6 concise technical keyword queries of 2-4 terms each for
+arXiv/OpenAlex; no full sentences, no 'vs'/'exact'/'using' filler),
 target_research_stages (1-4; use 2-3 when the request describes a progression),
 stage_objectives (one short objective per stage, stage 1 first), contracts
 (stage-1 contracts: list of {{contract_id, target_backend, timeout_seconds,

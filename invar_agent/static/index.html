@@ -992,6 +992,15 @@ function setMode(mode) {
     : 'Ask the copilot to plan a build, or describe a change…  (Enter to send, Shift+Enter for newline)';
   updateExecToggle();
 }
+function truncateWords(text, maxLen) {
+  const s = String(text || '');
+  if (s.length <= maxLen) return s;
+  const cut = s.slice(0, maxLen);
+  const lastSpace = cut.lastIndexOf(' ');
+  // Never truncate mid-word: back off to the last word boundary when one
+  // exists in the second half of the window.
+  return (lastSpace > maxLen * 0.5 ? cut.slice(0, lastSpace) : cut) + '…';
+}
 function logTo(paneId, text) {
   const pane = document.getElementById(paneId);
   if (!pane) return;
@@ -1458,7 +1467,7 @@ function openResearchStream() {
       return;
     }
     const pane = ch === 'search_log' ? 'tab-search-log' : ch === 'goi_stream' ? 'tab-goi-stream' : 'tab-accelerator-log';
-    logTo(pane, `[${ch}] ${msg.event || 'log'} ${JSON.stringify(msg).slice(0, 300)}`);
+    logTo(pane, `[${ch}] ${msg.event || 'log'} ${truncateWords(JSON.stringify(msg), 300)}`);
     if (ch === 'search_log') pulseBadge('search-count');
     if (ch !== 'search_log') pulseBadge('accel-count');
     if ((msg.event === 'paper' || msg.event === 'hit') && ch === 'search_log') {

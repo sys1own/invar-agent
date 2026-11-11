@@ -157,6 +157,18 @@ print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
 '''
 
 
+CUSTOM_DISCRETE_MAP = "custom_discrete_map"
+RK4_ODE = "rk4_ode"
+
+# Kernel execution modes. ``rk4_ode`` is the classical ODE trajectory mode;
+# ``custom_discrete_map`` executes the researcher's exact discrete update law
+# z[k+1] = Phi_dt(z[k]) (discrete gradients, symplectic/metriplectic maps,
+# automata) — the bridge loop calls the exported step function exactly once
+# per step in both modes, so a custom map is a first-class kernel, never
+# wrapped in a hardcoded RK4 stepper.
+KERNEL_MODES = (RK4_ODE, CUSTOM_DISCRETE_MAP)
+
+
 class DynamicCABIBridge:
     """Compiles C++ source to a shared library and drives entry points."""
 
@@ -226,11 +238,26 @@ class DynamicCABIBridge:
                 symbols.append(parts[2])
         return symbols
 
+    @staticmethod
+    def resolve_entry(entry: str, kernel_mode: str = RK4_ODE) -> str:
+        """Normalise the exported entry symbol for a kernel mode.
+
+        Custom discrete-map kernels may export ``execute_custom_step`` or
+        ``step_custom`` in addition to the canonical ``execute_step``; both
+        name the same per-step update law z[k+1] = Phi_dt(z[k]).
+        """
+        if kernel_mode not in KERNEL_MODES:
+            raise ValueError(f"unknown kernel_mode {kernel_mode!r}")
+        if entry in ("execute_custom_step", "step_custom"):
+            return "execute_custom_step"
+        return entry
+
     def run(self, cpp_code: str, initial_state: List[float], dt: float,
             steps: int, entry: str = "execute_step",
             timeout_seconds: float = 30.0,
             max_memory_mb: int = 1024,
-            isolated: bool = True) -> Dict[str, object]:
+            isolated: bool = True,
+            kernel_mode: str = RK4_ODE) -> Dict[str, object]:
         """Compile (cached) and run ``steps`` iterations of ``entry``.
 
         Returns ``state``, ``steps``, ``execution_time_ms`` (kernel wall time
@@ -238,7 +265,13 @@ class DynamicCABIBridge:
         ``bundle_hash``. Raises :class:`KernelExecutionError` on compile
         failure, missing entry point, timeout, memory exhaustion or a
         non-finite final state is reported via ``finite=False`` instead.
+
+        ``kernel_mode`` selects the stepping archetype: ``rk4_ode`` (default)
+        or ``custom_discrete_map`` for researcher-defined discrete update
+        laws. Both modes drive the exported C++ step function once per step;
+        no RK4 wrapper is ever injected around a custom map.
         """
+        entry = self.resolve_entry(entry, kernel_mode)
         start = time.perf_counter()
         so_path = self.compile(cpp_code)
         compile_ms = (time.perf_counter() - start) * 1000.0
@@ -350,7 +383,7 @@ class DynamicCABIBridge:
     @staticmethod
     def python_entry_name(entry: str) -> str:
         """Map a C-ABI entry symbol back to the module-level Python function."""
-        if entry == "execute_step":
+        if entry in ("execute_step", "execute_custom_step", "step_custom"):
             return "simulation_step"
         if entry.startswith("execute_"):
             return entry[len("execute_"):]
@@ -359,7 +392,8 @@ class DynamicCABIBridge:
     def run_python(self, python_code: str, initial_state: List[float], dt: float,
                    steps: int, entry: str = "execute_step",
                    timeout_seconds: float = 30.0,
-                   max_memory_mb: int = 1024) -> Dict[str, object]:
+                   max_memory_mb: int = 1024,
+                   kernel_mode: str = RK4_ODE) -> Dict[str, object]:
         """Execute the guard-passed Python kernel in an isolated subprocess.
 
         Deterministic fallback for C-ABI compilation failures: runs
@@ -368,6 +402,7 @@ class DynamicCABIBridge:
         returns the same result shape as :meth:`run`.
         """
         start = time.perf_counter()
+        entry = self.resolve_entry(entry, kernel_mode)
         func_name = self.python_entry_name(entry)
         key = hashlib.blake2b(python_code.encode(), digest_size=16).hexdigest()
         run_dir = Path(tempfile.mkdtemp(prefix="invar-pykernel-"))

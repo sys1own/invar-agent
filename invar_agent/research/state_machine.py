@@ -214,6 +214,50 @@ def _lower_kernel(code_template: str):
     return uast, cpp
 
 
+# -- kernel archetype detection ------------------------------------------------
+# Research targets involving novel time-stepping (discrete gradients,
+# symplectic/metriplectic maps, automata) must NOT be described as an RK4 ODE
+# trajectory: the compiled C++20 kernel executes the researcher's exact
+# discrete update law z[k+1] = Phi_dt(z[k]) once per step.
+_DISCRETE_MAP_RE = re.compile(
+    r"discrete[\s_\-]*(?:time|map|gradient)|gonzalez|biorthogonal|automata|"
+    r"metriplectic|symplectic|strang|verlet|cayley|fixed[\s_\-]*point|"
+    r"discrete[\s_\-]*update", re.IGNORECASE)
+_CUSTOM_STEPPER_NAMES = {
+    "custom_discrete_map", "discrete_map", "discrete_gradient", "gonzalez",
+    "biorthogonal", "symplectic_verlet", "metriplectic", "semi_implicit_euler",
+    "monte_carlo_xoshiro", "hin_exact_reduction",
+}
+
+
+def kernel_mode_for_blueprint(bp: ResearchBlueprint) -> str:
+    """Classify the stepping archetype of a blueprint's simulation kernel.
+
+    Returns ``"custom_discrete_map"`` for novel discrete-time update laws,
+    otherwise ``"rk4_ode"`` (the C-ABI RK4 ODE trajectory mode).
+    """
+    stepper = ""
+    evidence = getattr(bp, "structured_evidence", None)
+    if evidence is not None:
+        stepper = str(getattr(evidence, "recommended_stepper", "") or "").strip().lower()
+    text = f"{getattr(bp, 'falsifiable_hypothesis', '') or ''} " \
+           f"{getattr(bp, 'title', '') or ''}"
+    if stepper in _CUSTOM_STEPPER_NAMES or _DISCRETE_MAP_RE.search(text):
+        return "custom_discrete_map"
+    # The C-ABI bridge only distinguishes these two kernel archetypes; any
+    # named stepper that is not a discrete map runs as the RK4 ODE mode.
+    return "rk4_ode"
+
+
+def kernel_log_label(mode: str) -> str:
+    """Human-readable kernel archetype for the STAGE_k_BUILD log line."""
+    if mode == "custom_discrete_map":
+        return "custom discrete-map (z[k+1] = Phi_dt(z[k]))"
+    if mode == "rk4_ode":
+        return "RK4 trajectory"
+    return mode.replace("_", " ")
+
+
 _INVARIANT_FUNCS = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum,
                     "all": all, "any": any, "sqrt": math.sqrt, "sin": math.sin,
                     "cos": math.cos, "tan": math.tan, "asin": math.asin,
@@ -950,6 +994,19 @@ class ResearchStateMachine:
                         f"STAGE_{stage}_EXEC", "sandbox_diverged",
                         f"Attempt {attempt}: sandbox trajectory diverged. "
                         "Feeding counterexample back to model...")
+                # ALWAYS surface the exact attempt error (compiler diagnostic /
+                # schema violation / falsified invariant) BEFORE any healing
+                # dispatch, so the stream never jumps straight from a silent
+                # failure to "Tier-2 model synthesizing correction".
+                warn_step = ("BUILD_WARN" if ("compil" in fail_text
+                                               or failed_status == "ERROR")
+                             else "VALIDATION_WARN")
+                await self.emit_activity(
+                    f"STAGE_{stage}_BUILD" if warn_step == "BUILD_WARN"
+                    else f"STAGE_{stage}_EXEC",
+                    "attempt_error",
+                    f"Attempt {attempt} failed — exact error: {str(failure)[:500]}",
+                    level="warning")
                 failures.append(failure)
                 state.memory.append({"round": round_idx, "research_stage": stage,
                                      "outcome": outcome["status"], "counterexample": failure})
@@ -973,14 +1030,17 @@ class ResearchStateMachine:
                     failure = f"{failure}\n{diagnostic_context}"
                 # Reflex_Heal + refinement feed the counterexample back to GoI_Plan.
                 # (attempt < max_attempts here, so attempt + 1 is a real next round)
+                final_heal = attempt + 1 >= max_attempts
+                heal_tier = ("Tier-2" if final_heal else "Tier-1 fast")
                 await self.emit_activity(
                     "HEALING", "reasoning_dispatch",
-                    f"Tier-2 model synthesizing correction "
+                    f"{heal_tier} model synthesizing correction "
                     f"(Attempt {attempt + 1}/{max_attempts})...")
                 candidate_code = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=outcome.get("candidate_code") or candidate_code,
-                    contracts=contracts, failure=failure)
+                    contracts=contracts, failure=failure,
+                    attempt=attempt, max_attempts=max_attempts)
 
             if not verified:
                 if pinned_layers:
@@ -1226,11 +1286,20 @@ class ResearchStateMachine:
                                                     {k: v for k, v in last_telemetry.items()
                                                      if isinstance(v, (int, float))})})
             state.literature = await self._literature_search(queries, tag)
-            const_keys = list(getattr(bp, "variable_map", {}) or {})
+            # Literature constants come ONLY from ingested sources
+            # (equations/invariants + numeric constants). Blueprint state
+            # variables and contract evaluation metrics are NEVER literature
+            # constants and must not be conflated with them.
+            eq_count = sum(len((h or {}).get("equations") or []) for h in state.literature)
+            const_count = sum(len((h or {}).get("constants") or {}) for h in state.literature)
+            contract_vars = sorted(
+                {str(k) for k in (getattr(bp, "variable_map", {}) or {})}
+                | {str(i.variable_name) for c in contracts for i in c.invariants})
             await self.emit_activity(
                 "INGEST", "literature_hit",
-                f"Ingested {len(state.literature)} sources, "
-                f"extracted constants: {const_keys}")
+                f"Ingested {len(state.literature)} sources "
+                f"({eq_count} equations/invariants, {const_count} numeric "
+                f"constants); contract variables: {contract_vars}")
 
         # 2. GoI_Plan: accretive synthesis for stage k > 1.
         state.stage = "GoI_Plan"
@@ -1316,10 +1385,11 @@ class ResearchStateMachine:
                     "failure": f"transpiler: {exc}",
                     "candidate_code": candidate_code, "contracts": contracts}
         await emit("accelerator_log", "guard_pass", {**tag, "cpp_bytes": len(cpp_code)})
+        kernel_mode = kernel_mode_for_blueprint(bp)
         await self.emit_activity(
             f"STAGE_{stage}_BUILD", "cabi_compile",
-            f"Compiling RK4 trajectory kernel via Clang++ (-O3 -std=c++20) "
-            f"for {len(contracts)} contract(s)...")
+            f"Compiling {kernel_log_label(kernel_mode)} kernel via Clang++ "
+            f"(-O3 -std=c++20) for {len(contracts)} contract(s)...")
 
         # 6. SMT_Concolic_Verify: Z3 consistency of every contract's invariants.
         state.stage = "SMT_Concolic_Verify"
@@ -1357,8 +1427,10 @@ class ResearchStateMachine:
         # 7. Sandbox_Execute: regression of pinned layers + new contracts.
         state.stage = "Sandbox_Execute"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Sandbox_Execute"})
+        km_kw = {} if kernel_mode == "rk4_ode" else {"kernel_mode": kernel_mode}
         results, regression = await self._sandbox_execute(
-            bp, uast, cpp_code, unified, contracts, pinned_layers, stage, tag)
+            bp, uast, cpp_code, unified, contracts, pinned_layers, stage, tag,
+            **km_kw)
         state.results = results
         for r in results:
             await emit("accelerator_log", "result", {
@@ -1476,7 +1548,13 @@ class ResearchStateMachine:
                     await self._emit("search_log", "insight", {
                         **tag, "source": h.source, "badge": badge,
                         "title": h.title[:120], "insight": insight})
-            await self._emit("search_log", "query_done", {**tag, "query": q, "results": len(hits)})
+            meta = getattr(self.search_client, "last_query_meta", None) or {}
+            await self._emit("search_log", "query_done", {
+                **tag, "query": q, "results": len(hits),
+                "status": meta.get("status"),
+                "channel_counts": meta.get("channel_counts") or {},
+                "relaxed_query": meta.get("relaxed_query") or "",
+                "error": meta.get("error") or ""})
         self._record_literature(out)
         return out
 
@@ -1501,13 +1579,14 @@ class ResearchStateMachine:
     async def _heal_and_refine(self, *, stage: int, round_idx: int, objective: str,
                                candidate_code: Optional[str],
                                contracts: List[VerificationContract],
-                               failure: str) -> Optional[str]:
+                               failure: str,
+                               attempt: int = 1,
+                               max_attempts: int = 3) -> Optional[str]:
         if candidate_code is None:
             return None
-        # PreWrite_Guard / transpiler rejections (e.g. tuples, nested defs) are
-        # syntax-level violations the Tier-0 egg healer cannot repair; routing
-        # them to it first would burn rounds on irrelevant rewrites and skip the
-        # LLM refiner, so send them straight to the Tier-2 refiner.
+        # Deterministic AST/schema/header fixes ALWAYS run first (Tier-0):
+        # they cost zero tokens and resolve the majority of syntax-level
+        # failures before any LLM call is considered.
         guard_failure = failure.startswith(("PreWrite_Guard", "transpiler:"))
         if guard_failure:
             healed, notes = candidate_code, []
@@ -1518,18 +1597,28 @@ class ResearchStateMachine:
             "applied": bool(notes), "notes": notes or ["no Tier-0 repair applicable"]})
         if notes:
             return healed
-        if self.llm_planner is not None:
+        # Healing escalation: intermediate attempts use the fast Tier-1 model
+        # with a strict token cap; the FINAL healing round escalates to the
+        # Tier-2 reasoning model. This avoids the observed ~8-minute Tier-2
+        # stall on Attempt 1/2 failures.
+        final_heal = attempt + 1 >= max_attempts
+        llm, tier = ((self.llm_planner, 2) if (final_heal and self.llm_planner is not None)
+                     else ((self.llm_fast or self.llm_planner), 1)
+                     if (self.llm_fast is not None or self.llm_planner is not None)
+                     else (None, 0))
+        if llm is not None:
             try:
                 refined = await refine_stage_code(
-                    self.llm_planner, objective=objective, code=candidate_code,
+                    llm, objective=objective, code=candidate_code,
                     contracts=[c.model_dump() for c in contracts], failure=failure)
             except Exception as exc:  # noqa: BLE001
                 refined = None
                 await self._emit("goi_stream", "refine_error", {
-                    "round": round_idx, "research_stage": stage, "error": str(exc)[:300]})
+                    "round": round_idx, "research_stage": stage, "tier": tier,
+                    "error": str(exc)[:300]})
             if refined:
                 await self._emit("goi_stream", "refine", {
-                    "round": round_idx, "research_stage": stage, "tier": 2,
+                    "round": round_idx, "research_stage": stage, "tier": tier,
                     "module_hash": code_hash(refined)})
                 return refined
         return candidate_code
@@ -1623,7 +1712,8 @@ class ResearchStateMachine:
                                cpp_code: str, py_code: str,
                                contracts: List[VerificationContract],
                                pinned_layers: List[ModuleLayer], stage: int,
-                               tag: Dict[str, Any]) -> Tuple[List[SimulationResult], List[Dict[str, Any]]]:
+                               tag: Dict[str, Any],
+                               kernel_mode: str = "rk4_ode") -> Tuple[List[SimulationResult], List[Dict[str, Any]]]:
         results: List[SimulationResult] = []
         regression: List[Dict[str, Any]] = []
         entries = CppEmitter().entry_points(uast)
@@ -1632,19 +1722,23 @@ class ResearchStateMachine:
             entry = entry_symbol(layer_driver_name(layer.stage))
             for contract in layer.contracts:
                 r = await self._execute_contract(bp, uast, cpp_code, py_code, contract, entry,
-                                                 entries, stage, regression_of=layer.stage)
+                                                 entries, stage, regression_of=layer.stage,
+                                                 kernel_mode=kernel_mode)
                 regression.append({"layer": layer.layer_id, "contract_id": contract.contract_id,
                                    "status": r.status})
                 results.append(r.model_copy(update={
                     "contract_id": f"regression:{layer.layer_id}:{contract.contract_id}"}))
+        km_kw = {} if kernel_mode == "rk4_ode" else {"kernel_mode": kernel_mode}
         for contract in contracts:
             results.append(await self._execute_contract(
-                bp, uast, cpp_code, py_code, contract, "execute_step", entries, stage))
+                bp, uast, cpp_code, py_code, contract, "execute_step", entries, stage,
+                **km_kw))
         return results, regression
 
     async def _run_kernel_guarded(self, cpp_code: str, py_code: str,
                                   initial: List[float], contract: VerificationContract,
-                                  entry: str, stage: int) -> Dict[str, Any]:
+                                  entry: str, stage: int,
+                                  kernel_mode: str = "rk4_ode") -> Dict[str, Any]:
         """C-ABI execution with deterministic Python fallback on compile failure.
 
         Kernels here have already passed PreWrite_Guard AST validation, so a
@@ -1655,7 +1749,9 @@ class ResearchStateMachine:
         try:
             return await asyncio.to_thread(
                 self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
-                entry, contract.timeout_seconds, contract.max_memory_mb)
+                entry, contract.timeout_seconds, contract.max_memory_mb,
+                True,
+                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
         except KernelExecutionError as exc:
             if not getattr(exc, "compile_error", False) or not py_code:
                 raise
@@ -1664,7 +1760,8 @@ class ResearchStateMachine:
             run = await asyncio.to_thread(
                 self.bridge.run_python, py_code, initial, contract.dt,
                 contract.steps, entry, contract.timeout_seconds,
-                contract.max_memory_mb)
+                contract.max_memory_mb,
+                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
             await self.emit_activity(
                 f"STAGE_{stage}_BUILD", "cabi_fallback",
                 "C-ABI compiler fallback -> executed verified deterministic "
@@ -1673,7 +1770,8 @@ class ResearchStateMachine:
 
     async def _execute_contract(self, bp, uast, cpp_code, py_code, contract: VerificationContract,
                                 entry: str, entries: List[str], stage: int,
-                                regression_of: Optional[int] = None) -> SimulationResult:
+                                regression_of: Optional[int] = None,
+                                kernel_mode: str = "rk4_ode") -> SimulationResult:
         start = time.perf_counter()
         initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
         telemetry: Dict[str, float] = {}
@@ -1681,7 +1779,9 @@ class ResearchStateMachine:
         run_ctx: Optional[str] = None
         status = "ERROR"
         try:
-            run = await self._run_kernel_guarded(cpp_code, py_code, initial, contract, entry, stage)
+            km_kw = {} if kernel_mode == "rk4_ode" else {"kernel_mode": kernel_mode}
+            run = await self._run_kernel_guarded(cpp_code, py_code, initial, contract, entry,
+                                                 stage, **km_kw)
             telemetry = _telemetry(run, initial)
             telemetry.setdefault("dt", float(contract.dt))
             if run.get("fallback"):

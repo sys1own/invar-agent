@@ -20,9 +20,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-ARXIV_API = "http://export.arxiv.org/api/query"
+ARXIV_API = "https://export.arxiv.org/api/query"
 AR5IV_HTML = "https://ar5iv.labs.arxiv.org/html/"
 OPENALEX_API = "https://api.openalex.org/works"
 CROSSREF_API = "https://api.crossref.org/works"
@@ -35,7 +35,8 @@ WIKIDATA_ENTITIES = "https://www.wikidata.org/w/api.php"
 OEIS_SEARCH = "https://oeis.org/search"
 PUBCHEM_PROPERTIES = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
 
-USER_AGENT = "invar-agent-research/0.1 (mailto:research@invar-agent.local)"
+USER_AGENT = ("InvarAgent/1.0 (https://github.com/sys1own/invar-agent; "
+              "mailto:research@invar-agent.local")
 
 # -- query normalization -----------------------------------------------------
 # Literature APIs (arXiv/OpenAlex) return 0 hits for long natural-language
@@ -55,6 +56,10 @@ _QUERY_FILLER_TOKENS = {
     "set", "calculate", "compute", "determine", "assess", "given", "into",
     "uses", "use",
     "that", "this", "these", "those", "their", "its", "it", "we", "our",
+    # Conversational/conjunction filler that makes strict academic APIs
+    # (arXiv/OpenAlex/Wikidata) return 0 hits on 6-9 word planner queries.
+    "vs", "versus", "exact", "between", "comparison", "compare", "compared",
+    "generic",
 }
 
 
@@ -71,6 +76,35 @@ def _token_score(tok: str) -> int:
     return score
 
 
+def _kept_tokens(q: str) -> List[str]:
+    """Filler-stripped technical tokens of a raw query, in original order.
+
+    Unlike :func:`_sanitize_query` this keeps EVERY substantive token (no
+    top-3 truncation) so Pass-2 relaxation can still see long-tail domain
+    keywords (``metriplectic``, ``gradient``) that the compact Pass-1 query
+    drops.
+    """
+    original = (q or "").strip()
+    if not original:
+        return []
+    text = re.sub(r"\([^)]*\)", " ", original)
+    for phrase in _QUERY_FILLER_PHRASES:
+        text = re.sub(re.escape(phrase), " ", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?!\w-\w)[^A-Za-z0-9\-\. ]+", " ", text)
+    out: List[str] = []
+    for tok in cleaned.split():
+        tok = tok.strip(".")
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in _QUERY_FILLER_TOKENS:
+            continue
+        if len(tok) == 1 and tok.isalpha():
+            continue
+        out.append(tok)
+    return out
+
+
 def _sanitize_query(q: str) -> str:
     """Reduce a sentence-like research query to <=3 substantive entities.
 
@@ -83,21 +117,8 @@ def _sanitize_query(q: str) -> str:
     original = (q or "").strip()
     if not original:
         return ""
-    text = re.sub(r"\([^)]*\)", " ", original)
-    for phrase in _QUERY_FILLER_PHRASES:
-        text = re.sub(re.escape(phrase), " ", text, flags=re.IGNORECASE)
-    # Punctuation -> space, but keep intra-token hyphens (Sutton-Graves) and
-    # decimal points (5.8 km/s); stray dots are trimmed per token below.
-    cleaned = re.sub(r"(?!\w-\w)[^A-Za-z0-9\-\. ]+", " ", text)
-    tokens = [t.strip(".") for t in cleaned.split() if t.strip(".")]
-    kept: List[Tuple[int, str]] = []  # (score, tok) in original order
-    for tok in tokens:
-        low = tok.lower()
-        if low in _QUERY_FILLER_TOKENS:
-            continue
-        if len(tok) == 1 and tok.isalpha():  # single-letter stoichiometric params
-            continue
-        kept.append((_token_score(tok), tok))
+    kept_pairs = [(_token_score(tok), tok) for tok in _kept_tokens(original)]
+    kept: List[Tuple[int, str]] = kept_pairs
     if not kept:
         # Nothing but filler: keep the original technical words so the API
         # still gets a query.
@@ -125,6 +146,96 @@ def _sanitize_query(q: str) -> str:
         idx += 1
     entities.sort(reverse=True)
     return " ".join(words for _, _, words in entities[:3])
+
+
+# -- progressive query relaxation (Pass 2 / Pass 3) --------------------------
+# Domain vocabulary that marks a token as a high-IDF technical keyword even
+# when it is short or lowercase (numerical analysis / theoretical mechanics).
+_DOMAIN_KEYWORD_BOOST = {
+    "metriplectic", "gradient", "discrete", "integrator", "integration",
+    "splitting", "strang", "gonzalez", "symplectic", "verlet", "euler",
+    "conservation", "entropy", "stiff", "stability", "cayley", "newton",
+    "automata", "kdv", "soliton", "hamiltonian", "lagrangian", "poisson",
+    "runge", "kutta", "collocation", "finite", "element", "volume",
+}
+
+
+# Outcome/process descriptors that must not dominate a relaxed core query:
+# "conservation"/"energy" describe WHAT is measured, not the method.
+_RELAX_STOP = {"conservation", "energy", "stiff", "stability", "systems",
+               "system", "time", "behaviour", "behavior", "exact"}
+
+
+def _relax_token_score(tok: str) -> int:
+    """IDF-like keyword score: domain vocabulary > length > technical shape."""
+    score = len(tok)
+    low = tok.lower()
+    if low in _DOMAIN_KEYWORD_BOOST:
+        score += 8
+    if low in _RELAX_STOP:
+        score -= 12
+    if tok[:1].isupper():
+        score += 3
+    if "-" in tok or any(ch.isdigit() for ch in tok):
+        score += 3
+    return score
+
+
+def _relax_keywords(query: str) -> List[str]:
+    """Core technical keywords of a sanitized query, best-first, deduped."""
+    toks = [t for t in (query or "").split() if t]
+    scored = sorted(toks, key=lambda t: (-_relax_token_score(t), -len(t), t))
+    seen, out = set(), []
+    for tok in scored:
+        low = tok.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(tok)
+    return out
+
+
+def relaxed_queries(query: str, max_queries: int = 2) -> List[str]:
+    """Pass-2 relaxed queries: top 2-3 highest-IDF domain keywords.
+
+    ``"GENERIC metriplectic discrete gradient"`` -> ``["metriplectic discrete
+    gradient", "discrete gradient metriplectic"]`` style cores that strict
+    academic APIs can actually match.
+    """
+    kws = _relax_keywords(query)
+    if len(kws) < 3:
+        return []
+    queries: List[str] = []
+    # Windowed cores over the score-sorted keywords, each rendered in the
+    # query's original word order: [k0 k1 k2] and [k1 k2 k3] cover both the
+    # leading method terms and the trailing method+object pairs.
+    order = {t.lower(): i for i, t in enumerate((query or "").split())}
+
+    def _render(window: List[str]) -> str:
+        return " ".join(sorted(window, key=lambda t: order.get(t.lower(), 99)))
+
+    if len(kws) >= 3:
+        queries.append(_render(kws[:3]))
+    if len(kws) >= 4:
+        queries.append(_render(kws[1:4]))
+    elif len(kws) == 3:
+        queries.append(_render(kws[:3]))
+    # De-duplicate while preserving order.
+    seen, unique = set(), []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+    return unique[:max_queries]
+
+
+def entity_concept(query: str) -> str:
+    """Compact 1-2 word canonical concept for entity APIs (Pass 3).
+
+    Wikidata/OEIS/PubChem must never receive full 7-word sentences.
+    """
+    kws = _relax_keywords(query)
+    return " ".join(kws[:2]) if kws else ""
 
 
 # Offline fallback: domain constants extracted from a curated aerospace /
@@ -280,6 +391,8 @@ class LiteratureSearchClient:
         self.timeout = timeout
         self.max_results = max_results
         self._fetch = fetch or _default_fetch
+        # Diagnostic telemetry of the most recent search() call (Pass 1/2/3).
+        self.last_query_meta: Dict[str, Any] = {}
 
     # -- public API -------------------------------------------------------
     def search(self, query: str, max_results: Optional[int] = None,
@@ -291,32 +404,91 @@ class LiteratureSearchClient:
         concurrently with strict per-connector timeouts; per-source failures
         degrade gracefully to cached results. ``sources`` may still pin an
         explicit legacy tuple (arxiv/openalex/wikipedia/...).
+
+        Progressive 3-pass relaxation (zero extra cost when Pass 1 hits):
+        Pass 1 queries the primary academic APIs with the sanitized technical
+        keywords; on 0 results for a >3-word query, Pass 2 re-queries arXiv
+        and OpenAlex with the top 2-3 highest-IDF domain keywords; Pass 3
+        retries the entity APIs (Wikidata/OEIS/PubChem) with a compact 1-2
+        word canonical concept only. Diagnostics land in
+        ``self.last_query_meta`` for ``search_log`` telemetry.
         """
-        query = _sanitize_query(query)
+        raw_query = (query or "").strip()
+        query = _sanitize_query(raw_query)
         limit = max_results or self.max_results
         if sources is None:
-            sources = tuple(_channels_for_prompt(prompt_or_query or query))
-        results: List[LiteratureResult] = []
-        if self.offline or len(sources) <= 1:
-            for source in sources:
-                try:
-                    results.extend(self._search_source(source, query, limit))
-                except Exception:  # noqa: BLE001 - one bad source must not kill ingest
-                    continue
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
-                futures = {pool.submit(self._search_source_safe, source, query,
-                                       limit): source for source in sources}
-                for fut in as_completed(futures):
+            sources = tuple(_channels_for_prompt(prompt_or_query or raw_query))
+        channel_counts: Dict[str, int] = {}
+        relaxed_query = ""
+        error_note = ""
+
+        def _run(pass_sources: tuple, pass_query: str) -> List[LiteratureResult]:
+            nonlocal error_note
+            pass_results: List[LiteratureResult] = []
+            if self.offline or len(pass_sources) <= 1:
+                for source in pass_sources:
                     try:
-                        results.extend(fut.result())
-                    except Exception:  # noqa: BLE001
-                        continue
+                        got = self._search_source(source, pass_query, limit)
+                        channel_counts[source] = channel_counts.get(source, 0) + len(got)
+                        pass_results.extend(got)
+                    except Exception as exc:  # noqa: BLE001
+                        error_note = f"{source}: {str(exc)[:120]}"
+            else:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=min(4, len(pass_sources))) as pool:
+                    futures = {pool.submit(self._search_source_safe, source,
+                                           pass_query, limit): source
+                               for source in pass_sources}
+                    for fut in as_completed(futures):
+                        src = futures[fut]
+                        try:
+                            got = fut.result()
+                            channel_counts[src] = channel_counts.get(src, 0) + len(got)
+                            pass_results.extend(got)
+                        except Exception as exc:  # noqa: BLE001
+                            error_note = f"{src}: {str(exc)[:120]}"
+            return pass_results
+
+        # Pass 1: primary academic APIs with cleaned technical keywords.
+        results = _run(sources, query)
+
+        # Pass 2: automatic relaxation on 0 results for >3-word queries. The
+        # keyword pool comes from the FULL filler-stripped token list, not the
+        # top-3-truncated Pass-1 query, so long-tail domain terms survive.
+        keyword_pool = " ".join(_kept_tokens(raw_query)) or query
+        if not results and len(keyword_pool.split()) > 3:
+            for relaxed in relaxed_queries(keyword_pool):
+                pass2_sources = tuple(s for s in ("arxiv", "openalex") if s in sources) \
+                    or ("arxiv", "openalex")
+                relaxed_results = _run(pass2_sources, relaxed)
+                if relaxed_results:
+                    relaxed_query = relaxed
+                    results = relaxed_results
+                    break
+
+        # Pass 3: entity APIs with a compact 1-2 word canonical concept only.
+        if not results:
+            concept = entity_concept(keyword_pool)
+            pass3_sources = tuple(s for s in sources
+                                  if s in ("wikidata", "oeis", "pubchem"))
+            if concept and pass3_sources:
+                results = _run(pass3_sources, concept)
+                if results:
+                    relaxed_query = concept
+
         # Stable order: keep connector grouping deterministic for caching/tests.
         order = {s: i for i, s in enumerate(sources)}
         results.sort(key=lambda r: order.get(r.source, 99))
         results = results[: max(limit * 2, limit)]
+        # Diagnostic telemetry for search_log query_done events.
+        self.last_query_meta = {
+            "query": query,
+            "raw_query": raw_query,
+            "status": "ok" if results else "empty",
+            "channel_counts": channel_counts,
+            "relaxed_query": relaxed_query,
+            "error": error_note,
+        }
         if not results:
             # Never let the kernel receive empty parameters: fall back to
             # curated domain constants when every API returned 0 hits.
