@@ -8,6 +8,7 @@ it emits :class:`HealingDirective` dictionaries which are applied here.
 from __future__ import annotations
 
 import ast
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -66,6 +67,79 @@ def _has_math_import(tree: ast.Module) -> bool:
         if isinstance(node, ast.ImportFrom) and node.module == "math":
             return True
     return False
+
+
+def _is_none_const(node: Optional[ast.AST]) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+class _NoneLiteralTransformer(ast.NodeTransformer):
+    """Lower Python ``None`` to the numeric C-ABI dialect before transpile."""
+
+    def __init__(self) -> None:
+        self.changed = False
+        self.notes: set[str] = set()
+        self._void_stack: List[bool] = []
+
+    def _has_value_return(self, fn: ast.FunctionDef) -> bool:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Return) and node.value is not None \
+                    and not _is_none_const(node.value):
+                return True
+        return False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self._void_stack.append(not self._has_value_return(node))
+        try:
+            self.generic_visit(node)
+        finally:
+            self._void_stack.pop()
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        self.generic_visit(node)
+        if _is_none_const(node.value):
+            self.changed = True
+            self.notes.add("return None lowered")
+            node.value = None if self._void_stack and self._void_stack[-1] else _num(0.0)
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        self.generic_visit(node)
+        if _is_none_const(node.value):
+            self.changed = True
+            self.notes.add("None assignment lowered to 0.0")
+            node.value = _num(0.0)
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        self.generic_visit(node)
+        if node.value is not None and _is_none_const(node.value):
+            self.changed = True
+            self.notes.add("None assignment lowered to 0.0")
+            node.value = _num(0.0)
+        return node
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            op = node.ops[0]
+            if isinstance(op, (ast.Is, ast.IsNot)) and (
+                    _is_none_const(node.left) or _is_none_const(node.comparators[0])):
+                self.changed = True
+                self.notes.add("is None comparison lowered")
+                value = isinstance(op, ast.IsNot)
+                return ast.copy_location(ast.Constant(value=value), node)
+        return node
+
+
+def _strip_none_literals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    transformer = _NoneLiteralTransformer()
+    tree = transformer.visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree, transformer.changed, sorted(transformer.notes)
 
 
 def _ensure_math_import(tree: ast.Module) -> bool:
@@ -222,13 +296,16 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     except SyntaxError:
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    tree, none_changed, none_notes = _strip_none_literals_tree(tree)
     transformer = _IntrinsicTransformer()
     transformer.defined = _defined_names(tree)
     transformer.guard_eps = float(eps)
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(transformer.notes)
+    notes = sorted(set(none_notes) | set(transformer.notes))
+    if none_changed:
+        changed = True
     if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
         if _ensure_math_import(tree):
             notes.append("injected import math")
@@ -265,6 +342,57 @@ def _target_slot(node: ast.AST) -> Optional[int]:
     if isinstance(sl, ast.Constant) and isinstance(sl.value, int):
         return int(sl.value)
     return None
+
+
+def _expr_free_vars(expr: ast.AST) -> List[str]:
+    names = sorted({n.id for n in ast.walk(expr)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)})
+    return names
+
+
+def _eval_numeric_expr(expr: ast.AST, env: Dict[str, float]) -> Optional[float]:
+    try:
+        value = eval(compile(ast.Expression(expr), "<egg_guard>", "eval"),  # noqa: S307
+                     {"__builtins__": {}}, dict(env))
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def numeric_expr_equivalent(left: ast.AST, right: ast.AST, *,
+                            tolerance: float = 1e-12,
+                            points: int = 3) -> bool:
+    """Reject algebraic rewrites that change numeric evaluation.
+
+    Free variables are assigned three deterministic non-zero pseudo-random
+    values; any absolute deviation above ``tolerance`` rejects the rewrite.
+    """
+    vars_ = sorted(set(_expr_free_vars(left)) | set(_expr_free_vars(right)))
+    for point in range(max(1, int(points))):
+        env = {name: 0.37 + 0.13 * idx + 0.031 * point + 0.017 * idx * point
+               for idx, name in enumerate(vars_)}
+        a = _eval_numeric_expr(left, env)
+        b = _eval_numeric_expr(right, env)
+        if a is None or b is None or not (math.isfinite(a) and math.isfinite(b)):
+            return False
+        if abs(a - b) > float(tolerance):
+            return False
+    return True
+
+
+def strip_none_literals(code: str) -> SanitizerResult:
+    """Public Tier-0 entry point for ``STRIP_NONE_LITERALS`` directives."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    original = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    tree, changed, notes = _strip_none_literals_tree(tree)
+    if not changed:
+        return SanitizerResult(code, [], False)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
 
 
 def _is_state_target(node: ast.AST, slot: int) -> bool:
@@ -413,6 +541,143 @@ def infer_monotone_drift_directives(contracts: Sequence[Any], code: str) -> List
     return out
 
 
+
+
+def _slot_index(node: ast.AST) -> Optional[int]:
+    return _target_slot(node)
+
+
+def _state_slot_expr(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Subscript):
+        return False
+    base = node.value
+    name = ""
+    if isinstance(base, ast.Name):
+        name = base.id
+    elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+        name = f"{base.value.id}.{base.attr}"
+    return name in {"state", "data", "buf.data", "buf"} and _target_slot(node) is not None
+
+
+def _choose_prev_slot(code: str, slot: int, contracts: Sequence[Any] = ()) -> Optional[int]:
+    used = {int(m.group(1)) for m in re.finditer(r"(?:state|buf\.data|data)\[(\d+)\]", code)}
+    used.add(slot)
+    sizes = [len(getattr(contract, "initial_state", None) or [])
+             for contract in contracts or []]
+    sizes = [n for n in sizes if n]
+    limit = max(sizes) if sizes else 16
+    for cand in (31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16):
+        if cand > slot and cand < limit and cand not in used:
+            return cand
+    return None
+
+
+def _drift_self_pattern(body: List[ast.stmt], slot: int):
+    for i, stmt in enumerate(body[:-1]):
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 \
+                or not isinstance(stmt.targets[0], ast.Name) or not isinstance(stmt.value, ast.BinOp) \
+                or not isinstance(stmt.value.op, ast.Sub):
+            continue
+        diff = stmt.targets[0].id
+        left, right = stmt.value.left, stmt.value.right
+        if _state_slot_expr(right) and _slot_index(right) == slot and isinstance(left, ast.Name):
+            obs = left.id
+            expr = f"{obs} - buf.data[{slot}]"
+        elif _state_slot_expr(left) and _slot_index(left) == slot and isinstance(right, ast.Name):
+            obs = right.id
+            expr = f"buf.data[{slot}] - {obs}"
+        else:
+            continue
+        nxt = body[i + 1]
+        if not isinstance(nxt, ast.If):
+            continue
+        test = nxt.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+            continue
+        if not (isinstance(test.left, ast.Name) and test.left.id == diff
+                and isinstance(test.ops[0], (ast.Gt, ast.GtE))):
+            continue
+        assigns_slot = False
+        for sub in ast.walk(nxt):
+            if isinstance(sub, ast.Assign):
+                for target in sub.targets:
+                    if _state_slot_expr(target) and _slot_index(target) == slot:
+                        assigns_slot = True
+        if not assigns_slot:
+            continue
+        return i, diff, obs, expr
+    return None
+
+
+def repair_drift_self_comparison(code: str, *, slot: int, prev_slot: int,
+                                 contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Repair ``diff = obs - buf.data[error_slot]`` self-comparisons."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    changed = False
+    notes: List[str] = []
+    var = f"_step_drift_{slot}"
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        body = fn.body
+        found = _drift_self_pattern(body, int(slot))
+        if found is None:
+            continue
+        i, diff, obs, expr = found
+        expr = expr.replace(f"buf.data[{slot}]", f"buf.data[{prev_slot}]")
+        expr = expr.replace(f"state[{slot}]", f"state[{prev_slot}]")
+        expr = expr.replace(f"data[{slot}]", f"data[{prev_slot}]")
+        snippet = (
+            "if buf.steps > 0:\n"
+            f"    {var} = max(0.0, {expr})\n"
+            f"    if {var} > buf.data[{slot}]:\n"
+            f"        buf.data[{slot}] = {var}\n"
+            f"buf.data[{prev_slot}] = {obs}\n"
+        )
+        repl = ast.parse(snippet).body
+        # Keep any unrelated statements between the diff assignment and guard.
+        body[i:i + 2] = repl
+        ast.fix_missing_locations(tree)
+        changed = True
+        notes.append(f"repaired drift self-comparison state[{slot}] via buf.data[{prev_slot}]")
+        break
+    if not changed:
+        return SanitizerResult(code, [], False)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+
+
+def infer_drift_self_comparison_directives(contracts: Sequence[Any],
+                                           code: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for contract in contracts or []:
+        for inv in getattr(contract, "invariants", None) or []:
+            name = str(getattr(inv, "variable_name", "") or "").lower()
+            assertion = str(getattr(inv, "assertion", "") or "")
+            if not any(tok in name for tok in ("drift", "error", "err", "residual", "violation", "mismatch")):
+                continue
+            if float(getattr(inv, "tolerance", 1.0) or 1.0) > 1e-6:
+                continue
+            m = re.search(r"(?:state|buf(?:\.data)?|data)\[(\d+)\]\s*<=\s*([0-9.eE+-]+)",
+                          f"{name} {assertion}")
+            if not m:
+                continue
+            slot = int(m.group(1))
+            bound = float(m.group(2))
+            if bound > 1e-6 or slot in seen:
+                continue
+            seen.add(slot)
+            prev = _choose_prev_slot(code, slot, contracts)
+            if prev is None:
+                continue
+            if repair_drift_self_comparison(code, slot=slot, prev_slot=prev,
+                                            contracts=contracts).changed:
+                out.append({"op": "REPAIR_DRIFT_SELF_COMPARISON", "slot": slot,
+                            "prev_slot": prev})
+    return out
+
+
 def _wrap_substep(tree: ast.Module, substeps: int) -> bool:
     n = max(1, int(substeps or 1))
     if n == 1:
@@ -501,6 +766,20 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
             var = str(raw.get("var") or "")
             if var and _scale_coefficient(tree, var, float(raw.get("factor", 1.0) or 1.0)):
                 notes.append(f"SCALE_COEFFICIENT({var},{float(raw.get('factor', 1.0) or 1.0)})")
+        elif op == "REPAIR_DRIFT_SELF_COMPARISON":
+            slot = int(raw.get("slot", -1))
+            prev = int(raw.get("prev_slot", -1))
+            if slot >= 0 and prev >= 0:
+                rw = repair_drift_self_comparison(ast.unparse(tree) + "\n", slot=slot,
+                                                 prev_slot=prev, contracts=contracts)
+                if rw.changed:
+                    tree = ast.parse(rw.code)
+                    notes.extend(rw.notes)
+        elif op == "STRIP_NONE_LITERALS":
+            stripped = strip_none_literals(ast.unparse(tree) + "\n")
+            if stripped.changed:
+                tree = ast.parse(stripped.code)
+                notes.append("STRIP_NONE_LITERALS")
         elif op == "CLAMP_STATE_NORM":
             notes.append("CLAMP_STATE_NORM recorded (no scalar AST rewrite)")
         elif op == "BIND_SLOT_TO_VAR":
@@ -508,10 +787,16 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
         else:
             notes.append(f"ignored unknown directive {op or '<missing>'}")
     # Contract-inferred deterministic drift repairs run without an LLM.
-    inferred = infer_monotone_drift_directives(contracts, ast.unparse(tree) + "\n")
+    current_code = ast.unparse(tree) + "\n"
+    inferred = infer_monotone_drift_directives(contracts, current_code)
+    inferred += infer_drift_self_comparison_directives(contracts, current_code)
     for d in inferred:
-        rw = rewrite_monotone_drift(ast.unparse(tree) + "\n", slot=int(d["slot"]),
-                                    direction=str(d.get("direction") or "non_increasing"))
+        if d.get("op") == "REPAIR_DRIFT_SELF_COMPARISON":
+            rw = repair_drift_self_comparison(ast.unparse(tree) + "\n", slot=int(d["slot"]),
+                                             prev_slot=int(d["prev_slot"]), contracts=contracts)
+        else:
+            rw = rewrite_monotone_drift(ast.unparse(tree) + "\n", slot=int(d["slot"]),
+                                        direction=str(d.get("direction") or "non_increasing"))
         if rw.changed:
             tree = ast.parse(rw.code)
             notes.extend(rw.notes)
@@ -526,5 +811,7 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
 __all__ = [
     "SanitizerResult", "sanitize_intrinsics", "rewrite_monotone_drift",
     "infer_monotone_drift_directives", "apply_healing_directives",
+    "strip_none_literals", "numeric_expr_equivalent",
+    "repair_drift_self_comparison", "infer_drift_self_comparison_directives",
     "MATH_FUNCS", "INTRINSIC_ALIASES",
 ]

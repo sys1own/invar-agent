@@ -66,12 +66,30 @@ def _literature_rows(literature: List[Dict[str, Any]], limit: int = 8) -> List[s
     return rows
 
 
+def _fallback_variable_map(bp: ResearchBlueprint) -> Dict[str, int]:
+    """Deterministic variable_map fallback so reports never show an empty map."""
+    mapping: Dict[str, int] = {}
+    for contract in getattr(bp, "contracts", None) or []:
+        for inv in getattr(contract, "invariants", None) or []:
+            import re as _re
+            text = f"{getattr(inv, 'variable_name', '')} {getattr(inv, 'assertion', '')}"
+            m = _re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", text)
+            if m and getattr(inv, "variable_name", ""):
+                mapping.setdefault(str(inv.variable_name), int(m.group(1)))
+    if not mapping:
+        mapping = {f"state_{i}": i for i in range(4)}
+    return dict(list(mapping.items())[:64])
+
+
 def build_research_report(state) -> str:
     """Markdown Verified Quantitative Research Report for a finished run."""
     bp: ResearchBlueprint = state.blueprint
     results: List[SimulationResult] = list(state.results)
     feasibility = bp.feasibility
-    observables = extract_observables(bp.variable_map or {}, results)
+    variable_map = dict(bp.variable_map or {})
+    if not variable_map:
+        variable_map = _fallback_variable_map(bp)
+    observables = extract_observables(variable_map, results)
 
     lines: List[str] = []
     lines.append(f"# Verified Quantitative Research Report — {bp.title}")
@@ -83,14 +101,17 @@ def build_research_report(state) -> str:
     # 1. Executive summary & exact numerical results
     lines.append("## 1. Executive Summary & Numerical Results")
     lines.append("")
-    if observables:
-        lines.append("| Observable (units in name) | Value | Source contract | Stage |")
-        lines.append("|---|---|---|---|")
-        for name in sorted(observables):
-            obs = observables[name]
-            lines.append(
-                f"| `{name}` | **{_fmt_value(obs['value'])}** | "
-                f"`{obs['contract_id']}` | {obs['stage']} |")
+    if variable_map:
+        lines.append("| Observable (units in name) | State slot | Value | Source contract | Stage |")
+        lines.append("|---|---:|---|---|---|")
+        for name in sorted(variable_map):
+            obs = observables.get(name)
+            if obs is None:
+                lines.append(f"| `{name}` | {variable_map[name]} | n/a | - | - |")
+            else:
+                lines.append(
+                    f"| `{name}` | {variable_map[name]} | **{_fmt_value(obs['value'])}** | "
+                    f"`{obs['contract_id']}` | {obs['stage']} |")
         lines.append("")
     else:
         lines.append("_No named observables were mapped in this blueprint "

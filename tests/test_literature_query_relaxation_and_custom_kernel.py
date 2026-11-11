@@ -804,3 +804,86 @@ def test_auto_init_preserves_physical_observables():
     auto = [w for w in warnings if w.startswith("auto-init:")]
     assert any("roundtrip_error" in w for w in auto)
     assert not any(("purity" in w or "trace_current" in w) for w in auto)
+
+
+# -- regression coverage for None lowering, egg guard, drift repair, slots ----
+NONE_DRIFT_KERNEL = """def simulation_step(buf, dt):
+    x = None
+    if x is None:
+        buf.data[0] = 0.0
+    else:
+        buf.data[0] = 1.0
+    Dent = 0.65
+    drift = Dent - buf.data[15]
+    if drift > buf.data[15]:
+        buf.data[15] = drift
+    return None
+"""
+
+
+def test_none_literals_and_drift_self_comparison_repair():
+    from invar_agent.healing.deterministic_ast import apply_healing_directives
+    from invar_agent.schemas.research import InvariantConstraint, VerificationContract
+
+    contract = VerificationContract(
+        contract_id="c_entropy", target_backend="cpp",
+        initial_state=[0.0] * 32,
+        invariants=[InvariantConstraint(
+            variable_name="entropy_drift", assertion="state[15] <= 1e-12",
+            tolerance=1e-12)])
+    out = apply_healing_directives(NONE_DRIFT_KERNEL, [], contracts=[contract])
+    assert "None" not in out.code
+    assert "buf.data[31]" in out.code
+    assert "_step_drift_15" in out.code
+
+
+def test_egg_rewrite_rejects_dropped_terms():
+    from invar_agent.research.state_machine import _egg_simplify
+
+    code = ("def simulation_step(buf, dt):\n"
+            "    rr = buf.data[0]\n"
+            "    ss = buf.data[1]\n"
+            "    pp = buf.data[2]\n"
+            "    qq = buf.data[3]\n"
+            "    buf.data[12] = rr * rr + ss * ss + 2.0 * (pp * pp + qq * qq)\n")
+    healed, notes = _egg_simplify(code)
+    assert "egg:" not in " ".join(notes)
+    assert "rr * rr" in healed and "ss * ss" in healed
+
+
+def test_canonical_slots_and_report_variable_map_fallback():
+    from invar_agent.research.planner import normalize_blueprint_payload
+    from invar_agent.research.report import build_research_report
+    from invar_agent.research.state_machine import ResearchRunState
+
+    payload = {
+        "blueprint_id": "slot_bp", "title": "Canonical slot test",
+        "falsifiable_hypothesis": "Slots stay canonical across stages.",
+        "search_queries": ["q"],
+        "code_template": "def simulation_step(buf, dt):\n    buf.data[12] = 0.0\n",
+        "contracts": [
+            {"contract_id": "c1_trace", "target_backend": "cpp",
+             "invariants": [{"variable_name": "trace_error_max",
+                             "assertion": "state[12] <= 1e-12", "tolerance": 1e-12}]},
+            {"contract_id": "c3_roundtrip", "target_backend": "cpp",
+             "invariants": [
+                 {"variable_name": "roundtrip_error",
+                  "assertion": "state[12] <= 1e-13", "tolerance": 1e-13},
+                 {"variable_name": "trace_error_max",
+                  "assertion": "state[13] <= 1e-12", "tolerance": 1e-12}]},
+        ],
+    }
+    out = normalize_blueprint_payload(payload)
+    c1 = out["contracts"][0]["invariants"][0]
+    c3 = out["contracts"][1]["invariants"]
+    assert c1["assertion"] == "state[12] <= 1e-12"
+    assert c3[0]["assertion"] == "state[16] <= 1e-13"
+    assert c3[1]["assertion"] == "state[12] <= 1e-12"
+    assert out["variable_map"] == {"trace_error_max": 12, "roundtrip_error": 16}
+
+    bp = _bp(contracts=[VerificationContract.model_validate(c) for c in out["contracts"]],
+             variable_map=out["variable_map"], code_template=payload["code_template"])
+    state = ResearchRunState(blueprint=bp, status="ERROR", results=[], literature=[])
+    report = build_research_report(state)
+    assert "trace_error_max" in report and "roundtrip_error" in report
+    assert "variable_map empty" not in report

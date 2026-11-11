@@ -50,8 +50,10 @@ from .accretion import (AccretionError, code_hash, layer_driver_name,
                         merge_accretive_module, pin_layer_code, candidate_layer_code,
                         unified_from_layers)
 from .feasibility import _heuristic_verdict
-from .planner import guided_queries, request_healing_directives, synthesize_accretive_stage
-from ..healing.deterministic_ast import apply_healing_directives, sanitize_intrinsics
+from .planner import (canonicalize_contract_dicts, guided_queries,
+                        request_healing_directives, synthesize_accretive_stage)
+from ..healing.deterministic_ast import (
+    apply_healing_directives, numeric_expr_equivalent, sanitize_intrinsics)
 from .search import LiteratureSearchClient
 from .smt import check_invariants_consistent
 
@@ -796,6 +798,19 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     return initial, warnings
 
 
+def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
+    """Enforce one canonical buf.data slot per named observable across stages."""
+    contracts = [c.model_dump() for c in getattr(bp, "contracts", None) or []]
+    if not contracts:
+        return
+    new_contracts, vm, notes = canonicalize_contract_dicts(
+        contracts, dict(getattr(bp, "variable_map", None) or {}))
+    if not notes and vm == dict(getattr(bp, "variable_map", None) or {}):
+        return
+    bp.contracts = [VerificationContract.model_validate(c) for c in new_contracts]
+    bp.variable_map = vm
+
+
 def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
     """Infer ``variable_map`` from contract constraints when the planner left
     it empty, so report Section 1 never says 'variable_map empty'."""
@@ -1004,6 +1019,7 @@ class ResearchStateMachine:
 
     # -- top-level loop ----------------------------------------------------
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
+        _canonicalize_blueprint_slots(blueprint)
         _auto_populate_variable_map(blueprint)
         state = ResearchRunState(blueprint=blueprint)
         # Defense-in-depth epistemic gate. A blueprint that already carries a
@@ -1538,6 +1554,10 @@ class ResearchStateMachine:
                     telemetry=last_telemetry, literature=state.literature,
                     failures=failures)
                 candidate_code = synth["code"]
+                prior_contract_dicts = [c.model_dump() for layer in pinned_layers
+                                        for c in layer.contracts]
+                synth["contracts"], _, _ = canonicalize_contract_dicts(
+                    synth.get("contracts") or [], prior_contracts=prior_contract_dicts)
                 staged = list(contracts)
                 contracts = [VerificationContract.model_validate(c) for c in synth["contracts"]]
                 seen = {c.contract_id for c in contracts}
@@ -1836,10 +1856,15 @@ class ResearchStateMachine:
         healed, notes = candidate_code, list(det.notes)
         if det.changed:
             healed = det.code
-        fixed, fix_notes = tier0_heal(healed)
+        lowered_failure = str(failure or "").lower()
+        allow_egg = not ("transpiler:" in lowered_failure or "compile_error" in lowered_failure
+                         or "compilation failed" in lowered_failure or "syntaxerror" in lowered_failure)
+        fixed, fix_notes = tier0_heal(healed, allow_egg=allow_egg)
         if fix_notes:
             healed, notes = fixed, notes + fix_notes
-        applied_ops = [n for n in notes if n]
+        none_lowering = {"return None lowered", "None assignment lowered to 0.0",
+                         "is None comparison lowered"}
+        applied_ops = [n for n in notes if n and n not in none_lowering]
         await self._emit("goi_stream", "heal", {
             "round": round_idx, "research_stage": stage, "tier": 0,
             "applied": bool(applied_ops), "notes": applied_ops or ["no Tier-0 repair applicable"]})
@@ -2252,7 +2277,7 @@ def _extract_insights(text: str, limit: int = 2) -> List[str]:
 
 # -- Tier-0 deterministic heal ------------------------------------------------
 
-def tier0_heal(code: str) -> Tuple[str, List[str]]:
+def tier0_heal(code: str, *, allow_egg: bool = True) -> Tuple[str, List[str]]:
     """Deterministic, semantics-preserving source repairs + egg simplification.
 
     Returns ``(code, notes)``; ``notes`` is empty when nothing applied.
@@ -2296,7 +2321,10 @@ def tier0_heal(code: str) -> Tuple[str, List[str]]:
     tree = _Fix().visit(tree)
     ast.fix_missing_locations(tree)
     healed = ast.unparse(tree) + "\n"
-    healed2, egg_notes = _egg_simplify(healed)
+    if allow_egg:
+        healed2, egg_notes = _egg_simplify(healed)
+    else:
+        healed2, egg_notes = healed, []
     return healed2, notes + egg_notes
 
 
@@ -2355,7 +2383,8 @@ def _egg_simplify(code: str) -> Tuple[str, List[str]]:
                     new = from_uast(out)
                 except BaseException:  # noqa: BLE001 - pyo3 PanicException is BaseException
                     new = None
-                if new is not None and size(new) < size(node.value):
+                if new is not None and size(new) < size(node.value) \
+                        and numeric_expr_equivalent(node.value, new):
                     notes.append(f"egg: {ast.unparse(node.value)} -> {ast.unparse(new)}")
                     node.value = new
             return node

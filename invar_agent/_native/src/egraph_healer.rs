@@ -181,6 +181,28 @@ fn build_enode(
     }
 }
 
+
+fn collect_var_counts(v: &Value, out: &mut std::collections::BTreeMap<String, usize>) {
+    match v {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("reference") {
+                if let Some(name) = map.get("name").and_then(Value::as_str) {
+                    *out.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            for val in map.values() {
+                collect_var_counts(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                collect_var_counts(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rec_expr_to_value(expr: &RecExpr<AeroAstLanguage>, id: Id) -> Value {
     match &expr[id] {
         AeroAstLanguage::Num(n) => {
@@ -240,6 +262,13 @@ pub fn repair_uast_expression(expr_json: &str) -> PyResult<String> {
 
     let root_id = Id::from(best.as_ref().len().saturating_sub(1));
     let out = rec_expr_to_value(&best, root_id);
+    let mut input_vars = std::collections::BTreeMap::new();
+    let mut output_vars = std::collections::BTreeMap::new();
+    collect_var_counts(&value, &mut input_vars);
+    collect_var_counts(&out, &mut output_vars);
+    if input_vars != output_vars {
+        return Ok(expr_json.to_string());
+    }
     serde_json::to_string(&out)
         .map_err(|e| PyValueError::new_err(format!("output JSON serialization failed: {}", e)))
 }

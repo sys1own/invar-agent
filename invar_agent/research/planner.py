@@ -8,6 +8,7 @@ invariants, and cumulative (accretive) multi-stage integration rules.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from typing import Any, Callable, Dict, List, Optional
@@ -162,7 +163,10 @@ target_backend, timeout_seconds, invariants: [{{variable_name, assertion,
 tolerance}}], max_memory_mb, initial_state: [floats], dt, steps}}),
 code_template (the STAGE-1 module only, v9_transpiler_friendly Python),
 variable_map ({{"<metric_with_units>": <buf.data index>}} for every numerical
-quantity the user requested), max_feedback_rounds (2-4).
+quantity the user requested), max_feedback_rounds (2-4). Across stages each named
+metric keeps ONE unique buf.data slot; never reuse an error/drift accumulator to
+store a previous observable; compute val_before at the top and val_after at the
+bottom and update violations with `viol = max(0.0, val_after - val_before)`.
 Keep initial_state small (<= 16 slots unless the surrogate genuinely needs more,
 max 64) and steps <= 20000. initial_state must be the physical state of the
 surrogate model, never a repeating dummy vector.
@@ -193,6 +197,13 @@ blueprint evolution, stage {stage} of {total}).
 - Verified layers are re-verified with their original contracts inside the same
   compiled module, so do not change the meaning of shared buffer slots used by
   verified layers; use new slots (append beyond the existing ones) for new state.
+- Canonical slot map (MANDATORY): every named observable/metric has exactly one
+  buf.data slot across ALL stages. Never reuse an error/drift accumulator slot to
+  store a previous observable. For step-to-step drift compute val_before at the
+  top and val_after at the bottom, then `viol = max(0.0, val_after - val_before)`;
+  update the error slot only when `viol` is larger. Helper calls must receive the
+  identical coordinate representation in forward and time-reversed steps.
+- `None` literals are scalarized by Tier-0; still prefer explicit `0.0` returns.
 - Add cross-coupling invariants that test the combined system (e.g. bounded
   limit cycle amplitude, phase-space bounds, reduction to the verified model when
   the new coupling is zero).
@@ -212,6 +223,9 @@ blueprint evolution, stage {stage} of {total}).
 
 ## Verified contracts (still enforced)
 {verified_contracts}
+
+## Canonical slot map (reuse exactly; do not renumber)
+{canonical_slots}
 
 ## Telemetry of the last verified stage
 {telemetry}
@@ -265,7 +279,8 @@ You MUST NOT output Python, C++, or any source code. Output ONE strict JSON obje
 Allowed directive ops: INLINE_INTRINSIC {name}, GUARD_MATH_DOMAINS {eps},
 REWRITE_MONOTONE_DRIFT {slot,direction,before_var,after_var}, WRAP_SUBSTEP {substeps},
 SCALE_COEFFICIENT {var,factor}, CLAMP_STATE_NORM {slots,max_norm},
-BIND_SLOT_TO_VAR {slot,var}. No markdown fences. Output JSON only.
+BIND_SLOT_TO_VAR {slot,var}, STRIP_NONE_LITERALS {}, REPAIR_DRIFT_SELF_COMPARISON {slot,prev_slot}.
+No markdown fences. Output JSON only.
 
 Stage objective: {objective}
 Failing module hash/context (never rewrite it):
@@ -690,6 +705,169 @@ def _sanitize_raw_blueprint_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+
+_CANON_SLOT_RE = re.compile(r"(?<![A-Za-z0-9_])(?:state|buf\.data|data)\[(\d+)\]")
+_CANON_REWRITE_RE = re.compile(
+    r"(?P<prefix>\b(?:state|initial|trace_min|trace_max|buf\.data|data))\[(?P<slot>\d+)\]")
+_CANON_OBSERVABLE_TOKENS = (
+    "error", "err", "drift", "purity", "entropy", "energy", "eigen", "roundtrip",
+    "trace", "max", "min", "observable", "metric", "loss", "fidelity",
+    "infidelity", "distance", "residual", "violation", "bound",
+)
+_CANON_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)[_-]", re.IGNORECASE)
+
+
+def _canon_stage_index(contract_id: str) -> int:
+    m = _CANON_STAGE_RE.match(contract_id or "")
+    return int(m.group(1)) if m else 1
+
+
+def _canon_observable_name(name: str, variable_map: Optional[Dict[str, int]] = None) -> bool:
+    low = str(name or "").lower()
+    if not low or low in {"value", "state", "buf", "data"}:
+        return False
+    if variable_map and low in {str(k).lower() for k in variable_map}:
+        return True
+    return any(tok in low for tok in _CANON_OBSERVABLE_TOKENS)
+
+
+def _canon_slots_in_text(text: str) -> List[int]:
+    return [int(m.group(1)) for m in _CANON_SLOT_RE.finditer(text or "")]
+
+
+def _canon_rewrite_slots(text: str, old: int, new: int) -> str:
+    def repl(m: "re.Match[str]") -> str:
+        if int(m.group("slot")) == int(old):
+            return f"{m.group('prefix')}[{int(new)}]"
+        return m.group(0)
+    return _CANON_REWRITE_RE.sub(repl, text or "")
+
+
+def _canon_alloc_slot(assigned: set, reserved: set) -> int:
+    for cand in range(16, 4096):
+        if cand not in assigned and cand not in reserved:
+            return cand
+    return max(assigned | reserved | {15}) + 1
+
+
+def canonicalize_contract_dicts(
+        contracts: List[Dict[str, Any]],
+        variable_map: Optional[Dict[str, int]] = None,
+        prior_contracts: Optional[List[Dict[str, Any]]] = None
+        ) -> tuple[List[Dict[str, Any]], Dict[str, int], List[str]]:
+    """Deterministically give every named observable one unique state slot.
+
+    Works on planner/accretion contract dicts before pydantic validation.
+    Earlier stages win slot ownership; later duplicate names are rewritten to
+    the canonical slot and conflicting names receive the next free high slot.
+    """
+    notes: List[str] = []
+    contracts = copy.deepcopy(contracts or [])
+    vm = {str(k): int(v) for k, v in (variable_map or {}).items() if str(k).strip()}
+    prior = copy.deepcopy(prior_contracts or [])
+    all_contracts = prior + contracts
+    order = sorted(range(len(all_contracts)),
+                   key=lambda i: (_canon_stage_index(str(all_contracts[i].get("contract_id") or "")), i))
+
+    reserved: set = set()
+    for c in all_contracts:
+        for inv in (c.get("invariants") or []):
+            if isinstance(inv, dict):
+                reserved.update(_canon_slots_in_text(str(inv.get("assertion") or "")))
+    reserved.update(int(v) for v in vm.values())
+
+    name_slot: Dict[str, int] = {}
+    slot_owner: Dict[int, str] = {}
+    name_order: List[str] = []
+    remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
+
+    def assign_for_inv(c: Dict[str, Any], inv: Dict[str, Any], record: bool) -> None:
+        name = str(inv.get("variable_name") or "").strip()
+        if not _canon_observable_name(name, vm):
+            return
+        slots = _canon_slots_in_text(str(inv.get("assertion") or ""))
+        desired = slots[0] if slots else vm.get(name)
+        if desired is None:
+            return
+        desired = int(desired)
+        canonical = name_slot.get(name)
+        if canonical is None:
+            owner = slot_owner.get(desired)
+            if owner is not None and owner != name:
+                canonical = _canon_alloc_slot(set(name_slot.values()), reserved)
+                notes.append(f"canonical slot conflict: {name} state[{desired}] -> state[{canonical}]")
+            else:
+                canonical = desired
+            name_slot[name] = canonical
+            slot_owner[canonical] = name
+            if name not in name_order:
+                name_order.append(name)
+        if desired != canonical and record:
+            remaps.append((c, inv, desired, canonical))
+
+    for idx in order:
+        c = all_contracts[idx]
+        is_prior = idx < len(prior)
+        for inv in (c.get("invariants") or []):
+            if isinstance(inv, dict):
+                assign_for_inv(c, inv, record=not is_prior)
+
+    for c, inv, old, new in remaps:
+        inv["assertion"] = _canon_rewrite_slots(str(inv.get("assertion") or ""), old, new)
+        notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
+
+    # Canonicalize explicit variable_map entries against contract-owned names.
+    assigned_names = set(name_slot)
+    assigned_slots = set(name_slot.values())
+    new_vm: Dict[str, int] = {}
+    for name, idx in vm.items():
+        canonical = name_slot.get(name)
+        if canonical is None:
+            owner = slot_owner.get(int(idx))
+            if owner is not None and owner != name:
+                canonical = _canon_alloc_slot(assigned_slots, reserved)
+                notes.append(f"canonical variable_map conflict: {name} state[{idx}] -> state[{canonical}]")
+            elif int(idx) in assigned_slots:
+                canonical = _canon_alloc_slot(assigned_slots, reserved)
+            else:
+                canonical = int(idx)
+            name_slot[name] = canonical
+            slot_owner[canonical] = name
+            assigned_names.add(name)
+        new_vm[name] = int(canonical)
+        assigned_slots.add(int(canonical))
+    vm = new_vm
+
+    if not vm:
+        for name in name_order:
+            if _canon_observable_name(name, {}):
+                vm[name] = int(name_slot[name])
+                if len(vm) >= 64:
+                    break
+    if not vm:
+        # Last-resort deterministic map so reports never see an empty map.
+        first: Dict[str, int] = {}
+        for c in contracts:
+            for inv in (c.get("invariants") or []):
+                if not isinstance(inv, dict):
+                    continue
+                nm = str(inv.get("variable_name") or "").strip()
+                slots = _canon_slots_in_text(str(inv.get("assertion") or ""))
+                if nm and slots and nm not in first:
+                    first[nm] = slots[0]
+        vm = dict(list(first.items())[:64]) or {f"state_{i}": i for i in range(4)}
+    return contracts, vm, notes
+
+
+def canonical_slot_map_text(contracts: List[Dict[str, Any]],
+                            variable_map: Optional[Dict[str, int]] = None) -> str:
+    """Human-readable canonical slot table for synthesis prompts."""
+    _, vm, _ = canonicalize_contract_dicts(contracts, variable_map)
+    if not vm:
+        return "(no named observables)"
+    return "\n".join(f"- `{name}` -> state[{idx}]" for name, idx in sorted(vm.items()))
+
+
 def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce minor LLM schema drift instead of discarding the whole response.
 
@@ -748,6 +926,9 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         out["variable_map"] = vm
     elif variable_map is not None:
         out.pop("variable_map", None)
+    if isinstance(out.get("contracts"), list):
+        out["contracts"], out["variable_map"], _ = canonicalize_contract_dicts(
+            out["contracts"], out.get("variable_map"))
     return out
 
 
@@ -987,6 +1168,7 @@ async def synthesize_accretive_stage(llm_complete: Callable[[str], Any], *,
         ACCRETION_PROMPT, tools=TOOLS_CONTEXT, stage=stage, total=total, prev=stage - 1,
         objective=objective, verified_code=verified_code.strip(),
         verified_contracts=json.dumps(verified_contracts, indent=1)[:6000],
+        canonical_slots=canonical_slot_map_text(verified_contracts),
         telemetry=json.dumps(telemetry, default=str)[:3000],
         literature=format_literature(literature),
         failures="\n".join(f"- {f}" for f in failures[-3:]) or "(none)")
@@ -996,6 +1178,8 @@ async def synthesize_accretive_stage(llm_complete: Callable[[str], Any], *,
         raise ValueError("accretion synthesis returned no {code, contracts} JSON")
     if not isinstance(data.get("contracts"), list) or not data["contracts"]:
         raise ValueError("accretion synthesis returned no contracts")
+    data["contracts"], data["variable_map"], _ = canonicalize_contract_dicts(
+        data["contracts"], data.get("variable_map"), prior_contracts=verified_contracts)
     return data
 
 

@@ -128,6 +128,8 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
             return {"type": "return",
                     "value": {"type": "tuple",
                               "elements": [_lower_expr(e) for e in stmt.value.elts]}}
+        if isinstance(stmt.value, ast.Constant) and stmt.value.value is None:
+            return {"type": "return", "value": None}
         return {"type": "return",
                 "value": _lower_expr(stmt.value) if stmt.value is not None else None}
     if isinstance(stmt, ast.If):
@@ -193,7 +195,10 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
     if isinstance(expr, (ast.Await, ast.Yield, ast.YieldFrom)):
         raise UnsupportedError("async/yield expressions", node=expr)
     if isinstance(expr, ast.Constant):
-        return {"type": "literal", "value": expr.value}
+        # Python ``None`` is not a numeric literal.  Return-position ``None``
+        # is handled by the statement lowering above; every expression use is
+        # scalarized so emitters never see an unsupported ``None`` literal.
+        return {"type": "literal", "value": 0.0 if expr.value is None else expr.value}
     if isinstance(expr, ast.Name):
         return {"type": "reference", "name": expr.id}
     if isinstance(expr, ast.Call):
