@@ -1553,6 +1553,8 @@ class ResearchStateMachine:
                 **tag, "query": q, "results": len(hits),
                 "status": meta.get("status"),
                 "channel_counts": meta.get("channel_counts") or {},
+                "raw_counts": meta.get("raw_counts") or {},
+                "channel_errors": meta.get("channel_errors") or {},
                 "relaxed_query": meta.get("relaxed_query") or "",
                 "error": meta.get("error") or ""})
         self._record_literature(out)

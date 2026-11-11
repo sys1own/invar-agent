@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from invar_agent.research.search import (
-    LiteratureResult, LiteratureSearchClient, _sanitize_query,
+    LiteratureResult, LiteratureSearchClient, _normalize_terms,
+    _sanitize_query, _stem_token, anchor_or_queries, bigram_relaxations,
     entity_concept, relaxed_queries,
 )
 from invar_agent.research.state_machine import (
@@ -23,6 +24,15 @@ from invar_agent.research.state_machine import (
 from invar_agent.schemas.research import (
     InvariantConstraint, ResearchBlueprint, VerificationContract,
 )
+
+# The exact 5 planner queries from the live run that returned 0 results.
+FAILING_QUERIES = [
+    "metriplectic integrators discrete gradients",
+    "structure-preserving GENERIC discretization",
+    "discrete gradient entropy conservation",
+    "biorthogonal degeneracy symplectic",
+    "stiff dissipative geometric integrators",
+]
 
 LONG_QUERIES = [
     "GENERIC metriplectic integrator discrete gradient exact energy conservation",
@@ -49,6 +59,86 @@ def _bp(**kw) -> ResearchBlueprint:
 
 
 # -- 1. query sanitization + relaxation --------------------------------------
+def test_stemming_and_hyphen_normalization():
+    assert _stem_token("integrators") == "integrator"
+    assert _stem_token("gradients") == "gradient"
+    assert _stem_token("equations") == "equation"
+    assert _stem_token("systems") == "system"
+    assert _stem_token("discretizations") == "discretization"
+    terms = _normalize_terms("structure-preserving GENERIC discretization")
+    assert "structure" in terms and "preserving" in terms
+    assert "generic" not in terms  # conversational filler removed
+    assert "discretization" in terms
+
+
+def test_bigram_decomposition_for_all_five_queries():
+    expected = {
+        "metriplectic integrators discrete gradients":
+            ["metriplectic integrator", "discrete gradient", "metriplectic gradient"],
+        "biorthogonal degeneracy symplectic":
+            ["degeneracy symplectic", "biorthogonal symplectic"],
+    }
+    for q in FAILING_QUERIES:
+        bigrams = bigram_relaxations(q)
+        assert bigrams, f"no bigram relaxation for {q!r}"
+        for b in bigrams:
+            assert len(b.split()) == 2
+    for q, wants in expected.items():
+        got = bigram_relaxations(q)
+        for w in wants:
+            assert w in got, f"{w!r} missing from {got}"
+    for q in FAILING_QUERIES:
+        anchors = anchor_or_queries(q)
+        assert anchors
+        assert all(len(a.split()) <= 3 for a in anchors)
+
+
+def test_openalex_abstract_inverted_index_reconstruction():
+    payload = json.dumps({"results": [{
+        "title": "Metriplectic integrators",
+        "abstract_inverted_index": {"energy": [0], "is": [1], "conserved": [2]},
+        "doi": "https://doi.org/10.1/x", "publication_year": 2020}]})
+    results = LiteratureSearchClient._parse_openalex(payload)
+    assert len(results) == 1
+    assert "energy is conserved" in results[0].summary
+
+
+def test_relaxed_query_trail_never_empty_when_relaxation_ran():
+    class _Empty:
+        def __call__(self, url, timeout):
+            if "openalex" in url:
+                return json.dumps({"results": []})
+            if "wikidata" in url:
+                return json.dumps({"search": []})
+            return ""
+    client = LiteratureSearchClient(offline=False, fetch=_Empty())
+    client.search(FAILING_QUERIES[0], sources=("openalex", "arxiv"))
+    meta = client.last_query_meta
+    assert meta["relaxed_query"], "relaxed_query must log the attempted trail"
+    assert "|" in meta["relaxed_query"]
+    assert isinstance(meta.get("raw_counts"), dict)
+    assert isinstance(meta.get("channel_errors"), dict)
+
+
+def test_public_api_smoke_five_queries():
+    """Free public arXiv/OpenAlex/Crossref/Wikipedia smoke, zero LLM tokens.
+
+    Every one of the 5 previously-failing planner queries must ingest > 0
+    sources; total across the 5 queries must be >= 10.
+    """
+    import time
+    client = LiteratureSearchClient(offline=False, timeout=6.0)
+    total = 0
+    start = time.perf_counter()
+    for q in FAILING_QUERIES:
+        hits = client.search(q, max_results=3)
+        assert len(hits) > 0, f"query {q!r} ingested 0 sources"
+        total += len(hits)
+    elapsed = time.perf_counter() - start
+    assert total >= 10, f"expected >= 10 total sources, got {total}"
+    assert elapsed < 120.0
+
+
 def test_long_planner_queries_sanitized_and_relaxed():
     for q in LONG_QUERIES:
         clean = _sanitize_query(q)

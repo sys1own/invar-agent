@@ -1467,7 +1467,13 @@ function openResearchStream() {
       return;
     }
     const pane = ch === 'search_log' ? 'tab-search-log' : ch === 'goi_stream' ? 'tab-goi-stream' : 'tab-accelerator-log';
-    logTo(pane, `[${ch}] ${msg.event || 'log'} ${truncateWords(JSON.stringify(msg), 300)}`);
+    // search_log lines carry hypothesis/relaxed_query/error diagnostics and
+    // must never be character-truncated mid-field; other channels keep a
+    // word-boundary cap for readability.
+    const line = ch === 'search_log'
+      ? JSON.stringify(msg)
+      : truncateWords(JSON.stringify(msg), 300);
+    logTo(pane, `[${ch}] ${msg.event || 'log'} ${line}`);
     if (ch === 'search_log') pulseBadge('search-count');
     if (ch !== 'search_log') pulseBadge('accel-count');
     if ((msg.event === 'paper' || msg.event === 'hit') && ch === 'search_log') {

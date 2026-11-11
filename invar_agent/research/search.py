@@ -166,10 +166,49 @@ _RELAX_STOP = {"conservation", "energy", "stiff", "stability", "systems",
                "system", "time", "behaviour", "behavior", "exact"}
 
 
+def _stem_token(tok: str) -> str:
+    """Lightweight scientific de-pluralization for API query terms.
+
+    ``integrators`` -> ``integrator``, ``gradients`` -> ``gradient``,
+    ``equations`` -> ``equation``, ``systems`` -> ``system``,
+    ``discretizations`` -> ``discretization``. Conservative: only strips a
+    single trailing plural suffix and never touches short tokens.
+    """
+    t = (tok or "").strip().lower()
+    if not t:
+        return t
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    if len(t) > 4 and t.endswith("es") and not t.endswith(("ses", "xes", "zes")):
+        return t[:-2]
+    return t
+
+
+def _normalize_terms(q: str) -> List[str]:
+    """API-query terms: filler-stripped, hyphen-split, de-pluralized.
+
+    ``structure-preserving`` becomes ``structure preserving``; every token is
+    stemmed so ``integrators discrete gradients`` queries match singular
+    index entries. Order-preserving and de-duplicated (case-insensitive).
+    """
+    out: List[str] = []
+    seen = set()
+    for tok in _kept_tokens(q):
+        for part in tok.replace("-", " ").split():
+            stem = _stem_token(part)
+            if not stem or stem in seen:
+                continue
+            seen.add(stem)
+            out.append(stem)
+    return out
+
+
 def _relax_token_score(tok: str) -> int:
     """IDF-like keyword score: domain vocabulary > length > technical shape."""
-    score = len(tok)
-    low = tok.lower()
+    score = len(_stem_token(tok))
+    low = _stem_token(tok)
     if low in _DOMAIN_KEYWORD_BOOST:
         score += 8
     if low in _RELAX_STOP:
@@ -182,8 +221,12 @@ def _relax_token_score(tok: str) -> int:
 
 
 def _relax_keywords(query: str) -> List[str]:
-    """Core technical keywords of a sanitized query, best-first, deduped."""
-    toks = [t for t in (query or "").split() if t]
+    """Core technical keywords of a query, best-first, de-pluralized.
+
+    Operates on :func:`_normalize_terms` output, so hyphenated compounds are
+    split and plurals stemmed before scoring.
+    """
+    toks = _normalize_terms(query) or [t for t in (query or "").split() if t]
     scored = sorted(toks, key=lambda t: (-_relax_token_score(t), -len(t), t))
     seen, out = set(), []
     for tok in scored:
@@ -236,6 +279,100 @@ def entity_concept(query: str) -> str:
     """
     kws = _relax_keywords(query)
     return " ".join(kws[:2]) if kws else ""
+
+
+def bigram_relaxations(query: str, max_queries: int = 4) -> List[str]:
+    """Pass-2 2-word core decompositions of ANY query (2+ terms).
+
+    Generates adjacent pairs plus the first+last domain anchor pair from the
+    normalized, de-pluralized term list, e.g.::
+
+        metriplectic integrators discrete gradients
+          -> ["metriplectic integrator", "integrator discrete",
+              "discrete gradient", "metriplectic gradient"]
+
+    Adjacent pairs come first (in query order), then the first+last anchor
+    pair, de-duplicated. Never returns the full query itself.
+    """
+    terms = _normalize_terms(query)
+    if len(terms) < 2:
+        return []
+    full = " ".join(terms)
+    pairs: List[str] = []
+
+    def _add(a: str, b: str) -> None:
+        cand = f"{a} {b}"
+        if cand != full and cand not in pairs:
+            pairs.append(cand)
+
+    for i in range(len(terms) - 1):
+        _add(terms[i], terms[i + 1])
+    if len(terms) > 2:
+        _add(terms[0], terms[-1])
+    return pairs[:max_queries]
+
+
+def anchor_or_queries(query: str, max_queries: int = 2) -> List[str]:
+    """Pass-3 broad fallback: single highest-specificity anchor, then an
+    explicit 2-anchor OR pair for arXiv/OpenAlex broad recall."""
+    kws = _relax_keywords(query)
+    if not kws:
+        return []
+    out: List[str] = [kws[0]]
+    if len(kws) > 1:
+        out.append(f"{kws[0]} OR {kws[1]}")
+    return out[:max_queries]
+
+
+def _arxiv_query_string(query: str) -> str:
+    """Build an arXiv ``search_query`` value that the API parser accepts.
+
+    Hyphens are replaced with spaces (unquoted hyphens inside ``all:`` break
+    arXiv's parser). Queries with >= 3 terms never require a 4-way AND:
+    terms are paired into 2-term ``(all:a AND all:b)`` bigrams joined by OR,
+    giving broad recall with precise pairs. 1-2 term queries stay a plain
+    AND. An explicit ``OR``/``all:`` query is passed through untouched.
+    """
+    raw = (query or "").strip()
+    if not raw:
+        return "all:"
+    if " OR " in raw or raw.startswith(("all:", "ti:", "abs:")):
+        return raw
+    terms = [t for t in raw.replace("-", " ").split() if t]
+    if not terms:
+        return "all:"
+    if len(terms) <= 2:
+        return " AND ".join(f"all:{t}" for t in terms)
+    bigrams = [f"(all:{terms[i]} AND all:{terms[i + 1]})"
+               for i in range(len(terms) - 1)]
+    return " OR ".join(bigrams[:3])
+
+
+def _count_json_list(payload: str, key: str) -> int:
+    """Number of raw HTTP records in a JSON API payload (before filtering)."""
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return 0
+    items = data.get(key)
+    return len(items) if isinstance(items, list) else 0
+
+
+def _count_crossref_items(payload: str) -> int:
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return 0
+    items = ((data.get("message") or {}).get("items")) or []
+    return len(items)
+
+
+_STRIP_HTML_TAGS = re.compile(r"<[^>]+>")
+
+
+def _strip_markup(text: str) -> str:
+    """Strip JATS XML / HTML tags (incl. Wikipedia ``searchmatch`` spans)."""
+    return _STRIP_HTML_TAGS.sub(" ", text or "")
 
 
 # Offline fallback: domain constants extracted from a curated aerospace /
@@ -414,12 +551,21 @@ class LiteratureSearchClient:
         ``self.last_query_meta`` for ``search_log`` telemetry.
         """
         raw_query = (query or "").strip()
-        query = _sanitize_query(raw_query)
+        # Pass 1: cleaned, de-pluralized, hyphen-normalized FULL query.
+        # Short planner queries (<=5 terms) keep every technical token;
+        # sentence-like input still goes through the <=3-entity sanitizer.
+        kept = _kept_tokens(raw_query)
+        if 0 < len(kept) <= 5:
+            query = " ".join(_normalize_terms(raw_query)) or _sanitize_query(raw_query)
+        else:
+            query = _sanitize_query(raw_query)
         limit = max_results or self.max_results
         if sources is None:
             sources = tuple(_channels_for_prompt(prompt_or_query or raw_query))
         channel_counts: Dict[str, int] = {}
-        relaxed_query = ""
+        raw_counts: Dict[str, int] = {}
+        channel_errors: Dict[str, str] = {}
+        relaxed_trail: List[str] = []
         error_note = ""
 
         def _run(pass_sources: tuple, pass_query: str) -> List[LiteratureResult]:
@@ -430,8 +576,11 @@ class LiteratureSearchClient:
                     try:
                         got = self._search_source(source, pass_query, limit)
                         channel_counts[source] = channel_counts.get(source, 0) + len(got)
+                        raw_counts[source] = raw_counts.get(source, 0) + \
+                            getattr(self, "_last_raw_count", 0)
                         pass_results.extend(got)
                     except Exception as exc:  # noqa: BLE001
+                        channel_errors[source] = f"{type(exc).__name__}: {str(exc)[:120]}"
                         error_note = f"{source}: {str(exc)[:120]}"
             else:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -446,35 +595,60 @@ class LiteratureSearchClient:
                             channel_counts[src] = channel_counts.get(src, 0) + len(got)
                             pass_results.extend(got)
                         except Exception as exc:  # noqa: BLE001
+                            channel_errors[src] = f"{type(exc).__name__}: {str(exc)[:120]}"
                             error_note = f"{src}: {str(exc)[:120]}"
             return pass_results
 
-        # Pass 1: primary academic APIs with cleaned technical keywords.
-        results = _run(sources, query)
+        # Merge per-channel raw counts / errors recorded by _search_source.
+        def _merge_diag() -> None:
+            for src, n in (getattr(self, "_channel_raw", {}) or {}).items():
+                raw_counts[src] = raw_counts.get(src, 0) + int(n or 0)
+            for src, msg in (getattr(self, "_channel_errors", {}) or {}).items():
+                channel_errors.setdefault(src, str(msg)[:160])
 
-        # Pass 2: automatic relaxation on 0 results for >3-word queries. The
-        # keyword pool comes from the FULL filler-stripped token list, not the
-        # top-3-truncated Pass-1 query, so long-tail domain terms survive.
-        keyword_pool = " ".join(_kept_tokens(raw_query)) or query
-        if not results and len(keyword_pool.split()) > 3:
-            for relaxed in relaxed_queries(keyword_pool):
-                pass2_sources = tuple(s for s in ("arxiv", "openalex") if s in sources) \
-                    or ("arxiv", "openalex")
+        # Pass 1: primary academic APIs with the normalized full query.
+        self._channel_raw = {}
+        self._channel_errors = {}
+        results = _run(sources, query)
+        _merge_diag()
+
+        # Pass 2: 2-word bigram decomposition — runs whenever Pass 1 accepted
+        # 0 sources, regardless of the initial word count (2-, 3- or 4-word
+        # queries included). Prioritizes adjacent pairs and first+last domain
+        # anchors from the de-pluralized term list.
+        if not results:
+            pass2_sources = tuple(s for s in ("arxiv", "openalex") if s in sources) \
+                or ("arxiv", "openalex")
+            for relaxed in bigram_relaxations(raw_query):
+                relaxed_trail.append(relaxed)
                 relaxed_results = _run(pass2_sources, relaxed)
+                _merge_diag()
                 if relaxed_results:
-                    relaxed_query = relaxed
                     results = relaxed_results
                     break
 
-        # Pass 3: entity APIs with a compact 1-2 word canonical concept only.
+        # Pass 3: broad single-anchor / explicit OR query on arXiv & OpenAlex.
         if not results:
-            concept = entity_concept(keyword_pool)
+            for anchor_q in anchor_or_queries(raw_query):
+                relaxed_trail.append(anchor_q)
+                relaxed_results = _run(pass2_sources, anchor_q)
+                _merge_diag()
+                if relaxed_results:
+                    results = relaxed_results
+                    break
+
+        # Pass 4: entity APIs (Wikidata/OEIS/PubChem) with a compact 1-2 word
+        # canonical concept only — never full sentences.
+        if not results:
+            concept = entity_concept(" ".join(_kept_tokens(raw_query)) or raw_query)
             pass3_sources = tuple(s for s in sources
                                   if s in ("wikidata", "oeis", "pubchem"))
             if concept and pass3_sources:
+                relaxed_trail.append(concept)
                 results = _run(pass3_sources, concept)
-                if results:
-                    relaxed_query = concept
+                _merge_diag()
+
+        relaxed_query = " | ".join(relaxed_trail) if relaxed_trail else ""
 
         # Stable order: keep connector grouping deterministic for caching/tests.
         order = {s: i for i, s in enumerate(sources)}
@@ -486,6 +660,8 @@ class LiteratureSearchClient:
             "raw_query": raw_query,
             "status": "ok" if results else "empty",
             "channel_counts": channel_counts,
+            "raw_counts": raw_counts,
+            "channel_errors": channel_errors,
             "relaxed_query": relaxed_query,
             "error": error_note,
         }
@@ -499,8 +675,11 @@ class LiteratureSearchClient:
                             limit: int) -> List[LiteratureResult]:
         try:
             return self._search_source(source, query, limit)
-        except Exception:  # noqa: BLE001
-            return []
+        except Exception as exc:  # noqa: BLE001
+            errs = getattr(self, "_channel_errors", None)
+            if errs is not None:
+                errs[source] = f"{type(exc).__name__}: {str(exc)[:140]}"
+            raise
 
     def search_literature(self, queries: List[str],
                           max_results: Optional[int] = None) -> List[LiteratureResult]:
@@ -518,32 +697,52 @@ class LiteratureSearchClient:
     # -- source implementations -------------------------------------------
     def _search_source(self, source: str, query: str, limit: int) -> List[LiteratureResult]:
         cached = self._read_cache(source, query)
+        raw = getattr(self, "_channel_raw", None)
         if self.offline:
+            if raw is not None:
+                raw[source] = raw.get(source, 0) + len(cached)
             return cached or []
+        raw_count = 0
         try:
             if source == "arxiv":
                 payload = self._fetch_with_backoff(self._arxiv_url(query, limit))
+                raw_count = payload.count("<entry>")
                 results = self._parse_arxiv(payload)
             elif source == "openalex":
                 payload = self._fetch_with_backoff(self._openalex_url(query, limit))
+                raw_count = _count_json_list(payload, "results")
                 results = self._parse_openalex(payload)
             elif source == "crossref":
                 payload = self._fetch_with_backoff(self._crossref_url(query, limit))
+                raw_count = _count_crossref_items(payload)
                 results = self._parse_crossref(payload)
             elif source == "wikipedia":
                 results = self._search_wikipedia(query, limit)
+                raw_count = len(results)
             elif source == "semantic_scholar":
                 results = self._search_semantic_scholar(query, limit)
+                raw_count = len(results)
             elif source == "wikidata":
                 results = self._search_wikidata_constants(query, limit)
+                raw_count = len(results)
             elif source == "oeis":
                 results = self._search_oeis(query, limit)
+                raw_count = len(results)
             elif source == "pubchem":
                 results = self._search_pubchem(query, limit)
+                raw_count = len(results)
             else:
                 return cached or []
-        except Exception:  # noqa: BLE001 - fall back to cache on network failure
+        except Exception as exc:  # noqa: BLE001 - record error, fall back to cache
+            errs = getattr(self, "_channel_errors", None)
+            if errs is not None:
+                errs[source] = f"{type(exc).__name__}: {str(exc)[:140]}"
             return cached or []
+        if raw is not None:
+            raw[source] = raw.get(source, 0) + (raw_count or len(results))
+        # No relevance gate here: academic papers are ingested even with short
+        # or missing abstracts — extractor.py handles symbolic content.
+        results = [r for r in results if r.title]
         if results:
             self._write_cache(source, query, [r.__dict__ for r in results])
             return results
@@ -562,7 +761,7 @@ class LiteratureSearchClient:
 
     @staticmethod
     def _arxiv_url(query: str, limit: int) -> str:
-        q = urllib.parse.quote(f"all:{query}")
+        q = urllib.parse.quote(_arxiv_query_string(query))
         return f"{ARXIV_API}?search_query={q}&start=0&max_results={limit}"
 
     @staticmethod
@@ -620,7 +819,7 @@ class LiteratureSearchClient:
         for item in (data.get("message") or {}).get("items", []):
             titles = item.get("title") or []
             title = titles[0] if titles else ""
-            abstract = re.sub(r"<[^>]+>", " ", item.get("abstract", "") or "")
+            abstract = _strip_markup(item.get("abstract", "") or "")
             year = None
             date_parts = (item.get("issued") or {}).get("date-parts") or [[]]
             if date_parts and date_parts[0] and date_parts[0][0]:
@@ -644,7 +843,7 @@ class LiteratureSearchClient:
             try:
                 summary = json.loads(self._fetch_with_backoff(
                     WIKIPEDIA_SUMMARY + urllib.parse.quote(title.replace(" ", "_"))))
-                extract = summary.get("extract") or ""
+                extract = _strip_markup(summary.get("extract") or "")
                 result = LiteratureResult(
                     "wikipedia", summary.get("title") or title, extract[:1200],
                     summary.get("content_urls", {}).get("desktop", {}).get("page", url)
