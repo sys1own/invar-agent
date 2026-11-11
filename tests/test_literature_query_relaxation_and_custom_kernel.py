@@ -999,3 +999,177 @@ def test_transpiler_complex_literal_last_resort_fallback():
     bindings = [n for n in children[0]["body"] if n["type"] == "binding"]
     assert bindings[0]["value"] == {"type": "literal", "value": 1.0}
     assert bindings[1]["value"] == {"type": "literal", "value": 0.5}
+
+
+# -- Step-0 history slots / parameter collisions / monotone drift -------------
+CAYLEY_HISTORY_KERNEL = '''
+import math
+
+
+def cayley_apply(x, y, z, dt, M00, M01, M02, M10, M11, M12, M20, M21, M22):
+    h = 0.5 * dt
+    a00 = 1.0 - h * M00
+    a01 = -h * M01
+    a02 = -h * M02
+    a10 = -h * M10
+    a11 = 1.0 - h * M11
+    a12 = -h * M12
+    a20 = -h * M20
+    a21 = -h * M21
+    a22 = 1.0 - h * M22
+    b0 = x + h * (M00 * x + M01 * y + M02 * z)
+    b1 = y + h * (M10 * x + M11 * y + M12 * z)
+    b2 = z + h * (M20 * x + M21 * y + M22 * z)
+    det = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20)
+    if abs(det) < 1e-300:
+        det = 1e-300
+    n0 = b0 * (a11 * a22 - a12 * a21) - a01 * (b1 * a22 - a12 * b2) + a02 * (b1 * a21 - a11 * b2)
+    n1 = a00 * (b1 * a22 - a12 * b2) - b0 * (a10 * a22 - a12 * a20) + a02 * (a10 * b2 - b1 * a20)
+    n2 = a00 * (a11 * b2 - b1 * a21) - a01 * (a10 * b2 - b1 * a20) + b0 * (a10 * a21 - a11 * a20)
+    return n0 / det, n1 / det, n2 / det
+
+
+def simulation_step(buf, dt):
+    x = buf.data[0]
+    y = buf.data[1]
+    z = buf.data[2]
+    omega = buf.data[11]
+    kappa = buf.data[12]
+    gam1 = kappa * omega
+    gam2 = kappa * omega
+    gam_phi = 0.5 * gam1
+    M00 = -gam_phi
+    M01 = -omega
+    M02 = 0.0
+    M10 = omega
+    M11 = -gam_phi
+    M12 = 0.0
+    M20 = 0.0
+    M21 = 0.0
+    M22 = -gam1
+    nx, ny, nz = cayley_apply(x, ny if False else y, z, dt, M00, M01, M02, M10, M11, M12, M20, M21, M22)
+    buf.data[0] = nx
+    buf.data[1] = ny
+    buf.data[2] = nz
+    buf.data[3] = 1.0
+    r = math.sqrt(nx * nx + ny * ny + nz * nz)
+    buf.data[4] = 0.5 * (1.0 - r)
+    buf.data[5] = 0.5 * (1.0 + r * r)
+    buf.data[6] = 0.5 * (1.0 + r)
+    p0 = 0.5 * (1.0 + nz)
+    p1 = 0.5 * (1.0 - nz)
+    if p0 < 1e-300:
+        p0 = 1e-300
+    if p1 < 1e-300:
+        p1 = 1e-300
+    rho_ss_z = -1.0
+    p0ss = 0.5 * (1.0 + rho_ss_z)
+    p1ss = 0.5 * (1.0 - rho_ss_z)
+    if p0ss < 1e-300:
+        p0ss = 1e-300
+    if p1ss < 1e-300:
+        p1ss = 1e-300
+    rp = r
+    wss = rho_ss_z
+    trr = 1.0 + rp * wss
+    if trr < 1e-300:
+        trr = 1e-300
+    D = 0.5 * (1.0 + rp * wss) * math.log(0.5 * (1.0 + rp * wss) / p0ss) + 0.5 * (1.0 - rp * wss) * math.log(0.5 * (1.0 - rp * wss) / p1ss)
+    dprev = buf.data[7]
+    incr = D - dprev
+    if incr > buf.data[8]:
+        buf.data[8] = incr
+    buf.data[7] = D
+    te = abs(buf.data[3] - 1.0)
+    if te > buf.data[9]:
+        buf.data[9] = te
+    if buf.data[12] < 1e-300:
+        invx, invy, invz = cayley_apply(nx, ny, nz, -dt, M00, M01, M02, M10, M11, M12, M20, M21, M22)
+        e = (invx - buf.data[13]) * (invx - buf.data[13]) + (invy - buf.data[14]) * (invy - buf.data[14]) + (invz - buf.data[15]) * (invz - buf.data[15])
+        buf.data[10] = math.sqrt(e)
+        if buf.data[10] > buf.data[11]:
+            buf.data[11] = buf.data[10]
+    buf.data[13] = x
+    buf.data[14] = y
+    buf.data[15] = z
+'''
+
+
+def _cayley_contract(cid: str, dt: float, invariants) -> VerificationContract:
+    return VerificationContract(
+        contract_id=cid, target_backend="cpp", dt=dt, steps=5,
+        initial_state=[0.0, 0.0, -0.9] + [0.0] * 13,
+        invariants=invariants)
+
+
+def test_cayley_step0_history_parameter_and_monotone_native(tmp_path):
+    """Exact live-failure kernel: Step-0 history spike, delayed roundtrip state,
+    omega/roundtrip slot collision, polar init, and negative timing must all be
+    repaired deterministically before native C++20 execution."""
+    from invar_agent.healing.deterministic_ast import (
+        rewrite_monotone_drift, sanitize_intrinsics)
+    from invar_agent.research.state_machine import (
+        _eval_invariant, _guard_contract_initial_state)
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge as CabiBridge
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    trace_bounds = [
+        InvariantConstraint(variable_name="cayley_trace", assertion="abs(state[3] - 1.0) <= 1e-14"),
+        InvariantConstraint(variable_name="purity_bound", assertion="state[4] >= -1e-15"),
+        InvariantConstraint(variable_name="bloch_norm_bound",
+                            assertion="state[5] <= 1.0 + 1e-14 and state[5] > 0.0"),
+        InvariantConstraint(variable_name="entropy_monotone", assertion="state[8] <= 1e-15",
+                            tolerance=1e-15),
+        InvariantConstraint(variable_name="bloch_radius", assertion="state[0]**2 + state[1]**2 + state[2]**2 <= 1.0 + 1e-12"),
+    ]
+    contracts = [
+        _cayley_contract("c1_cayley_trace_positivity", 0.1, trace_bounds),
+        _cayley_contract("c2_stiff_kappa_1e5", 0.25, trace_bounds),
+        _cayley_contract("c3_closed_limit_reversibility", 0.1, [
+            InvariantConstraint(variable_name="roundtrip_error",
+                                assertion="state[10] <= 1e-13", tolerance=1e-13),
+        ]),
+    ]
+
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+    bridge = CabiBridge(tmp_path / "cabi")
+    for contract in contracts:
+        san = sanitize_intrinsics(CAYLEY_HISTORY_KERNEL, contracts=[contract])
+        assert san.changed
+        assert any("history step-0 guard" in n for n in san.notes)
+        assert any("protected parameter buf.data[11]" in n for n in san.notes)
+        assert any("delayed state-history" in n for n in san.notes)
+        rw = rewrite_monotone_drift(san.code, slot=8, direction="non_increasing")
+        code = rw.code if rw.changed else san.code
+        if contract.contract_id != "c3_closed_limit_reversibility":
+            assert rw.changed and any("r_after-r_before" in n for n in rw.notes)
+
+        initial, warnings = _guard_contract_initial_state(code, contract)
+        assert len(initial) >= 29  # scratch slot buf.data[28] stays in bounds
+        assert initial[0] == pytest.approx(0.3)
+        assert initial[1] == pytest.approx(0.0)
+        assert initial[2] == pytest.approx(-0.8)
+        assert initial[11] == pytest.approx(1.0)  # omega parameter seeded
+        if contract.contract_id == "c2_stiff_kappa_1e5":
+            assert initial[12] == pytest.approx(1.0e5)
+        elif contract.contract_id == "c3_closed_limit_reversibility":
+            assert initial[12] == pytest.approx(0.0)
+        else:
+            assert initial[12] == pytest.approx(1.0)
+        assert any("polar state[0..2]" in w for w in warnings)
+
+        cpp = CppEmitter().emit_module(python_source_to_uast(code))
+        run = bridge.run(cpp, initial, dt=contract.dt, steps=contract.steps,
+                         entry="execute_step", isolated=True)
+        assert run.get("fallback") != "python"
+        assert run["finite"] is True
+        assert run["execution_time_ms"] >= 0.0
+        state = run["state"]
+        telemetry = {"execution_time_ms": run["execution_time_ms"], "cabi_fallback": 0.0}
+        for inv in contract.invariants:
+            assert _eval_invariant(inv.assertion, state, telemetry), inv.assertion
+        assert state[8] <= 1e-15
+        assert state[11] == pytest.approx(initial[11])  # omega not overwritten by roundtrip
+        if contract.contract_id == "c3_closed_limit_reversibility":
+            assert state[10] <= 1e-13

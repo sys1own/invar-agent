@@ -54,7 +54,7 @@ class KernelExecutionError(RuntimeError):
 
 
 _RUNNER_SOURCE = r'''
-import ctypes, json, math, sys
+import ctypes, json, math, sys, time
 
 so_path, entry, initial_json, dt, steps = (
     sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), int(sys.argv[5]))
@@ -75,6 +75,7 @@ fn.restype = None
 trace_min = list(initial)
 trace_max = list(initial)
 first_nonfinite = -1
+t0 = time.perf_counter()
 for step in range(steps):
     fn(ctypes.byref(buf))
     for i in range(n):
@@ -90,6 +91,7 @@ for step in range(steps):
 state = list(data)
 finite = all(math.isfinite(v) for v in state)
 print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
+                  "execution_time_ms": (time.perf_counter() - t0) * 1000.0,
                   "trace_min": trace_min, "trace_max": trace_max,
                   "first_nonfinite_step": first_nonfinite}))
 '''
@@ -440,7 +442,7 @@ class DynamicCABIBridge:
         state = [float(v) for v in payload["state"]]
         finite = bool(payload.get("finite", True)) and all(
             math.isfinite(v) for v in state)
-        run_ms = wall_ms - compile_ms
+        exec_ms = max(0.0, float(payload.get("execution_time_ms", wall_ms)))
         return {
             "state": state,
             "steps": int(payload.get("steps", steps)),
@@ -448,7 +450,7 @@ class DynamicCABIBridge:
             "trace_min": [float(v) for v in payload.get("trace_min", state)],
             "trace_max": [float(v) for v in payload.get("trace_max", state)],
             "first_nonfinite_step": int(payload.get("first_nonfinite_step", -1)),
-            "execution_time_ms": run_ms,
+            "execution_time_ms": exec_ms,
             "run_ms": wall_ms,
             "compile_ms": compile_ms,
             "bundle_hash": key,
@@ -529,7 +531,7 @@ class DynamicCABIBridge:
         state = [float(v) for v in payload["state"]]
         finite = bool(payload.get("finite", True)) and all(
             math.isfinite(v) for v in state)
-        run_ms = float(payload.get("execution_time_ms", 0.0))
+        run_ms = max(0.0, float(payload.get("execution_time_ms", 0.0)))
         return {
             "state": state,
             "steps": int(payload.get("steps", steps)),

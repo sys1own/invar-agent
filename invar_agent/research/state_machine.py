@@ -53,7 +53,8 @@ from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
                         request_healing_directives, synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
-    apply_healing_directives, numeric_expr_equivalent, sanitize_intrinsics)
+    apply_healing_directives, numeric_expr_equivalent, sanitize_intrinsics,
+    rewrite_monotone_drift)
 from .search import LiteratureSearchClient
 from .smt import check_invariants_consistent
 
@@ -704,7 +705,7 @@ def _telemetry(run: Dict[str, Any], initial: List[float]) -> Dict[str, float]:
     state = run["state"]
     finite = bool(run.get("finite", True))
     tel = {
-        "execution_time_ms": float(run.get("execution_time_ms", 0.0)),
+        "execution_time_ms": max(0.0, float(run.get("execution_time_ms", 0.0))),
         "steps": float(run.get("steps", 0)),
         "finite": 1.0 if finite else 0.0,
         "initial_l2": _l2(initial),
@@ -750,6 +751,49 @@ def _kernel_assigns_slots(py_code: str, slots: List[int]) -> List[int]:
     return missing
 
 
+def _max_state_slot(py_code: str, contract: VerificationContract) -> int:
+    """Highest ``state[k]``/``buf.data[k]`` index reachable by code or contract."""
+    slots: List[int] = []
+    texts = [py_code or ""]
+    for inv in (contract.invariants or []):
+        texts.append(f"{inv.variable_name} {inv.assertion}")
+    for text in texts:
+        for m in re.finditer(r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", text):
+            slots.append(int(m.group(1)))
+    return max(slots, default=15)
+
+
+_PARAM_OMEGA_NAMES = {"omega", "omega0", "k0", "m_mass"}
+_PARAM_KAPPA_NAMES = {"kappa", "stiffness"}
+
+
+def _contract_is_closed_or_reversible(contract: VerificationContract) -> bool:
+    cid = str(getattr(contract, "contract_id", "") or "").lower()
+    return "closed" in cid or "revers" in cid
+
+
+def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
+                                initial: List[float], warnings: List[str]) -> None:
+    """Seed read-only physical parameter slots that the planner left at 0.0."""
+    closed = _contract_is_closed_or_reversible(contract)
+    dt = float(getattr(contract, "dt", 0.0) or 0.0)
+    for m in re.finditer(
+            r"\b(omega0|omega|k0|m_mass|kappa|stiffness)\s*=\s*"
+            r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
+        name, slot = m.group(1).lower(), int(m.group(2))
+        if slot >= len(initial) or initial[slot] != 0.0:
+            continue
+        if name in _PARAM_OMEGA_NAMES:
+            initial[slot] = 1.0
+            warnings.append(
+                f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded 1.0")
+        elif name in _PARAM_KAPPA_NAMES and not closed:
+            initial[slot] = 1.0e5 if dt >= 0.2 else 1.0
+            warnings.append(
+                f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded "
+                f"{initial[slot]:.6g} for dt={dt}")
+
+
 def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                                   ) -> Tuple[List[float], List[str]]:
     """Static contract-slot guard + auto-initializer.
@@ -757,11 +801,16 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     1. Contract error/drift metrics (tolerance <= 1e-6) must start at 0.0 —
        never 1.0 — so an un-triggered stage metric cannot falsify step 0.
     2. Dynamical slots state[0..2] must never ALL be zero (trivial fixed
-       point); seed slot 0 with 0.6 when they are.
+       point); seed slot 0 with 0.6 when they are. A polar state [0,0,z] is
+       seeded to [0.3,0,±0.8] so z-axis rotation has genuine 3D coupling.
+    3. The buffer is padded past the highest slot referenced by the kernel so
+       Tier-0 scratch writes (e.g. buf.data[28]) stay in bounds.
     Returns (initial_state, warnings).
     """
     initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
-    while len(initial) < 16:
+    max_slot = _max_state_slot(py_code, contract)
+    needed = max(16, max_slot + 1)
+    while len(initial) < needed:
         initial.append(0.0)
     warnings: List[str] = []
     # 1. Error/drift metrics initialize to 0.0.
@@ -783,12 +832,21 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                     f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
                     f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
                 initial[k] = 0.0
-    # 2. Never a trivial all-zero dynamical state.
-    if len(initial) >= 3 and all(abs(initial[i]) < 1e-12 for i in range(3)):
+    # 2. Physical parameter slots must not start as silent zeros.
+    _parameter_initial_defaults(py_code, contract, initial, warnings)
+    # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed.
+    if len(initial) >= 3 and initial[0] == 0.0 and initial[1] == 0.0 \
+            and abs(initial[2]) > 0.0:
+        initial[0] = 0.3
+        if abs(initial[2]) > 0.8:
+            initial[2] = math.copysign(0.8, initial[2])
+        warnings.append("auto-init: polar state[0..2]=[0,0,z] is stationary under "
+                        "z-rotation; seeded [0.3, 0.0, ±0.8]")
+    elif len(initial) >= 3 and all(abs(initial[i]) < 1e-12 for i in range(3)):
         warnings.append("auto-init: state[0..2] all zero (trivial fixed point); "
                         "seeding state[0] = 0.6")
         initial[0] = 0.6
-    # 3. Warn (never silently pass) when a contract slot is never computed.
+    # 4. Warn (never silently pass) when a contract slot is never computed.
     missing = _kernel_assigns_slots(py_code, _contract_state_slots(contract))
     for k in missing:
         warnings.append(
@@ -1572,7 +1630,7 @@ class ResearchStateMachine:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "no candidate module for this stage"}
 
-        san = sanitize_intrinsics(candidate_code)
+        san = sanitize_intrinsics(candidate_code, contracts=contracts)
         if san.changed:
             candidate_code = san.code
             await self.emit_activity(
@@ -1862,6 +1920,31 @@ class ResearchStateMachine:
         fixed, fix_notes = tier0_heal(healed, allow_egg=allow_egg)
         if fix_notes:
             healed, notes = fixed, notes + fix_notes
+        # Deterministic monotone/drift fallback for tightly bounded state slots
+        # (e.g. entropy_monotone <= 1e-15) falsified with a Step-0 history spike.
+        fail_text = str(failure or "").lower()
+        seen_slots = set()
+        for contract in contracts or []:
+            for inv in getattr(contract, "invariants", None) or []:
+                name = str(getattr(inv, "variable_name", "") or "").lower()
+                if not any(tok in name for tok in
+                           ("monotone", "drift", "entropy", "error", "err",
+                            "residual", "violation", "mismatch")):
+                    continue
+                text = f"{getattr(inv, 'variable_name', '')} {getattr(inv, 'assertion', '')}"
+                m = re.search(r"(?:state|buf(?:\.data)?|data)\[(\d+)\]\s*<=\s*([0-9.eE+-]+)", text)
+                if not m:
+                    continue
+                slot, bound = int(m.group(1)), float(m.group(2))
+                if bound > 1e-8 or slot in seen_slots:
+                    continue
+                if not ("falsified" in fail_text or name in fail_text
+                        or f"state[{slot}]" in fail_text):
+                    continue
+                rw = rewrite_monotone_drift(healed, slot=slot, direction="non_increasing")
+                if rw.changed:
+                    healed, notes = rw.code, notes + rw.notes
+                    seen_slots.add(slot)
         none_lowering = {"return None lowered", "None assignment lowered to 0.0",
                          "is None comparison lowered"}
         applied_ops = [n for n in notes if n and n not in none_lowering]

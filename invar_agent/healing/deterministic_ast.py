@@ -941,8 +941,419 @@ def _insert_intrinsic_helpers(tree: ast.Module, names: Iterable[str]) -> bool:
     return True
 
 
+# -- simulation_step slot repairs -------------------------------------------
+
+_STATE_COORD_NAMES = {"x", "y", "z", "q", "p"}
+_RHO_NAME = re.compile(r"^r\d+$")
+_PARAM_BLOCK_TOKENS = (
+    "prev", "before", "old", "incr", "diff", "drift", "err", "error",
+    "residual", "violation", "mismatch", "trace", "entropy", "purity",
+    "population", "coh", "mag", "rp", "wss", "trr", "p0", "p1", "rho", "te",
+)
+_OMEGA_NAMES = {"omega", "omega0", "k0", "m_mass"}
+_KAPPA_NAMES = {"kappa", "stiffness"}
+
+
+def _is_parameter_name(name: str) -> bool:
+    low = name.lower()
+    if low not in _OMEGA_NAMES | _KAPPA_NAMES:
+        return False
+    return not any(tok in low for tok in _PARAM_BLOCK_TOKENS)
+
+
+def _state_subscript_slot(node: ast.AST) -> Optional[int]:
+    if not isinstance(node, ast.Subscript):
+        return None
+    slot = _target_slot(node)
+    if slot is None:
+        return None
+    base = node.value
+    if isinstance(base, ast.Attribute) and base.attr == "data" \
+            and isinstance(base.value, ast.Name) and base.value.id == "buf":
+        return slot
+    if isinstance(base, ast.Name) and base.id in {"state", "data", "buf"}:
+        return slot
+    return None
+
+
+def _simulation_functions(tree: ast.Module) -> List[ast.FunctionDef]:
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name == "simulation_step" or (
+                node.args.args and node.args.args[0].arg == "buf"):
+            out.append(node)
+    return out
+
+
+def _assign_target_name(stmt: ast.stmt) -> Optional[str]:
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return None
+    target = stmt.targets[0]
+    return target.id if isinstance(target, ast.Name) else None
+
+
+def _stmt_slot_target(stmt: ast.stmt) -> Optional[int]:
+    if isinstance(stmt, ast.Assign):
+        for target in stmt.targets:
+            slot = _state_subscript_slot(target)
+            if slot is not None:
+                return slot
+    elif isinstance(stmt, ast.AnnAssign):
+        slot = _state_subscript_slot(stmt.target)
+        if slot is not None:
+            return slot
+    elif isinstance(stmt, ast.AugAssign):
+        slot = _state_subscript_slot(stmt.target)
+        if slot is not None:
+            return slot
+    return None
+
+
+def _has_step0_guard(fn: ast.AST, prev: str, curr: str) -> bool:
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+                or not isinstance(test.ops[0], ast.Eq) \
+                or not isinstance(test.left, ast.Name) or test.left.id != prev \
+                or len(test.comparators) != 1:
+            continue
+        comp = test.comparators[0]
+        if not (isinstance(comp, ast.Constant) and isinstance(comp.value, (int, float))
+                and not isinstance(comp.value, bool) and float(comp.value) == 0.0):
+            continue
+        for sub in node.body:
+            if isinstance(sub, ast.Assign) and len(sub.targets) == 1 \
+                    and isinstance(sub.targets[0], ast.Name) \
+                    and sub.targets[0].id == prev \
+                    and isinstance(sub.value, ast.Name) and sub.value.id == curr:
+                return True
+    return False
+
+
+def _diff_updates_accumulator(fn: ast.AST, diff_var: str) -> bool:
+    compared: set[int] = set()
+    assigned: set[int] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare):
+            operands = [node.left] + list(node.comparators)
+            for i, operand in enumerate(operands):
+                other = operands[1 - i] if len(operands) == 2 else None
+                if other is None:
+                    continue
+                if isinstance(operand, ast.Name) and operand.id == diff_var:
+                    slot = _state_subscript_slot(other)
+                    if slot is not None:
+                        compared.add(slot)
+        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+            target_slot = None
+            value = None
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    target_slot = _state_subscript_slot(target)
+                    if target_slot is not None:
+                        break
+                value = node.value
+            else:
+                target_slot = _state_subscript_slot(node.target)
+                value = node.value
+            if target_slot is not None and value is not None:
+                if any(isinstance(sub, ast.Name) and sub.id == diff_var
+                       for sub in ast.walk(value)):
+                    assigned.add(target_slot)
+    return bool(compared & assigned)
+
+
+def _repair_history_guard_in_function(fn: ast.FunctionDef, notes: set[str]) -> bool:
+    changed = False
+    body = fn.body
+    for _ in range(16):
+        inserted = False
+        for i, stmt in enumerate(body):
+            prev = _assign_target_name(stmt)
+            if prev is None or not isinstance(stmt.value, ast.Subscript):
+                continue
+            prev_slot = _state_subscript_slot(stmt.value)
+            if prev_slot is None:
+                continue
+            curr = None
+            write_idx = -1
+            for j in range(i + 1, len(body)):
+                later = body[j]
+                if _stmt_slot_target(later) == prev_slot \
+                        and isinstance(later, (ast.Assign, ast.AnnAssign)) \
+                        and getattr(later, "value", None) is not None \
+                        and isinstance(later.value, ast.Name):
+                    curr = later.value.id
+                    write_idx = j
+                    break
+            if curr is None or write_idx <= i + 1:
+                continue
+            diff_var = None
+            diff_idx = -1
+            for k in range(i + 1, write_idx):
+                cand = body[k]
+                name = _assign_target_name(cand)
+                if name is None or not isinstance(cand.value, ast.BinOp) \
+                        or not isinstance(cand.value.op, ast.Sub):
+                    continue
+                left = cand.value.left
+                right = cand.value.right
+                pair = set()
+                if isinstance(left, ast.Name):
+                    pair.add(left.id)
+                if isinstance(right, ast.Name):
+                    pair.add(right.id)
+                if pair == {prev, curr}:
+                    diff_var, diff_idx = name, k
+                    break
+            if diff_var is None or not _diff_updates_accumulator(fn, diff_var):
+                continue
+            if _has_step0_guard(fn, prev, curr):
+                continue
+            guard = ast.parse(
+                f"if {prev} == 0.0:\n    {prev} = {curr}\n").body[0]
+            body.insert(diff_idx, guard)
+            ast.fix_missing_locations(fn)
+            notes.add(f"history step-0 guard for {prev} (slot {prev_slot})")
+            changed = True
+            inserted = True
+            break
+        if not inserted:
+            break
+    return changed
+
+
+def _repair_delayed_state_history_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    changed = False
+    notes: List[str] = []
+    for fn in _simulation_functions(tree):
+        body = fn.body
+        delayed: Dict[int, Tuple[str, int]] = {}
+        for stmt in body:
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            slot = _state_subscript_slot(target)
+            if slot is None or not isinstance(stmt.value, ast.Name):
+                continue
+            state_var = stmt.value.id
+            if state_var not in _STATE_COORD_NAMES and not _RHO_NAME.match(state_var):
+                continue
+            assign_lineno = getattr(stmt, "lineno", 0) or 0
+            read_before = False
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) \
+                        and _state_subscript_slot(node) == slot \
+                        and (getattr(node, "lineno", 0) or 0) < assign_lineno:
+                    read_before = True
+                    break
+            if read_before:
+                delayed[slot] = (state_var, assign_lineno)
+        if not delayed:
+            continue
+
+        class _DelayedReadRewrite(ast.NodeTransformer):
+            def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                self.generic_visit(node)
+                if not isinstance(node.ctx, ast.Load):
+                    return node
+                slot = _state_subscript_slot(node)
+                entry = delayed.get(slot) if slot is not None else None
+                if entry is None:
+                    return node
+                var, assign_lineno = entry
+                if (getattr(node, "lineno", 0) or 0) >= assign_lineno:
+                    return node
+                return ast.copy_location(ast.Name(id=var, ctx=ast.Load()), node)
+
+        transformer = _DelayedReadRewrite()
+        fn.body = [transformer.visit(stmt) for stmt in body]  # type: ignore[assignment]
+        ast.fix_missing_locations(fn)
+        changed = True
+        notes.append("replaced delayed state-history reads with current state: "
+                     + ", ".join(f"buf.data[{slot}]" for slot in sorted(delayed)))
+    return tree, changed, notes
+
+
+def _used_state_slots(tree: ast.Module) -> set[int]:
+    used: set[int] = set()
+    for node in ast.walk(tree):
+        slot = _state_subscript_slot(node)
+        if slot is not None:
+            used.add(slot)
+    return used
+
+
+def _scratch_slot(used: set[int], avoid: set[int]) -> int:
+    for cand in list(range(28, 48)) + list(range(16, 28)):
+        if cand not in used and cand not in avoid:
+            return cand
+    return max(used | avoid | {0}) + 1
+
+
+def _contract_closed_or_reversible(contract: Any) -> bool:
+    cid = str(getattr(contract, "contract_id", "") or "").lower()
+    return "closed" in cid or "revers" in cid
+
+
+def _contracts_allow_kappa_default(contracts: Sequence[Any]) -> bool:
+    contracts = list(contracts or [])
+    return bool(contracts) and not any(_contract_closed_or_reversible(c) for c in contracts)
+
+
+def _zero_guard_exists(body: List[ast.stmt], idx: int, var: str) -> bool:
+    if idx + 1 >= len(body):
+        return False
+    node = body[idx + 1]
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return isinstance(test, ast.Compare) and len(test.ops) == 1 \
+        and isinstance(test.ops[0], ast.Eq) \
+        and isinstance(test.left, ast.Name) and test.left.id == var \
+        and len(test.comparators) == 1 \
+        and isinstance(test.comparators[0], ast.Constant) \
+        and test.comparators[0].value == 0.0
+
+
+def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
+                                  ) -> Tuple[ast.Module, bool, List[str]]:
+    changed = False
+    notes: List[str] = []
+    used = _used_state_slots(tree)
+    allow_kappa = _contracts_allow_kappa_default(contracts)
+    for fn in _simulation_functions(tree):
+        body = fn.body
+        reads: List[Tuple[int, str, int, ast.stmt]] = []
+        for idx, stmt in enumerate(body):
+            name = _assign_target_name(stmt)
+            if name is None or not isinstance(stmt.value, ast.Subscript):
+                continue
+            if not _is_parameter_name(name):
+                continue
+            slot = _state_subscript_slot(stmt.value)
+            if slot is None:
+                continue
+            reads.append((idx, name, slot, stmt))
+        if not reads:
+            continue
+        insert_after: Dict[int, List[ast.stmt]] = {}
+        for idx, var, slot, read_stmt in reads:
+            low = var.lower()
+            later_writes: List[ast.AST] = []
+            read_lineno = getattr(read_stmt, "lineno", 0) or 0
+            for node in ast.walk(fn):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) \
+                        and _stmt_slot_target(node) == slot \
+                        and (getattr(node, "lineno", 0) or 0) > read_lineno:
+                    later_writes.append(node)
+            if later_writes:
+                scratch = _scratch_slot(used, {slot})
+                used.add(scratch)
+                for node in later_writes:
+                    target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+                    if _state_subscript_slot(target) == slot:
+                        target.slice = ast.Constant(value=scratch)  # type: ignore[attr-defined]
+                changed = True
+                notes.append(f"protected parameter buf.data[{slot}] ({var}) -> buf.data[{scratch}]")
+            if _zero_guard_exists(body, idx, var):
+                continue
+            if low in _OMEGA_NAMES:
+                snippet = ast.parse(f"if {var} == 0.0:\n    {var} = 1.0\n").body
+            elif low in _KAPPA_NAMES and allow_kappa:
+                dt_name = fn.args.args[1].arg if len(fn.args.args) > 1 else "dt"
+                snippet = ast.parse(
+                    f"if {var} == 0.0:\n"
+                    f"    if {dt_name} >= 0.2:\n"
+                    f"        {var} = 1.0e5\n"
+                    f"    else:\n"
+                    f"        {var} = 1.0\n").body
+            else:
+                continue
+            insert_after.setdefault(idx, []).extend(snippet)
+            changed = True
+            notes.append(f"nonzero fallback for parameter {var} (buf.data[{slot}])")
+        if insert_after:
+            new_body: List[ast.stmt] = []
+            for i, stmt in enumerate(body):
+                new_body.append(stmt)
+                new_body.extend(insert_after.get(i, []))
+            fn.body = new_body
+            ast.fix_missing_locations(fn)
+    return tree, changed, notes
+
+
+def _repair_history_slots_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    notes: set[str] = set()
+    changed = False
+    for fn in _simulation_functions(tree):
+        if _repair_history_guard_in_function(fn, notes):
+            changed = True
+    tree, delayed_changed, delayed_notes = _repair_delayed_state_history_tree(tree)
+    changed = changed or delayed_changed
+    return tree, changed, sorted(notes) + delayed_notes
+
+
+def _rewrite_monotone_r_difference(tree: ast.Module, slot: int) -> Tuple[ast.Module, bool, List[str]]:
+    for fn in _simulation_functions(tree):
+        body = fn.body
+        diff_var = None
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+                    or len(test.comparators) != 1:
+                continue
+            left = test.left
+            comp = test.comparators[0]
+            if isinstance(left, ast.Name) and _state_subscript_slot(comp) == slot \
+                    and isinstance(test.ops[0], (ast.Gt, ast.GtE)):
+                diff_var = left.id
+                break
+        if diff_var is None:
+            continue
+        diff_idx = -1
+        prev = curr = None
+        for i, stmt in enumerate(body):
+            if _assign_target_name(stmt) != diff_var:
+                continue
+            value = getattr(stmt, "value", None)
+            if not isinstance(value, ast.BinOp) or not isinstance(value.op, ast.Sub):
+                continue
+            left, right = value.left, value.right
+            if isinstance(left, ast.Name) and isinstance(right, ast.Name):
+                prev, curr = left.id, right.id
+                diff_idx = i
+                break
+            if isinstance(right, ast.Name) and isinstance(left, ast.Name):
+                prev, curr = right.id, left.id
+                diff_idx = i
+                break
+        if diff_idx < 0 or prev is None or curr is None:
+            continue
+        names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        if not {"x", "y", "z", "nx", "ny", "nz"}.issubset(names):
+            continue
+        if "r_before" in names or "r_after" in names:
+            continue
+        replacement = ast.parse(
+            "r_before = math.sqrt(x * x + y * y + z * z)\n"
+            "r_after = math.sqrt(nx * nx + ny * ny + nz * nz)\n"
+            f"{diff_var} = max(0.0, r_after - r_before)\n").body
+        body[diff_idx:diff_idx + 1] = replacement
+        ast.fix_missing_locations(fn)
+        return tree, True, [f"rewrote monotone slot[{slot}] to r_after-r_before bound"]
+    return tree, False, []
+
+
 def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
-                        eps: float = 1e-300) -> SanitizerResult:
+                        eps: float = 1e-300,
+                        contracts: Sequence[Any] = ()) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
         tree = ast.parse(code)
@@ -951,14 +1362,17 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     tree, none_changed, none_notes = _strip_none_literals_tree(tree)
     tree, complex_changed, complex_notes = _lower_complex_tree(tree)
+    tree, history_changed, history_notes = _repair_history_slots_tree(tree)
+    tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, contracts)
     transformer = _IntrinsicTransformer()
     transformer.defined = _defined_names(tree)
     transformer.guard_eps = float(eps)
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(none_notes) | set(complex_notes) | set(transformer.notes))
-    if none_changed or complex_changed:
+    notes = sorted(set(none_notes) | set(complex_notes) | set(history_notes)
+                   | set(param_notes) | set(transformer.notes))
+    if none_changed or complex_changed or history_changed or param_changed:
         changed = True
     if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
         if _ensure_math_import(tree):
@@ -1140,6 +1554,9 @@ def rewrite_monotone_drift(code: str, *, slot: int, direction: str = "non_increa
     except SyntaxError:
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    tree, history_changed, history_notes = _repair_history_slots_tree(tree)
+    tree, r_changed, r_notes = _rewrite_monotone_r_difference(tree, slot)
+    ast.fix_missing_locations(tree)
 
     class _SlotTransformer(ast.NodeTransformer):
         def visit_Assign(self, node: ast.Assign) -> ast.AST:
@@ -1163,9 +1580,10 @@ def rewrite_monotone_drift(code: str, *, slot: int, direction: str = "non_increa
     transformer = _SlotTransformer()
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
-    changed = transformer.changed or ast.dump(tree, annotate_fields=False,
-                                              include_attributes=False) != original
-    notes = [f"rewrote monotone drift state[{slot}] ({direction})"] if transformer.changed else []
+    changed = (history_changed or r_changed or transformer.changed
+               or ast.dump(tree, annotate_fields=False, include_attributes=False) != original)
+    notes = history_notes + r_notes + ([f"rewrote monotone drift state[{slot}] ({direction})"]
+                                       if transformer.changed else [])
     return SanitizerResult(ast.unparse(tree) + "\n", notes, changed)
 
 
@@ -1377,7 +1795,7 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
     notes: List[str] = []
     current = code
     # Always run the intrinsic/domain sanitizer first (Tier-0, zero tokens).
-    san = sanitize_intrinsics(current)
+    san = sanitize_intrinsics(current, contracts=contracts)
     if san.changed:
         current = san.code
         notes.extend(san.notes)
