@@ -569,3 +569,103 @@ def test_healing_search_queries_complete_words_max_five():
         assert len(words) <= 6  # topic (<=3) + failure-mode terms (<=3)
         # No mid-word slicing artifacts: every word is a complete token.
         assert all(w.isalpha() or "-" in w or "^" in w or "/" in w for w in words)
+
+
+# ---------------------------------------------------------------------------
+# Spec: ctypes.CDLL sandbox crash, helper-buf transpilation, healing bypass,
+# contract-slot guard, variable_map auto-population, report sanitization.
+# ---------------------------------------------------------------------------
+
+HELPER_BUF_KERNEL = '''
+import math
+
+
+def cayley_kraus_step(buf, dt):
+    x = buf.data[0]
+    purity = buf.data[5]
+    err = buf.data[7]
+    x_new = x * math.cos(dt) - 0.001 * x * dt
+    buf.data[0] = x_new
+    buf.data[5] = min(1.0, x_new * x_new + 0.5)
+    buf.data[7] = err * 0.999
+
+
+def simulation_step(buf, dt):
+    cayley_kraus_step(buf, dt)
+    buf.data[8] = max(0.0, 1.0 - buf.data[5])
+'''
+
+
+def test_helper_buf_void_kernel_compiles_and_runs_native():
+    """Helper taking ``buf`` with no return value compiles to C++20 and runs
+    through the C-ABI bridge with NO Python fallback (rc == 0)."""
+    import math
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge as CabiBridge
+    import tempfile
+    from pathlib import Path
+
+    uast = python_source_to_uast(HELPER_BUF_KERNEL)
+    cpp = CppEmitter().emit_module(uast)
+    assert "SimulationBuffer* buf" in cpp
+    with tempfile.TemporaryDirectory() as td:
+        bridge = CabiBridge(workspace=Path(td))
+        initial = [0.6, 0.1, 0.2] + [0.0] * 13
+        out = bridge.run(cpp, initial, 0.01, 5,
+                         entry="execute_step", isolated=True)
+        state = out["state"]
+        for k in (5, 7, 8):
+            assert math.isfinite(state[k]), f"state[{k}] not finite"
+        assert 0.0 <= state[5] <= 1.0  # purity physical
+        assert state[7] >= 0.0  # trace error non-negative
+
+
+def test_refine_stage_code_accepts_raw_python_reply():
+    """0-second healing bypass: an LLM reply with raw Python (no JSON) must
+    still repair the code instead of silently returning None."""
+    import asyncio
+    from invar_agent.research.planner import refine_stage_code
+
+    broken = "def simulation_step(buf, dt):\n    return (1, 2)\n"
+    repaired = "def simulation_step(buf, dt):\n    buf.data[0] = 1.0\n"
+
+    async def spy(prompt):
+        return "```python\n" + repaired + "```\nSome trailing prose."
+
+    out = asyncio.run(refine_stage_code(spy, objective="obj", code=broken,
+                                       contracts=[], failure="boom"))
+    assert out is not None and "buf.data[0]" in out
+
+
+def test_contract_slot_guard_and_variable_map_autopopulate():
+    """Error metrics init to 0.0, dynamical slots never all-zero, uncomputed
+    contract slots are flagged, and empty variable_map is auto-populated."""
+    from invar_agent.research.state_machine import (
+        _guard_contract_initial_state, _auto_populate_variable_map)
+    from invar_agent.schemas.research import (
+        ResearchBlueprint, VerificationContract, InvariantConstraint)
+
+    kernel = ("def simulation_step(buf, dt):\n"
+              "    buf.data[0] = buf.data[0] * 0.9\n")
+    contract = VerificationContract(
+        contract_id="c1", target_backend="cpp",
+        initial_state=[0.0, 0.0, 0.0] + [1.0] * 13,
+        invariants=[
+            InvariantConstraint(variable_name="roundtrip_error",
+                                assertion="state[4] <= 1e-13", tolerance=1e-13),
+            InvariantConstraint(variable_name="trace_error_max",
+                                assertion="state[7] <= 1e-14", tolerance=1e-14),
+        ])
+    initial, warnings = _guard_contract_initial_state(kernel, contract)
+    assert initial[4] == 0.0 and initial[7] == 0.0  # metrics zeroed
+    assert initial[0] == 0.6  # trivial fixed point seeded
+    assert any("CONTRACT_SLOT_GUARD" in w and "state[7]" in w for w in warnings)
+
+    bp = ResearchBlueprint(
+        blueprint_id="b1", title="Test blueprint", falsifiable_hypothesis="hyp",
+        search_queries=["q"], variable_map={}, code_template="",
+        contracts=[contract])
+    _auto_populate_variable_map(bp)
+    assert bp.variable_map.get("roundtrip_error") == 4
+    assert bp.variable_map.get("trace_error_max") == 7

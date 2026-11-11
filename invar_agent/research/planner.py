@@ -76,6 +76,15 @@ VARIABLE STYLE: prefer plain scalar variables and indexable arrays over
 nested Python tuples. Tuple unpacking (`a, b = b, a`), sequence unpacking
 (`q, p, s = state`) and tuple literals are supported by the transpiler, but
 simple scalars keep kernels readable and portable.
+KERNEL HYGIENE (hard rules): (1) NO comment monologues — at most 5 short
+comment lines across the entire file; never write `# Wait...` derivations
+inside code comments. (2) NO `# placeholder` slots — every state[k]
+(buf.data[k]) referenced in ANY contract invariant (roundtrip_error,
+entropy_monotonicity, trace_error_max, min_eigenvalue, purity, ...) MUST be
+explicitly computed and assigned to buf.data[k] inside simulation_step on
+every step. (3) Error/drift metrics (roundtrip_error, trace_error,
+entropy_drift, energy_drift, residuals) must be RECOMPUTED each step and
+start at 0.0 — never left at an arbitrary initial value.
 Invariants must be falsifiable and physically meaningful; never write vacuous
 invariants (like x == x) and never loosen tolerances to force a pass.
 CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper
@@ -983,6 +992,17 @@ async def refine_stage_code(llm_complete: Callable[[str], Any], *, objective: st
     data = _extract_json(str(raw))
     if isinstance(data, dict) and isinstance(data.get("code"), str) and data["code"].strip():
         return data["code"]
+    # Fallback: reasoning models often ignore the JSON contract and return the
+    # repaired module as a fenced/raw Python block. Accept it instead of
+    # silently retrying the unchanged broken code (the 0-second healing bug).
+    text = str(raw or "")
+    for m in _FENCE_RE.finditer(text):
+        block = m.group(1).strip()
+        if "def " in block and ("simulation_step" in block or "buf" in block):
+            return block
+    stripped = text.strip()
+    if stripped.startswith(("def ", "import ", "#")) and "simulation_step" in stripped:
+        return stripped
     return None
 
 

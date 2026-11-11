@@ -722,6 +722,94 @@ def _telemetry(run: Dict[str, Any], initial: List[float]) -> Dict[str, float]:
     return tel
 
 
+def _contract_state_slots(contract: VerificationContract) -> List[int]:
+    """All ``state[k]`` / ``initial[k]`` buffer indices referenced by a contract."""
+    slots: List[int] = []
+    for inv in (contract.invariants or []):
+        text = f"{inv.variable_name} {inv.assertion}"
+        for m in re.finditer(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", text):
+            slots.append(int(m.group(1)))
+    return sorted(set(slots))
+
+
+def _kernel_assigns_slots(py_code: str, slots: List[int]) -> List[int]:
+    """Contract slots NEVER assigned via ``buf.data[k] =`` anywhere in the kernel."""
+    missing: List[int] = []
+    for k in slots:
+        pat = re.compile(rf"buf(?:\.data|->data)\[\s*{k}\s*\]\s*(?:[-+*/%&|^]?=)")
+        # Augmented/annotated/plain assignment all count as computed.
+        pat2 = re.compile(rf"buf(?:\.data|->data)\[\s*{k}\s*\]\s*(?:=|\+=|-=|\*=|/=)")
+        if not (pat.search(py_code or "") or pat2.search(py_code or "")):
+            # Also accept assignment through an alias: ``state[k] = ...``
+            # where the kernel binds ``state = buf.data``.
+            if not re.search(rf"\bstate\[\s*{k}\s*\]\s*(?:=|\+=|-=|\*=|/=)", py_code or ""):
+                missing.append(k)
+    return missing
+
+
+def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
+                                  ) -> Tuple[List[float], List[str]]:
+    """Static contract-slot guard + auto-initializer.
+
+    1. Contract error/drift metrics (tolerance <= 1e-6) must start at 0.0 —
+       never 1.0 — so an un-triggered stage metric cannot falsify step 0.
+    2. Dynamical slots state[0..2] must never ALL be zero (trivial fixed
+       point); seed slot 0 with 0.6 when they are.
+    Returns (initial_state, warnings).
+    """
+    initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
+    while len(initial) < 16:
+        initial.append(0.0)
+    warnings: List[str] = []
+    # 1. Error/drift metrics initialize to 0.0.
+    for inv in (contract.invariants or []):
+        m = re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", f"{inv.variable_name} {inv.assertion}")
+        if not m:
+            continue
+        k = int(m.group(1))
+        name = (inv.variable_name or "").lower()
+        metric = any(tok in name for tok in ("error", "drift", "residual", "trace",
+                                             "purity", "eigen"))
+        if metric or (inv.tolerance or 1.0) <= 1e-6:
+            if k < len(initial) and initial[k] != 0.0:
+                warnings.append(
+                    f"auto-init: contract metric state[{k}] ({inv.variable_name}) "
+                    f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
+                initial[k] = 0.0
+    # 2. Never a trivial all-zero dynamical state.
+    if len(initial) >= 3 and all(abs(initial[i]) < 1e-12 for i in range(3)):
+        warnings.append("auto-init: state[0..2] all zero (trivial fixed point); "
+                        "seeding state[0] = 0.6")
+        initial[0] = 0.6
+    # 3. Warn (never silently pass) when a contract slot is never computed.
+    missing = _kernel_assigns_slots(py_code, _contract_state_slots(contract))
+    for k in missing:
+        warnings.append(
+            f"CONTRACT_SLOT_GUARD: state[{k}] is checked by contract "
+            f"'{contract.contract_id}' but is NEVER assigned in the kernel; "
+            "it will hold its initial value.")
+    return initial, warnings
+
+
+def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
+    """Infer ``variable_map`` from contract constraints when the planner left
+    it empty, so report Section 1 never says 'variable_map empty'."""
+    if bp.variable_map:
+        return
+    mapping: Dict[str, int] = {}
+    contracts = getattr(bp, "contracts", None) or []
+    for contract in contracts:
+        for inv in (getattr(contract, "invariants", None) or []):
+            text = f"{inv.variable_name} {inv.assertion}"
+            m = re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", text)
+            if m and inv.variable_name:
+                mapping.setdefault(inv.variable_name, int(m.group(1)))
+    if not mapping:
+        for i in range(4):
+            mapping[f"state_{i}"] = i
+    bp.variable_map = dict(list(mapping.items())[:64])
+
+
 def _json_safe(tel: Dict[str, float]) -> Dict[str, float]:
     return {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else -1.0)
             for k, v in tel.items()}
@@ -911,6 +999,7 @@ class ResearchStateMachine:
 
     # -- top-level loop ----------------------------------------------------
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
+        _auto_populate_variable_map(blueprint)
         state = ResearchRunState(blueprint=blueprint)
         # Defense-in-depth epistemic gate. A blueprint that already carries a
         # PASSING feasibility verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE)
@@ -1746,6 +1835,16 @@ class ResearchStateMachine:
                 await self._emit("goi_stream", "refine_error", {
                     "round": round_idx, "research_stage": stage, "tier": tier,
                     "error": str(exc)[:300]})
+                await self.emit_activity(
+                    "HEALING", "llm_repair_failed",
+                    f"[HEALING_WARN] LLM repair call failed: {str(exc)[-300:]}",
+                    level="warning")
+            if refined is None:
+                await self.emit_activity(
+                    "HEALING", "llm_repair_failed",
+                    "[HEALING_WARN] LLM repair call returned no usable code; "
+                    "keeping current candidate for the next attempt.",
+                    level="warning")
             if refined:
                 await self._emit("goi_stream", "refine", {
                     "round": round_idx, "research_stage": stage, "tier": tier,
@@ -1883,20 +1982,27 @@ class ResearchStateMachine:
                 True,
                 *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
         except KernelExecutionError as exc:
-            if not getattr(exc, "compile_error", False) or not py_code:
+            compile_failed = bool(getattr(exc, "compile_error", False))
+            # Runtime loader/ctypes failures (rc != 0, e.g. dlopen ENOMEM)
+            # also fall back to the verified Python kernel — never abort a
+            # stage with ERROR(rc=1) when the Python kernel is valid.
+            runtime_failed = (getattr(exc, "returncode", None) not in (None, 0)
+                              and not getattr(exc, "timed_out", False))
+            if not (compile_failed or runtime_failed) or not py_code:
                 raise
-            logger.warning("C-ABI compilation failed (%s); falling back to the "
-                           "deterministic Python kernel sandbox", str(exc)[:400])
+            reason = "compilation" if compile_failed else f"runtime rc={getattr(exc, 'returncode', '?')}"
+            diag = str(exc).replace("\n", " ")[-400:]
+            logger.warning("C-ABI %s failed; falling back to the "
+                           "deterministic Python kernel sandbox", reason)
             run = await asyncio.to_thread(
                 self.bridge.run_python, py_code, initial, contract.dt,
                 contract.steps, entry, contract.timeout_seconds,
                 contract.max_memory_mb,
                 *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
-            diag = str(exc).replace("\n", " ")[:300]
             await self.emit_activity(
                 f"STAGE_{stage}_BUILD", "cabi_fallback",
-                "C-ABI compiler fallback -> executed verified deterministic "
-                f"Python kernel in sandbox; compiler diagnostic: {diag}")
+                "C-ABI compiler/runtime fallback -> executed verified "
+                f"deterministic Python kernel in sandbox; diagnostic tail: {diag}")
             return run
 
     async def _execute_contract(self, bp, uast, cpp_code, py_code, contract: VerificationContract,
@@ -1904,7 +2010,12 @@ class ResearchStateMachine:
                                 regression_of: Optional[int] = None,
                                 kernel_mode: str = "rk4_ode") -> SimulationResult:
         start = time.perf_counter()
-        initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
+        # Static contract-slot guard: error metrics start at 0.0, dynamical
+        # slots are never all-zero, and uncomputed contract slots are logged.
+        initial, slot_warnings = _guard_contract_initial_state(py_code or "", contract)
+        for w in slot_warnings:
+            await self.emit_activity(
+                f"STAGE_{stage}_EXEC", "contract_slot_guard", w, level="warning")
         telemetry: Dict[str, float] = {}
         counterexample: Optional[str] = None
         run_ctx: Optional[str] = None

@@ -49,7 +49,9 @@ def _fmt_value(value: float) -> str:
 def _stage_rows(state) -> List[str]:
     rows = []
     for h in state.blueprint.evolution_history:
-        note = f" — {h.note[:80]}" if h.note else ""
+        # Multi-line tracebacks / notes must never corrupt the Markdown table.
+        note = (f" — {h.note[:120]}" if h.note else "")
+        note = note.replace("\n", " ").replace("|", "/").replace("\r", " ")
         rows.append(f"| {h.stage} | {h.status} | `{h.bundle_hash[:16]}` |{note} |")
     return rows
 

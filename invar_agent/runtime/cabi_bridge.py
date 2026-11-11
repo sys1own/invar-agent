@@ -198,6 +198,7 @@ class DynamicCABIBridge:
         so_path = self.workspace / f"kernel_{key}.so"
         cpp_path.write_text(cpp_code)
         cmd = [self.compiler, "-O3", "-std=c++20", "-fPIC", "-shared",
+               "-Wl,--no-undefined",
                str(cpp_path), "-o", str(so_path)]
         if "clang" in self.compiler:
             cmd[1:1] = ["-march=native"]
@@ -325,11 +326,15 @@ class DynamicCABIBridge:
             runner.write_text(_RUNNER_SOURCE)
             cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
             mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
+            # 64-bit CPython + libstdc++ virtual mappings exceed 256MB even
+            # with tiny physical RSS; floor RLIMIT_AS so dlopen() never
+            # fails with ENOMEM ("failed to map segment from shared object").
+            as_bytes = max(mem_bytes, 2048 * 1024 * 1024)
 
             def _limits() -> None:
                 if resource is not None:
                     resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
-                    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+                    resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
 
             preexec = _limits if (sys.platform != "win32" and resource is not None) else None
             start = time.perf_counter()
@@ -413,11 +418,12 @@ class DynamicCABIBridge:
             runner.write_text(_PY_RUNNER_SOURCE)
             cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
             mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
+            as_bytes = max(mem_bytes, 2048 * 1024 * 1024)
 
             def _limits() -> None:
                 if resource is not None:
                     resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
-                    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+                    resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
 
             preexec = _limits if (sys.platform != "win32" and resource is not None) else None
             try:
