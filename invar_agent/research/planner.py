@@ -259,6 +259,23 @@ eliminate EVERY tuple from the module.
 Output strict JSON: {{"code": "<fixed full module>", "rationale": "..."}}. No fences.
 """
 
+HEALING_DIRECTIVE_PROMPT = """You are the directive-only healing controller for a verified research kernel.
+You MUST NOT output Python, C++, or any source code. Output ONE strict JSON object:
+{"fixable": true|false, "unfixable_reason": "...", "directives": [...]}.
+Allowed directive ops: INLINE_INTRINSIC {name}, GUARD_MATH_DOMAINS {eps},
+REWRITE_MONOTONE_DRIFT {slot,direction,before_var,after_var}, WRAP_SUBSTEP {substeps},
+SCALE_COEFFICIENT {var,factor}, CLAMP_STATE_NORM {slots,max_norm},
+BIND_SLOT_TO_VAR {slot,var}. No markdown fences. Output JSON only.
+
+Stage objective: {objective}
+Failing module hash/context (never rewrite it):
+{code}
+Contracts:
+{contracts}
+Failure/counterexample:
+{failure}
+"""
+
 QUERY_PROMPT = """You steer literature search for a computational research loop.
 Stage {stage} objective: {objective}
 Hypothesis: {hypothesis}
@@ -979,6 +996,33 @@ async def synthesize_accretive_stage(llm_complete: Callable[[str], Any], *,
         raise ValueError("accretion synthesis returned no {code, contracts} JSON")
     if not isinstance(data.get("contracts"), list) or not data["contracts"]:
         raise ValueError("accretion synthesis returned no contracts")
+    return data
+
+
+async def request_healing_directives(llm_complete: Callable[[str], Any], *,
+                                     objective: str, code: str,
+                                     contracts: List[Dict[str, Any]],
+                                     failure: str) -> Optional[Dict[str, Any]]:
+    """Ask the LLM for structured healing directives only (never source code)."""
+    import asyncio
+    import inspect
+    prompt = _fill(HEALING_DIRECTIVE_PROMPT, objective=objective,
+                   code=code.strip()[:12000],
+                   contracts=json.dumps(contracts, indent=1)[:6000],
+                   failure=str(failure)[:3000])
+    try:
+        result = llm_complete(prompt)
+        raw = (await asyncio.wait_for(result, timeout=30.0)
+               if inspect.isawaitable(result) else result)
+    except Exception:  # noqa: BLE001 - directive call is best-effort
+        return None
+    data = _extract_json(str(raw))
+    if not isinstance(data, dict):
+        return None
+    # Directive plans must not smuggle source repairs through a `code` key.
+    data.pop("code", None)
+    data.pop("replacements", None)
+    data.pop("ast_patches", None)
     return data
 
 

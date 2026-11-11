@@ -149,20 +149,22 @@ async def test_state_machine_hard_stop_on_max_retries(tmp_path):
     assert state.status == "PARTIAL", state.status
     assert len(state.blueprint.verified_layers) == 1
 
-    # Exactly max_feedback_rounds attempts for stage 2: healing is dispatched
-    # only BETWEEN attempts (2 times for 3 attempts), and "Attempt 4/3" style
-    # messages never appear.
+    # max_feedback_rounds is an upper bound; two identical no-op healing
+    # passes terminate the stage early as unfixable (still bounded, never
+    # "Attempt 4/3" style messages).
     heals = _activity(events, "HEALING", "reasoning_dispatch")
     assert len(heals) == 2, [h["message"] for h in heals]
     joined = "\n".join(str(p.get("message", "")) for _, p in events)
     assert "Attempt 4" not in joined
+    terminated = _activity(events, "HEALING", "healing_terminated")
+    assert terminated and "[HEALING_TERMINATED]" in terminated[0]["message"]
 
-    # Rollback (adjoint) events are bounded to the actual rounds: stage 2 ran
-    # exactly 3 rounds, so exactly 3 stage-2 rollback events exist.
+    # Rollback (adjoint) events are bounded to the actual rounds: stage 2
+    # stopped after two no-improvement attempts, so two rollback events exist.
     rollbacks = [p for ch, p in events
                  if ch == "accelerator_log" and p.get("event") == "rollback"
                  and p.get("research_stage") == 2]
-    assert len(rollbacks) == 3, f"unbounded rollback loop: {len(rollbacks)}"
+    assert len(rollbacks) == 2, f"unbounded rollback loop: {len(rollbacks)}"
 
     # Graceful partial finalization activity.
     partial = _activity(events, "VAULT", "partial_finalization")

@@ -50,7 +50,8 @@ from .accretion import (AccretionError, code_hash, layer_driver_name,
                         merge_accretive_module, pin_layer_code, candidate_layer_code,
                         unified_from_layers)
 from .feasibility import _heuristic_verdict
-from .planner import guided_queries, refine_stage_code, synthesize_accretive_stage
+from .planner import guided_queries, request_healing_directives, synthesize_accretive_stage
+from ..healing.deterministic_ast import apply_healing_directives, sanitize_intrinsics
 from .search import LiteratureSearchClient
 from .smt import check_invariants_consistent
 
@@ -768,12 +769,16 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
             continue
         k = int(m.group(1))
         name = (inv.variable_name or "").lower()
-        metric = any(tok in name for tok in ("error", "drift", "residual", "trace",
-                                             "purity", "eigen"))
-        if metric or (inv.tolerance or 1.0) <= 1e-6:
+        assertion = str(getattr(inv, "assertion", "") or "")
+        bound_match = re.search(
+            r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*<=\s*([0-9.eE+-]+)", assertion)
+        bound = float(bound_match.group(1)) if bound_match else None
+        error_metric = any(tok in name for tok in
+                           ("error", "err", "drift", "residual", "violation", "mismatch"))
+        if error_metric and bound is not None and bound <= 1e-6:
             if k < len(initial) and initial[k] != 0.0:
                 warnings.append(
-                    f"auto-init: contract metric state[{k}] ({inv.variable_name}) "
+                    f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
                     f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
                 initial[k] = 0.0
     # 2. Never a trivial all-zero dynamical state.
@@ -1093,6 +1098,8 @@ class ResearchStateMachine:
             # result and telemetry are kept for the report.
             best_attempt: Optional[Dict[str, Any]] = None
             best_score: Optional[Tuple[int, float]] = None
+            healing_stall = 0
+            healing_terminated = False
             while attempt < max_attempts:
                 if self._aborted(state):
                     break
@@ -1206,11 +1213,37 @@ class ResearchStateMachine:
                     "HEALING", "reasoning_dispatch",
                     f"{heal_tier} model synthesizing correction "
                     f"(Attempt {attempt + 1}/{max_attempts})...")
-                candidate_code = await self._heal_and_refine(
+                pre_heal_hash = code_hash(candidate_code or "")
+                raw_heal = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=outcome.get("candidate_code") or candidate_code,
                     contracts=contracts, failure=failure,
                     attempt=attempt, max_attempts=max_attempts)
+                if isinstance(raw_heal, dict):
+                    heal_outcome = raw_heal
+                elif isinstance(raw_heal, str):
+                    heal_outcome = {"code": raw_heal, "terminated": False}
+                else:
+                    heal_outcome = {"code": candidate_code, "terminated": False}
+                if heal_outcome.get("terminated"):
+                    healing_terminated = True
+                    break
+                healed_code = heal_outcome.get("code") or candidate_code
+                post_heal_hash = code_hash(healed_code or "")
+                if post_heal_hash == pre_heal_hash:
+                    healing_stall += 1
+                else:
+                    healing_stall = 0
+                candidate_code = healed_code
+                if healing_stall >= 2:
+                    await self.emit_activity(
+                        "HEALING", "healing_terminated",
+                        "[HEALING_TERMINATED] Stage determined unfixable after "
+                        "deterministic + directive passes: two consecutive "
+                        "healing attempts produced no residual improvement.",
+                        level="warning")
+                    healing_terminated = True
+                    break
 
             if not verified:
                 # Best-attempt retention: if the LAST attempt was worse than
@@ -1519,6 +1552,14 @@ class ResearchStateMachine:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "no candidate module for this stage"}
 
+        san = sanitize_intrinsics(candidate_code)
+        if san.changed:
+            candidate_code = san.code
+            await self.emit_activity(
+                f"STAGE_{stage}_BUILD", "deterministic_sanitizer",
+                "Tier-0 sanitizer normalized scalar intrinsics/math domains "
+                f"({'; '.join(san.notes[:3])}).")
+
         if stage > 1:
             try:
                 merge = merge_accretive_module(pinned_code, candidate_code)
@@ -1771,86 +1812,76 @@ class ResearchStateMachine:
         if self.stage_synthesizer is not None:
             return await self.stage_synthesizer(
                 verified_contracts=verified_contracts, **kw)
-        if self.llm_planner is None:
-            raise RuntimeError("accretive stages require a Tier-2 REASONING LLM "
+        synth_llm = self.llm_fast or self.llm_planner
+        if synth_llm is None:
+            raise RuntimeError("accretive stages require a Tier-1 FAST LLM "
                                "(configure a provider) or a stage synthesizer")
         pinned_code = kw["pinned_code"]
-        return await synthesize_accretive_stage(
-            self.llm_planner, stage=kw["stage"], total=kw["total"],
+        return await asyncio.wait_for(synthesize_accretive_stage(
+            synth_llm, stage=kw["stage"], total=kw["total"],
             objective=kw["objective"],
             verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
             verified_contracts=verified_contracts, telemetry=kw["telemetry"],
-            literature=kw["literature"], failures=kw["failures"])
+            literature=kw["literature"], failures=kw["failures"]), timeout=45.0)
 
     async def _heal_and_refine(self, *, stage: int, round_idx: int, objective: str,
                                candidate_code: Optional[str],
                                contracts: List[VerificationContract],
                                failure: str,
                                attempt: int = 1,
-                               max_attempts: int = 3) -> Optional[str]:
+                               max_attempts: int = 3) -> Dict[str, Any]:
         if candidate_code is None:
-            return None
-        # Deterministic AST/schema/header fixes ALWAYS run first (Tier-0):
-        # they cost zero tokens and resolve the majority of syntax-level
-        # failures before any LLM call is considered.
-        guard_failure = failure.startswith(("PreWrite_Guard", "transpiler:"))
-        if guard_failure:
-            healed, notes = candidate_code, []
-        else:
-            healed, notes = tier0_heal(candidate_code)
+            return {"code": None, "terminated": False}
+        det = apply_healing_directives(candidate_code, [], contracts=contracts)
+        healed, notes = candidate_code, list(det.notes)
+        if det.changed:
+            healed = det.code
+        fixed, fix_notes = tier0_heal(healed)
+        if fix_notes:
+            healed, notes = fixed, notes + fix_notes
+        applied_ops = [n for n in notes if n]
         await self._emit("goi_stream", "heal", {
             "round": round_idx, "research_stage": stage, "tier": 0,
-            "applied": bool(notes), "notes": notes or ["no Tier-0 repair applicable"]})
-        if notes:
-            return healed
-        # Healing escalation: intermediate attempts use the fast Tier-1 model
-        # with a strict token cap; the FINAL healing round escalates to the
-        # Tier-2 reasoning model. This avoids the observed ~8-minute Tier-2
-        # stall on Attempt 1/2 failures.
-        final_heal = attempt + 1 >= max_attempts
-        llm, tier = ((self.llm_planner, 2) if (final_heal and self.llm_planner is not None)
-                     else ((self.llm_fast or self.llm_planner), 1)
-                     if (self.llm_fast is not None or self.llm_planner is not None)
-                     else (None, 0))
-        if llm is not None:
-            # Mathematical & Numerical Diagnosis Checklist: the healer must
-            # verify gradient consistency and fixed-point convergence instead
-            # of applying blind mutations (e.g. multiplying corrections by 0).
-            checklist = (
-                "DIAGNOSIS CHECKLIST: (1) Verify gradH/gradS are the EXACT "
-                "partial derivatives of H_energy/S_entropy (e.g. if H contains "
-                "+ c_v*s then dH/ds == c_v; if H is purely mechanical, ensure "
-                "<gradH, z[k+1]-z[k]> == 0 identically). (2) Verify the "
-                "discrete-gradient/implicit-midpoint update runs a fixed-point "
-                "iteration (e.g. for _ in range(12)) until convergence and "
-                "NEVER multiplies the correction by 0.0. (3) Preserve the "
-                "full current kernel source; only fix the diagnosed defect.\n\n")
-            try:
-                refined = await refine_stage_code(
-                    llm, objective=objective, code=candidate_code,
-                    contracts=[c.model_dump() for c in contracts],
-                    failure=checklist + str(failure))
-            except Exception as exc:  # noqa: BLE001
-                refined = None
-                await self._emit("goi_stream", "refine_error", {
-                    "round": round_idx, "research_stage": stage, "tier": tier,
-                    "error": str(exc)[:300]})
-                await self.emit_activity(
-                    "HEALING", "llm_repair_failed",
-                    f"[HEALING_WARN] LLM repair call failed: {str(exc)[-300:]}",
-                    level="warning")
-            if refined is None:
-                await self.emit_activity(
-                    "HEALING", "llm_repair_failed",
-                    "[HEALING_WARN] LLM repair call returned no usable code; "
-                    "keeping current candidate for the next attempt.",
-                    level="warning")
-            if refined:
-                await self._emit("goi_stream", "refine", {
-                    "round": round_idx, "research_stage": stage, "tier": tier,
-                    "module_hash": code_hash(refined)})
-                return refined
-        return candidate_code
+            "applied": bool(applied_ops), "notes": applied_ops or ["no Tier-0 repair applicable"]})
+        if applied_ops:
+            await self.emit_activity(
+                "HEALING", "deterministic_reflex",
+                "[HEALING_DIRECTIVE] Applied deterministic ops: "
+                + json.dumps(applied_ops[:12]))
+            return {"code": healed, "terminated": False, "applied_ops": applied_ops}
+
+        llm = self.llm_fast or self.llm_planner
+        if llm is None:
+            return {"code": candidate_code, "terminated": False}
+        plan = await request_healing_directives(
+            llm, objective=objective, code=candidate_code,
+            contracts=[c.model_dump() for c in contracts], failure=str(failure))
+        if plan is None:
+            return {"code": candidate_code, "terminated": False}
+        if plan.get("fixable") is False:
+            reason = str(plan.get("unfixable_reason") or "unsatisfiable contract").strip()
+            await self.emit_activity(
+                "HEALING", "healing_terminated",
+                "[HEALING_TERMINATED] Stage determined unfixable after "
+                f"deterministic + directive passes: {reason}",
+                level="warning")
+            return {"code": candidate_code, "terminated": True,
+                    "unfixable_reason": reason}
+        directives = plan.get("directives") or []
+        if not isinstance(directives, list):
+            directives = []
+        patched = apply_healing_directives(candidate_code, directives,
+                                           contracts=contracts)
+        ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
+        if ops:
+            await self.emit_activity(
+                "HEALING", "directive_applied",
+                "[HEALING_DIRECTIVE] Applied deterministic ops: "
+                + json.dumps(ops[:12]))
+        if patched.changed:
+            return {"code": patched.code, "terminated": False,
+                    "applied_ops": ops or patched.notes}
+        return {"code": candidate_code, "terminated": False, "applied_ops": ops}
 
     async def _diagnostic_research(self, state: ResearchRunState, *, stage: int,
                                    outcome: Dict[str, Any]) -> str:

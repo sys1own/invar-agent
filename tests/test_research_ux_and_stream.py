@@ -169,8 +169,11 @@ async def test_healing_activity_stream_and_sse_heartbeat(tmp_path):
                     telemetry={"final_max": 1.0}),
                 "contracts_out": []}
 
+    heal_pass = {"n": 0}
+
     async def fake_heal(**kw):
-        return STAGE1
+        heal_pass["n"] += 1
+        return STAGE1 + f"\n# healing pass {heal_pass['n']}\n"
 
     machine._run_round = fake_round  # type: ignore[assignment]
     machine._heal_and_refine = fake_heal  # type: ignore[assignment]

@@ -31,9 +31,11 @@ WHILE_GUARD = 10_000_000
 _MATH_FUNCS = {
     "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh",
     "tanh", "exp", "log", "log10", "log2", "log1p", "expm1", "ceil", "floor",
-    "pow", "fabs", "fmod", "hypot", "copysign", "trunc",
+    "pow", "fabs", "fmod", "hypot", "copysign", "trunc", "isfinite", "isnan",
+    "isinf", "radians", "degrees",
 }
-_INTRINSICS = {"prng_uniform": 2, "clamp": 3, "sign": 1}
+_INTRINSICS = {"prng_uniform": 2, "clamp": 3, "clip": 3, "sign": 1, "sgn": 1,
+               "sq": 1, "lerp": 3, "safe_div": 2}
 _CMPS = {"==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
          "is": "==", "is_not": "!="}
 
@@ -57,7 +59,12 @@ static inline long pymod_i(long a, long b) { long r = a % b; return (r != 0 && (
 static inline long floordiv_i(long a, long b) { long q = a / b; return ((a % b != 0) && ((a < 0) != (b < 0))) ? q - 1 : q; }
 static inline double pymod_f(double a, double b) { double r = std::fmod(a, b); return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r; }
 static inline double clamp(double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static inline double clip(double x, double lo, double hi) { return clamp(x, lo, hi); }
 static inline double sign(double x) { return (x > 0.0) - (x < 0.0); }
+static inline double sgn(double x) { return sign(x); }
+static inline double sq(double x) { return x * x; }
+static inline double lerp(double a, double b, double t) { return a + t * (b - a); }
+static inline double safe_div(double a, double b) { return a / (std::fabs(b) > 1e-30 ? b : 1e-30); }
 static inline double prng_uniform(double seed, double k) {
     uint64_t z = static_cast<uint64_t>(static_cast<int64_t>(seed)) * 0x9E3779B97F4A7C15ULL
                + static_cast<uint64_t>(static_cast<int64_t>(k)) + 0x9E3779B97F4A7C15ULL;

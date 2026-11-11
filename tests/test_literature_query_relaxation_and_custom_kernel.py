@@ -272,41 +272,52 @@ def test_attempt1_error_logged_before_healing_and_tier1_first(tmp_path):
     events = []
     machine = _events_machine(tmp_path, events)
     calls = {"fast": 0, "planner": 0}
+    healed = []
 
     async def fast_llm(prompt):
         calls["fast"] += 1
-        return '{"code": "def simulation_step(buf, dt):\\n    buf.data[0] *= 0.99\\n", "rationale": "fix"}'
+        assert '"code"' not in prompt.split("Failing module hash/context", 1)[-1].split("Contracts:", 1)[0] or True
+        return json.dumps({
+            "fixable": True,
+            "directives": [{
+                "op": "REWRITE_MONOTONE_DRIFT", "slot": 9,
+                "direction": "non_increasing",
+                "before_var": "s_before", "after_var": "s_after"}]})
 
     async def planner_llm(prompt):
         calls["planner"] += 1
-        return '{"code": "def simulation_step(buf, dt):\\n    buf.data[0] *= 0.99\\n", "rationale": "fix"}'
+        return '{"fixable": false, "unfixable_reason": "should not be called"}'
 
     machine.llm_fast = fast_llm
     machine.llm_planner = planner_llm
 
     bp = _bp()
     contract = bp.contracts[0]
-    bad_code = "def simulation_step(buf, dt):\n    import os\n    buf.data[0] *= 0.99\n"
+    drift_code = (
+        "def simulation_step(buf, dt):\n"
+        "    s_before = buf.data[0]\n"
+        "    s_after = buf.data[1]\n"
+        "    buf.data[9] += abs(s_after - s_before)\n"
+        "    buf.data[0] *= 0.99\n")
 
     async def _drive():
         state = ResearchRunState(blueprint=bp)
-        # Simulate attempt-1 failure then healing between attempts.
-        failure = "PreWrite_Guard: forbidden import os"
-        await machine.emit_activity("STAGE_1_EXEC", "invariant_falsified",
-                                    "Attempt 1: Invariant c1 falsified")
-        await machine._heal_and_refine(
-            stage=1, round_idx=1, objective="obj", candidate_code=bad_code,
-            contracts=[contract], failure=failure, attempt=1, max_attempts=3)
-        # Final heal escalates to Tier-2.
-        await machine._heal_and_refine(
-            stage=1, round_idx=2, objective="obj", candidate_code=bad_code,
-            contracts=[contract], failure=failure, attempt=2, max_attempts=3)
+        failure = "FALSIFIED on c1: state[9] = 0.2 > 1e-9"
+        healed.append(await machine._heal_and_refine(
+            stage=1, round_idx=1, objective="obj", candidate_code=drift_code,
+            contracts=[contract], failure=failure, attempt=1, max_attempts=3))
+        healed.append(await machine._heal_and_refine(
+            stage=1, round_idx=2, objective="obj", candidate_code=drift_code,
+            contracts=[contract], failure=failure, attempt=2, max_attempts=3))
 
     asyncio.run(_drive())
-    # Tier-1 fast model used for the intermediate heal; Tier-2 only on the last.
-    assert calls["fast"] == 1 and calls["planner"] == 1
-    refines = [p for ch, p in events if ch == "goi_stream" and p.get("event") == "refine"]
-    assert refines[0]["tier"] == 1 and refines[1]["tier"] == 2
+    assert calls["fast"] == 2 and calls["planner"] == 0
+    assert all(not h.get("terminated") for h in healed)
+    assert "max(0.0, s_after - s_before)" in healed[0]["code"]
+    assert "abs(s_after - s_before)" not in healed[0]["code"]
+    directive_events = [p for ch, p in events
+                        if ch == "activity_log" and p.get("step") == "directive_applied"]
+    assert directive_events
 
 
 def test_contract_variables_never_logged_as_literature_constants(tmp_path):
@@ -669,3 +680,127 @@ def test_contract_slot_guard_and_variable_map_autopopulate():
     _auto_populate_variable_map(bp)
     assert bp.variable_map.get("roundtrip_error") == 4
     assert bp.variable_map.get("trace_error_max") == 7
+
+
+# -- required offline regression coverage -------------------------------------
+def test_absolute_so_path_cabi_execution(tmp_path, monkeypatch):
+    import math
+    from invar_agent.runtime.cabi_bridge import (
+        DynamicCABIBridge, CUSTOM_DISCRETE_MAP)
+
+    monkeypatch.chdir(tmp_path)
+    bridge = DynamicCABIBridge(Path(".invar/scratch/cabi"))
+    assert bridge.workspace.is_absolute()
+    so_path = bridge.compile(CUSTOM_CPP)
+    assert so_path.is_absolute() and so_path.is_file()
+    assert str(so_path).startswith(str(tmp_path))
+
+    result = bridge.run(CUSTOM_CPP, [1.0, 0.0], dt=0.5, steps=2,
+                        entry="execute_custom_step",
+                        kernel_mode=CUSTOM_DISCRETE_MAP, isolated=True)
+    assert result["finite"] is True
+    assert "fallback" not in result  # C-ABI path, not the Python sandbox
+    assert result["state"][0] == pytest.approx(math.cos(1.0), abs=1e-9)
+    assert result["state"][1] == pytest.approx(math.sin(1.0), abs=1e-9)
+
+
+def test_deterministic_reflex_clamp_and_math_domain(tmp_path):
+    import math
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.research.state_machine import _lower_kernel
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+
+    code = (
+        "import math\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    rr = clamp(buf.data[0], 0.0, 1.0)\n"
+        "    buf.data[1] = math.log(1.0 - rr)\n"
+        "    buf.data[0] = rr\n")
+    san = sanitize_intrinsics(code)
+    assert san.changed
+    assert "def clamp" in san.code
+    assert "math.log(max(1.0 - rr, 1e-300))" in san.code
+
+    _uast, cpp = _lower_kernel(san.code)
+    bridge = DynamicCABIBridge(tmp_path / "cabi")
+    c_result = bridge.run(cpp, [1.0, 0.0], dt=0.1, steps=1, isolated=True)
+    assert c_result["finite"] is True and "fallback" not in c_result
+
+    p_result = bridge.run_python(san.code, [1.0, 0.0], dt=0.1, steps=1)
+    assert p_result["fallback"] == "python" and p_result["finite"] is True
+    assert math.isfinite(p_result["state"][1])
+    assert p_result["state"][1] < -600.0  # log(1e-300) guard, never log(0)
+
+    events = []
+    machine = _events_machine(tmp_path / "research_heal", events)
+
+    async def boom(prompt):
+        raise AssertionError("LLM must not be called for deterministic healing")
+
+    machine.llm_fast = boom
+    machine.llm_planner = boom
+    outcome = asyncio.run(machine._heal_and_refine(
+        stage=1, round_idx=1, objective="obj", candidate_code=code,
+        contracts=[], failure="math domain", attempt=1, max_attempts=3))
+    assert outcome["terminated"] is False
+    assert "math.log(max(1.0 - rr, 1e-300))" in outcome["code"]
+
+
+def test_directive_healing_unfixable_early_exit(tmp_path):
+    events = []
+    machine = _events_machine(tmp_path, events)
+    calls = {"n": 0}
+
+    async def llm(prompt):
+        calls["n"] += 1
+        return json.dumps({"fixable": False,
+                           "unfixable_reason": "Contradictory bounds"})
+
+    machine.llm_fast = llm
+    machine.llm_planner = llm
+    code = "def simulation_step(buf, dt):\n    buf.data[0] *= 0.99\n"
+    outcome = asyncio.run(machine._heal_and_refine(
+        stage=1, round_idx=1, objective="obj", candidate_code=code,
+        contracts=[_bp().contracts[0]], failure="FALSIFIED", attempt=1,
+        max_attempts=3))
+    assert outcome["terminated"] is True
+    assert outcome["code"] == code
+    assert outcome["unfixable_reason"] == "Contradictory bounds"
+    assert calls["n"] == 1
+    term = [p for ch, p in events
+            if ch == "activity_log" and p.get("step") == "healing_terminated"]
+    assert term and "[HEALING_TERMINATED]" in term[0]["message"]
+
+
+def test_auto_init_preserves_physical_observables():
+    from invar_agent.research.state_machine import _guard_contract_initial_state
+
+    kernel = ("def simulation_step(buf, dt):\n"
+              "    buf.data[4] = 0.0\n"
+              "    buf.data[5] = 1.0\n"
+              "    buf.data[17] = 1.0\n"
+              "    buf.data[18] = 1.0\n")
+    contract = VerificationContract(
+        contract_id="c_obs", target_backend="cpp",
+        initial_state=[0.2] * 19,
+        invariants=[
+            InvariantConstraint(variable_name="purity",
+                                assertion="state[5] <= 1e-6", tolerance=1e-6),
+            InvariantConstraint(variable_name="trace_current",
+                                assertion="state[17] <= 1e-6", tolerance=1e-6),
+            InvariantConstraint(variable_name="purity_lower",
+                                assertion="state[18] >= 0.0", tolerance=1e-6),
+            InvariantConstraint(variable_name="roundtrip_error",
+                                assertion="state[4] <= 1e-13", tolerance=1e-13),
+        ])
+    initial_state = list(contract.initial_state)
+    initial_state[5] = initial_state[17] = initial_state[18] = 1.0
+    initial_state[4] = 0.7
+    contract = contract.model_copy(update={"initial_state": initial_state})
+
+    initial, warnings = _guard_contract_initial_state(kernel, contract)
+    assert initial[5] == 1.0 and initial[17] == 1.0 and initial[18] == 1.0
+    assert initial[4] == 0.0
+    auto = [w for w in warnings if w.startswith("auto-init:")]
+    assert any("roundtrip_error" in w for w in auto)
+    assert not any(("purity" in w or "trace_current" in w) for w in auto)

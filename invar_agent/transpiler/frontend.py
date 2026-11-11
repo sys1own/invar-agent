@@ -19,6 +19,16 @@ SAFE_STD_MODULES = {"io", "sys", "time", "math"}
 SAFE_BUILTINS = {"print", "len", "range", "abs", "min", "max", "sum", "enumerate"}
 MATH_CONSTANTS = {"pi": 3.141592653589793, "e": 2.718281828459045,
                   "tau": 6.283185307179586, "inf": float("inf")}
+MATH_FUNCS = {
+    "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh",
+    "cosh", "tanh", "exp", "log", "log10", "log2", "log1p", "expm1", "ceil",
+    "floor", "pow", "fabs", "fmod", "hypot", "copysign", "trunc", "isfinite",
+    "isnan", "isinf", "radians", "degrees",
+}
+INTRINSIC_ALIASES = {"clamp": "clamp", "clip": "clamp", "sign": "sign",
+                     "sgn": "sign", "sq": "sq", "lerp": "lerp",
+                     "safe_div": "safe_div"}
+NP_MATH_FUNCS = MATH_FUNCS | {"abs", "clip", "sign", "sgn"}
 
 
 class UnsupportedError(ValueError):
@@ -194,7 +204,26 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
         local = getattr(_lower_expr, "local_functions", set())
         callee_name = func.id if isinstance(func, ast.Name) else None
         call_type = "user_function_call" if callee_name in local else "call"
-        return {"type": call_type, "function": _lower_expr(func),
+        func_node = _lower_expr(func)
+        if isinstance(func_node, dict) and func_node.get("type") == "reference":
+            fname = str(func_node.get("name") or "")
+            if isinstance(func, ast.Name) and func.id in MATH_FUNCS \
+                    and func.id not in local:
+                func_node = {"type": "reference", "name": f"math.{func.id}"}
+            elif isinstance(func, ast.Name) and func.id in INTRINSIC_ALIASES \
+                    and func.id not in local:
+                func_node = {"type": "reference",
+                             "name": INTRINSIC_ALIASES[func.id]}
+            elif fname.startswith(("np.", "numpy.")):
+                attr = fname.split(".", 1)[1]
+                if attr in {"clip", "sign", "sgn"}:
+                    func_node = {"type": "reference",
+                                 "name": {"clip": "clamp", "sgn": "sign"}.get(attr, attr)}
+                elif attr in {"sq", "lerp", "safe_div"}:
+                    func_node = {"type": "reference", "name": attr}
+                elif attr in NP_MATH_FUNCS:
+                    func_node = {"type": "reference", "name": f"math.{attr}"}
+        return {"type": call_type, "function": func_node,
                 "argument": args[0] if args else None, "arguments": args}
     if isinstance(expr, ast.IfExp):
         return {"type": "if", "condition": _lower_expr(expr.test),

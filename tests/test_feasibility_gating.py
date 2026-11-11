@@ -7,6 +7,19 @@ import pytest
 from invar_agent.schemas.research import FeasibilityAssessment, FeasibilityVerdict
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_llm_env(monkeypatch, tmp_path_factory):
+    for var in (
+        "GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY", "INVAR_API_KEY", "INVAR_LLM_PROVIDER",
+        "INVAR_PERSIST_KEY", "INVAR_LLM_TIER_FAST", "INVAR_LLM_TIER_REASONING",
+        "DEEPSEEK_MODEL_FAST", "DEEPSEEK_MODEL_REASONING",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVAR_CONFIG_PATH",
+                       str(tmp_path_factory.mktemp("cfg") / "config.json"))
+
+
 def test_verdict_enum_case_insensitive():
     assert FeasibilityVerdict("optimal_direct") is FeasibilityVerdict.OPTIMAL_DIRECT
     assert FeasibilityVerdict("refused_impossible") is FeasibilityVerdict.REFUSED_IMPOSSIBLE
@@ -39,7 +52,9 @@ def test_refusal_verdicts_keep_boundary_and_reformulation():
 
 def test_run_success_response_has_started_true(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "0")
+    import invar_agent.server as server
     from invar_agent.server import create_app
+    monkeypatch.setattr(server, "_STATE", None)
     app = create_app(tmp_path / "ws")
     client = app.test_client() if hasattr(app, "test_client") else None
     # FastAPI TestClient via httpx
@@ -56,9 +71,10 @@ def test_run_success_response_has_started_true(tmp_path, monkeypatch):
 
 def test_run_refusal_response_has_started_false(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "0")
-    from invar_agent.server import create_app
+    import invar_agent.server as server
+    monkeypatch.setattr(server, "_STATE", None)
     from fastapi.testclient import TestClient
-    c = TestClient(create_app(tmp_path / "ws2"))
+    c = TestClient(server.create_app(tmp_path / "ws2"))
     r = c.post("/api/v1/research/run",
                json={"question": "closed-loop mechanical flywheel with COP = 1.25"})
     assert r.status_code == 200

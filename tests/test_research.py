@@ -293,9 +293,8 @@ def test_native_hin_arena_and_healer():
 
 
 @pytest.mark.asyncio
-async def test_heal_and_refine_routes_guard_failures_to_llm(tmp_path):
-    """PreWrite_Guard/transpiler rejections must skip Tier-0 (which cannot fix
-    tuples) and go straight to the Tier-2 LLM refiner."""
+async def test_heal_and_refine_routes_guard_failures_to_directives(tmp_path, monkeypatch):
+    """Guard failures Tier-0 cannot fix escalate to the directive-only LLM."""
     from invar_agent.research.state_machine import ResearchStateMachine
 
     events = []
@@ -303,33 +302,33 @@ async def test_heal_and_refine_routes_guard_failures_to_llm(tmp_path):
     async def cb(channel, payload):
         events.append((channel, payload))
 
-    refine_calls = []
+    directive_calls = []
 
-    async def fake_refine(llm_complete, *, objective, code, contracts, failure):
-        refine_calls.append(failure)
-        return "def simulation_step(buf, dt):\n    return None\n"
+    async def fake_directives(llm_complete, *, objective, code, contracts, failure):
+        directive_calls.append({"objective": objective, "code": code,
+                                "contracts": contracts, "failure": failure})
+        return {"fixable": True,
+                "directives": [{"op": "INLINE_INTRINSIC", "name": "clamp"}]}
 
     machine = ResearchStateMachine(tmp_path / "research", progress_cb=cb,
                                    llm_planner=lambda prompt: "{}")
     machine.workspace_root = tmp_path
 
     import invar_agent.research.state_machine as sm
-    original = sm.refine_stage_code
-    sm.refine_stage_code = fake_refine
-    try:
-        out = await machine._heal_and_refine(
-            stage=1, round_idx=1, objective="obj",
-            candidate_code="def simulation_step(buf, dt):\n    a, b = 1, 2\n    return None\n",
-            contracts=[], failure="PreWrite_Guard: unsupported construct: tuples")
-    finally:
-        sm.refine_stage_code = original
+    monkeypatch.setattr(sm, "request_healing_directives", fake_directives)
+    out = await machine._heal_and_refine(
+        stage=1, round_idx=1, objective="obj",
+        candidate_code="def simulation_step(buf, dt):\n    a, b = 1, 2\n    return None\n",
+        contracts=[], failure="PreWrite_Guard: unsupported construct: tuples")
 
-    assert len(refine_calls) == 1
-    # The Mathematical & Numerical Diagnosis Checklist is prepended; the
-    # original guard failure must remain intact at the end.
-    assert refine_calls[0].endswith("PreWrite_Guard: unsupported construct: tuples")
-    assert "DIAGNOSIS CHECKLIST" in refine_calls[0]
-    assert out == "def simulation_step(buf, dt):\n    return None\n"
+    assert len(directive_calls) == 1
+    assert directive_calls[0]["failure"].endswith(
+        "PreWrite_Guard: unsupported construct: tuples")
+    assert out["terminated"] is False
+    assert "def clamp" in out["code"]
     heal_events = [p for c, p in events if p.get("event") == "heal"]
     assert heal_events and heal_events[0]["tier"] == 0
     assert heal_events[0]["applied"] is False
+    directive_events = [p for c, p in events
+                        if c == "activity_log" and p.get("step") == "directive_applied"]
+    assert directive_events

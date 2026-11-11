@@ -102,6 +102,55 @@ print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
 _PY_RUNNER_SOURCE = r'''
 import json, math, sys, time
 
+
+def clamp(x, lo, hi):
+    return min(max(x, lo), hi)
+
+
+def clip(x, lo, hi):
+    return clamp(x, lo, hi)
+
+
+def sign(x):
+    return 1.0 if x > 0.0 else (-1.0 if x < 0.0 else 0.0)
+
+
+def sgn(x):
+    return sign(x)
+
+
+def sq(x):
+    return x * x
+
+
+def lerp(a, b, t):
+    return a + t * (b - a)
+
+
+def safe_div(a, b):
+    return a / (b if abs(b) > 1e-30 else 1e-30)
+
+
+class _NumpyShim:
+    pi = math.pi
+    e = math.e
+
+    def __getattr__(self, name):
+        if name == "clip":
+            return clip
+        if name == "abs":
+            return abs
+        if name in ("sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                    "atan2", "sinh", "cosh", "tanh", "exp", "log", "log2",
+                    "log10", "floor", "ceil", "fabs", "isfinite", "isnan",
+                    "isinf"):
+            return getattr(math, name)
+        raise AttributeError(name)
+
+
+np = _NumpyShim()
+numpy = np
+
 py_path, entry, initial_json, dt, steps = (
     sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), int(sys.argv[5]))
 
@@ -123,7 +172,18 @@ class SimulationBuffer:
 
 
 src = open(py_path, encoding="utf-8").read()
-namespace = {"__name__": "invar_kernel_fallback"}
+namespace = {"__name__": "invar_kernel_fallback", "math": math,
+             "clamp": clamp, "clip": clip, "sign": sign, "sgn": sgn,
+             "sq": sq, "lerp": lerp, "safe_div": safe_div,
+             "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+             "tan": math.tan, "asin": math.asin, "acos": math.acos,
+             "atan": math.atan, "atan2": math.atan2, "sinh": math.sinh,
+             "cosh": math.cosh, "tanh": math.tanh, "exp": math.exp,
+             "log": math.log, "log2": math.log2, "log10": math.log10,
+             "floor": math.floor, "ceil": math.ceil, "fabs": math.fabs,
+             "isfinite": math.isfinite, "isnan": math.isnan,
+             "isinf": math.isinf, "pi": math.pi, "e": math.e,
+             "np": np, "numpy": numpy}
 exec(compile(src, py_path, "exec"), namespace)  # noqa: S102 - guard-passed kernel
 fn = namespace.get(entry)
 if fn is None:
@@ -173,7 +233,7 @@ class DynamicCABIBridge:
     """Compiles C++ source to a shared library and drives entry points."""
 
     def __init__(self, workspace: Path, compiler: Optional[str] = None):
-        self.workspace = Path(workspace)
+        self.workspace = Path(workspace).expanduser().resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.compiler = compiler or self._detect_compiler()
         self._cache: Dict[str, Path] = {}
@@ -194,8 +254,8 @@ class DynamicCABIBridge:
         cached = self._cache.get(key)
         if cached and cached.exists():
             return cached
-        cpp_path = self.workspace / f"kernel_{key}.cpp"
-        so_path = self.workspace / f"kernel_{key}.so"
+        cpp_path = (self.workspace / f"kernel_{key}.cpp").resolve()
+        so_path = (self.workspace / f"kernel_{key}.so").resolve()
         cpp_path.write_text(cpp_code)
         cmd = [self.compiler, "-O3", "-std=c++20", "-fPIC", "-shared",
                "-Wl,--no-undefined",
@@ -208,6 +268,10 @@ class DynamicCABIBridge:
             raise KernelExecutionError(
                 f"C-ABI compilation failed ({self.compiler}):\n"
                 f"{proc.stderr.strip()[:2000]}", compile_error=True)
+        if not so_path.is_file():
+            raise KernelExecutionError(
+                f"C-ABI compiler did not produce shared object: {so_path}",
+                compile_error=True)
         self._cache[key] = so_path
         return so_path
 
@@ -286,6 +350,9 @@ class DynamicCABIBridge:
     # -- in-process (tests / trusted callers) ------------------------------
     def _run_inprocess(self, so_path: Path, entry: str, initial_state,
                        dt, steps, compile_ms, key) -> Dict[str, object]:
+        so_path = Path(so_path).resolve()
+        if not so_path.is_file():
+            raise KernelExecutionError(f"compiled kernel missing: {so_path}")
         lib = ctypes.CDLL(str(so_path))
         fn = getattr(lib, entry, None)
         if fn is None:
@@ -315,6 +382,9 @@ class DynamicCABIBridge:
     def _run_subprocess(self, so_path: Path, entry: str, initial_state,
                         dt, steps, timeout_seconds, max_memory_mb,
                         compile_ms, key) -> Dict[str, object]:
+        so_path = Path(so_path).resolve()
+        if not so_path.is_file():
+            raise KernelExecutionError(f"compiled kernel missing: {so_path}")
         symbols = self.exported_symbols(so_path)
         if symbols and entry not in symbols:
             raise KernelExecutionError(

@@ -15,6 +15,7 @@ from .evaluator import PatchFitnessEvaluator
 from .hin_graph import CausalFaultInteractionGraph
 from .llm_healer import LLMRepairResult, SurgicalLLMHealer
 from .router import HealingTierRouter
+from .deterministic_ast import sanitize_intrinsics
 
 try:
     from invar_agent._native import PyDeterministicHealer as _NativeHealer
@@ -192,6 +193,14 @@ class AutonomicHealerOrchestrator:
             if healed:
                 new_source, rule_id = healed
                 return new_source, rule_id, (time.perf_counter() - start) * 1000.0
+        # 1b. Python kernel intrinsic/domain sanitizer (clamp/math guards).
+        if failing_source and "def " in failing_source:
+            try:
+                san = sanitize_intrinsics(failing_source)
+            except Exception:  # noqa: BLE001
+                san = None
+            if san is not None and san.changed:
+                return san.code, "deterministic_ast_sanitizer", (time.perf_counter() - start) * 1000.0
         # 2. Fix cache lookup.
         if self.fix_cache is not None and failing_source:
             record = self.fix_cache.lookup_reflex_patch(
