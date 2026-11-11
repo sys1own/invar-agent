@@ -635,11 +635,23 @@ def extract_infobox_parameters(wikitext: str, source: str = "Wikipedia",
     return params
 
 
+_LATEX_COMMAND = re.compile(r"\\[a-zA-Z]+")
+_LATEX_GROUP = re.compile(r"\\[a-zA-Z]*\{[^{}]*\}")
+
+
+def _strip_latex_commands(text: str) -> str:
+    """Remove LaTeX control sequences so ``\\rangle = 0`` never parses as a
+    physical constant named ``rangle`` (or ``m``/``n`` from boundary math)."""
+    s = _LATEX_GROUP.sub(" ", text or "")
+    s = _LATEX_COMMAND.sub(" ", s)
+    return s
+
+
 def extract_parameters_from_text(text: str, source: str = "",
                                  confidence: float = 0.6,
                                  limit: int = 24) -> List[ExtractedParameter]:
     """Free-text ``name = number unit`` / ``name number unit`` pairs."""
-    text = _clean_wikitext(text or "")
+    text = _strip_latex_commands(_clean_wikitext(text or ""))
     params: List[ExtractedParameter] = []
     seen_spans: List[Tuple[int, int]] = []
 
@@ -655,6 +667,11 @@ def extract_parameters_from_text(text: str, source: str = "",
             unit = ""
         name = _snake(name_raw)
         if not name:
+            return
+        # Boundary conditions like ``M = 0`` / ``n = 5`` in prompts or
+        # equations are not physical constants: never extract single-letter
+        # symbols from user prompts.
+        if source == "user_prompt" and len(name) <= 1:
             return
         si_value, si_unit = normalize_to_si(value, unit)
         symbol = name_raw.strip().split()[-1] if name_raw.strip() else ""
@@ -897,11 +914,49 @@ DOMAIN_REFERENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Domains only unlock on EXPLICIT benchmark-system mentions; generic words
+# like "discrete", "thermal", "stiff" or "nonlinear" must never pull in
+# tungsten densities, Black-Scholes or Mars heat-shield constants.
+_REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
+    "fundamental_constants": ("codata", "fundamental constant", "speed of light",
+               "planck constant", "boltzmann", "avogadro", "fine-structure",
+               "electron mass", "gravitational constant"),
+    "aerospace_entry": ("mars entry", "martian entry", "venus entry",
+                        "sutton-graves", "allen-eggers", "re-entry",
+                        "reentry", "heat shield", "ablation", "stagnation-point"),
+    "relativistic_plasma": ("relativistic plasma", "magnetic sail", "magsail",
+                            "plasma sail", "solar wind", "aurora",
+                            "lorentz plasma"),
+    "materials_thermophysics": ("tungsten", "pica", "carbide", "titanium",
+                                "ablative", "heat shield", "phenolic",
+                                "ceramic matrix"),
+    "nonlinear_dynamics": ("duffing", "van der pol", "lorenz", "lotka",
+                           "volterra", "henon", "circle map", "standard map"),
+    "chemical_kinetics": ("robertson", "arrhenius", "michaelis",
+                          "enzyme kinetics", "stiff chemical",
+                          "chemical kinetic"),
+    "discrete_finance": ("black-scholes", "black scholes", "fibonacci",
+                         "catalan", "option pricing", "binomial model",
+                         "lattice model", "risk-neutral"),
+}
+
+
 def classify_registry_domains(text: str) -> List[str]:
-    """Registry domains whose keywords occur in ``text`` (registry order)."""
+    """Registry domains whose EXPLICIT anchors occur in ``text``.
+
+    Strict gating: a domain matches only when one of its benchmark-system
+    anchors (e.g. "Sutton-Graves", "Black-Scholes", "Robertson", "Lorenz")
+    appears in the text — generic scientific vocabulary never matches.
+    """
     t = (text or "").lower()
-    return [name for name, spec in DOMAIN_REFERENCE_REGISTRY.items()
-            if any(k in t for k in spec["keywords"])]
+    out = []
+    for name, spec in DOMAIN_REFERENCE_REGISTRY.items():
+        anchors = _REGISTRY_ANCHORS.get(name)
+        if anchors is None:
+            anchors = tuple(spec.get("keywords") or ())
+        if any(a in t for a in anchors):
+            out.append(name)
+    return out
 
 
 def registry_evidence(text: str) -> Tuple[List[ExtractedParameter], List[ExtractedEquation],

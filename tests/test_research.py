@@ -324,7 +324,11 @@ async def test_heal_and_refine_routes_guard_failures_to_llm(tmp_path):
     finally:
         sm.refine_stage_code = original
 
-    assert refine_calls == ["PreWrite_Guard: unsupported construct: tuples"]
+    assert len(refine_calls) == 1
+    # The Mathematical & Numerical Diagnosis Checklist is prepended; the
+    # original guard failure must remain intact at the end.
+    assert refine_calls[0].endswith("PreWrite_Guard: unsupported construct: tuples")
+    assert "DIAGNOSIS CHECKLIST" in refine_calls[0]
     assert out == "def simulation_step(buf, dt):\n    return None\n"
     heal_events = [p for c, p in events if p.get("event") == "heal"]
     assert heal_events and heal_events[0]["tier"] == 0

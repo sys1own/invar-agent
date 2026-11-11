@@ -532,6 +532,57 @@ def _detect_unit_scaling(observed: float, bound: float) -> Optional[Dict[str, An
     return best
 
 
+def _attempt_quality_score(outcome: Dict[str, Any],
+                           results: List[Any]) -> Tuple[int, float]:
+    """Rank a failed attempt: VERIFIED > FALSIFIED (finite, small violation)
+    > DIVERGED (largest first_nonfinite_step) > COMPILE_ERROR/ERROR."""
+    status = str(outcome.get("failed_status") or outcome.get("result_status") or "").upper()
+    telems = [getattr(r, "telemetry", None) or {} for r in results]
+    finite = [t for t in telems
+              if t.get("first_nonfinite_step", -1) in (-1, None)
+              or str(t.get("first_nonfinite_step", "")) in ("-1", "None")]
+    if status == "FALSIFIED":
+        # Prefer the smallest relative constraint violation among finite runs.
+        viol = min((float(t.get("max_violation", t.get("max_relative_violation", 1e9)))
+                    for t in finite), default=1e9)
+        return (3, -viol)
+    if status == "DIVERGED":
+        # Prefer the trajectory that survived the most steps before diverging.
+        steps = max((float(t.get("first_nonfinite_step", 0) or 0) for t in telems),
+                    default=0.0)
+        return (2, steps)
+    if status == "VERIFIED":
+        return (4, 0.0)
+    return (1, 0.0)
+
+
+def _failure_topic_keywords(blueprint: Any, raw_topic: str, max_words: int = 3) -> List[str]:
+    """Top 2-3 COMPLETE domain keywords for healing re-search queries.
+
+    Sources the blueprint's own literature queries first (they are already
+    technical keyword strings), falls back to the hypothesis/title words.
+    Words are taken whole — never sliced mid-word.
+    """
+    candidates: List[str] = []
+    for q in (getattr(blueprint, "search_queries", None) or []):
+        candidates.extend(re.findall(r"[A-Za-z][A-Za-z0-9_-]*", str(q)))
+    if not candidates:
+        candidates = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", raw_topic or "")
+    stop = {"the", "a", "an", "of", "and", "or", "for", "with", "using",
+            "model", "system", "study", "analysis", "simulation", "via",
+            "this", "that", "into", "from", "equation", "equations"}
+    seen: List[str] = []
+    for w in candidates:
+        low = w.lower().strip("-_")
+        if len(low) < 3 or low in stop:
+            continue
+        if low not in {s.lower() for s in seen}:
+            seen.append(w)
+        if len(seen) >= max_words:
+            break
+    return seen or ([raw_topic] if raw_topic else [])
+
+
 def formulate_diagnostic_search_query(blueprint: ResearchBlueprint,
                                       failure_result: Any) -> List[str]:
     """Closed-loop telemetry-guided re-search queries for DIVERGED/FALSIFIED.
@@ -540,8 +591,12 @@ def formulate_diagnostic_search_query(blueprint: ResearchBlueprint,
     diagnostics are exposed via :func:`unit_scaling_diagnostic` on the same
     failure payload.
     """
-    topic = re.sub(r"\s+", " ",
-                   blueprint.falsifiable_hypothesis or blueprint.title or "").strip()[:90]
+    raw_topic = re.sub(r"\s+", " ",
+                       blueprint.falsifiable_hypothesis or blueprint.title or "").strip()
+    # Complete domain keywords only (no mid-word slicing): top technical terms
+    # from the blueprint's own search queries, max 4 words total per query.
+    topic_words = _failure_topic_keywords(blueprint, raw_topic)
+    topic = " ".join(topic_words)
     status = ""
     telemetry: Dict[str, Any] = {}
     counterexample = ""
@@ -556,21 +611,20 @@ def formulate_diagnostic_search_query(blueprint: ResearchBlueprint,
         counterexample = str(getattr(failure_result, "failure_counterexample", "") or "")
     status = status.upper()
     queries: List[str] = []
+    # Max 4 words total: top domain keywords + 1 concise failure-mode term.
     if status == "DIVERGED" or "non-finite" in counterexample.lower() \
             or "diverged" in counterexample.lower():
-        queries.append(f"{topic} numerical stability CFL step size damping closure")
-        queries.append(f"{topic} stiff integrator substepping implicit damping")
+        queries.append(f"{topic} stability" if topic else "numerical stability")
+        queries.append(f"{topic} convergence" if topic else "fixed point convergence")
     if status == "FALSIFIED":
         # Unit-scaling diagnostic: observed metric vs invariant bound.
         diag = unit_scaling_diagnostic(blueprint, telemetry, counterexample)
         if diag:
-            queries.append(
-                f"{topic} {'MW/m^2' if diag.get('si_unit') == 'W/m^2' else diag.get('si_unit', 'unit')} "
-                "conversion factor heat flux unit scaling")
-        queries.append(f"{topic} counterexample regime breakdown governing equations")
-        queries.append(f"{topic} empirical parameter uncertainty bounds")
+            unit = "MW/m^2" if diag.get("si_unit") == "W/m^2" else (diag.get("si_unit") or "unit")
+            queries.append(f"{topic} {unit} conversion" if topic else f"{unit} conversion")
+        queries.append(f"{topic} counterexample" if topic else "regime breakdown")
     if not queries:
-        queries.append(f"{topic} governing equations parameters verification")
+        queries.append(f"{topic} verification" if topic else "governing equations")
     seen, out = set(), []
     for q in queries:
         if q and q not in seen:
@@ -944,11 +998,18 @@ class ResearchStateMachine:
             # healing dispatch and no further adjoint rollback can be queued.
             max_attempts = max(1, int(getattr(blueprint, "max_feedback_rounds", 3) or 3))
             attempt = 0
+            results_base = len(state.results)
+            # Best-attempt retention: a later healing attempt may diverge
+            # where an earlier one stayed finite; the best candidate's code,
+            # result and telemetry are kept for the report.
+            best_attempt: Optional[Dict[str, Any]] = None
+            best_score: Optional[Tuple[int, float]] = None
             while attempt < max_attempts:
                 if self._aborted(state):
                     break
                 attempt += 1
                 round_idx += 1
+                pre_results_len = len(state.results)
                 outcome = await self._run_round(
                     state, stage=stage, attempt=attempt, round_idx=round_idx,
                     objective=objective, pinned_code=pinned_code,
@@ -1017,6 +1078,17 @@ class ResearchStateMachine:
                     f"Attempt {attempt} failed — exact error: {str(failure)[:500]}",
                     level="warning")
                 failures.append(failure)
+                # Snapshot ONLY this attempt's results so a worse later
+                # attempt never overwrites the best finite candidate.
+                attempt_results = state.results[pre_results_len:]
+                q_score = _attempt_quality_score(outcome, attempt_results)
+                if best_score is None or q_score > best_score:
+                    best_score = q_score
+                    best_attempt = {
+                        "candidate_code": candidate_code,
+                        "results": list(attempt_results),
+                        "status": outcome.get("result_status", "ERROR"),
+                    }
                 state.memory.append({"round": round_idx, "research_stage": stage,
                                      "outcome": outcome["status"], "counterexample": failure})
                 state.blueprint = state.blueprint.model_copy(update={
@@ -1052,6 +1124,15 @@ class ResearchStateMachine:
                     attempt=attempt, max_attempts=max_attempts)
 
             if not verified:
+                # Best-attempt retention: if the LAST attempt was worse than
+                # an earlier finite candidate (e.g. Attempt 1 FALSIFIED but
+                # finite for all steps, Attempts 2-3 DIVERGED), restore the
+                # best candidate's results so the report never shows a
+                # diverged trajectory that an earlier attempt avoided.
+                if best_attempt and best_attempt.get("results"):
+                    base = results_base
+                    state.results = list(state.results[:base]) + list(best_attempt["results"])
+                    candidate_code = best_attempt.get("candidate_code") or candidate_code
                 if pinned_layers:
                     state.checkpoint_path = self._export_checkpoint(
                         state.blueprint, len(pinned_layers))
@@ -1301,6 +1382,20 @@ class ResearchStateMachine:
             # constants and must not be conflated with them.
             eq_count = sum(len((h or {}).get("equations") or []) for h in state.literature)
             const_count = sum(len((h or {}).get("constants") or {}) for h in state.literature)
+            if eq_count == 0 and const_count == 0 and state.literature:
+                # Extraction runs HERE, before the INGEST log, so M/K reflect
+                # what was actually pulled from the ingested abstracts.
+                from .extractor import extract_parameters_from_text
+                for h in state.literature:
+                    summary = str((h or {}).get("summary") or "")
+                    if not summary:
+                        continue
+                    params = extract_parameters_from_text(summary, source=str((h or {}).get("source") or "literature"))
+                    if params:
+                        h.setdefault("constants", {}).update(
+                            {p.name: p.si_value for p in params[:8]})
+                eq_count = sum(len((h or {}).get("equations") or []) for h in state.literature)
+                const_count = sum(len((h or {}).get("constants") or {}) for h in state.literature)
             contract_vars = sorted(
                 {str(k) for k in (getattr(bp, "variable_map", {}) or {})}
                 | {str(i.variable_name) for c in contracts for i in c.invariants})
@@ -1487,11 +1582,20 @@ class ResearchStateMachine:
         # (.cpp/.so/.dylib) and evict it from the bridge cache; verified
         # stages keep their artifacts.
         self.bridge.discard(cpp_code)
-        await emit("accelerator_log", "rollback", {
-            **tag, "scope": "stage_delta" if stage > 1 else "stage",
-            "preserved_layers": [layer.layer_id for layer in pinned_layers],
-            "failed_contract": failed.contract_id if failed else None,
-            "status": failed.status if failed else "ERROR"})
+        # Emit the rollback marker AT MOST ONCE per failed attempt: identical
+        # consecutive rollback signatures (same stage/scope/contract/status)
+        # are suppressed so the stream never dumps duplicate lines.
+        rb_key = (stage, "stage_delta" if stage > 1 else "stage",
+                  failed.contract_id if failed else None,
+                  failed.status if failed else "ERROR",
+                  tag.get("round"), tag.get("attempt"))
+        if getattr(self, "_last_rollback_key", None) != rb_key:
+            self._last_rollback_key = rb_key
+            await emit("accelerator_log", "rollback", {
+                **tag, "scope": "stage_delta" if stage > 1 else "stage",
+                "preserved_layers": [layer.layer_id for layer in pinned_layers],
+                "failed_contract": failed.contract_id if failed else None,
+                "status": failed.status if failed else "ERROR"})
         failure = (f"{failed.status} on {failed.contract_id}: {failed.failure_counterexample}"
                    if failed else "no results")
         return {"status": (failed.status.lower() if failed else "error"),
@@ -1620,10 +1724,23 @@ class ResearchStateMachine:
                      if (self.llm_fast is not None or self.llm_planner is not None)
                      else (None, 0))
         if llm is not None:
+            # Mathematical & Numerical Diagnosis Checklist: the healer must
+            # verify gradient consistency and fixed-point convergence instead
+            # of applying blind mutations (e.g. multiplying corrections by 0).
+            checklist = (
+                "DIAGNOSIS CHECKLIST: (1) Verify gradH/gradS are the EXACT "
+                "partial derivatives of H_energy/S_entropy (e.g. if H contains "
+                "+ c_v*s then dH/ds == c_v; if H is purely mechanical, ensure "
+                "<gradH, z[k+1]-z[k]> == 0 identically). (2) Verify the "
+                "discrete-gradient/implicit-midpoint update runs a fixed-point "
+                "iteration (e.g. for _ in range(12)) until convergence and "
+                "NEVER multiplies the correction by 0.0. (3) Preserve the "
+                "full current kernel source; only fix the diagnosed defect.\n\n")
             try:
                 refined = await refine_stage_code(
                     llm, objective=objective, code=candidate_code,
-                    contracts=[c.model_dump() for c in contracts], failure=failure)
+                    contracts=[c.model_dump() for c in contracts],
+                    failure=checklist + str(failure))
             except Exception as exc:  # noqa: BLE001
                 refined = None
                 await self._emit("goi_stream", "refine_error", {
@@ -1775,10 +1892,11 @@ class ResearchStateMachine:
                 contract.steps, entry, contract.timeout_seconds,
                 contract.max_memory_mb,
                 *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
+            diag = str(exc).replace("\n", " ")[:300]
             await self.emit_activity(
                 f"STAGE_{stage}_BUILD", "cabi_fallback",
                 "C-ABI compiler fallback -> executed verified deterministic "
-                "Python kernel in sandbox")
+                f"Python kernel in sandbox; compiler diagnostic: {diag}")
             return run
 
     async def _execute_contract(self, bp, uast, cpp_code, py_code, contract: VerificationContract,

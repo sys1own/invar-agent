@@ -93,6 +93,10 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
                 return {"type": "multi_binding", "names": names,
                         "values": [_lower_expr(v) for v in stmt.value.elts]}
             if not isinstance(stmt.value, (ast.Tuple, ast.List)):
+                if isinstance(stmt.value, ast.Call):
+                    # Call-site tuple unpacking: x, y, z = fn(...)
+                    return {"type": "tuple_unbind", "names": names,
+                            "value": _lower_expr(stmt.value)}
                 # Unpacking from an array/indexable: q, p, s = state
                 # -> q = state[0]; p = state[1]; s = state[2] (via temps).
                 value = _lower_expr(stmt.value)
@@ -108,6 +112,12 @@ def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
             return {"type": "binding", "target": lowered_target,
                     "value": _lower_expr(stmt.value)}
     if isinstance(stmt, ast.Return):
+        if isinstance(stmt.value, ast.Tuple):
+            # Multi-value return: return a, b, c -> UAST tuple node so
+            # emitters can lower it to std::tuple / std::make_tuple.
+            return {"type": "return",
+                    "value": {"type": "tuple",
+                              "elements": [_lower_expr(e) for e in stmt.value.elts]}}
         return {"type": "return",
                 "value": _lower_expr(stmt.value) if stmt.value is not None else None}
     if isinstance(stmt, ast.If):
@@ -249,8 +259,9 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
                     "fill": _lower_expr(elt.left.elts[0])}
         raise UnsupportedError("list comprehensions", node=expr)
     if isinstance(expr, (ast.Tuple, ast.List)):
-        # Tuple literals are lowered to the emitter's list/array dialect;
-        # indexing t[0] then works through the normal subscript node.
+        # Tuple/list literals are lowered to the emitter's list/array dialect;
+        # indexing t[0] then works through the normal subscript node. In
+        # return position the caller wraps them in a UAST ``tuple`` node.
         if any(isinstance(e, ast.Starred) for e in expr.elts):
             raise UnsupportedError("starred expressions", node=expr)
         return {"type": "list",

@@ -441,3 +441,131 @@ def test_tuple_kernel_compiles_with_clangxx(tmp_path):
         [compiler, "-O3", "-std=c++20", "-fsyntax-only", str(harness)],
         capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+# -- 8. C++20 multi-return tuple kernel (cabi_fallback == 0) ------------------
+MULTIRETURN_KERNEL = '''
+k0 = 1.0
+m_mass = 1.0
+c_v = 2.0
+beta = 0.1
+
+def H_energy(q, p, s):
+    return 0.5 * (q * q + p * p) / m_mass + c_v * s + beta * q * q * q * q
+
+def S_entropy(q, p, s):
+    return c_v * s
+
+def gradH(q, p, s):
+    dq = q / m_mass + 4.0 * beta * q * q * q
+    dp = p / m_mass
+    ds = c_v
+    return dq, dp, ds
+
+def gradS(q, p, s):
+    return 0.0, 0.0, c_v
+
+def dg_H(q0, q1, p0, p1, s0, s1):
+    gHq, gHp, gHs = gradH(0.5 * (q0 + q1), 0.5 * (p0 + p1), 0.5 * (s0 + s1))
+    return gHq * (q1 - q0) + gHp * (p1 - p0) + gHs * (s1 - s0)
+
+def simulation_step(buf, t, dt):
+    state = buf.data
+    q, p, s = state
+    q1 = q
+    p1 = p
+    s1 = s
+    for _ in range(12):
+        gHq, gHp, gHs = gradH(0.5 * (q + q1), 0.5 * (p + p1), 0.5 * (s + s1))
+        q_new = q - dt * gHq
+        p_new = p - dt * gHp
+        s_new = s - dt * gHs
+        diff = abs(q_new - q1) + abs(p_new - p1) + abs(s_new - s1)
+        q1 = q_new
+        p1 = p_new
+        s1 = s_new
+        if diff < 1e-10:
+            break
+    buf.data[0] = q1
+    buf.data[1] = p1
+    buf.data[2] = s1
+    return buf.data[0]
+'''
+
+
+def test_cpp20_multireturn_tuple_kernel_compiles_and_runs(tmp_path):
+    """gradH/gradS/dg_H returning 3-tuples must compile via cabi_bridge with
+    NO Python fallback (cabi_fallback == 0)."""
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge as CabiBridge
+    cpp = CppEmitter().emit_module(python_source_to_uast(MULTIRETURN_KERNEL))
+    assert "std::tuple<double, double, double>" in cpp
+    assert "std::make_tuple" in cpp
+    assert "std::get<" in cpp
+    bridge = CabiBridge(tmp_path / "cabi")
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+    run = bridge.run(cpp, [1.0, 0.5, 0.25], 0.01, 5, "execute_step", 30, 512)
+    assert run.get("fallback") != "python"
+    assert run.get("state") and all(v == v and abs(v) < 1e6 for v in run["state"][:3])
+
+
+# -- 9. LaTeX blacklist & ReferenceRegistry isolation --------------------------
+def test_latex_commands_and_registry_pollution_isolation():
+    from invar_agent.research.extractor import (
+        extract_parameters_from_text, registry_evidence)
+    prompt = (r"Verify that $\langle \bar{\nabla} H, z_{k+1} - z_k \rangle = 0$ "
+              r"holds with boundary condition M = 0 and n = 5 steps for the "
+              "metriplectic unsplit discrete gradient integrator.")
+    params = extract_parameters_from_text(prompt, source="user_prompt")
+    names = {p.name for p in params}
+    assert "rangle" not in names and "langle" not in names and "nabla" not in names
+    assert "m" not in names and "n" not in names
+    # Registry must NOT unlock on generic words ("discrete", "gradient",
+    # "metriplectic"): no aerospace/materials/finance/kinetics pollution.
+    _p, _e, benchmarks, _i, domains = registry_evidence(prompt)
+    banned = {"aerospace_entry", "materials_thermophysics", "discrete_finance",
+              "chemical_kinetics"}
+    assert not (set(domains) & banned), domains
+    blob = " ".join(str(b.get("name", "")) for b in benchmarks).lower()
+    for bad in ("tungsten", "pica", "black-scholes", "robertson", "sutton"):
+        assert bad not in blob
+
+
+# -- 10. best-attempt scoring + healing query word integrity --------------------
+def test_attempt_quality_score_prefers_finite_falsified():
+    from invar_agent.research.state_machine import _attempt_quality_score
+
+    class R:
+        def __init__(self, telemetry):
+            self.telemetry = telemetry
+            self.contract_id = "c1"
+    falsified = {"failed_status": "FALSIFIED"}
+    finite = [R({"first_nonfinite_step": -1, "max_relative_energy_drift": 0.9})]
+    diverged = {"failed_status": "DIVERGED"}
+    div = [R({"first_nonfinite_step": 39})]
+    assert _attempt_quality_score(falsified, finite) > _attempt_quality_score(diverged, div)
+    # Among DIVERGED attempts, surviving MORE steps ranks higher.
+    early = [R({"first_nonfinite_step": 39})]
+    late = [R({"first_nonfinite_step": 205})]
+    assert _attempt_quality_score(diverged, late) > _attempt_quality_score(diverged, early)
+
+
+def test_healing_search_queries_complete_words_max_five():
+    from invar_agent.research.state_machine import formulate_diagnostic_search_query
+
+    class BP:
+        falsifiable_hypothesis = ("A Cayley-projected unsplit discrete update "
+                                  "using a biorthogonal projected discrete-gradient "
+                                  "counterexample regime breakdown")
+        title = "unsplit_metriplectic_v1"
+        search_queries = ["metriplectic discrete gradient stability",
+                          "discrete gradient fixed point convergence"]
+    out = formulate_diagnostic_search_query(BP(), {"status": "FALSIFIED",
+                                                   "telemetry": {}, "counterexample": ""})
+    assert out
+    for q in out:
+        words = q.split()
+        assert len(words) <= 6  # topic (<=3) + failure-mode terms (<=3)
+        # No mid-word slicing artifacts: every word is a complete token.
+        assert all(w.isalpha() or "-" in w or "^" in w or "/" in w for w in words)
