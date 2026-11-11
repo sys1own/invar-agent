@@ -21,11 +21,14 @@ from pydantic import BaseModel, Field
 
 from invar_agent.config import (
     GENERIC_KEY_ENV,
+    INVAR_AGENT_ROOT,
     PROVIDER_KEY_ENVS,
     Tier,
     detect_llm_from_env,
+    default_project_workspace,
     load_persisted_state,
     persist_config,
+    resolve_project_workspace,
     resolve_tier_model,
 )
 from invar_agent.contracts import AgentStateStage, ASTSurgicalPatch, TaskWavefrontNode
@@ -137,9 +140,10 @@ class ResearchActionRequest(BaseModel):
 class ServerState:
     """Thread-safe server state: workspace, agent, latest run, overlay txs."""
 
-    def __init__(self, workspace_root: str | Path, provider_override: Optional[str] = None) -> None:
+    def __init__(self, workspace_root: str | Path | None, provider_override: Optional[str] = None) -> None:
         self.lock = threading.Lock()
-        self.workspace_root = Path(workspace_root)
+        self.workspace_root = resolve_project_workspace(workspace_root)
+        self.project_workspace_dir = self.workspace_root
         self.agent: Optional[VerifiedAutonomousAgent] = None
         self.router = CognitiveModelRouter(budget_guardrail=TokenBudgetGuardrail())
         self.last_report: Optional[AgentRunReport] = None
@@ -336,11 +340,85 @@ class ServerState:
 _STATE: Optional[ServerState] = None
 
 
-def get_state(workspace_root: str | Path = ".", provider: Optional[str] = None) -> ServerState:
+def get_state(workspace_root: str | Path | None = None, provider: Optional[str] = None) -> ServerState:
     global _STATE
     if _STATE is None:
         _STATE = ServerState(workspace_root, provider_override=provider)
     return _STATE
+
+
+_WORKSPACE_CLEAR_REPO_MARKERS = (".git", "pyproject.toml", "Cargo.toml", "invar_agent")
+_WORKSPACE_CLEAR_PROTECTED = {".invar", ".git", ".venv", ".gitignore"}
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    """True when ``child`` is ``parent`` or lives underneath it."""
+    return child == parent or parent in child.parents
+
+
+def _assert_workspace_clear_allowed(workspace: str | Path,
+                                    project_root: str | Path | None = None) -> Path:
+    """Return the resolved clear target or raise HTTP 400 for unsafe targets."""
+    raw = Path(workspace).expanduser()
+    if any(part == ".." for part in raw.parts):
+        raise HTTPException(
+            status_code=400,
+            detail="SecurityError: Cannot clear workspace. Target path contains '..' parent traversal.")
+    resolved = raw.resolve()
+    home = Path.home().resolve()
+    agent_package = INVAR_AGENT_ROOT / "invar_agent"
+    if resolved == Path("/") or _path_contains(resolved, home):
+        raise HTTPException(
+            status_code=400,
+            detail="SecurityError: Cannot clear protected system path.")
+    # Refuse the agent installation root, its package tree, and any ancestor
+    # directory that would recursively contain them (e.g. the parent ``repos``
+    # directory). The dedicated ``./workspace`` child remains allowed.
+    if (_path_contains(resolved, INVAR_AGENT_ROOT)
+            or _path_contains(resolved, agent_package)
+            or _path_contains(agent_package, resolved)):
+        raise HTTPException(
+            status_code=400,
+            detail="SecurityError: Cannot clear workspace. Target directory contains "
+                   "invar-agent repository source files.")
+    # Once a server has a dedicated project workspace, other directories inside
+    # the agent checkout (tests/, docs/, etc.) are still repository files.
+    allowed_project = (Path(project_root).expanduser().resolve()
+                       if project_root is not None else default_project_workspace().resolve())
+    if resolved != allowed_project and _path_contains(INVAR_AGENT_ROOT, resolved):
+        raise HTTPException(
+            status_code=400,
+            detail="SecurityError: Cannot clear workspace. Target directory contains "
+                   "invar-agent repository source files.")
+    for marker in _WORKSPACE_CLEAR_REPO_MARKERS:
+        if os.path.lexists(resolved / marker):
+            raise HTTPException(
+                status_code=400,
+                detail="SecurityError: Cannot clear workspace. Target directory contains "
+                       "invar-agent repository source files.")
+    return resolved
+
+
+def _clear_workspace_contents(workspace: str | Path,
+                              project_root: str | Path | None = None) -> list[str]:
+    """Delete workspace children while preserving vault/config/safety entries."""
+    workspace = _assert_workspace_clear_allowed(workspace, project_root=project_root)
+    cleared: list[str] = []
+    for entry in sorted(workspace.iterdir()):
+        if entry.name in _WORKSPACE_CLEAR_PROTECTED:
+            continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            cleared.append(entry.name)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.warning("Could not remove %s: %s", entry.name, exc)
+    scratch_dir = workspace / ".invar" / "scratch"
+    if scratch_dir.exists():
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+    return cleared
 
 
 def _resolved_tier_models(state: ServerState) -> dict[str, Optional[str]]:
@@ -412,7 +490,7 @@ async def _plan_llm_callable(state: ServerState, question: str,
     return resp.content if resp else None
 
 
-def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None) -> FastAPI:
+def create_app(workspace_root: str | Path | None = None, provider: Optional[str] = None) -> FastAPI:
     state = get_state(workspace_root, provider=provider)
     # Auto-migrate legacy research artifacts (research/, checkpoints/,
     # research_report.md, research/cabi scratch) into the Research Vault so
@@ -808,26 +886,11 @@ def create_app(workspace_root: str | Path = ".", provider: Optional[str] = None)
         """Safely wipe generated software files, preserving the Research Vault.
 
         Removes every workspace entry except ``.invar`` (research vault),
-        ``.git`` and ``.venv``, then clears compiler scratch under
+        ``.git``, ``.venv`` and ``.gitignore``, then clears compiler scratch under
         ``.invar/scratch`` without touching ``.invar/research_vault``.
         """
-        workspace = state.workspace_root
-        protected = {".invar", ".git", ".venv"}
-        cleared: list[str] = []
-        for entry in sorted(workspace.iterdir()):
-            if entry.name in protected:
-                continue
-            try:
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-                cleared.append(entry.name)
-            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
-                logger.warning("Could not remove %s: %s", entry.name, exc)
-        scratch_dir = workspace / ".invar" / "scratch"
-        if scratch_dir.exists():
-            shutil.rmtree(scratch_dir, ignore_errors=True)
+        cleared = _clear_workspace_contents(
+            state.workspace_root, project_root=state.project_workspace_dir)
         return {
             "status": "success",
             "message": "Workspace codebase cleared successfully.",

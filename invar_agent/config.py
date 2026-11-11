@@ -66,6 +66,32 @@ PROVIDER_ENV_VAR = "INVAR_LLM_PROVIDER"
 
 DEFAULT_CONFIG_PATH = Path.home() / ".invar-agent" / "config.json"
 
+# The installation/repo root is the directory that contains the ``invar_agent``
+# package. The target project workspace is deliberately separate from it.
+INVAR_AGENT_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_DIR_ENV = "INVAR_WORKSPACE_DIR"
+DEFAULT_PROJECT_WORKSPACE_NAME = "workspace"
+
+
+def default_project_workspace() -> Path:
+    """Default isolated project workspace (``./workspace`` under the cwd)."""
+    return Path.cwd() / DEFAULT_PROJECT_WORKSPACE_NAME
+
+
+def resolve_project_workspace(workspace: Optional[str | Path] = None) -> Path:
+    """Resolve the user project workspace, creating it when needed.
+
+    Precedence: explicit ``workspace`` argument, then ``INVAR_WORKSPACE_DIR``,
+    then ``./workspace``. The result is always absolute and never defaults to
+    the agent installation/repo root.
+    """
+    raw = workspace if workspace is not None else os.environ.get(WORKSPACE_DIR_ENV)
+    raw = str(raw).strip() if raw is not None else ""
+    path = Path(raw).expanduser() if raw else default_project_workspace()
+    resolved = path.resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
 
 def _tier_env_name(tier: str) -> str:
     return f"INVAR_LLM_TIER_{tier.upper()}"

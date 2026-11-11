@@ -39,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("--out", default=None)
 
     p_serve = sub.add_parser("serve", help="Launch the web console")
-    p_serve.add_argument("workspace", nargs="?", default=".")
+    p_serve.add_argument("workspace", nargs="?", default=None,
+                         help="Project workspace directory (default: $INVAR_WORKSPACE_DIR or ./workspace)")
+    p_serve.add_argument("--workspace-dir", dest="workspace_dir", default=None,
+                         help="Project workspace directory (overrides positional workspace and "
+                              "$INVAR_WORKSPACE_DIR)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--provider", default=None,
@@ -90,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from invar_agent.server import create_app
 
-        app = create_app(args.workspace, provider=args.provider)
+        app = create_app(args.workspace_dir or args.workspace, provider=args.provider)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 

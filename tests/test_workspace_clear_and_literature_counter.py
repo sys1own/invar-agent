@@ -6,9 +6,12 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from invar_agent import server
+from invar_agent.config import WORKSPACE_DIR_ENV, resolve_project_workspace
 from invar_agent.research.search import LiteratureResult
 from invar_agent.research.state_machine import ResearchRunState, ResearchStateMachine
 from invar_agent.research.vault import ResearchVaultManager
@@ -54,7 +57,7 @@ def test_clear_workspace_preserves_vault_and_cleans_codebase(tmp_path, monkeypat
     ws = tmp_path / "ws"
     (ws / "src").mkdir(parents=True)
     (ws / "src" / "main.rs").write_text("fn main() {}")
-    (ws / "Cargo.toml").write_text("[package]\nname='x'")
+    (ws / ".gitignore").write_text("*.pyc\n")
     (ws / "cpp_core").mkdir()
     (ws / "cpp_core" / "kernel.cpp").write_text("int main(){return 0;}")
     (ws / "tests").mkdir()
@@ -74,11 +77,13 @@ def test_clear_workspace_preserves_vault_and_cleans_codebase(tmp_path, monkeypat
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "success"
-    assert set(data["cleared_items"]) >= {"src", "Cargo.toml", "cpp_core", "tests", "hello.py"}
+    assert set(data["cleared_items"]) >= {"src", "cpp_core", "tests", "hello.py"}
+    assert ".gitignore" not in data["cleared_items"]
     assert ".invar/research_vault" in data["preserved"]
 
-    for gone in ("src", "Cargo.toml", "cpp_core", "tests", "hello.py"):
+    for gone in ("src", "cpp_core", "tests", "hello.py"):
         assert not (ws / gone).exists(), gone
+    assert (ws / ".gitignore").read_text() == "*.pyc\n"
     assert not (ws / ".invar" / "scratch").exists()
     assert (vault_run / "report.md").read_text() == "# report"
     assert json.loads((vault_run / "metadata.json").read_text())["run_id"] == "test_run"
@@ -88,6 +93,60 @@ def test_clear_workspace_preserves_vault_and_cleans_codebase(tmp_path, monkeypat
         not (files.get("tree") or files.get("files") or [])
     vault = client.get("/api/v1/research/vault").json()
     assert any(r.get("run_id") == "test_run" for r in vault.get("runs", []))
+
+
+def test_project_workspace_defaults_to_isolated_workspace(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(WORKSPACE_DIR_ENV, raising=False)
+    ws = resolve_project_workspace()
+    assert ws == (tmp_path / "workspace").resolve()
+    assert ws.is_dir()
+
+    monkeypatch.setenv(WORKSPACE_DIR_ENV, str(tmp_path / "env_ws"))
+    assert resolve_project_workspace() == (tmp_path / "env_ws").resolve()
+
+
+@pytest.mark.parametrize("marker", [".git", "pyproject.toml", "Cargo.toml", "invar_agent"])
+def test_workspace_clear_rejects_repository_markers(tmp_path, monkeypatch, marker):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "keep.txt").write_text("keep")
+    target = ws / marker
+    if marker in {".git", "invar_agent"}:
+        target.mkdir()
+    else:
+        target.write_text("marker")
+
+    monkeypatch.setattr(server, "_STATE", None)
+    client = TestClient(server.create_app(str(ws)))
+    resp = client.post("/api/v1/workspace/clear")
+
+    assert resp.status_code == 400
+    assert "SecurityError: Cannot clear workspace. Target directory contains " \
+           "invar-agent repository source files." in resp.json()["detail"]
+    assert (ws / "keep.txt").read_text() == "keep"
+    assert target.exists()
+
+
+@pytest.mark.parametrize("target", [Path("/"), Path.home()])
+def test_workspace_clear_guard_rejects_protected_system_paths(target):
+    with pytest.raises(HTTPException) as exc:
+        server._assert_workspace_clear_allowed(target)
+    assert exc.value.status_code == 400
+
+
+def test_workspace_clear_guard_rejects_parent_traversal(tmp_path):
+    with pytest.raises(HTTPException) as exc:
+        server._assert_workspace_clear_allowed(tmp_path / ".." / "escape")
+    assert exc.value.status_code == 400
+
+
+def test_workspace_clear_guard_rejects_agent_checkout_subdirectory():
+    project = server.INVAR_AGENT_ROOT / "workspace"
+    with pytest.raises(HTTPException) as exc:
+        server._assert_workspace_clear_allowed(server.INVAR_AGENT_ROOT / "tests",
+                                               project_root=project)
+    assert exc.value.status_code == 400
 
 
 def test_literature_count_propagation_in_state_machine(tmp_path):
