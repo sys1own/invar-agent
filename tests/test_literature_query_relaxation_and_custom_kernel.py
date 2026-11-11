@@ -887,3 +887,115 @@ def test_canonical_slots_and_report_variable_map_fallback():
     report = build_research_report(state)
     assert "trace_error_max" in report and "roundtrip_error" in report
     assert "variable_map empty" not in report
+
+
+# -- complex -> real Tier-0 lowering -----------------------------------------
+COMPLEX_RHO_KERNEL = '''
+import math
+
+
+def rho_from_bloch(rx, ry, rz):
+    r01 = 0.5 * (rx - 1j * ry)
+    r10 = 0.5 * (rx + 1j * ry)
+    conj = r01.conjugate()
+    mag = abs(conj)
+    r00 = 0.5 * (1.0 + rz) + 0.0 * mag
+    r11 = 0.5 * (1.0 - rz)
+    return r00, r01, r10, r11
+
+
+def simulation_step(buf, dt):
+    rx = buf.data[0]
+    ry = buf.data[1]
+    rz = buf.data[2]
+    r00, r01, r10, r11 = rho_from_bloch(rx, ry, rz)
+    coh_sq = (r01 * r10).real
+    mag = abs(r01)
+    purity = r00 * r00 + r11 * r11 + 2.0 * coh_sq
+    buf.data[3] = r01.real
+    buf.data[4] = r01.imag
+    buf.data[5] = purity + 0.0 * mag
+    return buf.data[5]
+'''
+
+
+def test_complex_rho_from_bloch_lowering_native_execution(tmp_path):
+    """`1j`/`.real`/`.imag`/`.conjugate()`/`abs()` must lower deterministically
+    and execute through C++20 C-ABI with no Python fallback."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge as CabiBridge
+
+    san = sanitize_intrinsics(COMPLEX_RHO_KERNEL)
+    assert san.changed
+    assert "1j" not in san.code and "cmath" not in san.code
+    assert "rho_from_bloch" not in san.code  # inlined, then pruned as dead
+    assert "r01__re" in san.code and "r01__im" in san.code
+
+    cpp = CppEmitter().emit_module(python_source_to_uast(san.code))
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+    bridge = CabiBridge(tmp_path / "cabi")
+    run = bridge.run(cpp, [0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                     dt=0.01, steps=1, entry="execute_step", isolated=True)
+    assert run.get("fallback") != "python"
+    assert run["finite"] is True
+    assert run["state"][3] == pytest.approx(0.3, abs=1e-15)
+    assert run["state"][4] == pytest.approx(-0.4, abs=1e-15)
+    assert run["state"][5] == pytest.approx(1.0, abs=1e-15)
+
+
+UNUSED_COMPLEX_HELPER_KERNEL = '''
+import cmath
+
+
+def rho_from_bloch(rx, ry, rz):
+    z = complex(rx, ry)
+    w = cmath.exp(1j * rz)
+    return 0.5 * (z + w.conjugate())
+
+
+def simulation_step(buf, dt):
+    buf.data[0] = 0.25 * buf.data[0] + 0.5
+    buf.data[1] = buf.data[0] * buf.data[0]
+    return buf.data[1]
+'''
+
+
+def test_unused_complex_helper_pruned_before_transpile(tmp_path):
+    """An uncalled helper containing `1j`/`complex()`/`cmath` must be pruned so
+    the remaining module transpiles and compiles with zero LLM calls."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.transpiler.frontend import python_source_to_uast
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge as CabiBridge
+
+    san = sanitize_intrinsics(UNUSED_COMPLEX_HELPER_KERNEL)
+    assert san.changed
+    assert "rho_from_bloch" not in san.code
+    assert "1j" not in san.code and "complex(" not in san.code and "cmath" not in san.code
+
+    cpp = CppEmitter().emit_module(python_source_to_uast(san.code))
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+    bridge = CabiBridge(tmp_path / "cabi")
+    run = bridge.run(cpp, [0.5, 0.0, 0.0, 0.0], dt=0.1, steps=2,
+                     entry="execute_step", isolated=True)
+    assert run.get("fallback") != "python"
+    assert run["finite"] is True
+    assert run["state"][1] == pytest.approx(run["state"][0] ** 2, abs=1e-15)
+
+
+def test_transpiler_complex_literal_last_resort_fallback():
+    """A stray complex constant reaching the frontend lowers to a float literal
+    instead of raising `cannot render literal 1j`."""
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    uast = python_source_to_uast(
+        "def simulation_step(buf, dt):\n"
+        "    buf.data[0] = 1j\n"
+        "    buf.data[1] = 0.5j\n")
+    children = uast["children"]
+    assert children and children[0]["type"] == "function_declaration"
+    bindings = [n for n in children[0]["body"] if n["type"] == "binding"]
+    assert bindings[0]["value"] == {"type": "literal", "value": 1.0}
+    assert bindings[1]["value"] == {"type": "literal", "value": 0.5}

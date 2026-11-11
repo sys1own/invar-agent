@@ -48,13 +48,17 @@ simultaneous assignment `x, v = x + dt * v, v - dt * x`; augmented assignment;
 `import math` and math.sqrt/sin/cos/tan/exp/log/pow/fabs/atan2/hypot/floor/...,
 math.pi/math.e; abs/min/max/int/float/len(buf.data)/len(local_list); intrinsics
 prng_uniform(seed, k) -> [0,1) (deterministic counter PRNG), clamp(x, lo, hi), sign(x).
+STRICT REAL-SCALAR RULE: NEVER use Python complex literals (`1j`), `complex()`, or `cmath`.
+Represent all complex quantities (such as off-diagonal density matrix coherences $\\rho_{01}$)
+strictly as separate real and imaginary `float` variables (`rho01_re`, `rho01_im`).
 Helper functions take scalars (and optionally `buf` as FIRST parameter) and return
 a float/int or nothing. Module-level scalar constants are allowed.
 FORBIDDEN (rejected by PreWrite_Guard / transpiler): classes/dataclasses,
 try/except, with, yield, async/await, lambda, nested functions/closures,
 global/nonlocal, tuples other than simultaneous assignment, dict/set, list
 comprehensions (except the 2-D idiom), strings, print, import of anything except
-math (no os/sys/socket/random/re/json/numpy), returning lists, passing lists to
+math (no os/sys/socket/random/re/json/numpy), complex literals/`complex()`/`cmath`,
+returning lists, passing lists to
 helpers, rebinding buf.data, attribute access other than buf.data/buf.size/buf.dt,
 `while True` without break.
 
@@ -279,7 +283,8 @@ You MUST NOT output Python, C++, or any source code. Output ONE strict JSON obje
 Allowed directive ops: INLINE_INTRINSIC {name}, GUARD_MATH_DOMAINS {eps},
 REWRITE_MONOTONE_DRIFT {slot,direction,before_var,after_var}, WRAP_SUBSTEP {substeps},
 SCALE_COEFFICIENT {var,factor}, CLAMP_STATE_NORM {slots,max_norm},
-BIND_SLOT_TO_VAR {slot,var}, STRIP_NONE_LITERALS {}, REPAIR_DRIFT_SELF_COMPARISON {slot,prev_slot}.
+BIND_SLOT_TO_VAR {slot,var}, STRIP_NONE_LITERALS {}, REPAIR_DRIFT_SELF_COMPARISON {slot,prev_slot},
+LOWER_COMPLEX_TO_REAL {}, PRUNE_UNUSED_HELPERS {}.
 No markdown fences. Output JSON only.
 
 Stage objective: {objective}

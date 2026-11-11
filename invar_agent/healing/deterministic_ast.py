@@ -8,6 +8,7 @@ it emits :class:`HealingDirective` dictionaries which are applied here.
 from __future__ import annotations
 
 import ast
+import copy
 import math
 import re
 from dataclasses import dataclass
@@ -140,6 +141,658 @@ def _strip_none_literals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     return tree, transformer.changed, sorted(transformer.notes)
+
+
+# -- deterministic complex -> real lowering ---------------------------------
+
+@dataclass
+class _ComplexValue:
+    re: ast.expr
+    im: ast.expr
+    complex_: bool = False
+
+    def copy(self) -> "_ComplexValue":
+        return _ComplexValue(copy.deepcopy(self.re), copy.deepcopy(self.im),
+                             self.complex_)
+
+
+class _ComplexScope:
+    def __init__(self, outer: Optional["_ComplexScope"] = None,
+                 funcs: Optional[Dict[str, ast.FunctionDef]] = None) -> None:
+        self.outer = outer
+        self.values: Dict[str, _ComplexValue] = {}
+        self.funcs = funcs if funcs is not None else (
+            outer.funcs if outer is not None else {})
+
+    def lookup(self, name: str) -> Optional[_ComplexValue]:
+        if name in self.values:
+            return self.values[name].copy()
+        if self.outer is not None:
+            return self.outer.lookup(name)
+        return None
+
+
+def _fconst(value: float) -> ast.Constant:
+    return ast.Constant(value=float(value))
+
+
+def _is_zero_expr(node: Optional[ast.AST]) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+        and not isinstance(node.value, bool) and float(node.value) == 0.0
+
+
+def _const_float(node: Optional[ast.AST]) -> Optional[float]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+            and not isinstance(node.value, bool):
+        return float(node.value)
+    return None
+
+
+def _mk_complex(re: ast.expr, im: ast.expr,
+                complex_: Optional[bool] = None) -> _ComplexValue:
+    re = copy.deepcopy(re)
+    im = copy.deepcopy(im)
+    is_complex = (not _is_zero_expr(im)) if complex_ is None else complex_
+    return _ComplexValue(re, im, bool(is_complex))
+
+
+def _real_expr(node: ast.expr) -> _ComplexValue:
+    return _mk_complex(copy.deepcopy(node), _fconst(0.0), False)
+
+
+def _math_call(name: str, *args: ast.expr) -> ast.Call:
+    return ast.Call(
+        func=ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()),
+                           attr=name, ctx=ast.Load()),
+        args=[copy.deepcopy(a) for a in args], keywords=[])
+
+
+def _name_load(name: str) -> ast.Name:
+    return ast.Name(id=name, ctx=ast.Load())
+
+
+def _binop_node(op: ast.operator, left: ast.expr, right: ast.expr) -> ast.BinOp:
+    return ast.BinOp(left=copy.deepcopy(left), op=op,
+                     right=copy.deepcopy(right))
+
+
+def _add_expr(a: ast.expr, b: ast.expr) -> ast.expr:
+    if _is_zero_expr(a):
+        return copy.deepcopy(b)
+    if _is_zero_expr(b):
+        return copy.deepcopy(a)
+    return _binop_node(ast.Add(), a, b)
+
+
+def _sub_expr(a: ast.expr, b: ast.expr) -> ast.expr:
+    if _is_zero_expr(b):
+        return copy.deepcopy(a)
+    if _is_zero_expr(a):
+        return ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(b))
+    return _binop_node(ast.Sub(), a, b)
+
+
+def _mul_expr(a: ast.expr, b: ast.expr) -> ast.expr:
+    if _is_zero_expr(a) or _is_zero_expr(b):
+        return _fconst(0.0)
+    if _const_float(a) == 1.0:
+        return copy.deepcopy(b)
+    if _const_float(b) == 1.0:
+        return copy.deepcopy(a)
+    return _binop_node(ast.Mult(), a, b)
+
+
+def _div_expr(a: ast.expr, b: ast.expr) -> ast.expr:
+    if _is_zero_expr(a):
+        return _fconst(0.0)
+    if _const_float(b) == 1.0:
+        return copy.deepcopy(a)
+    return _binop_node(ast.Div(), a, b)
+
+
+def _neg_expr(a: ast.expr) -> ast.expr:
+    if _is_zero_expr(a):
+        return copy.deepcopy(a)
+    return ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(a))
+
+
+def _complex_binop(op: ast.operator, a: _ComplexValue, b: _ComplexValue) -> _ComplexValue:
+    if isinstance(op, ast.Add):
+        return _mk_complex(_add_expr(a.re, b.re), _add_expr(a.im, b.im))
+    if isinstance(op, ast.Sub):
+        return _mk_complex(_sub_expr(a.re, b.re), _sub_expr(a.im, b.im))
+    if isinstance(op, ast.Mult):
+        re = _add_expr(_mul_expr(a.re, b.re), _neg_expr(_mul_expr(a.im, b.im)))
+        im = _add_expr(_mul_expr(a.re, b.im), _mul_expr(a.im, b.re))
+        return _mk_complex(re, im)
+    if isinstance(op, ast.Div):
+        den_re = _add_expr(_mul_expr(b.re, b.re), _mul_expr(b.im, b.im))
+        den = ast.Call(func=_name_load("max"),
+                       args=[den_re, _fconst(1e-300)], keywords=[])
+        re = _div_expr(_add_expr(_mul_expr(a.re, b.re),
+                                 _mul_expr(a.im, b.im)), den)
+        im = _div_expr(_sub_expr(_mul_expr(a.im, b.re),
+                                 _mul_expr(a.re, b.im)), den)
+        return _mk_complex(re, im)
+    if a.complex_ or b.complex_:
+        return _mk_complex(ast.Constant(value=0.0), ast.Constant(value=0.0), False)
+    return _real_expr(_binop_node(op, a.re, b.re))
+
+
+def _contains_complex_construct(node: ast.AST) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, complex):
+            return True
+        if isinstance(sub, ast.Call):
+            name = _call_name(sub.func)
+            if name == "complex" or (name or "").startswith("cmath."):
+                return True
+        if isinstance(sub, ast.Attribute) and sub.attr in {"real", "imag", "conjugate"}:
+            return True
+    return False
+
+
+def _simple_return_exprs(fn: ast.FunctionDef) -> Optional[List[ast.expr]]:
+    returns = [s for s in fn.body if isinstance(s, ast.Return)]
+    if len(returns) != 1:
+        return None
+    value = returns[0].value
+    if value is None:
+        return []
+    if isinstance(value, (ast.Tuple, ast.List)):
+        return list(value.elts)
+    return [value]
+
+
+def _inline_call_values(call: ast.Call, scope: _ComplexScope,
+                        depth: int = 0) -> Optional[List[_ComplexValue]]:
+    """Evaluate a pure single-return/tuple helper without emitting its body."""
+    if depth > 8 or call.keywords:
+        return None
+    if not isinstance(call.func, ast.Name):
+        return None
+    fn = scope.funcs.get(call.func.id)
+    if fn is None:
+        return None
+    returns = _simple_return_exprs(fn)
+    if returns is None:
+        return None
+    for stmt in fn.body:
+        if isinstance(stmt, (ast.If, ast.For, ast.While, ast.AsyncFor, ast.Try,
+                             ast.With, ast.Match, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            return None
+        if isinstance(stmt, ast.Expr) and not (
+                isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)):
+            return None
+    local = _ComplexScope(outer=scope)
+    params = [a.arg for a in fn.args.args]
+    for i, param in enumerate(params):
+        if i < len(call.args):
+            val = _decompose_expr(call.args[i], scope, depth + 1)
+        else:
+            val = _real_expr(_fconst(0.0))
+        if val is None:
+            return None
+        local.values[param] = val
+    for stmt in fn.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                and isinstance(stmt.targets[0], ast.Name):
+            val = _decompose_expr(stmt.value, local, depth + 1)
+            if val is None:
+                return None
+            local.values[stmt.targets[0].id] = val
+        elif isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom, ast.Return)):
+            continue
+        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+                and isinstance(stmt.value.value, str):
+            continue
+        else:
+            return None
+    out: List[_ComplexValue] = []
+    for expr in returns:
+        val = _decompose_expr(expr, local, depth + 1)
+        if val is None:
+            return None
+        out.append(val)
+    return out
+
+
+def _decompose_expr(node: ast.expr, scope: _ComplexScope,
+                    depth: int = 0) -> Optional[_ComplexValue]:
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, complex):
+            return _mk_complex(_fconst(value.real), _fconst(value.imag), True)
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return None
+        if isinstance(value, (int, float)):
+            return _real_expr(_fconst(value))
+        return None
+    if isinstance(node, ast.Name):
+        val = scope.lookup(node.id)
+        if val is not None:
+            return val
+        return _real_expr(_name_load(node.id))
+    if isinstance(node, ast.Attribute) and node.attr in {"real", "imag"}:
+        val = _decompose_expr(node.value, scope, depth)
+        if val is None:
+            return None
+        part = val.re if node.attr == "real" else val.im
+        return _real_expr(part)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub,
+                                                         ast.Mult, ast.Div)):
+        left = _decompose_expr(node.left, scope, depth)
+        right = _decompose_expr(node.right, scope, depth)
+        if left is None or right is None:
+            return None
+        return _complex_binop(node.op, left, right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        val = _decompose_expr(node.operand, scope, depth)
+        if val is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return val.copy()
+        return _mk_complex(_neg_expr(val.re), _neg_expr(val.im), val.complex_)
+    if isinstance(node, ast.Call):
+        return _decompose_call(node, scope, depth)
+    if _contains_complex_construct(node):
+        return None
+    return _real_expr(copy.deepcopy(node))
+
+
+def _decompose_call(node: ast.Call, scope: _ComplexScope,
+                    depth: int = 0) -> Optional[_ComplexValue]:
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" \
+            and not node.args:
+        val = _decompose_expr(node.func.value, scope, depth + 1)
+        if val is None:
+            return None
+        return _mk_complex(val.re, _neg_expr(val.im), val.complex_)
+    name = _call_name(node.func)
+    if name == "complex" and not node.keywords:
+        if not node.args or len(node.args) > 2:
+            return None
+        re = _decompose_expr(node.args[0], scope, depth + 1)
+        if re is None:
+            return None
+        if len(node.args) == 1:
+            return _mk_complex(re.re, _fconst(0.0), re.complex_)
+        im = _decompose_expr(node.args[1], scope, depth + 1)
+        if im is None:
+            return None
+        return _mk_complex(re.re, im.re, True)
+    if name in {"conj", "cmath.conj"} and len(node.args) == 1:
+        val = _decompose_expr(node.args[0], scope, depth + 1)
+        if val is None:
+            return None
+        return _mk_complex(val.re, _neg_expr(val.im), val.complex_)
+    if name == "abs" and len(node.args) == 1:
+        val = _decompose_expr(node.args[0], scope, depth + 1)
+        if val is None:
+            return None
+        if val.complex_:
+            sq = _add_expr(_mul_expr(val.re, val.re), _mul_expr(val.im, val.im))
+            return _real_expr(_math_call("sqrt", sq))
+        return _real_expr(ast.Call(func=_name_load("abs"),
+                                   args=[val.re], keywords=[]))
+    if name == "cmath.exp" and len(node.args) == 1:
+        val = _decompose_expr(node.args[0], scope, depth + 1)
+        if val is None:
+            return None
+        if not val.complex_:
+            return _real_expr(_math_call("exp", val.re))
+        e = _math_call("exp", val.re)
+        re = _mul_expr(e, _math_call("cos", val.im))
+        im = _mul_expr(copy.deepcopy(e), _math_call("sin", val.im))
+        return _mk_complex(re, im, True)
+    if name in {"cmath.sqrt", "cmath.sin", "cmath.cos"} and len(node.args) == 1:
+        val = _decompose_expr(node.args[0], scope, depth + 1)
+        if val is None:
+            return None
+        return _real_expr(_math_call(name.rsplit(".", 1)[1], val.re))
+    inlined = _inline_call_values(node, scope, depth)
+    if inlined is not None and len(inlined) == 1 and inlined[0].complex_:
+        return inlined[0]
+    if _contains_complex_construct(node):
+        return None
+    return _real_expr(copy.deepcopy(node))
+
+
+def _complex_target_name(target: ast.expr, suffix: str) -> Optional[str]:
+    if isinstance(target, ast.Name):
+        return f"{target.id}{suffix}"
+    return None
+
+
+def _assign_stmt(target: ast.expr, value: ast.expr) -> ast.Assign:
+    return ast.Assign(targets=[copy.deepcopy(target)],
+                      value=copy.deepcopy(value))
+
+
+def _expr_references_complex(node: ast.AST, scope: _ComplexScope) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+            val = scope.lookup(sub.id)
+            if val is not None and val.complex_:
+                return True
+    return False
+
+
+def _needs_complex_lowering(node: ast.AST, scope: _ComplexScope) -> bool:
+    return _contains_complex_construct(node) or _expr_references_complex(node, scope)
+
+
+class _ComplexLoweringTransformer(ast.NodeTransformer):
+    def __init__(self, funcs: Dict[str, ast.FunctionDef]) -> None:
+        self.funcs = {name: copy.deepcopy(fn) for name, fn in funcs.items()}
+        self.notes: set[str] = set()
+        self.changed = False
+        self.generated_math = False
+        self._scopes: List[_ComplexScope] = [_ComplexScope(funcs=self.funcs)]
+
+    @property
+    def scope(self) -> _ComplexScope:
+        return self._scopes[-1]
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self._scopes.append(_ComplexScope(outer=self._scopes[-1], funcs=self.funcs))
+        try:
+            self.generic_visit(node)
+        finally:
+            self._scopes.pop()
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Import(self, node: ast.Import) -> ast.AST:
+        changed = False
+        for alias in node.names:
+            if alias.name == "cmath":
+                alias.name = "math"
+                alias.asname = None if alias.asname in {None, "cmath"} else alias.asname
+                changed = True
+        if changed:
+            self.changed = True
+            self.notes.add("import cmath lowered to math")
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
+        if node.module == "cmath":
+            node.module = "math"
+            self.changed = True
+            self.notes.add("from cmath lowered to math")
+        return node
+
+    def _set_scope_value(self, name: str, val: _ComplexValue,
+                         re_name: Optional[str] = None,
+                         im_name: Optional[str] = None) -> None:
+        if val.complex_ and re_name and im_name:
+            self.scope.values[name] = _ComplexValue(_name_load(re_name),
+                                                    _name_load(im_name), True)
+        elif val.complex_:
+            self.scope.values[name] = val.copy()
+        else:
+            self.scope.values[name] = _real_expr(_name_load(name))
+
+    def _emit_complex_assignment(self, target: ast.Name,
+                                 val: _ComplexValue) -> List[ast.stmt]:
+        re_name = f"{target.id}__re"
+        im_name = f"{target.id}__im"
+        out = [
+            _assign_stmt(ast.Name(id=re_name, ctx=ast.Store()), val.re),
+            _assign_stmt(ast.Name(id=im_name, ctx=ast.Store()), val.im),
+        ]
+        self._set_scope_value(target.id, val, re_name, im_name)
+        return out
+
+    def _lower_assign_value(self, stmt: ast.Assign) -> Optional[List[ast.stmt]]:
+        if len(stmt.targets) != 1:
+            return None
+        target = stmt.targets[0]
+        value = stmt.value
+        if isinstance(target, (ast.Tuple, ast.List)):
+            if not (all(isinstance(e, ast.Name) for e in target.elts)
+                    and isinstance(value, ast.Call)):
+                return None
+            vals = _inline_call_values(value, self.scope)
+            if vals is not None and len(vals) == len(target.elts) \
+                    and any(v.complex_ for v in vals):
+                out: List[ast.stmt] = []
+                for elt, val in zip(target.elts, vals):
+                    if val.complex_:
+                        out.extend(self._emit_complex_assignment(elt, val))
+                    else:
+                        out.append(_assign_stmt(elt, val.re))
+                        self._set_scope_value(elt.id, val)
+                self.changed = True
+                self.notes.add("LOWER_COMPLEX_TO_REAL")
+                return out
+            return None
+        val = _decompose_expr(value, self.scope)
+        if val is None:
+            return None
+        needs = _needs_complex_lowering(value, self.scope)
+        if isinstance(target, ast.Name):
+            stale_complex = target.id in self.scope.values \
+                and self.scope.values[target.id].complex_
+            if val.complex_:
+                out = self._emit_complex_assignment(target, val)
+                self.changed = True
+                self.notes.add("LOWER_COMPLEX_TO_REAL")
+                return out
+            if needs or stale_complex:
+                out = [_assign_stmt(target, val.re)]
+                self._set_scope_value(target.id, val)
+                self.changed = True
+                self.notes.add("LOWER_COMPLEX_TO_REAL")
+                return out
+            return None
+        # buf.data[k] / attribute targets are scalar sinks: keep the real part.
+        if not (val.complex_ or needs):
+            return None
+        if val.complex_:
+            self.notes.add("complex value lowered to real part at scalar sink")
+        self.changed = True
+        self.notes.add("LOWER_COMPLEX_TO_REAL")
+        return [_assign_stmt(target, val.re)]
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        lowered = self._lower_assign_value(node)
+        if lowered is not None:
+            return lowered
+        self.generic_visit(node)
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        if isinstance(node.target, ast.Name):
+            target_val = self.scope.lookup(node.target.id)
+            rhs = _decompose_expr(node.value, self.scope)
+            if rhs is not None and ((target_val is not None and target_val.complex_)
+                                    or rhs.complex_):
+                if target_val is None:
+                    target_val = _real_expr(_name_load(node.target.id))
+                re_name = f"{node.target.id}__re"
+                im_name = f"{node.target.id}__im"
+                op = node.op
+                re_expr = _complex_binop(op, target_val, rhs).re
+                im_expr = _complex_binop(op, target_val, rhs).im
+                self.scope.values[node.target.id] = _ComplexValue(
+                    _name_load(re_name), _name_load(im_name), True)
+                self.changed = True
+                self.notes.add("LOWER_COMPLEX_TO_REAL")
+                return [
+                    ast.Assign(targets=[ast.Name(id=re_name, ctx=ast.Store())],
+                               value=re_expr),
+                    ast.Assign(targets=[ast.Name(id=im_name, ctx=ast.Store())],
+                               value=im_expr),
+                ]
+        self.generic_visit(node)
+        return node
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        if node.value is None:
+            return node
+        if isinstance(node.value, (ast.Tuple, ast.List)):
+            vals = [_decompose_expr(e, self.scope) for e in node.value.elts]
+            if all(v is not None for v in vals):
+                assert all(v is not None for v in vals)
+                needs = any(v.complex_ or _needs_complex_lowering(e, self.scope)
+                            for e, v in zip(node.value.elts, vals))
+                if not needs:
+                    return node
+                any_complex = any(v.complex_ for v in vals)
+                if any_complex:
+                    flat: List[ast.expr] = []
+                    for val in vals:
+                        assert val is not None
+                        flat.append(val.re)
+                        if val.complex_:
+                            flat.append(val.im)
+                    node.value = ast.Tuple(elts=flat, ctx=ast.Load())
+                else:
+                    node.value = ast.Tuple(elts=[v.re for v in vals if v is not None],
+                                           ctx=ast.Load())
+                self.changed = True
+                self.notes.add("LOWER_COMPLEX_TO_REAL")
+                return node
+            self.generic_visit(node)
+            return node
+        val = _decompose_expr(node.value, self.scope)
+        if val is not None and (val.complex_
+                                or _needs_complex_lowering(node.value, self.scope)):
+            node.value = val.re
+            if val.complex_:
+                self.notes.add("complex return lowered to real part")
+            self.changed = True
+            self.notes.add("LOWER_COMPLEX_TO_REAL")
+            return node
+        self.generic_visit(node)
+        return node
+
+
+def _function_call_names(fn: ast.FunctionDef, names: set[str]) -> set[str]:
+    out: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            name = _call_name(node.func)
+            if name in names:
+                out.add(name)
+    return out
+
+
+def _dead_assignments_in_function(fn: ast.FunctionDef) -> Tuple[ast.FunctionDef, bool]:
+    loaded = {n.id for n in ast.walk(fn)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+    class _Dead(ast.NodeTransformer):
+        def __init__(self) -> None:
+            self.changed = False
+
+        def visit_Assign(self, node: ast.Assign) -> ast.AST:
+            self.generic_visit(node)
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                pure = not any(isinstance(n, ast.Call) for n in ast.walk(node.value))
+                if name not in loaded and pure:
+                    self.changed = True
+                    return None  # type: ignore[return-value]
+            return node
+
+    transformer = _Dead()
+    new_fn = transformer.visit(fn)
+    return new_fn, transformer.changed
+
+
+def _prune_helpers_tree(tree: ast.Module,
+                        entrypoints: Sequence[str] = ("simulation_step",)
+                        ) -> Tuple[ast.Module, bool, List[str]]:
+    notes: List[str] = []
+    funcs = [n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    changed = False
+    if funcs:
+        names = {f.name for f in funcs}
+        calls = {f.name: _function_call_names(f, names) for f in funcs}
+        roots = [e for e in entrypoints if e in names]
+        if roots:
+            live = set(roots)
+            stack = list(roots)
+            while stack:
+                cur = stack.pop()
+                for nxt in calls.get(cur, set()):
+                    if nxt not in live:
+                        live.add(nxt)
+                        stack.append(nxt)
+            kept = []
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and node.name not in live:
+                    changed = True
+                    notes.append(f"PRUNE_UNUSED_HELPERS({node.name})")
+                    continue
+                kept.append(node)
+            tree.body = kept
+    for node in list(tree.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            new_node, node_changed = _dead_assignments_in_function(node)
+            if node_changed:
+                changed = True
+                notes.append(f"PRUNE_UNUSED_HELPERS(dead assignments in {node.name})")
+            tree.body[tree.body.index(node)] = new_node
+    ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
+def _lower_complex_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    notes: List[str] = []
+    changed = False
+    tree, p_changed, p_notes = _prune_helpers_tree(tree)
+    changed |= p_changed
+    notes.extend(p_notes)
+    funcs = {n.name: n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    transformer = _ComplexLoweringTransformer(funcs)
+    tree = transformer.visit(tree)
+    ast.fix_missing_locations(tree)
+    if transformer.changed:
+        changed = True
+        notes.extend(sorted(transformer.notes))
+    if transformer.generated_math or any(n == "LOWER_COMPLEX_TO_REAL" for n in notes):
+        if _ensure_math_import(tree):
+            notes.append("injected import math")
+            changed = True
+    tree, q_changed, q_notes = _prune_helpers_tree(tree)
+    changed |= q_changed
+    notes.extend(q_notes)
+    return tree, changed, sorted(set(notes))
+
+
+def lower_complex_to_real(code: str) -> SanitizerResult:
+    """Public Tier-0 entry point for ``LOWER_COMPLEX_TO_REAL`` directives."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    tree, changed, notes = _lower_complex_tree(tree)
+    if not changed:
+        return SanitizerResult(code, [], False)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+
+
+def prune_unused_helpers(code: str,
+                         entrypoints: Sequence[str] = ("simulation_step",)
+                         ) -> SanitizerResult:
+    """Public Tier-0 entry point for ``PRUNE_UNUSED_HELPERS`` directives."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    tree, changed, notes = _prune_helpers_tree(tree, entrypoints)
+    if not changed:
+        return SanitizerResult(code, [], False)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
 
 
 def _ensure_math_import(tree: ast.Module) -> bool:
@@ -297,14 +950,15 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     tree, none_changed, none_notes = _strip_none_literals_tree(tree)
+    tree, complex_changed, complex_notes = _lower_complex_tree(tree)
     transformer = _IntrinsicTransformer()
     transformer.defined = _defined_names(tree)
     transformer.guard_eps = float(eps)
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(none_notes) | set(transformer.notes))
-    if none_changed:
+    notes = sorted(set(none_notes) | set(complex_notes) | set(transformer.notes))
+    if none_changed or complex_changed:
         changed = True
     if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
         if _ensure_math_import(tree):
@@ -775,6 +1429,16 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
                 if rw.changed:
                     tree = ast.parse(rw.code)
                     notes.extend(rw.notes)
+        elif op == "LOWER_COMPLEX_TO_REAL":
+            lowered = lower_complex_to_real(ast.unparse(tree) + "\n")
+            if lowered.changed:
+                tree = ast.parse(lowered.code)
+                notes.append("LOWER_COMPLEX_TO_REAL")
+        elif op == "PRUNE_UNUSED_HELPERS":
+            pruned = prune_unused_helpers(ast.unparse(tree) + "\n")
+            if pruned.changed:
+                tree = ast.parse(pruned.code)
+                notes.append("PRUNE_UNUSED_HELPERS")
         elif op == "STRIP_NONE_LITERALS":
             stripped = strip_none_literals(ast.unparse(tree) + "\n")
             if stripped.changed:
@@ -812,6 +1476,7 @@ __all__ = [
     "SanitizerResult", "sanitize_intrinsics", "rewrite_monotone_drift",
     "infer_monotone_drift_directives", "apply_healing_directives",
     "strip_none_literals", "numeric_expr_equivalent",
+    "lower_complex_to_real", "prune_unused_helpers",
     "repair_drift_self_comparison", "infer_drift_self_comparison_directives",
     "MATH_FUNCS", "INTRINSIC_ALIASES",
 ]

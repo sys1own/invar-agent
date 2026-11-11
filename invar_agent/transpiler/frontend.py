@@ -195,6 +195,12 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
     if isinstance(expr, (ast.Await, ast.Yield, ast.YieldFrom)):
         raise UnsupportedError("async/yield expressions", node=expr)
     if isinstance(expr, ast.Constant):
+        # Last-resort complex fallback: Tier-0 should have lowered complex
+        # arithmetic already, but never crash on a stray ``1j`` literal.
+        if isinstance(expr.value, complex):
+            value = expr.value
+            return {"type": "literal",
+                    "value": float(value.real if value.real != 0.0 else value.imag)}
         # Python ``None`` is not a numeric literal.  Return-position ``None``
         # is handled by the statement lowering above; every expression use is
         # scalarized so emitters never see an unsupported ``None`` literal.
