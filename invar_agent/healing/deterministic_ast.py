@@ -1505,6 +1505,14 @@ def _contract_state_slots(contract: Any) -> List[int]:
     return sorted(set(slots))
 
 
+_STAGE_INDEX_RE = re.compile(r"^(?:c|stage)(\d+)[_-]", re.IGNORECASE)
+
+
+def _contract_stage_index(contract_id: str) -> int:
+    m = _STAGE_INDEX_RE.match(contract_id or "")
+    return int(m.group(1)) if m else 1
+
+
 def _assigned_state_slots(tree: ast.Module) -> set[int]:
     slots: set[int] = set()
     for node in ast.walk(tree):
@@ -1887,6 +1895,13 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, none_changed, none_notes = _strip_none_literals_tree(tree)
     tree, complex_changed, complex_notes = _lower_complex_tree(tree)
     tree, history_changed, history_notes = _repair_history_slots_tree(tree)
+    tree, sdiv_changed, sdiv_notes = _lower_safe_division_tree(tree)
+    tree, unify_changed, unify_notes = _unify_concept_slots_tree(tree, bridge_contracts)
+    tree, concept_changed, concept_notes = _bridge_unassigned_concept_slots_tree(
+        tree, bridge_contracts)
+    tree, cons_changed, cons_notes = _enforce_conservation_projection_tree(
+        tree, bridge_contracts)
+    tree, lyap_changed, lyap_notes = _enforce_lyapunov_sign_tree(tree, bridge_contracts)
     tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, contracts)
     tree, diss_changed, diss_notes = _seed_dissipation_parameters_tree(tree, contracts)
     transformer = _IntrinsicTransformer()
@@ -1897,9 +1912,13 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
     notes = sorted(set(alias_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
+                   | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
+                   | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
     if (alias_changed or bridge_changed or monotone_changed or none_changed
-            or complex_changed or history_changed or param_changed or diss_changed):
+            or complex_changed or history_changed or sdiv_changed or unify_changed
+            or concept_changed or cons_changed or lyap_changed
+            or param_changed or diss_changed):
         changed = True
     if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
         if _ensure_math_import(tree):
@@ -2358,6 +2377,14 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
                 if rw.changed:
                     tree = ast.parse(rw.code)
                     notes.extend(rw.notes)
+        elif op in {"ENFORCE_CONSERVATION_PROJECTION", "ENFORCE_LYAPUNOV_SIGN",
+                    "REWRITE_MONOTONE_DRIFT_CONCEPT", "LOWER_SAFE_DIVISION",
+                    "UNIFY_CONCEPT_SLOTS", "BRIDGE_UNASSIGNED_SLOTS"}:
+            text = ast.unparse(tree) + "\n"
+            rw = _apply_physics_guard_pass(op, text, contracts)
+            if rw.changed:
+                tree = ast.parse(rw.code)
+                notes.extend(rw.notes or [op])
         elif op == "WRAP_SUBSTEP":
             if _wrap_substep(tree, int(raw.get("substeps", 1) or 1)):
                 notes.append(f"WRAP_SUBSTEP({int(raw.get('substeps', 1) or 1)})")
@@ -2417,11 +2444,716 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
     return SanitizerResult(out if changed else code, sorted(set(notes)), changed)
 
 
+# -- Tier-0 universal physics guards ------------------------------------------
+#
+# The passes below are domain-agnostic: they key off the *shape* of the kernel
+# (paired ``<fn>(new...)`` / ``<fn>(old...)`` invariant evaluations feeding a
+# bounded state slot) rather than any specific equation, so they apply to
+# Hamiltonian/metriplectic, quantum, PDE-lattice and kinetic kernels alike.
+
+_SAFE_DIV_HELPER = "_invar_sdiv"
+_SAFE_DIV_SRC = (
+    "def _invar_sdiv(a, b):\n"
+    "    if b >= 0.0 and b < 1e-30:\n"
+    "        return a / 1e-30\n"
+    "    if b < 0.0 and b > -1e-30:\n"
+    "        return a / (-1e-30)\n"
+    "    return a / b\n"
+)
+
+def _module_level_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _call_key(call: ast.Call) -> Optional[Tuple[str, int]]:
+    """``(function name, arity)`` for a plain ``name(...)`` call, else None."""
+    if call.keywords or not isinstance(call.func, ast.Name):
+        return None
+    return call.func.id, len(call.args)
+
+
+def _assign_pairs(fn: ast.FunctionDef, body: List[ast.stmt]
+                  ) -> Dict[str, Tuple[str, ast.Call]]:
+    """Map ``var -> (fn_name, call)`` for simple ``var = fn(args...)`` assigns."""
+    out: Dict[str, Tuple[str, ast.Call]] = {}
+    for stmt in body:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 \
+                or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        value = stmt.value
+        if not isinstance(value, ast.Call):
+            continue
+        key = _call_key(value)
+        if key is None:
+            continue
+        out[stmt.targets[0].id] = (key[0], value)
+    return out
+
+
+def _abs_diff_pair(node: ast.AST) -> Optional[Tuple[str, str]]:
+    """``abs(a - b)`` -> ``(a, b)`` when both sides are plain names."""
+    if not isinstance(node, ast.Call) or len(node.args) != 1:
+        return None
+    name = _call_name(node.func)
+    if name not in {"abs", "math.fabs"}:
+        return None
+    arg = node.args[0]
+    if not isinstance(arg, ast.BinOp) or not isinstance(arg.op, ast.Sub):
+        return None
+    if not isinstance(arg.left, ast.Name) or not isinstance(arg.right, ast.Name):
+        return None
+    return arg.left.id, arg.right.id
+
+
+def _call_arg_name(arg: ast.expr) -> Optional[str]:
+    return arg.id if isinstance(arg, ast.Name) else None
+
+
+def _expr_refs_names(node: ast.AST, names: set) -> bool:
+    """True when ``node`` references any name in ``names``."""
+    if not names:
+        return False
+    wanted = set(names)
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id in wanted:
+            return True
+    return False
+
+
+def _indirect_names(body: List[ast.stmt], predicate) -> set:
+    """Names assigned (top-level) from an expression satisfying ``predicate``."""
+    out: set = set()
+    for stmt in body:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 \
+                or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if predicate(stmt.value):
+            out.add(stmt.targets[0].id)
+    return out
+
+
+def _slot_write_references(stmt: ast.stmt, names: set,
+                           gates: Dict[int, List[Tuple[str, float]]]
+                           ) -> Optional[int]:
+    """First gated slot written anywhere in ``stmt`` whose value references ``names``."""
+    for node in ast.walk(stmt):
+        targets: List[ast.AST] = []
+        value: Optional[ast.AST] = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+            value = node.value
+        if value is None or not _expr_refs_names(value, names):
+            continue
+        for tgt in targets:
+            slot = _state_subscript_slot(tgt)
+            if slot is not None and slot in gates:
+                return slot
+    return None
+
+
+def _matching_new_old(pairs: Dict[str, Tuple[str, ast.Call]],
+                      new_var: str, old_var: str
+                      ) -> Optional[Tuple[str, List[str], List[str], List[str]]]:
+    """Match ``new = fn(new_args)`` with ``old = fn(old_args)``.
+
+    Returns ``(fn_name, new_args, old_args, evolving_indices)`` where the
+    evolving indices are the argument positions whose new/old names differ.
+    """
+    if new_var not in pairs or old_var not in pairs:
+        return None
+    fn_new, call_new = pairs[new_var]
+    fn_old, call_old = pairs[old_var]
+    if fn_new != fn_old or len(call_new.args) != len(call_old.args):
+        return None
+    if len(call_new.args) < 1 or len(call_new.args) > 6:
+        return None
+    evolving_idx: List[int] = []
+    for pos, (a_new, a_old) in enumerate(zip(call_new.args, call_old.args)):
+        n_new, n_old = _call_arg_name(a_new), _call_arg_name(a_old)
+        if n_new is None or n_old is None:
+            return None
+        if n_new != n_old:
+            evolving_idx.append(pos)
+    if not (1 <= len(evolving_idx) <= 3):
+        return None
+    return fn_new, [_call_arg_name(a) or "" for a in call_new.args], \
+        [_call_arg_name(a) or "" for a in call_old.args], evolving_idx
+
+
+def _contract_slot_gates(contracts: Sequence[Any]) -> Dict[int, List[Tuple[str, float]]]:
+    """``slot -> [(direction, tolerance)]`` for machine-precision slot bounds."""
+    gates: Dict[int, List[Tuple[str, float]]] = {}
+    for contract in contracts or []:
+        for _name, assertion, tolerance in _contract_invariant_items(contract):
+            direction = _bound_direction(assertion)
+            if direction not in {"le", "ge"}:
+                continue
+            try:
+                tol = float(tolerance)
+            except (TypeError, ValueError):
+                tol = 1e-6
+            if abs(tol) > 1e-6:
+                continue
+            for slot in _contract_state_slots_from_text(assertion):
+                gates.setdefault(slot, []).append((direction, tol))
+    return gates
+
+
+def _projection_block(fn_name: str, new_var: str, old_var: str,
+                      new_args: Sequence[str], old_args: Sequence[str],
+                      evolving_idx: Sequence[int]) -> List[ast.stmt]:
+    """Build the 4-iteration finite-difference manifold projection block.
+
+    Only the ``evolving_idx`` argument positions (the ones whose new/old names
+    differ) are projected; every other argument (parameters, fixed state) is
+    passed through unchanged so the call arity matches the matched invariant.
+    The target level set is ``fn_name(old_args)`` evaluated directly, so it
+    never depends on ``old_var`` being assigned before this block.
+    """
+    base = [str(a) for a in new_args]
+    old_call = f"{fn_name}({', '.join(str(a) for a in old_args)})"
+
+    def _call(perturb: Optional[Tuple[int, str]] = None) -> str:
+        parts = list(base)
+        if perturb is not None:
+            idx, expr = perturb
+            parts[idx] = expr
+        return f"{fn_name}({', '.join(parts)})"
+
+    lines = [f"_H_target_proj = {old_call}"]
+    lines.append("for _proj_it in range(4):")
+    lines.append(f"    _H_cur_proj = {_call()}")
+    lines.append("    _H_err_proj = _H_cur_proj - _H_target_proj")
+    lines.append("    if abs(_H_err_proj) <= 1e-15:")
+    lines.append("        break")
+    lines.append("    _eps_proj = 1e-8")
+    grad_parts = []
+    for g, idx in enumerate(evolving_idx):
+        arg = base[idx]
+        grad_parts.append(
+            f"_g{g}_proj = ({_call((idx, f'({arg} + _eps_proj)'))} - _H_cur_proj) / _eps_proj")
+    lines.extend("    " + g for g in grad_parts)
+    norm = " + ".join(f"_g{g}_proj * _g{g}_proj" for g in range(len(evolving_idx)))
+    lines.append(f"    _gn2_proj = {norm}")
+    lines.append("    if _gn2_proj > 1e-30:")
+    for g, idx in enumerate(evolving_idx):
+        arg = base[idx]
+        lines.append(
+            f"        {arg} = {arg} - (_H_err_proj / _gn2_proj) * _g{g}_proj")
+    src = "\n".join(lines) + "\n"
+    block = ast.parse(src).body
+    ast.fix_missing_locations(block[0])
+    return block
+
+
+def _enforce_conservation_projection_tree(
+        tree: ast.Module, contracts: Sequence[Any]
+        ) -> Tuple[ast.Module, bool, List[str]]:
+    """Project updated state onto the conserved level set before drift eval."""
+    gates = _contract_slot_gates(contracts)
+    if not gates:
+        return tree, False, []
+    notes: List[str] = []
+    changed = False
+    for fn in _simulation_functions(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        body = fn.body
+        pairs = _assign_pairs(fn, body)
+        for idx, stmt in enumerate(body):
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 \
+                    or not isinstance(stmt.targets[0], ast.Name):
+                continue
+            new_var = stmt.targets[0].id
+            if not (new_var.endswith("_new") or new_var.endswith("new")
+                    or new_var.endswith("1")):
+                continue
+            # Look for the matching ``*_old`` assignment and a drift slot write.
+            old_var = None
+            for cand in (new_var[:-4] + "_old" if new_var.endswith("_new") else None,
+                         new_var[:-3] + "_old" if new_var.endswith("new") else None,
+                         new_var[:-1] + "_old" if new_var.endswith("1") else None):
+                if cand and cand in pairs:
+                    old_var = cand
+                    break
+            if old_var is None:
+                continue
+            match = _matching_new_old(pairs, new_var, old_var)
+            if match is None:
+                continue
+            fn_name, new_args, old_args, evolving_idx = match
+            # The drift of these two values must feed a tightly bounded slot,
+            # either directly (``state[k] = abs(H_new - H_old)``) or through an
+            # intermediate (``drift = abs(...); if drift > state[k]: ...``).
+            pair_names = {new_var, old_var}
+            indirect = _indirect_names(body, lambda v: bool(
+                _abs_diff_pair(v) and set(_abs_diff_pair(v)) == pair_names))
+            drift_slot = None
+            for later in body[idx + 1:]:
+                drift_slot = _slot_write_references(later, pair_names | indirect, gates)
+                if drift_slot is not None:
+                    break
+            if drift_slot is None:
+                continue
+            evolving_names = [new_args[i] for i in evolving_idx]
+            block = _projection_block(fn_name, new_var, old_var, new_args,
+                                      old_args, evolving_idx)
+            body[idx:idx] = block
+            ast.fix_missing_locations(fn)
+            changed = True
+            notes.append(
+                f"ENFORCE_CONSERVATION_PROJECTION: projected {evolving_names} onto "
+                f"{fn_name}(...) level set before state[{drift_slot}] drift eval")
+            # Stop here: the inserted block re-assigns ``H_new`` and would
+            # otherwise re-match on the next iteration (infinite loop).
+            break
+        if changed:
+            break
+    return tree, changed, notes
+
+
+def _enforce_lyapunov_sign_tree(
+        tree: ast.Module, contracts: Sequence[Any]
+        ) -> Tuple[ast.Module, bool, List[str]]:
+    """Reflect wrongly-signed dissipative updates so entropy never decreases."""
+    gates = _contract_slot_gates(contracts)
+    if not gates:
+        return tree, False, []
+    # Non-decreasing slots only (entropy production / Lyapunov growth).
+    ge_slots = {slot for slot, entries in gates.items()
+                if any(d == "ge" for d, _t in entries)}
+    if not ge_slots:
+        return tree, False, []
+    notes: List[str] = []
+    changed = False
+    for fn in _simulation_functions(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        body = fn.body
+        pairs = _assign_pairs(fn, body)
+        for idx, stmt in enumerate(body):
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 \
+                    or not isinstance(stmt.targets[0], ast.Name):
+                continue
+            new_var = stmt.targets[0].id
+            old_var = None
+            for cand in (new_var[:-4] + "_old" if new_var.endswith("_new") else None,
+                         new_var[:-3] + "_old" if new_var.endswith("new") else None,
+                         new_var[:-1] + "_old" if new_var.endswith("1") else None):
+                if cand and cand in pairs:
+                    old_var = cand
+                    break
+            if old_var is None:
+                continue
+            match = _matching_new_old(pairs, new_var, old_var)
+            if match is None:
+                continue
+            fn_name, new_args, old_args, evolving_idx = match
+            # ``dS = S_new - S_old`` must feed a non-decreasing bounded slot,
+            # directly or through an intermediate (``dS = ...; if dS < state[k]``).
+            pair_names = {new_var, old_var}
+
+            def _is_entropy_diff(v: ast.AST) -> bool:
+                return (isinstance(v, ast.BinOp) and isinstance(v.op, ast.Sub)
+                        and _expr_refs_names(v.left, {new_var})
+                        and _expr_refs_names(v.right, {old_var}))
+
+            indirect = _indirect_names(body, _is_entropy_diff)
+            # A genuine entropy production ``S_new - S_old`` must feed the
+            # non-decreasing slot. ``abs(H_new - H_old)`` is conservation drift
+            # (handled by the projection pass), never a Lyapunov difference, so
+            # require the difference (or an intermediate of it) to be present.
+            has_diff = bool(indirect) or any(
+                _is_entropy_diff(getattr(later, "value", None))
+                for later in body[idx + 1:]
+                if isinstance(later, ast.Assign))
+            target_slot = None
+            if has_diff:
+                for later in body[idx + 1:]:
+                    target_slot = _slot_write_references(
+                        later, indirect | pair_names,
+                        {s: gates[s] for s in ge_slots})
+                    if target_slot is not None:
+                        break
+            if target_slot is None:
+                continue
+            # Insert the reflection guard immediately after the S_old assign.
+            old_idx = next((i for i, s in enumerate(body)
+                            if isinstance(s, ast.Assign) and s.targets
+                            and isinstance(s.targets[0], ast.Name)
+                            and s.targets[0].id == old_var), None)
+            if old_idx is None:
+                continue
+            ei = evolving_idx[0]
+            evo_new = new_args[ei]
+            evo_old = old_args[ei]
+            call = f"{fn_name}({', '.join(new_args)})"
+            lines = ["if S_new < S_old:"]
+            lines.append(f"    {evo_new} = 2.0 * {evo_old} - {evo_new}")
+            lines.append(f"    S_new = {call}")
+            lines.append("    if S_new < S_old:")
+            lines.append(f"        {evo_new} = {evo_old}")
+            lines.append("        S_new = S_old")
+            block = ast.parse("\n".join(lines) + "\n").body
+            # Substitute the literal S_new/S_old names.
+            for stmt in block:
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name) and node.id == "S_new":
+                        node.id = new_var
+                    elif isinstance(node, ast.Name) and node.id == "S_old":
+                        node.id = old_var
+            body[old_idx + 1:old_idx + 1] = block
+            ast.fix_missing_locations(fn)
+            changed = True
+            notes.append(
+                f"ENFORCE_LYAPUNOV_SIGN: reflected {evo_new} to keep "
+                f"{new_var} >= {old_var} (state[{target_slot}])")
+            break
+        if changed:
+            break
+    return tree, changed, notes
+
+
+class _NonZeroConstantTracker(ast.NodeVisitor):
+    """Collect names bound to non-zero numeric constants (module + function)."""
+
+    def __init__(self) -> None:
+        self.nonzero: set[str] = set()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, float)) \
+                and not isinstance(node.value.value, bool) and node.value.value != 0:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.nonzero.add(target.id)
+        self.generic_visit(node)
+
+    visit_AnnAssign = visit_Assign
+
+
+class _SafeDivisionTransformer(ast.NodeTransformer):
+    """Lower ``a / b`` to ``_invar_sdiv(a, b)`` unless ``b`` is a nonzero const."""
+
+    def __init__(self, nonzero: set[str]) -> None:
+        self.nonzero = nonzero
+        self.changed = False
+        self.notes: set[str] = set()
+
+    def _denominator_safe(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            return node.value != 0
+        if isinstance(node, ast.Name) and node.id in self.nonzero:
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) \
+                and isinstance(node.operand, ast.Constant) \
+                and isinstance(node.operand.value, (int, float)):
+            return node.operand.value != 0
+        return False
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Div) and not self._denominator_safe(node.right):
+            self.changed = True
+            self.notes.add("safe-division lowered")
+            return ast.copy_location(
+                ast.Call(func=ast.Name(id=_SAFE_DIV_HELPER, ctx=ast.Load()),
+                         args=[node.left, node.right], keywords=[]), node)
+        return node
+
+
+def _lower_safe_division_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    tracker = _NonZeroConstantTracker()
+    tracker.visit(tree)
+    transformer = _SafeDivisionTransformer(tracker.nonzero)
+    tree = transformer.visit(tree)
+    if transformer.changed and _SAFE_DIV_HELPER not in _module_level_names(tree):
+        tree.body.insert(0, ast.parse(_SAFE_DIV_SRC).body[0])
+        _ensure_math_import(tree)
+    ast.fix_missing_locations(tree)
+    return tree, transformer.changed, sorted(transformer.notes)
+
+
+# Concept buckets for auto-bridging unassigned contract slots (mirrors the
+# planner's physical-concept classification, kept local to avoid a cycle).
+_CONCEPT_BUCKET_ROOTS = {
+    "energy": ("energy", "hamiltonian", "h_energy"),
+    "entropy": ("entropy", "s_entropy", "lyapunov"),
+    "trace": ("trace",),
+    "roundtrip": ("roundtrip", "revers"),
+}
+_CONCEPT_LE_TOKENS = ("drift", "err", "error", "residual", "bound", "violation",
+                      "roundtrip", "revers", "max")
+_CONCEPT_GE_TOKENS = ("monotone", "step", "min", "prod", "positivity",
+                      "eigenvalue", "lambda_min")
+_CONCEPT_SUFFIXES = ("_trace_rho2", "_bound", "_limit", "_max", "_min",
+                     "_current", "_val", "_check", "_error", "_err", "_drift")
+
+
+def _concept_stem(name: str) -> str:
+    low = str(name or "").lower().strip()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("max_", "min_", "unified_", "total_", "step_"):
+            if low.startswith(prefix) and len(low) > len(prefix):
+                low = low[len(prefix):]
+                changed = True
+        for suffix in _CONCEPT_SUFFIXES:
+            if low.endswith(suffix) and len(low) > len(suffix):
+                low = low[:-len(suffix)]
+                changed = True
+    return low
+
+
+def _concept_bucket_for(name: str, direction: str) -> str:
+    low = str(name or "").lower()
+    stem = _concept_stem(low)
+    tokens = _CONCEPT_GE_TOKENS if direction == "ge" else _CONCEPT_LE_TOKENS
+    if not any(tok in low for tok in tokens):
+        return ""
+    for bucket, roots in _CONCEPT_BUCKET_ROOTS.items():
+        if any(tok in low or tok in stem for tok in roots):
+            return bucket
+    if direction == "ge" and any(tok in low for tok in ("positivity", "eigenvalue",
+                                                        "lambda_min")):
+        return "positivity"
+    return ""
+
+
+def _bridge_unassigned_concept_slots_tree(
+        tree: ast.Module, contracts: Sequence[Any]
+        ) -> Tuple[ast.Module, bool, List[str]]:
+    """Copy an assigned slot onto unassigned slots of the same concept bucket."""
+    contracts = list(contracts or [])
+    if not contracts:
+        return tree, False, []
+    driver = _simulation_driver(tree)
+    if driver is None:
+        return tree, False, []
+    assigned = _assigned_state_slots(tree)
+    slot_meta: Dict[int, List[Tuple[str, str, float]]] = {}
+    for contract in contracts:
+        for name, assertion, tol in _contract_invariant_items(contract):
+            direction = _bound_direction(assertion)
+            if direction not in {"le", "ge"}:
+                continue
+            try:
+                tol_f = float(tol)
+            except (TypeError, ValueError):
+                tol_f = 1e-6
+            if abs(tol_f) > 1e-6:
+                continue
+            bucket = _concept_bucket_for(name, direction)
+            for slot in _contract_state_slots_from_text(assertion):
+                slot_meta.setdefault(slot, []).append((name, direction, tol_f))
+    missing = [s for s in sorted(slot_meta) if s not in assigned]
+    if not missing:
+        return tree, False, []
+    additions: List[ast.stmt] = []
+    notes: List[str] = []
+    for slot in missing:
+        metas = slot_meta[slot]
+        target = None
+        # Prefer an assigned slot sharing the same concept bucket.
+        for cand in sorted(assigned):
+            for _n, direction, tol_f in metas:
+                cand_bucket = next((_concept_bucket_for(nm, d)
+                                    for nm, d, _t in slot_meta.get(cand, [])), "")
+                if cand_bucket and cand_bucket == _concept_bucket_for(_n, direction):
+                    target = cand
+                    break
+            if target is not None:
+                break
+        # Fall back to the same inequality direction + tolerance.
+        if target is None:
+            for cand in sorted(assigned):
+                for name, direction, tol_f in metas:
+                    for _cn, cd, ct in slot_meta.get(cand, []):
+                        if cd == direction and abs(ct - tol_f) <= 1e-12:
+                            target = cand
+                            break
+                    if target is not None:
+                        break
+                if target is not None:
+                    break
+        if target is None and assigned:
+            target = sorted(assigned)[0]
+        if target is None:
+            continue
+        additions.append(ast.parse(f"buf.data[{slot}] = buf.data[{target}]").body[0])
+        notes.append(f"bridged unassigned state[{slot}] <- state[{target}] "
+                     f"(concept bucket / bound match)")
+    if not additions:
+        return tree, False, []
+    driver.body.extend(additions)
+    ast.fix_missing_locations(tree)
+    return tree, True, notes
+
+
+def _unify_concept_slots_tree(tree: ast.Module, contracts: Sequence[Any]
+                              ) -> Tuple[ast.Module, bool, List[str]]:
+    """Rewrite later-stage concept slots in-place onto earlier stage slots.
+
+    Mirrors the planner's concept-bucket unification at the AST level so a
+    kernel that computes ``state[16]``/``state[17]`` also mirrors them onto
+    the canonical ``state[8]``/``state[10]`` slots the earlier stages check.
+    """
+    contracts = list(contracts or [])
+    if not contracts:
+        return tree, False, []
+    slot_meta: Dict[int, Dict[str, Any]] = {}
+    for contract in contracts:
+        stage = _contract_stage_index(str(_contract_get(contract, "contract_id", "") or ""))
+        for name, assertion, tol in _contract_invariant_items(contract):
+            direction = _bound_direction(assertion)
+            if direction not in {"le", "ge"}:
+                continue
+            try:
+                tol_f = float(tol)
+            except (TypeError, ValueError):
+                tol_f = 1e-6
+            if abs(tol_f) > 1e-6:
+                continue
+            bucket = _concept_bucket_for(name, direction)
+            if not bucket:
+                continue
+            for slot in _contract_state_slots_from_text(assertion):
+                slot_meta.setdefault(slot, {"bucket": bucket, "direction": direction,
+                                            "stage": stage})
+    if len(slot_meta) < 2:
+        return tree, False, []
+    # Canonical slot per (bucket, direction): the earliest stage's slot.
+    canonical: Dict[Tuple[str, str], int] = {}
+    for slot in sorted(slot_meta, key=lambda s: (slot_meta[s]["stage"], s)):
+        meta = slot_meta[slot]
+        key = (meta["bucket"], meta["direction"])
+        canonical.setdefault(key, slot)
+    remap: Dict[int, int] = {}
+    for slot, meta in slot_meta.items():
+        target = canonical[(meta["bucket"], meta["direction"])]
+        if slot != target:
+            remap[slot] = target
+    if not remap:
+        return tree, False, []
+    changed = False
+    notes: List[str] = []
+
+    def _rewrite(node: ast.AST) -> None:
+        nonlocal changed
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript):
+                base = sub.value
+                name = ""
+                if isinstance(base, ast.Name):
+                    name = base.id
+                elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+                    name = f"{base.value.id}.{base.attr}"
+                if name in {"state", "data", "buf", "buf.data"}:
+                    slot = _state_subscript_slot(sub)
+                    if slot in remap:
+                        sub.slice = ast.Constant(value=remap[slot])
+                        changed = True
+
+    for fn in _simulation_functions(tree):
+        _rewrite(fn)
+    ast.fix_missing_locations(tree)
+    if changed:
+        notes.append("unified concept slots: " + ", ".join(
+            f"state[{old}] -> state[{new}]" for old, new in sorted(remap.items())))
+    return tree, changed, notes
+
+
+def _tree_pass_wrapper(code: str, pass_fn, *, contracts: Sequence[Any] = ()) -> SanitizerResult:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    tree, changed, notes = pass_fn(tree, contracts)
+    if not changed:
+        return SanitizerResult(code, [], False)
+    ast.fix_missing_locations(tree)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+
+
+def enforce_conservation_projection(code: str, *,
+                                    contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Project conservative updates onto the exact invariant level set."""
+    return _tree_pass_wrapper(
+        code, lambda t, c: _enforce_conservation_projection_tree(t, c),
+        contracts=contracts)
+
+
+def enforce_lyapunov_sign(code: str, *, contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Reflect wrongly-signed dissipative updates (entropy never decreases)."""
+    return _tree_pass_wrapper(
+        code, lambda t, c: _enforce_lyapunov_sign_tree(t, c), contracts=contracts)
+
+
+def lower_safe_division(code: str) -> SanitizerResult:
+    """Lower ``a / b`` to ``_invar_sdiv(a, b)`` for non-constant denominators."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return SanitizerResult(code, [], False)
+    tree, changed, notes = _lower_safe_division_tree(tree)
+    if not changed:
+        return SanitizerResult(code, [], False)
+    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+
+
+def unify_concept_slots(code: str, *, contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Rewrite later-stage concept slots onto the canonical first-stage slot."""
+    return _tree_pass_wrapper(code, _unify_concept_slots_tree, contracts=contracts)
+
+
+def bridge_unassigned_concept_slots(code: str, *,
+                                    contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Bridge unassigned contract slots to same-concept assigned slots."""
+    return _tree_pass_wrapper(
+        code, _bridge_unassigned_concept_slots_tree, contracts=contracts)
+
+
+def _apply_physics_guard_pass(op: str, code: str, contracts: Sequence[Any]) -> SanitizerResult:
+    if op == "ENFORCE_CONSERVATION_PROJECTION":
+        return enforce_conservation_projection(code, contracts=contracts)
+    if op == "ENFORCE_LYAPUNOV_SIGN":
+        return enforce_lyapunov_sign(code, contracts=contracts)
+    if op == "REWRITE_MONOTONE_DRIFT_CONCEPT":
+        return _tree_pass_wrapper(code, _repair_monotone_observables_tree, contracts=contracts)
+    if op == "LOWER_SAFE_DIVISION":
+        return lower_safe_division(code)
+    if op == "UNIFY_CONCEPT_SLOTS":
+        return unify_concept_slots(code, contracts=contracts)
+    if op == "BRIDGE_UNASSIGNED_SLOTS":
+        return bridge_unassigned_concept_slots(code, contracts=contracts)
+    return SanitizerResult(code, [], False)
+
+
 __all__ = [
     "SanitizerResult", "sanitize_intrinsics", "rewrite_monotone_drift",
     "infer_monotone_drift_directives", "apply_healing_directives",
     "strip_none_literals", "numeric_expr_equivalent",
     "lower_complex_to_real", "prune_unused_helpers",
     "repair_drift_self_comparison", "infer_drift_self_comparison_directives",
+    "enforce_conservation_projection", "enforce_lyapunov_sign",
+    "lower_safe_division", "unify_concept_slots",
+    "bridge_unassigned_concept_slots",
     "MATH_FUNCS", "INTRINSIC_ALIASES",
 ]

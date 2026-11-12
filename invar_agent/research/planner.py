@@ -759,6 +759,122 @@ _CANON_SEMANTIC_SUFFIXES = (
     "_trace_rho2", "_bound", "_limit", "_max", "_min", "_current", "_val",
     "_check", "_error", "_err", "_drift",
 )
+# Concept buckets: every single-slot inequality constrained to machine
+# precision (|tol| <= 1e-6) is classified by domain root tokens so the SAME
+# physical quantity measured under different stage-specific names
+# (``energy_drift_max`` vs ``unified_energy_drift``) shares one canonical slot.
+_CONCEPT_BUCKETS: Tuple[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]], ...] = (
+    ("ENERGY_DRIFT", ("energy", "hamiltonian", "h_energy"), "le",
+     ("drift", "err", "error", "residual", "bound", "violation")),
+    ("ENTROPY_MONOTONE_LOWER", ("entropy", "s_entropy", "lyapunov"), "ge",
+     ("monotone", "step", "min", "prod")),
+    ("ENTROPY_DRIFT_UPPER", ("entropy", "s_entropy", "lyapunov"), "le",
+     ("drift", "monotone", "increase", "err", "error", "residual")),
+    ("TRACE_DRIFT", ("trace",), "le", ("drift", "err", "error", "max", "residual")),
+    ("ROUNDTRIP_ERROR", ("roundtrip", "revers"), "le",
+     ("roundtrip", "revers", "err", "error", "drift")),
+    ("POSITIVITY_MIN_EIG", ("positivity", "eigenvalue", "lambda_min"), "ge",
+     ("positivity", "eigenvalue", "lambda_min", "min")),
+)
+
+
+def concept_bucket_key(name: str, assertion: str
+                       ) -> Optional[Tuple[str, str, str, int]]:
+    """Canonical physical-concept key ``(bucket, direction, stem, slot)``.
+
+    Only single-slot machine-precision inequalities qualify (``state[k] <= tol``
+    or ``state[k] >= -tol`` with ``abs(tol) <= 1e-6``). Returns ``None`` for
+    everything else so ordinary observables keep the legacy semantic key.
+    """
+    low = str(name or "").lower().strip()
+    if not low:
+        return None
+    slots = _canon_slots_in_text(assertion or "")
+    if len(slots) != 1:
+        return None
+    bound = re.search(r"(?:state|buf\.data|data)\[\d+\]\s*(?:<=|>=|<|>)\s*([0-9.eE+-]+)",
+                      assertion or "")
+    if bound is None:
+        return None
+    try:
+        if abs(float(bound.group(1))) > 1e-6:
+            return None
+    except ValueError:
+        return None
+    direction = _canon_bound_direction(assertion)
+    if direction not in {"le", "ge"}:
+        return None
+    stem = _canon_semantic_stem(low)
+    for bucket, roots, bucket_dir, tokens in _CONCEPT_BUCKETS:
+        if bucket_dir != direction:
+            continue
+        if not any(tok in low or tok in stem for tok in roots):
+            continue
+        if not any(tok in low for tok in tokens):
+            continue
+        return bucket, direction, stem, slots[0]
+    return None
+
+
+_CONCEPT_REMAP_RE = re.compile(
+    r"(?<![A-Za-z_])(?P<prefix>state|buf\.data|buf|data)\[(?P<slot>\d+)\]")
+
+
+def concept_bucket_slot_map(contracts: List[Dict[str, Any]]
+                            ) -> Tuple[Dict[int, int], List[str]]:
+    """Map later-stage concept slots onto the first stage's slot per bucket.
+
+    Contracts are visited in stage order; the first slot claimed for a
+    concept bucket stays canonical and every later slot in the same bucket is
+    remapped to it. Returns ``(remap, notes)`` where ``remap`` maps an old slot
+    index to its canonical slot index (only entries that actually change).
+    """
+    ordered = sorted(
+        enumerate(contracts or []),
+        key=lambda kv: (_canon_stage_index(str(kv[1].get("contract_id") or "")), kv[0]))
+    bucket_slot: Dict[Tuple[str, str], int] = {}
+    remap: Dict[int, int] = {}
+    notes: List[str] = []
+    for _idx, contract in ordered:
+        if not isinstance(contract, dict):
+            continue
+        for inv in contract.get("invariants") or []:
+            if not isinstance(inv, dict):
+                continue
+            key = concept_bucket_key(str(inv.get("variable_name") or ""),
+                                     str(inv.get("assertion") or ""))
+            if key is None:
+                continue
+            bucket, direction, _stem, slot = key
+            claim = (bucket, direction)
+            canonical = bucket_slot.setdefault(claim, slot)
+            if slot != canonical:
+                remap[slot] = canonical
+                notes.append(
+                    f"concept slot unified: {inv.get('variable_name')} "
+                    f"state[{slot}] -> state[{canonical}] ({bucket})")
+    return remap, notes
+
+
+def apply_concept_bucket_remap(contracts: List[Dict[str, Any]],
+                               remap: Dict[int, int]) -> List[Dict[str, Any]]:
+    """Rewrite every ``state[k]``/``buf.data[k]`` reference per ``remap``."""
+    if not remap:
+        return contracts
+
+    def rewrite(text: str) -> str:
+        def repl(m: "re.Match[str]") -> str:
+            slot = int(m.group("slot"))
+            return f"{m.group('prefix')}[{remap.get(slot, slot)}]"
+        return _CONCEPT_REMAP_RE.sub(repl, text or "")
+
+    for contract in contracts or []:
+        if not isinstance(contract, dict):
+            continue
+        for inv in contract.get("invariants") or []:
+            if isinstance(inv, dict) and "assertion" in inv:
+                inv["assertion"] = rewrite(str(inv.get("assertion") or ""))
+    return contracts
 _CANON_INITIAL_STATE_RE = re.compile(r"\binitial_state\[(\d+)\]")
 
 
@@ -917,6 +1033,16 @@ def canonicalize_contract_dicts(
         new_vm[name] = canonical
         assigned_slots.add(canonical)
     vm = new_vm
+
+    # Cross-stage physical-concept slot unification runs LAST so the same
+    # conserved/monotone quantity measured under different stage names shares
+    # the first stage's slot (e.g. ``unified_energy_drift`` state[16] -> the
+    # ``energy_drift_max`` slot of the earlier stage) without the conflict
+    # resolver above re-allocating it to a fresh slot.
+    concept_remap, concept_notes = concept_bucket_slot_map(all_contracts)
+    if concept_remap:
+        apply_concept_bucket_remap(all_contracts, concept_remap)
+        notes.extend(concept_notes)
 
     if not vm:
         for name in name_order:

@@ -511,6 +511,9 @@ _PARAM_ASSIGN = re.compile(
     r"(?P<num>" + _NUMBER + r")\s*(?P<unit>" + _UNIT_TOKEN + r")?")
 _PARAM_WITH_UNIT = re.compile(
     r"(?P<num>" + _NUMBER + r")\s*(?P<unit>" + _UNIT_TOKEN + r")")
+# Single-letter subscript state tokens (``z_k``, ``q_0``, ``x_n``, ``i_2``,
+# ``j_m``, ...) are code identifiers, never physical constants.
+_SUBSCRIPT_STATE_RE = re.compile(r"^[a-zA-Z]_[knij012m]$")
 _NAME_FILLER = {"the", "a", "an", "of", "is", "and", "with", "at", "to", "for",
                 "in", "on", "by", "about", "approximately", "roughly", "around",
                 "value", "equal", "equals", "be", "was", "were", "are", "its"}
@@ -672,6 +675,10 @@ def extract_parameters_from_text(text: str, source: str = "",
         # equations are not physical constants: never extract single-letter
         # symbols from user prompts.
         if source == "user_prompt" and len(name) <= 1:
+            return
+        # Subscripted state tokens (``z_k``, ``q_0``, ``x_n``, ...) extracted
+        # from code-like prompt fragments are not physical constants.
+        if source == "user_prompt" and _SUBSCRIPT_STATE_RE.fullmatch(name):
             return
         si_value, si_unit = normalize_to_si(value, unit)
         symbol = name_raw.strip().split()[-1] if name_raw.strip() else ""

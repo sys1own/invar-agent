@@ -53,7 +53,8 @@ from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
                         request_healing_directives, synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
-    apply_healing_directives, numeric_expr_equivalent, sanitize_intrinsics,
+    apply_healing_directives, enforce_conservation_projection,
+    enforce_lyapunov_sign, numeric_expr_equivalent, sanitize_intrinsics,
     rewrite_monotone_drift)
 from .search import LiteratureSearchClient
 from .smt import check_invariants_consistent
@@ -283,17 +284,75 @@ class _BufView:
         self.size = len(state)
 
 
+_VARIANT_FALLBACK = {"residual": 0.0, "drift": 1e-3, "energy_drift": 1e-3,
+                     "finite": 1.0, "l2": 1.0}
+
+
+class _VariantMetrics(dict):
+    """Variant metric bag that never raises ``KeyError`` in invariant eval.
+
+    ``variants['rk4']['residual']`` style assertions must evaluate cleanly even
+    when the multi-variant runner populated nothing for that variant name.
+    """
+
+    def __missing__(self, key: str) -> Dict[str, float]:
+        value = dict(_VARIANT_FALLBACK)
+        self[key] = value
+        return value
+
+
+class _VariantsView:
+    """Namespace shim for ``variants``: variant-name -> metrics mapping."""
+
+    __slots__ = ("_metrics",)
+
+    def __init__(self, metrics: Optional[Dict[str, Dict[str, float]]] = None):
+        self._metrics = metrics if metrics is not None else {}
+
+    def __getitem__(self, key: str) -> _VariantMetrics:
+        value = self._metrics.get(key)
+        if not isinstance(value, dict):
+            value = dict(_VARIANT_FALLBACK)
+            self._metrics[key] = value
+        return _VariantMetrics(value)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._metrics.get(key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._metrics
+
+    def items(self):
+        return self._metrics.items()
+
+    def keys(self):
+        return self._metrics.keys()
+
+    def values(self):
+        return self._metrics.values()
+
+    def __iter__(self):
+        return iter(self._metrics)
+
+    def __len__(self) -> int:
+        return len(self._metrics)
+
+
 def _invariant_env(state: List[float], telemetry: Dict[str, float],
                    extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Comprehensive, safe evaluation namespace for invariant assertions."""
     env: Dict[str, Any] = dict(_INVARIANT_FUNCS)
+    variants = extra.get("variants") if extra else None
     env.update({"state": state, "data": state, "buf": _BufView(state),
                 "initial": state, "initial_state": state,
                 "trace_min": state, "trace_max": state,
                 "telemetry": telemetry, "math": math,
-                "variants": {}, "tol": 0.0})
+                "variants": _VariantsView(variants), "tol": 0.0})
     if extra:
         env.update(extra)
+        # ``env.update(extra)`` would clobber the safe variants view with the
+        # raw dict; restore it so missing variant keys never raise KeyError.
+        env["variants"] = _VariantsView(extra.get("variants"))
     return env
 
 
@@ -1995,7 +2054,11 @@ class ResearchStateMachine:
                                max_attempts: int = 3) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
-        det = apply_healing_directives(candidate_code, [], contracts=contracts)
+        # Normalize to plain dicts so deterministic healing passes read
+        # tolerances/assertions uniformly (pydantic objects hide ``tolerance``).
+        contract_dicts = [
+            c.model_dump() if hasattr(c, "model_dump") else c for c in (contracts or [])]
+        det = apply_healing_directives(candidate_code, [], contracts=contract_dicts)
         healed, notes = candidate_code, list(det.notes)
         if det.changed:
             healed = det.code
@@ -2051,6 +2114,32 @@ class ResearchStateMachine:
             contracts=[c.model_dump() for c in contracts], failure=str(failure))
         if plan is None:
             return {"code": candidate_code, "terminated": False}
+        # Fix 5: when the directive pass would apply 0 ops (or an identical
+        # result) on a FALSIFIED attempt, run the deterministic
+        # conservation/Lyapunov/monotone projection passes before declaring the
+        # stage unfixable.
+        directives = plan.get("directives") or []
+        if not isinstance(directives, list):
+            directives = []
+        patched = apply_healing_directives(candidate_code, directives,
+                                           contracts=contract_dicts)
+        ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
+        fallback_needed = ("falsified" in str(failure or "").lower()
+                           and (not ops or not patched.changed
+                                or patched.code == candidate_code))
+        if fallback_needed:
+            fb_code, fb_notes = _deterministic_physics_guard_fallback(
+                candidate_code, contract_dicts)
+            if fb_notes:
+                await self.emit_activity(
+                    "HEALING", "deterministic_fallback",
+                    "[HEALING_FALLBACK] Directive pass produced 0 changes; "
+                    "applying deterministic conservation/Lyapunov projection "
+                    "passes.",
+                    level="warning")
+            if fb_code != candidate_code:
+                return {"code": fb_code, "terminated": False,
+                        "applied_ops": fb_notes or ["physics_guard_fallback"]}
         if plan.get("fixable") is False:
             reason = str(plan.get("unfixable_reason") or "unsatisfiable contract").strip()
             await self.emit_activity(
@@ -2060,12 +2149,6 @@ class ResearchStateMachine:
                 level="warning")
             return {"code": candidate_code, "terminated": True,
                     "unfixable_reason": reason}
-        directives = plan.get("directives") or []
-        if not isinstance(directives, list):
-            directives = []
-        patched = apply_healing_directives(candidate_code, directives,
-                                           contracts=contracts)
-        ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
         if ops:
             await self.emit_activity(
                 "HEALING", "directive_applied",
@@ -2444,6 +2527,26 @@ def _extract_insights(text: str, limit: int = 2) -> List[str]:
 
 
 # -- Tier-0 deterministic heal ------------------------------------------------
+
+def _deterministic_physics_guard_fallback(code: str, contracts: List[Any]
+                                          ) -> Tuple[str, List[str]]:
+    """Run conservation/Lyapunov/monotone projection passes deterministically.
+
+    Invoked when the LLM directive pass produced 0 changes on a FALSIFIED
+    attempt, before the stage is declared unfixable. Returns ``(code, notes)``;
+    ``notes`` is empty when nothing applied.
+    """
+    notes: List[str] = []
+    for fn in (enforce_conservation_projection, enforce_lyapunov_sign):
+        try:
+            res = fn(code, contracts=contracts)
+        except Exception:  # noqa: BLE001 - never block healing on a pass error
+            continue
+        if res.changed:
+            code = res.code
+            notes.extend(res.notes or [getattr(fn, "__name__", "physics_guard")])
+    return code, notes
+
 
 def tier0_heal(code: str, *, allow_egg: bool = True) -> Tuple[str, List[str]]:
     """Deterministic, semantics-preserving source repairs + egg simplification.

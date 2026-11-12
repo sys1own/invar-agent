@@ -1343,3 +1343,227 @@ async def test_accretion_timeout_fallback_is_named_and_uses_pinned(tmp_path):
     assert state.status != "ERROR"
     assert any("TimeoutError" in str(p.get("message", "")) + str(p.get("note", ""))
                for _c, p in events if isinstance(p, dict))
+
+
+# -- 10. Universal physics guards: conservation projection, Lyapunov sign, --
+#     safe division, concept-slot unification, variants fallback -----------
+
+PHYSICS_KERNEL = r'''
+import math
+
+def ham(q, p, k, a):
+    return 0.5 * p * p + 0.5 * k * q * q + 0.25 * a * q * q * q * q
+
+def ent(s, T):
+    if T < 1e-6:
+        T = 1e-6
+    return s * s + math.log(T)
+
+def simulation_step(buf, dt):
+    D = buf.data
+    q0 = D[0]
+    p0 = D[1]
+    s0 = D[2]
+    T0 = D[3]
+    k = D[12]
+    a = D[13]
+    gam = D[12] * 1e-3
+    qm = 0.5 * (q0 + q0)
+    pm = 0.5 * (p0 + p0)
+    gHq = k * qm + a * qm * qm * qm
+    gHp = pm
+    gm = 0.5 * (s0 + s0)
+    gHs = 2.0 * gm
+    gHT = 1.0 / T0
+    dT = -gam * gHT * dt * 0.0
+    ds = -gam * gHs * dt
+    q1 = q0 + dt * gHp
+    p1 = p0 - dt * gHq
+    s1 = s0 + ds
+    T1 = T0 + dT
+    q1 = q0 + dt * 0.5 * (p0 + p1)
+    p1 = p0 - dt * 0.5 * (k * q0 + a * q0 * q0 * q0)
+    q1 = q0 + dt * 0.5 * (p0 + p1)
+    p1 = p0 - dt * 0.5 * (k * q0 + a * q0 * q0 * q0)
+    H_new = ham(q1, p1, k, a)
+    H_old = ham(q0, p0, k, a)
+    if D[4] == 0.0:
+        D[4] = H_old
+    drift = abs(H_new - H_old)
+    if drift > D[8]:
+        D[8] = drift
+    S_new = ent(s1, T1)
+    S_old = ent(s0, T0)
+    dS = S_new - S_old
+    if D[10] == 0.0:
+        D[10] = dS
+    if dS < D[10]:
+        D[10] = dS
+    D[11] = D[11] + dS
+    D[0] = q1
+    D[1] = p1
+    D[2] = s1
+    D[3] = T1
+    D[6] = H_new
+    D[7] = H_old
+    D[9] = 0.0
+'''
+
+
+def _phys_contracts():
+    def inv(name, assertion, tol):
+        return {"variable_name": name, "assertion": assertion, "tolerance": tol}
+    base = [1.0, 0.5, 0.0, 1.0] + [0.0] * 12
+    return [
+        {"contract_id": "c1_conservative", "target_backend": "cpp",
+         "dt": 0.001, "steps": 20, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": list(base),
+         "invariants": [
+             inv("energy_drift_max", "state[8] <= 1e-11", 1e-11),
+             inv("energy_drift_finite", "math.isfinite(state[8])", 0.0),
+             inv("roundtrip_error", "state[9] <= 1e-10", 1e-10),
+             inv("energy_positivity", "state[6] >= 0.0", 0.0)]},
+        {"contract_id": "c2_entropy", "target_backend": "cpp",
+         "dt": 0.001, "steps": 20, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": list(base),
+         "invariants": [
+             inv("energy_drift_max", "state[8] <= 1e-11", 1e-11),
+             inv("entropy_step_min", "state[10] >= -1e-13", 1e-13),
+             inv("entropy_total_nonneg", "state[11] >= 0.0", 0.0),
+             inv("entropy_drift_finite", "math.isfinite(state[8])", 0.0)]},
+        {"contract_id": "c3_multivariant", "target_backend": "multi_variant",
+         "dt": 0.001, "steps": 20, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": list(base),
+         "invariants": [
+             inv("unified_energy_drift", "state[16] <= 1e-11", 1e-11),
+             inv("entropy_monotone", "state[17] >= -1e-13", 1e-13),
+             inv("variant_finite",
+                 "math.isfinite(variants['rk4']['residual']) and "
+                 "math.isfinite(variants['strang']['residual'])", 0.0)]},
+    ]
+
+
+def test_concept_slot_unification_canonicalizer():
+    """Later-stage concept slots unify onto the first stage's slot."""
+    from invar_agent.research.planner import canonicalize_contract_dicts
+    contracts, _vm, notes = canonicalize_contract_dicts(_phys_contracts(), None, [])
+    by_id = {c["contract_id"]: c for c in contracts}
+    c3 = by_id["c3_multivariant"]
+    assertions = {i["variable_name"]: i["assertion"] for i in c3["invariants"]}
+    # unified_energy_drift state[16] -> state[8]; entropy_monotone state[17] -> state[10]
+    assert "state[8]" in assertions["unified_energy_drift"]
+    assert "state[16]" not in assertions["unified_energy_drift"]
+    assert "state[10]" in assertions["entropy_monotone"]
+    assert "state[17]" not in assertions["entropy_monotone"]
+    assert any("concept slot unified" in n for n in notes)
+
+
+def test_tier0_conservation_projection_and_lyapunov():
+    """Tier-0 injects the manifold projection + Lyapunov reflection guards."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.research.planner import canonicalize_contract_dicts
+    from invar_agent.schemas.research import VerificationContract
+    contracts, _vm, _ = canonicalize_contract_dicts(_phys_contracts(), None, [])
+    vc = [VerificationContract.model_validate(c) for c in contracts]
+    san = sanitize_intrinsics(PHYSICS_KERNEL, contracts=vc)
+    assert san.changed
+    assert "_H_target_proj" in san.code          # conservation projection loop
+    assert "_gn2_proj > 1e-30" in san.code
+    assert "S_new < S_old" in san.code           # Lyapunov reflection guard
+    assert "_invar_sdiv" in san.code             # safe division helper
+    assert "def _invar_sdiv" in san.code
+
+
+def test_safe_division_helper_guards_zero_denominator():
+    """``_invar_sdiv`` clamps near-zero denominators instead of dividing by 0."""
+    from invar_agent.healing.deterministic_ast import lower_safe_division
+    res = lower_safe_division("def f(buf, dt):\n    return 1.0 / buf.data[3]\n")
+    assert res.changed
+    ns = {}
+    exec(res.code, ns)
+    sdiv = ns["_invar_sdiv"]
+    # T0 == 0.0 must not raise; it clamps to a / 1e-30 (huge but finite).
+    assert sdiv(1.0, 0.0) == 1.0 / 1e-30
+    assert sdiv(1.0, 2.0) == 0.5
+    assert sdiv(-1.0, -1e-40) == -1.0 / (-1e-30)
+
+
+def _run_physics_native(tmp_path):
+    from invar_agent.research.planner import canonicalize_contract_dicts
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.research.state_machine import (
+        _lower_kernel, _guard_contract_initial_state, _telemetry,
+        _invariant_env, _eval_invariant)
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    contracts, _vm, _ = canonicalize_contract_dicts(_phys_contracts(), None, [])
+    vc = [VerificationContract.model_validate(c) for c in contracts]
+    san = sanitize_intrinsics(PHYSICS_KERNEL, contracts=vc)
+    _uast, cpp = _lower_kernel(san.code)
+    bridge = DynamicCABIBridge(tmp_path / "cabi")
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+    results = {}
+    for c in vc:
+        init, _warns = _guard_contract_initial_state(san.code, c)
+        init[12] = 10.0
+        init[13] = 0.5
+        run = bridge.run(cpp, init, c.dt, c.steps, "execute_step",
+                         c.timeout_seconds, c.max_memory_mb, isolated=True)
+        results[c.contract_id] = (c, run, san.code)
+    return results
+
+
+def test_native_three_stages_verified_no_cabi_fallback(tmp_path):
+    """All 3 stages VERIFY natively (no Python fallback) with tight bounds."""
+    from invar_agent.research.state_machine import _telemetry, _invariant_env, _eval_invariant
+    results = _run_physics_native(tmp_path)
+    variants = {
+        "rk4": {"residual": 0.0, "drift": 1e-3, "energy_drift": 1e-3,
+                "finite": 1.0, "l2": 1.0},
+        "strang": {"residual": 0.0, "drift": 1e-3, "energy_drift": 1e-3,
+                   "finite": 1.0, "l2": 1.0},
+        "reference": {"residual": 0.0, "ms": 1.0},
+    }
+    for contract_id, (contract, run, _code) in results.items():
+        assert run.get("fallback") is None, f"{contract_id} used Python fallback"
+        st = run["state"]
+        tel = _telemetry(run, run.get("initial") or st)
+        for inv in contract.invariants:
+            extra = {"initial": st, "initial_state": st,
+                     "trace_min": run.get("trace_min", st),
+                     "trace_max": run.get("trace_max", st),
+                     "variants": variants}
+            env_extra = dict(extra, tol=inv.tolerance)
+            assert _eval_invariant(inv.assertion, st, tel, env_extra), \
+                f"{contract_id}: {inv.assertion} failed"
+    # Tight numeric bounds on the conserved / monotone slots.
+    st = results["c2_entropy"][1]["state"]
+    assert st[8] <= 1e-14
+    assert st[10] >= 0.0
+    assert st[11] >= 0.0
+
+
+def test_variants_missing_key_fallback_eval():
+    """``variants['missing']['residual']`` evaluates to the safe fallback."""
+    from invar_agent.research.state_machine import _invariant_env, _eval_invariant
+    state = [0.0] * 20
+    env = _invariant_env(state, {}, {"variants": {}})
+    # Missing variant key must not raise; residual falls back to 0.0.
+    assert env["variants"]["rk4"]["residual"] == 0.0
+    assert env["variants"]["nope"]["residual"] == 0.0
+    assert _eval_invariant("math.isfinite(variants['rk4']['residual'])",
+                           state, {}, {"variants": {}})
+
+
+def test_extractor_filters_subscript_state_tokens():
+    """Subscripted code tokens (``z_k``, ``q_0``) are never constants."""
+    from invar_agent.research.extractor import extract_parameters_from_text
+    prompt = ("with z_k = 1.5 and q_0 = 2.0 and x_n = 3.0 and temperature = 300 K "
+              "and M = 0")
+    params = extract_parameters_from_text(prompt, source="user_prompt")
+    names = {p.name for p in params}
+    assert "z_k" not in names and "q_0" not in names and "x_n" not in names
+    assert "temperature" in names
+    # Same tokens from a non-prompt source are still extractable.
+    lit = extract_parameters_from_text("z_k = 1.5", source="equation")
+    assert any(p.name == "z_k" for p in lit)
