@@ -5,6 +5,7 @@ target/
 .invar_agent/
 *.whl
 *.so
+*.pyd
 .pytest_cache/
 *.egg-info/
 dist/

@@ -813,8 +813,25 @@ class LiteratureSearchClient:
                 categories=[work.get("type") or ""]))
         return [r for r in out if r.title]
 
+    HUMANITIES_EXCLUDE = {
+        "gedichte", "shakespeare", "poetry", "poesie", "theater", "theatre",
+        "literatur", "drama", "journal bearing", "journal bearings", "literary",
+    }
+    SCIENTIFIC_TOKENS = {
+        "quantum", "operator", "entropy", "dissipat", "unitary", "cayley",
+        "lindblad", "matrix", "equation", "numerical", "integrat", "hamilton",
+        "mechanic", "algebra", "markov", "stochastic", "pade", "algorithm",
+        "convergence", "discrete", "gradient", "manifold", "symplectic",
+        "energy", "drift", "invariant", "physics", "system",
+    }
+
     @staticmethod
     def _crossref_url(query: str, limit: int) -> str:
+        words = query.strip().split()
+        if len(words) == 1:
+            low = words[0].lower()
+            if low in {"kraus", "pade", "lindblad", "cayley", "runge", "kutta", "strang", "liouville"}:
+                query = f"{query} quantum operator"
         return f"{CROSSREF_API}?query={urllib.parse.quote(query)}&rows={limit}"
 
     @staticmethod
@@ -824,7 +841,14 @@ class LiteratureSearchClient:
         for item in (data.get("message") or {}).get("items", []):
             titles = item.get("title") or []
             title = titles[0] if titles else ""
+            low_title = title.lower()
+            container = " ".join(item.get("container-title") or []).lower()
+            if any(tok in low_title or tok in container for tok in LiteratureSearchClient.HUMANITIES_EXCLUDE):
+                continue
             abstract = _strip_markup(item.get("abstract", "") or "")
+            if not abstract.strip():
+                if not any(tok in low_title or tok in container for tok in LiteratureSearchClient.SCIENTIFIC_TOKENS):
+                    continue
             year = None
             date_parts = (item.get("issued") or {}).get("date-parts") or [[]]
             if date_parts and date_parts[0] and date_parts[0][0]:

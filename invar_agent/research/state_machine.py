@@ -939,13 +939,20 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
             r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*<=\s*([0-9.eE+-]+)", assertion)
         bound = float(bound_match.group(1)) if bound_match else None
         error_metric = any(tok in name for tok in
-                           ("error", "err", "drift", "residual", "violation", "mismatch"))
-        if error_metric and bound is not None and bound <= 1e-6:
-            if k < len(initial) and initial[k] != 0.0:
-                warnings.append(
-                    f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
-                    f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
-                initial[k] = 0.0
+                           ("error", "err", "drift", "residual", "violation", "mismatch", "hold", "bound", "increase"))
+        if bound is not None:
+            if (0.0 <= bound <= 1e-8) or (error_metric and bound <= 1e-6):
+                if k < len(initial) and initial[k] != 0.0:
+                    warnings.append(
+                        f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
+                        f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
+                    initial[k] = 0.0
+            elif abs(bound - 1.0) <= 1e-6:
+                if k < len(initial) and initial[k] > bound:
+                    warnings.append(
+                        f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
+                        f"clamped from {initial[k]} to 1.0")
+                    initial[k] = 1.0
     # 2. Physical parameter slots must not start as silent zeros.
     _parameter_initial_defaults(py_code, contract, initial, warnings)
     # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed.
@@ -1492,6 +1499,9 @@ class ResearchStateMachine:
                            terminal_event: str = "research_completed",
                            extra: Optional[Dict[str, Any]] = None) -> None:
         """Synthesize, persist and stream the Comprehensive Research Report."""
+        if getattr(state, "_report_emitted", False):
+            return
+        state._report_emitted = True
         await self._emit("accelerator_log", "synthesizing_report", {
             "research_stage": state.research_stage, "status": state.status})
         try:
@@ -1668,10 +1678,29 @@ class ResearchStateMachine:
         emit = self._emit
         tag = {"round": round_idx, "research_stage": stage, "attempt": attempt}
 
+        # Zero-LLM fast path for stage > 1 before running literature search
+        if stage > 1 and candidate_code is None and attempt == 1:
+            cumulative = _contracts_through_stage(bp, stage)
+            fast_candidate = _deterministic_accretion_candidate(pinned_code, stage)
+            if contracts and cumulative and fast_candidate:
+                trial = await self._run_round(
+                    state, stage=stage, attempt=attempt, round_idx=round_idx,
+                    objective=objective, pinned_code=pinned_code,
+                    pinned_layers=pinned_layers, candidate_code=fast_candidate,
+                    contracts=contracts, failures=failures,
+                    last_telemetry=last_telemetry)
+                if trial.get("status") == "commit":
+                    await self._emit("accelerator_log", "accretion_fast_path", {
+                        **tag, "research_stage": stage,
+                        "message": (f"[ACCRETION] Pinned unified module already "
+                                    f"satisfies Stage {stage} contracts "
+                                    "(0 LLM tokens used).")})
+                    return trial
+
         # 1. Ingest: live literature retrieval (never inside the sandbox).
         state.stage = "Ingest"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Ingest"})
-        if attempt == 1:
+        if attempt == 1 and candidate_code is None:
             if stage == 1:
                 queries = list(bp.search_queries)
                 q_source = "blueprint"
@@ -1719,22 +1748,6 @@ class ResearchStateMachine:
         state.stage = "GoI_Plan"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "GoI_Plan"})
         if stage > 1 and candidate_code is None:
-            cumulative = _contracts_through_stage(bp, stage)
-            fast_candidate = _deterministic_accretion_candidate(pinned_code, stage)
-            if contracts and cumulative and fast_candidate:
-                trial = await self._run_round(
-                    state, stage=stage, attempt=attempt, round_idx=round_idx,
-                    objective=objective, pinned_code=pinned_code,
-                    pinned_layers=pinned_layers, candidate_code=fast_candidate,
-                    contracts=contracts, failures=failures,
-                    last_telemetry=last_telemetry)
-                if trial.get("status") == "commit":
-                    await self._emit("accelerator_log", "accretion_fast_path", {
-                        **tag, "research_stage": stage,
-                        "message": (f"[ACCRETION] Pinned unified module already "
-                                    f"satisfies Stage {stage} contracts "
-                                    "(0 LLM tokens used).")})
-                    return trial
             try:
                 synth = await self._synthesize_stage(
                     stage=stage, total=bp.target_research_stages, objective=objective,
@@ -2044,7 +2057,7 @@ class ResearchStateMachine:
             objective=kw["objective"],
             verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
             verified_contracts=verified_contracts, telemetry=kw["telemetry"],
-            literature=kw["literature"], failures=kw["failures"]), timeout=45.0)
+            literature=kw["literature"], failures=kw["failures"]), timeout=60.0)
 
     async def _heal_and_refine(self, *, stage: int, round_idx: int, objective: str,
                                candidate_code: Optional[str],

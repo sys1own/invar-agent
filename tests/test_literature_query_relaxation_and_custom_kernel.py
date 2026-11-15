@@ -1567,3 +1567,238 @@ def test_extractor_filters_subscript_state_tokens():
     # Same tokens from a non-prompt source are still extractable.
     lit = extract_parameters_from_text("z_k = 1.5", source="equation")
     assert any(p.name == "z_k" for p in lit)
+
+
+# ---------------------------------------------------------------------------
+# Universal AST Sanitizer & Crossref Humanities Filtering Verification
+# ---------------------------------------------------------------------------
+
+CAYLEY_KRAUS_KERNEL = r'''
+import math
+
+def cayley_update(x, y, z, dt, omega, closed):
+    half_dt = 0.5 * dt * omega
+    denom = 1.0 + half_dt * half_dt
+    xn = ((1.0 - half_dt * half_dt) * x - 2.0 * half_dt * y) / denom
+    yn = (2.0 * half_dt * x + (1.0 - half_dt * half_dt) * y) / denom
+    zn = z
+    if closed <= 0.5:
+        gamma = 0.1
+        factor = math.exp(-gamma * dt)
+        xn *= factor
+        yn *= factor
+        zn = -1.0 + (z + 1.0) * factor
+    return xn, yn, zn
+
+def project_to_bloch_ball(x, y, z):
+    r2 = x * x + y * y + z * z
+    if r2 > 1.0:
+        scale = 1.0 / math.sqrt(r2)
+        return x * scale, y * scale, z * scale
+    return x, y, z
+
+def lambda_min_rho(x, y, z):
+    r = math.sqrt(max(0.0, x * x + y * y + z * z))
+    return 0.5 * (1.0 - r)
+
+def purity_rho(x, y, z):
+    return 0.5 * (1.0 + x * x + y * y + z * z)
+
+def spohn_relative_entropy(x, y, z):
+    r = math.sqrt(max(0.0, x * x + y * y + z * z))
+    if r > 0.999999:
+        r = 0.999999
+    p1 = 0.5 * (1.0 + r)
+    p2 = 0.5 * (1.0 - r)
+    s = 0.0
+    if p1 > 1e-15:
+        s -= p1 * math.log(p1)
+    if p2 > 1e-15:
+        s -= p2 * math.log(p2)
+    return s
+
+def layer_1_step(buf, dt):
+    x = buf.data[0]
+    y = buf.data[1]
+    z = buf.data[2]
+    kappa = buf.data[12]
+    closed = buf.data[14]
+    omega = 1.0
+    if kappa <= 0.0:
+        kappa = 1.0
+    buf.data[12] = kappa
+    xn, yn, zn = cayley_update(x, y, z, dt, omega, closed)
+    xn, yn, zn = project_to_bloch_ball(xn, yn, zn)
+    buf.data[0] = xn
+    buf.data[1] = yn
+    buf.data[2] = zn
+    pur = purity_rho(xn, yn, zn)
+    buf.data[4] = pur
+    lmin = lambda_min_rho(xn, yn, zn)
+    buf.data[3] = lmin
+    buf.data[5] = 0.0
+    S_old = spohn_relative_entropy(x, y, z)
+    S_new = spohn_relative_entropy(xn, yn, zn)
+    if buf.data[15] == 0.0 and buf.data[6] == 0.0:
+        buf.data[6] = S_new
+    if S_new > buf.data[7]:
+        buf.data[7] = S_old - S_new
+
+def simulation_step(buf, dt):
+    layer_1_step(buf, dt)
+'''
+
+
+def test_crossref_humanities_noise_filtering_and_query_augmentation():
+    """Crossref queries augment single surnames; humanities items are rejected."""
+    from invar_agent.research.search import LiteratureSearchClient
+
+    url = LiteratureSearchClient._crossref_url("Kraus", 5)
+    assert "quantum" in url.lower() or "operator" in url.lower()
+
+    payload = json.dumps({"message": {"items": [
+        {"title": ["Karl Kraus' Shakespeare"], "abstract": "", "issued": {"date-parts": [[1937]]}},
+        {"title": ["Ausgewählte Gedichte"], "abstract": "", "issued": {"date-parts": [[1939]]}},
+        {"title": ["Quantum operations and Kraus representation in Lindblad dynamics"],
+         "abstract": "We study Kraus operators and quantum channels.", "issued": {"date-parts": [[2021]]}},
+    ]}})
+    results = LiteratureSearchClient._parse_crossref(payload)
+    assert len(results) == 1
+    assert "Karl Kraus" not in results[0].title
+    assert "Gedichte" not in results[0].title
+    assert "Kraus" in results[0].title
+
+
+def test_no_conservation_projection_on_entropy():
+    """Tier-0 ENFORCE_CONSERVATION_PROJECTION must never project onto entropy/spohn."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.schemas.research import VerificationContract, InvariantConstraint
+
+    contract = VerificationContract(
+        contract_id="c2_entropy", target_backend="cpp", dt=0.01, steps=10,
+        initial_state=[0.5, 0.0, 0.5] + [0.0] * 17,
+        invariants=[
+            InvariantConstraint(variable_name="spohn_entropy_max_increase",
+                                assertion="state[7] <= 1e-15", tolerance=1e-15),
+            InvariantConstraint(variable_name="spohn_entropy_initial",
+                                assertion="state[6] >= 0.0", tolerance=0.0),
+        ])
+    san = sanitize_intrinsics(CAYLEY_KRAUS_KERNEL, contracts=[contract])
+    # Must NOT project onto spohn_relative_entropy
+    assert not any("spohn_relative_entropy" in n and "ENFORCE_CONSERVATION_PROJECTION" in n
+                   for n in san.notes)
+    assert "spohn_relative_entropy" not in san.code or "_H_target_proj" not in san.code
+
+
+def test_read_slot_protection_and_no_dynamical_source_bridging():
+    """buf.data[12] (read in kernel) is never overwritten by state coordinate buf.data[2]."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.schemas.research import VerificationContract, InvariantConstraint
+
+    contracts = [
+        VerificationContract(
+            contract_id="c1", target_backend="cpp", dt=0.01, steps=10,
+            initial_state=[0.5, 0.0, 0.5] + [0.0] * 17,
+            invariants=[
+                InvariantConstraint(variable_name="stiffness_kappa",
+                                    assertion="state[12] >= 0.0", tolerance=0.0),
+                InvariantConstraint(variable_name="trace_hold",
+                                    assertion="state[18] <= 1e-14", tolerance=1e-14),
+            ]),
+    ]
+    san = sanitize_intrinsics(CAYLEY_KRAUS_KERNEL, contracts=contracts)
+    # buf.data[12] must NOT be bridged from buf.data[2] or buf.data[0..3]
+    assert "buf.data[12] = buf.data[2]" not in san.code
+    assert "buf.data[12] = buf.data[0]" not in san.code
+    assert "buf.data[12] = buf.data[1]" not in san.code
+
+
+def test_monotone_increase_lyapunov_ast_normalization():
+    """Flawed 'if S_new > state[7]: state[7] = S_old - S_new' is normalized."""
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.schemas.research import VerificationContract, InvariantConstraint
+
+    contracts = [
+        VerificationContract(
+            contract_id="c2", target_backend="cpp", dt=0.01, steps=10,
+            initial_state=[0.5, 0.0, 0.5] + [0.0] * 17,
+            invariants=[
+                InvariantConstraint(variable_name="spohn_entropy_max_increase",
+                                    assertion="state[7] <= 1e-15", tolerance=1e-15),
+            ]),
+    ]
+    san = sanitize_intrinsics(CAYLEY_KRAUS_KERNEL, contracts=contracts)
+    assert "_step_inc_7" in san.code or "_monotone_viol_7" in san.code
+    assert "buf.data[7] = S_old - S_new" not in san.code
+
+
+def _cayley_kraus_contracts():
+    def inv(name, assertion, tol):
+        return {"variable_name": name, "assertion": assertion, "tolerance": tol}
+    base = [0.5, 0.0, 0.5, 0.0, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    return [
+        {"contract_id": "c1_cayley_stiff_trace", "target_backend": "cpp",
+         "dt": 0.01, "steps": 10, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": list(base),
+         "invariants": [
+             inv("trace_error_max", "state[5] <= 1e-14", 1e-14),
+             inv("z_bound", "state[2] >= -1.0 - 1e-15", 1e-15),
+             inv("purity_upper_bound", "state[4] <= 1.0 + 1e-14", 1e-14),
+             inv("purity_positivity", "state[4] >= 0.0", 0.0),
+             inv("dt_stiffness_scale", "state[12] >= 0.0", 0.0)]},
+        {"contract_id": "c2_entropy_monotone", "target_backend": "cpp",
+         "dt": 0.01, "steps": 10, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": list(base),
+         "invariants": [
+             inv("spohn_entropy_max_increase", "state[7] <= 1e-15", 1e-15),
+             inv("spohn_entropy_initial", "state[6] >= 0.0", 0.0),
+             inv("bloch_radius_bound", "state[16] <= 1.0", 0.0),
+             inv("purity_bounded", "state[17] <= 1.0 + 1e-14", 1e-14),
+             inv("trace_hold", "state[18] <= 1e-14", 1e-14)]},
+        {"contract_id": "c3_chiasmus_reversibility", "target_backend": "cpp",
+         "dt": 0.01, "steps": 10, "timeout_seconds": 30, "max_memory_mb": 512,
+         "initial_state": [0.5, 0.0, 0.5, 0.0, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+         "invariants": [
+             inv("reversibility_error", "state[8] <= 1e-13", 1e-13),
+             inv("purity_conserved", "state[19] <= 1.0 + 1e-13", 1e-13),
+             inv("trace_hold", "state[18] <= 1e-14", 1e-14),
+             inv("z_bound", "state[2] >= -1.0 - 1e-15", 1e-15)]},
+    ]
+
+
+def test_cayley_kraus_lindblad_2lvl_three_stages_verified(tmp_path):
+    """All 3 stages of cayley_kraus_lindblad_2lvl VERIFY natively in C++20."""
+    from invar_agent.research.planner import canonicalize_contract_dicts
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.research.state_machine import (
+        _lower_kernel, _guard_contract_initial_state, _telemetry,
+        _invariant_env, _eval_invariant)
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+
+    contracts, _vm, notes = canonicalize_contract_dicts(_cayley_kraus_contracts(), None, [])
+    vc = [VerificationContract.model_validate(c) for c in contracts]
+    san = sanitize_intrinsics(CAYLEY_KRAUS_KERNEL, contracts=vc)
+
+    # Assert AST sanitizer guards
+    assert not any("spohn_relative_entropy" in n and "ENFORCE_CONSERVATION_PROJECTION" in n for n in san.notes)
+    assert "buf.data[12] = buf.data[2]" not in san.code
+
+    _uast, cpp = _lower_kernel(san.code)
+    bridge = DynamicCABIBridge(tmp_path / "cabi")
+    (tmp_path / "cabi").mkdir(parents=True, exist_ok=True)
+
+    for c in vc:
+        init, warns = _guard_contract_initial_state(san.code, c)
+        assert init[12] >= 0.0  # kappa valid positive parameter
+        run = bridge.run(cpp, init, c.dt, c.steps, "execute_step",
+                         c.timeout_seconds, c.max_memory_mb, isolated=True)
+        assert run.get("fallback") is None, f"{c.contract_id} used Python fallback"
+        assert run.get("finite") is True
+        st = run["state"]
+        tel = _telemetry(run, run.get("initial") or st)
+        for inv in c.invariants:
+            env_extra = {"initial": st, "initial_state": st, "tol": inv.tolerance, "variants": {}}
+            assert _eval_invariant(inv.assertion, st, tel, env_extra), \
+                f"{c.contract_id}: invariant {inv.variable_name} ({inv.assertion}) failed! state: {st[:20]}"
+

@@ -768,11 +768,14 @@ _CONCEPT_BUCKETS: Tuple[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]], ...] 
      ("drift", "err", "error", "residual", "bound", "violation")),
     ("ENTROPY_MONOTONE_LOWER", ("entropy", "s_entropy", "lyapunov"), "ge",
      ("monotone", "step", "min", "prod")),
-    ("ENTROPY_DRIFT_UPPER", ("entropy", "s_entropy", "lyapunov"), "le",
-     ("drift", "monotone", "increase", "err", "error", "residual")),
-    ("TRACE_DRIFT", ("trace",), "le", ("drift", "err", "error", "max", "residual")),
-    ("ROUNDTRIP_ERROR", ("roundtrip", "revers"), "le",
-     ("roundtrip", "revers", "err", "error", "drift")),
+    ("ENTROPY_DRIFT_UPPER", ("entropy", "s_entropy", "lyapunov", "spohn"), "le",
+     ("drift", "monotone", "increase", "err", "error", "residual", "max")),
+    ("TRACE_DRIFT", ("trace",), "le",
+     ("drift", "err", "error", "max", "residual", "hold", "conservation")),
+    ("ROUNDTRIP_ERROR", ("roundtrip", "revers", "chiasmus"), "le",
+     ("roundtrip", "revers", "chiasmus", "err", "error", "drift")),
+    ("UNIT_UPPER_BOUND", ("purity", "closed_energy", "norm"), "le",
+     ("purity", "closed_energy", "norm", "bound", "upper", "max", "hold")),
     ("POSITIVITY_MIN_EIG", ("positivity", "eigenvalue", "lambda_min"), "ge",
      ("positivity", "eigenvalue", "lambda_min", "min")),
 )
@@ -797,7 +800,10 @@ def concept_bucket_key(name: str, assertion: str
     if bound is None:
         return None
     try:
-        if abs(float(bound.group(1))) > 1e-6:
+        val = float(bound.group(1))
+        is_zero_tol = abs(val) <= 1e-6
+        is_unit_tol = abs(val - 1.0) <= 1e-6
+        if not (is_zero_tol or is_unit_tol):
             return None
     except ValueError:
         return None
@@ -807,6 +813,10 @@ def concept_bucket_key(name: str, assertion: str
     stem = _canon_semantic_stem(low)
     for bucket, roots, bucket_dir, tokens in _CONCEPT_BUCKETS:
         if bucket_dir != direction:
+            continue
+        if bucket == "UNIT_UPPER_BOUND" and not is_unit_tol:
+            continue
+        if bucket != "UNIT_UPPER_BOUND" and not is_zero_tol:
             continue
         if not any(tok in low or tok in stem for tok in roots):
             continue

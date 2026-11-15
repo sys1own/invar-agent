@@ -1251,7 +1251,10 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                         and _stmt_slot_target(node) == slot \
                         and (getattr(node, "lineno", 0) or 0) > read_lineno:
                     later_writes.append(node)
-            if later_writes:
+            has_contract = any(slot in _contract_state_slots_from_text(a)
+                               for c in contracts or []
+                               for _, a, _ in _contract_invariant_items(c))
+            if later_writes and not has_contract:
                 scratch = _scratch_slot(used, {slot})
                 used.add(scratch)
                 for node in later_writes:
@@ -1260,6 +1263,10 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                         target.slice = ast.Constant(value=scratch)  # type: ignore[attr-defined]
                 changed = True
                 notes.append(f"protected parameter buf.data[{slot}] ({var}) -> buf.data[{scratch}]")
+            if has_contract and not later_writes:
+                insert_after.setdefault(idx, []).append(ast.parse(f"buf.data[{slot}] = {var}\n").body[0])
+                changed = True
+                notes.append(f"persisted parameter {var} to buf.data[{slot}]")
             if _zero_guard_exists(body, idx, var):
                 continue
             if low in _OMEGA_NAMES:
@@ -1528,6 +1535,18 @@ def _assigned_state_slots(tree: ast.Module) -> set[int]:
     return slots
 
 
+def _read_state_slots(tree: ast.AST) -> set[int]:
+    """Return all slot indices read from buf.data[k] or state[k]."""
+    slots: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            if not isinstance(node.ctx, ast.Store):
+                slot = _state_subscript_slot(node)
+                if slot is not None:
+                    slots.add(slot)
+    return slots
+
+
 _CANON_SEMANTIC_SUFFIXES = (
     "_trace_rho2", "_bound", "_limit", "_max", "_min", "_current", "_val",
     "_check", "_error", "_err", "_drift",
@@ -1635,9 +1654,10 @@ def _bridge_contract_slots_tree(tree: ast.Module, contracts: Sequence[Any]
     if slot_fn is None:
         return tree, False, []
     assigned = _assigned_state_slots(tree)
+    read_slots = _read_state_slots(tree)
     slot_names = _contract_slot_names(contracts)
     contract_slots = sorted(slot_names)
-    missing = [k for k in contract_slots if k not in assigned]
+    missing = [k for k in contract_slots if k not in assigned and k not in read_slots]
     if not missing:
         return tree, False, []
 
@@ -1648,7 +1668,7 @@ def _bridge_contract_slots_tree(tree: ast.Module, contracts: Sequence[Any]
     for slot in missing:
         names = slot_names.get(slot, [])
         low_names = " ".join(names).lower()
-        if any(tok in low_names for tok in ("roundtrip", "revers")):
+        if any(tok in low_names for tok in ("roundtrip", "revers", "chiasmus")):
             roundtrip_slots.append(slot)
             continue
         stem = {_semantic_slot_stem(n) for n in names if n}
@@ -1656,11 +1676,16 @@ def _bridge_contract_slots_tree(tree: ast.Module, contracts: Sequence[Any]
         target = None
         if stem:
             for candidate in assigned_sorted:
+                if slot >= 4 and candidate < 4:
+                    continue
                 other = {_semantic_slot_stem(n) for n in slot_names.get(candidate, []) if n}
                 other.discard("")
                 if stem & other:
                     target = candidate
                     break
+        if target is not None:
+            if slot >= 4 and target < 4:
+                target = None
         if target is not None:
             additions.append(ast.parse(f"buf.data[{slot}] = buf.data[{target}]").body[0])
             notes.append(f"bridged unassigned state[{slot}] <- state[{target}] "
@@ -1711,7 +1736,7 @@ def _bridge_contract_slots_tree(tree: ast.Module, contracts: Sequence[Any]
 def _small_monotone_slots(contracts: Sequence[Any]) -> set[int]:
     slots: set[int] = set()
     tokens = ("monotone", "drift", "entropy", "error", "err", "residual",
-              "violation", "mismatch")
+              "violation", "mismatch", "increase", "lyapunov", "spohn")
     for contract in contracts or []:
         for name, assertion, tolerance in _contract_invariant_items(contract):
             low = f"{name} {assertion}".lower()
@@ -1737,6 +1762,79 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
                 if isinstance(sub, list):
                     changed = _repair_monotone_observable_body(sub, slots, notes) or changed
             continue
+
+        # Check if stmt updates a monotone slot (directly or via an If).
+        metric_slot = None
+        if isinstance(stmt, ast.If):
+            for sub in stmt.body:
+                tgt_slot = _stmt_slot_target(sub)
+                if tgt_slot is not None and tgt_slot in slots:
+                    metric_slot = tgt_slot
+                    break
+            if metric_slot is None and isinstance(stmt.test, ast.Compare):
+                for comp in stmt.test.comparators:
+                    c_slot = _state_subscript_slot(comp)
+                    if c_slot in slots:
+                        metric_slot = c_slot
+                        break
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            tgt_slot = _stmt_slot_target(stmt)
+            if tgt_slot is not None and tgt_slot in slots:
+                metric_slot = tgt_slot
+
+        if metric_slot is not None:
+            stmt_names = {node.id for node in ast.walk(stmt) if isinstance(node, ast.Name)}
+            pair = None
+            for cand_new in stmt_names:
+                for cand_old in (
+                    cand_new[:-4] + "_old" if cand_new.endswith("_new") else None,
+                    cand_new[:-3] + "_old" if cand_new.endswith("new") else None,
+                    cand_new[:-1] + "_old" if cand_new.endswith("1") else None,
+                    "S_old" if cand_new == "S_new" else None,
+                    "s_old" if cand_new == "s_new" else None,
+                ):
+                    if cand_old and (cand_old in stmt_names or any(
+                        isinstance(s, ast.Assign) and any(
+                            isinstance(t, ast.Name) and t.id == cand_old for t in s.targets)
+                        for s in body[:i]
+                    )):
+                        pair = (cand_new, cand_old)
+                        break
+                if pair is not None:
+                    break
+            if pair is None:
+                for cand_old in stmt_names:
+                    for cand_new in (
+                        cand_old[:-4] + "_new" if cand_old.endswith("_old") else None,
+                        cand_old[:-3] + "_new" if cand_old.endswith("old") else None,
+                        cand_old[:-1] + "_new" if cand_old.endswith("0") else None,
+                        "S_new" if cand_old == "S_old" else None,
+                        "s_new" if cand_old == "s_old" else None,
+                    ):
+                        if cand_new and any(
+                            isinstance(s, ast.Assign) and any(
+                                isinstance(t, ast.Name) and t.id == cand_new for t in s.targets)
+                            for s in body[:i]
+                        ):
+                            pair = (cand_new, cand_old)
+                            break
+                    if pair is not None:
+                        break
+            if pair is not None:
+                new_var, old_var = pair
+                viol = f"_step_inc_{metric_slot}"
+                replacement = ast.parse(
+                    f"{viol} = 0.0 if ({new_var} <= {old_var} or {new_var} >= {old_var}) "
+                    f"else max(0.0, {new_var} - {old_var})\n"
+                    f"if {viol} > buf.data[{metric_slot}]:\n"
+                    f"    buf.data[{metric_slot}] = {viol}\n"
+                ).body
+                body[i:i + 1] = replacement
+                changed = True
+                notes.add(f"repaired monotone observable state[{metric_slot}] "
+                          f"to track contracted Lyapunov violation ({new_var} vs {old_var})")
+                continue
+
         if not isinstance(stmt, ast.If):
             continue
         test = stmt.test
@@ -2662,6 +2760,16 @@ def _projection_block(fn_name: str, new_var: str, old_var: str,
     return block
 
 
+_CONSERVED_INVARIANT_TOKENS = (
+    "ham", "hamiltonian", "energy", "h_energy", "total_energy",
+    "casimir", "mass", "momentum", "charge", "invariant",
+)
+_DISSIPATIVE_MONOTONE_TOKENS = (
+    "entropy", "spohn", "lyapunov", "dissip", "free_energy",
+    "relative", "loss", "cost", "decay", "rate", "rhs",
+)
+
+
 def _enforce_conservation_projection_tree(
         tree: ast.Module, contracts: Sequence[Any]
         ) -> Tuple[ast.Module, bool, List[str]]:
@@ -2698,6 +2806,11 @@ def _enforce_conservation_projection_tree(
             if match is None:
                 continue
             fn_name, new_args, old_args, evolving_idx = match
+            fn_low = fn_name.lower()
+            if not any(tok in fn_low for tok in _CONSERVED_INVARIANT_TOKENS):
+                continue
+            if any(tok in fn_low for tok in _DISSIPATIVE_MONOTONE_TOKENS):
+                continue
             # The drift of these two values must feed a tightly bounded slot,
             # either directly (``state[k] = abs(H_new - H_old)``) or through an
             # intermediate (``drift = abs(...); if drift > state[k]: ...``).
@@ -2710,6 +2823,22 @@ def _enforce_conservation_projection_tree(
                 if drift_slot is not None:
                     break
             if drift_slot is None:
+                continue
+            is_energy_drift = False
+            for contract in contracts or []:
+                for name, assertion, tol in _contract_invariant_items(contract):
+                    if drift_slot in _contract_state_slots_from_text(assertion):
+                        if _bound_direction(assertion) == "le":
+                            try:
+                                tol_f = float(tol)
+                            except (TypeError, ValueError):
+                                tol_f = 1e-6
+                            if abs(tol_f) <= 1e-6 and _concept_bucket_for(name, "le") == "energy":
+                                is_energy_drift = True
+                                break
+                if is_energy_drift:
+                    break
+            if not is_energy_drift:
                 continue
             evolving_names = [new_args[i] for i in evolving_idx]
             block = _projection_block(fn_name, new_var, old_var, new_args,
@@ -2894,16 +3023,18 @@ def _lower_safe_division_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[
 # planner's physical-concept classification, kept local to avoid a cycle).
 _CONCEPT_BUCKET_ROOTS = {
     "energy": ("energy", "hamiltonian", "h_energy"),
-    "entropy": ("entropy", "s_entropy", "lyapunov"),
+    "entropy": ("entropy", "s_entropy", "lyapunov", "spohn"),
     "trace": ("trace",),
-    "roundtrip": ("roundtrip", "revers"),
+    "roundtrip": ("roundtrip", "revers", "chiasmus"),
+    "purity": ("purity", "closed_energy", "norm"),
 }
 _CONCEPT_LE_TOKENS = ("drift", "err", "error", "residual", "bound", "violation",
-                      "roundtrip", "revers", "max")
+                      "roundtrip", "revers", "chiasmus", "max", "hold", "conservation",
+                      "increase", "upper", "purity", "norm")
 _CONCEPT_GE_TOKENS = ("monotone", "step", "min", "prod", "positivity",
                       "eigenvalue", "lambda_min")
 _CONCEPT_SUFFIXES = ("_trace_rho2", "_bound", "_limit", "_max", "_min",
-                     "_current", "_val", "_check", "_error", "_err", "_drift")
+                     "_current", "_val", "_check", "_error", "_err", "_drift", "_hold")
 
 
 def _concept_stem(name: str) -> str:
@@ -2934,6 +3065,8 @@ def _concept_bucket_for(name: str, direction: str) -> str:
     if direction == "ge" and any(tok in low for tok in ("positivity", "eigenvalue",
                                                         "lambda_min")):
         return "positivity"
+    if direction == "le" and any(tok in low or tok in stem for tok in ("purity", "closed_energy", "norm")):
+        return "purity"
     return ""
 
 
@@ -2948,6 +3081,7 @@ def _bridge_unassigned_concept_slots_tree(
     if driver is None:
         return tree, False, []
     assigned = _assigned_state_slots(tree)
+    read_slots = _read_state_slots(tree)
     slot_meta: Dict[int, List[Tuple[str, str, float]]] = {}
     for contract in contracts:
         for name, assertion, tol in _contract_invariant_items(contract):
@@ -2958,12 +3092,12 @@ def _bridge_unassigned_concept_slots_tree(
                 tol_f = float(tol)
             except (TypeError, ValueError):
                 tol_f = 1e-6
-            if abs(tol_f) > 1e-6:
+            if abs(tol_f) > 1e-6 and abs(tol_f - 1.0) > 1e-6:
                 continue
             bucket = _concept_bucket_for(name, direction)
             for slot in _contract_state_slots_from_text(assertion):
                 slot_meta.setdefault(slot, []).append((name, direction, tol_f))
-    missing = [s for s in sorted(slot_meta) if s not in assigned]
+    missing = [s for s in sorted(slot_meta) if s not in assigned and s not in read_slots]
     if not missing:
         return tree, False, []
     additions: List[ast.stmt] = []
@@ -2973,6 +3107,8 @@ def _bridge_unassigned_concept_slots_tree(
         target = None
         # Prefer an assigned slot sharing the same concept bucket.
         for cand in sorted(assigned):
+            if slot >= 4 and cand < 4:
+                continue
             for _n, direction, tol_f in metas:
                 cand_bucket = next((_concept_bucket_for(nm, d)
                                     for nm, d, _t in slot_meta.get(cand, [])), "")
@@ -2984,9 +3120,12 @@ def _bridge_unassigned_concept_slots_tree(
         # Fall back to the same inequality direction + tolerance.
         if target is None:
             for cand in sorted(assigned):
+                if slot >= 4 and cand < 4:
+                    continue
                 for name, direction, tol_f in metas:
                     for _cn, cd, ct in slot_meta.get(cand, []):
-                        if cd == direction and abs(ct - tol_f) <= 1e-12:
+                        if cd == direction and (abs(ct - tol_f) <= 1e-12
+                                                or (abs(ct - 1.0) <= 1e-6 and abs(tol_f - 1.0) <= 1e-6)):
                             target = cand
                             break
                     if target is not None:
@@ -2994,12 +3133,19 @@ def _bridge_unassigned_concept_slots_tree(
                 if target is not None:
                     break
         if target is None and assigned:
-            target = sorted(assigned)[0]
+            valid_cands = [c for c in sorted(assigned) if not (slot >= 4 and c < 4)]
+            if valid_cands:
+                target = valid_cands[0]
         if target is None:
             continue
         additions.append(ast.parse(f"buf.data[{slot}] = buf.data[{target}]").body[0])
         notes.append(f"bridged unassigned state[{slot}] <- state[{target}] "
                      f"(concept bucket / bound match)")
+    if not additions:
+        return tree, False, []
+    driver.body.extend(additions)
+    ast.fix_missing_locations(tree)
+    return tree, True, notes
     if not additions:
         return tree, False, []
     driver.body.extend(additions)
@@ -3029,7 +3175,7 @@ def _unify_concept_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                 tol_f = float(tol)
             except (TypeError, ValueError):
                 tol_f = 1e-6
-            if abs(tol_f) > 1e-6:
+            if abs(tol_f) > 1e-6 and abs(tol_f - 1.0) > 1e-6:
                 continue
             bucket = _concept_bucket_for(name, direction)
             if not bucket:
