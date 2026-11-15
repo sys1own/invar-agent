@@ -287,8 +287,9 @@ def test_persistence_round_trip_and_permissions(tmp_path, monkeypatch):
     path = tmp_path / "nested" / "config.json"
     persist_config("deepseek", tier_overrides={"fast": "deepseek-flash", "reasoning": ""},
                    api_key=SK_SECRET, path=path)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    raw = path.read_text()
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    raw = path.read_text(encoding="utf-8")
     assert SK_SECRET not in raw  # key not persisted by default
     loaded = load_persisted_state(path)
     assert loaded["provider"] == "deepseek"
@@ -299,7 +300,8 @@ def test_persistence_round_trip_and_permissions(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_PERSIST_KEY", "1")
     persist_config("deepseek", api_key=SK_SECRET, path=path)
     assert load_persisted_state(path)["api_key"] == SK_SECRET
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_env_auto_detection(monkeypatch):
@@ -472,8 +474,9 @@ def test_api_saved_config_survives_server_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "with-key.json"))
     first.post("/api/config", json={"provider": "deepseek", "api_key": SK_SECRET})
     key_path = tmp_path / "with-key.json"
-    assert SK_SECRET in key_path.read_text()
-    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert SK_SECRET in key_path.read_text(encoding="utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
     server._STATE = None
     third = TestClient(create_app(str(ws)))
     llm = third.get("/api/status").json()["llm"]

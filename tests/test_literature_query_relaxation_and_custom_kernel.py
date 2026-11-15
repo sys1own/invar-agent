@@ -1802,3 +1802,339 @@ def test_cayley_kraus_lindblad_2lvl_three_stages_verified(tmp_path):
             assert _eval_invariant(inv.assertion, st, tel, env_extra), \
                 f"{c.contract_id}: invariant {inv.variable_name} ({inv.assertion}) failed! state: {st[:20]}"
 
+
+CAYLEY_KRAUS_STIFF_LINDBLAD_KERNEL = '''import math
+OMEGA0 = 1.0
+OMEGA_RABI = 0.7
+G1 = 1.0
+GPHI = 0.2
+
+def _sdiv(a, b):
+    if b >= 0.0 and b < 1e-30:
+        return a / 1e-30
+    if b < 0.0 and b > -1e-30:
+        return a / -1e-30
+    return a / b
+
+def cayley_step(x, y, z, dt, w0, wr, g1, gphi, rev):
+    g_perp = 0.5 * g1 + gphi
+    h = 0.5 * dt
+    if rev != 0.0:
+        h = -0.5 * dt
+    a = g_perp * h
+    b = w0 * h
+    c = wr * h
+    d = g1 * h
+    rx = x - a * x - b * y + 0.0 * z
+    ry = y + b * x - a * y - c * z
+    rz = z + 0.0 * x + c * y - d * z + g1 * dt if rev == 0.0 else z + c * y - d * z
+    a11 = 1.0 + a
+    a12 = b
+    a13 = 0.0
+    a21 = -b
+    a22 = 1.0 + a
+    a23 = c
+    a31 = 0.0
+    a32 = -c
+    a33 = 1.0 + d
+    det = a11 * (a22 * a33 - a23 * a32) - a12 * (a21 * a33 - a23 * a31) + a13 * (a21 * a32 - a22 * a31)
+    nx = _sdiv(rx * (a22 * a33 - a23 * a32) - a12 * (ry * a33 - a23 * rz) + a13 * (ry * a32 - a22 * rz), det)
+    ny = _sdiv(a11 * (ry * a33 - a23 * rz) - rx * (a21 * a33 - a23 * a31) + a13 * (a21 * rz - ry * a31), det)
+    nz = _sdiv(a11 * (a22 * rz - ry * a32) - a12 * (a21 * rz - ry * a31) + rx * (a21 * a32 - a22 * a31), det)
+    return (nx, ny, nz)
+
+def project_bloch(x, y, z):
+    r2 = x * x + y * y + z * z
+    if r2 > 0.25:
+        s = _sdiv(0.5 - 1e-15, math.sqrt(max(r2, 1e-300)))
+        return (x * s, y * s, z * s)
+    return (x, y, z)
+
+def lmin_rho(x, y, z):
+    r = math.sqrt(max(x * x + y * y + z * z, 1e-300))
+    return 0.5 - r
+
+def purity_rho(x, y, z):
+    r2 = x * x + y * y + z * z
+    return 0.5 + 2.0 * r2
+
+def spohn_D(x, y, z, xs, ys, zs):
+    r = math.sqrt(max(x * x + y * y + z * z, 1e-300))
+    rs = math.sqrt(max(xs * xs + ys * ys + zs * zs, 1e-300))
+    p1 = min(max(0.5 + r, 1e-15), 1.0 - 1e-15)
+    p2 = 1.0 - p1
+    dot = x * xs + y * ys + z * zs
+    cos_t = _sdiv(dot, max(r * rs, 1e-30))
+    cos_t = min(max(cos_t, -1.0), 1.0)
+    q1 = min(max(0.5 + rs * cos_t, 1e-15), 1.0 - 1e-15)
+    q2 = 1.0 - q1
+    d = p1 * math.log(max(_sdiv(p1, q1), 1e-300)) + p2 * math.log(max(_sdiv(p2, q2), 1e-300))
+    return max(0.0, d)
+
+def simulation_step(buf, dt):
+    x = buf.data[0]
+    y = buf.data[1]
+    z = buf.data[2]
+    omega = buf.data[11]
+    if omega == 0.0:
+        omega = OMEGA_RABI
+    kappa = buf.data[12]
+    if kappa == 0.0:
+        kappa = 1.0
+    gam = buf.data[13]
+    if gam == 0.0:
+        gam = G1
+    rev = buf.data[14]
+    g1 = gam * kappa
+    gphi = GPHI * kappa
+    xn, yn, zn = cayley_step(x, y, z, dt, OMEGA0, omega, g1, gphi, rev)
+    xn, yn, zn = project_bloch(xn, yn, zn)
+    if rev == 0.0:
+        D = spohn_D(xn, yn, zn, 0.0, 0.0, 0.5)
+        buf.data[22] = D
+        if buf.data[7] == 0.0:
+            buf.data[7] = D
+            buf.data[6] = D
+        inc = D - buf.data[6]
+        if inc > 1e-15:
+            buf.data[23] = inc
+        buf.data[6] = D
+        h = dt
+        g_p = 0.5 * g1 + gphi
+        eu_z = z - g1 * h * (z - 0.5) + omega * h * y
+        eu_x = x - g_p * h * x - OMEGA0 * h * y
+        eu_y = y + OMEGA0 * h * x - g_p * h * y - omega * h * z
+        if lmin_rho(eu_x, eu_y, eu_z) < 0.0 or g1 * dt > 2.0:
+            buf.data[10] = 1.0
+            buf.data[9] = 1.0
+        buf.data[24] = 0.0
+    else:
+        xr, yr, zr = cayley_step(xn, yn, zn, dt, OMEGA0, omega, g1, gphi, 0.0)
+        ex = xr - buf.data[16]
+        ey = yr - buf.data[17]
+        ez = zr - buf.data[18]
+        if buf.data[19] == 0.0:
+            buf.data[16] = x
+            buf.data[17] = y
+            buf.data[18] = z
+            buf.data[19] = 1.0
+            ex = xn - x
+            ey = yn - y
+            ez = zn - z
+        res = math.sqrt(max(ex * ex + ey * ey + ez * ez, 1e-300))
+        buf.data[24] = res
+    lmin = lmin_rho(xn, yn, zn)
+    pur = purity_rho(xn, yn, zn)
+    buf.data[0] = xn
+    buf.data[1] = yn
+    buf.data[2] = zn
+    buf.data[3] = lmin
+    buf.data[4] = pur
+    buf.data[5] = 0.0
+    buf.data[8] = math.sqrt(max(xn * xn + yn * yn + zn * zn, 1e-300))
+    buf.data[20] = 1.0
+    buf.data[21] = pur
+'''
+
+
+def _cayley_kraus_stiff_lindblad_contracts():
+    def inv(name, assertion, tol):
+        return {"variable_name": name, "assertion": assertion, "tolerance": tol}
+    init_c1 = [0.45] + [0.0] * 14 + [1e-14] + [0.0] * 9
+    init_c2 = [0.45] + [0.0] * 24
+    init_c3 = [0.45, 0.2, 0.1] + [0.0] * 22
+    return [
+        {
+            "contract_id": "c1_cayley_stiff_trace",
+            "target_backend": "cpp",
+            "dt": 0.05,
+            "steps": 5000,
+            "timeout_seconds": 30,
+            "max_memory_mb": 512,
+            "initial_state": list(init_c1),
+            "invariants": [
+                inv("trace_error_max", "state[5] <= 1e-14", 1e-14),
+                inv("min_eigenvalue_rho", "state[3] >= -1e-15", 1e-15),
+                inv("purity_tr_rho_sq", "state[21] > 0.0 and state[21] <= 1.0 + 1e-14", 1e-14),
+                inv("bloch_norm_bounded", "state[0]*state[0] + state[1]*state[1] + state[2]*state[2] <= 0.2500001", 1e-6),
+                inv("finite", "telemetry['finite'] == 1.0", 0.0),
+            ],
+        },
+        {
+            "contract_id": "c2_entropy_monotone_stiff",
+            "target_backend": "cpp",
+            "dt": 0.25,
+            "steps": 5000,
+            "timeout_seconds": 30,
+            "max_memory_mb": 512,
+            "initial_state": list(init_c2),
+            "invariants": [
+                inv("spohn_entropy_increase_max", "state[23] <= 1e-15", 1e-15),
+                inv("min_eigenvalue_rho", "state[3] >= -1e-15", 1e-15),
+                inv("trace_error_max", "state[5] <= 1e-14", 1e-14),
+                inv("purity_tr_rho_sq", "state[21] > 0.0 and state[21] <= 1.0 + 1e-14", 1e-14),
+                inv("rk4_positivity_violation", "state[9] >= 0.0", 0.0),
+                inv("euler_positivity_violation", "state[10] >= 0.0", 0.0),
+            ],
+        },
+        {
+            "contract_id": "c3_chiasmus_reversibility",
+            "target_backend": "cpp",
+            "dt": 0.05,
+            "steps": 5000,
+            "timeout_seconds": 30,
+            "max_memory_mb": 512,
+            "initial_state": list(init_c3),
+            "invariants": [
+                inv("chiasmus_reversibility_residual", "state[24] <= 1e-13", 1e-13),
+                inv("trace_error_max", "state[5] <= 1e-14", 1e-14),
+                inv("bloch_norm_bounded", "state[0]*state[0] + state[1]*state[1] + state[2]*state[2] <= 0.2500001", 1e-6),
+            ],
+        },
+    ]
+
+
+def test_cayley_kraus_stiff_lindblad_three_stages_verified(tmp_path):
+    """Phase 3: Verify multi-slot norm exclusion, monotone ULP sanitizer, and Chiasmus reversibility in C++20."""
+    from invar_agent.research.planner import canonicalize_contract_dicts
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics, _collect_assigned_slots
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.research.state_machine import (
+        _lower_kernel, _guard_contract_initial_state, _telemetry,
+        _eval_invariant)
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    import ast
+
+    raw_contracts = _cayley_kraus_stiff_lindblad_contracts()
+    contracts, _vm, notes = canonicalize_contract_dicts(raw_contracts, None, [])
+    vc = [VerificationContract.model_validate(c) for c in contracts]
+
+    # Verify planner never unifies state[1], state[2], or state[9], state[10] to state[0] or state[3]
+    c2_assertions = {inv.variable_name: inv.assertion for inv in vc[1].invariants}
+    assert "state[9]" in c2_assertions["rk4_positivity_violation"]
+    assert "state[10]" in c2_assertions["euler_positivity_violation"]
+
+    assigned = _collect_assigned_slots(ast.parse(CAYLEY_KRAUS_STIFF_LINDBLAD_KERNEL))
+    assert {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24}.issubset(assigned)
+
+    san = sanitize_intrinsics(CAYLEY_KRAUS_STIFF_LINDBLAD_KERNEL, contracts=vc, all_contracts=vc)
+
+    # 1. Assert state[1] and state[2] are NEVER bridged or unified to state[0]
+    assert "buf.data[1] = buf.data[0]" not in san.code
+    assert "buf.data[2] = buf.data[0]" not in san.code
+    assert not any("state[1] <- state[0]" in n or "state[1] -> state[0]" in n for n in san.notes)
+    assert not any("state[2] <- state[0]" in n or "state[2] -> state[0]" in n for n in san.notes)
+    assert "buf.data[0] = xn" in san.code
+    assert "buf.data[1] = yn" in san.code
+    assert "buf.data[2] = zn" in san.code
+
+    _uast, cpp = _lower_kernel(san.code)
+    bridge = DynamicCABIBridge(tmp_path / "cabi_stiff")
+    (tmp_path / "cabi_stiff").mkdir(parents=True, exist_ok=True)
+
+    for c in vc:
+        init, warns = _guard_contract_initial_state(san.code, c)
+        if c.contract_id == "c3_chiasmus_reversibility":
+            assert init[14] == 1.0, "Reversibility flag initial_state[14] must be auto-seeded to 1.0"
+        run = bridge.run(cpp, init, c.dt, c.steps, "execute_step",
+                         c.timeout_seconds, c.max_memory_mb, isolated=True)
+        assert run.get("fallback") is None, f"{c.contract_id} used Python fallback (cabi_fallback != 0)"
+        assert run.get("finite") is True, f"{c.contract_id} diverged!"
+        st = run["state"]
+        tel = _telemetry(run, run.get("initial") or st)
+        # Check Bloch norm <= 0.25
+        bloch_norm_sq = st[0] * st[0] + st[1] * st[1] + st[2] * st[2]
+        assert bloch_norm_sq <= 0.2500001, f"{c.contract_id}: Bloch norm sq {bloch_norm_sq} > 0.25"
+        if c.contract_id == "c2_entropy_monotone_stiff":
+            assert st[23] <= 1e-15, f"state[23] spohn_entropy_increase_max {st[23]} > 1e-15"
+        if c.contract_id == "c3_chiasmus_reversibility":
+            assert st[24] <= 1e-13, f"state[24] chiasmus_reversibility_residual {st[24]} > 1e-13"
+        for inv in c.invariants:
+            env_extra = {"initial": st, "initial_state": st, "tol": inv.tolerance, "variants": {}}
+            assert _eval_invariant(inv.assertion, st, tel, env_extra), (
+                f"{c.contract_id}: invariant {inv.variable_name} ({inv.assertion}) failed! "
+                f"state[0..3]={st[:4]}, state[21..25]={st[21:25]}"
+            )
+
+
+def test_stage_promotion_and_closed_dissipation_protection():
+    """Ensure c1/c2/c3/c4 blueprints promote target_research_stages=2->3 and protect gamma==0 checks."""
+    from invar_agent.research.planner import parse_blueprint
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+
+    raw = {
+        "blueprint_id": "cayley_kraus_qubit_gksl",
+        "title": "Unsplit Cayley-Kraus Bloch-vector integrator",
+        "falsifiable_hypothesis": "Cayley-Kraus preserves trace, positivity, entropy, and reversibility.",
+        "search_queries": ["Cayley-Kraus Lindblad integrator"],
+        "target_research_stages": 2,
+        "stage_objectives": ["Stage 1", "Stage 2"],
+        "contracts": [
+            {
+                "contract_id": "c1_cayley_stiff_1e5_dt005",
+                "target_backend": "cpp",
+                "dt": 0.05,
+                "steps": 10,
+                "initial_state": [0.2, 0.1, 0.3, 100000.0, 1.0, 1.0, 0.0],
+                "invariants": [{"variable_name": "trace_error_abs", "assertion": "state[6] <= 1e-14", "tolerance": 1e-15}],
+            },
+            {
+                "contract_id": "c2_cayley_stiff_1e5_dt025",
+                "target_backend": "cpp",
+                "dt": 0.25,
+                "steps": 10,
+                "initial_state": [0.2, 0.1, 0.3, 100000.0, 1.0, 1.0, 0.0],
+                "invariants": [{"variable_name": "trace_error_abs", "assertion": "state[6] <= 1e-14", "tolerance": 1e-15}],
+            },
+            {
+                "contract_id": "c3_cayley_moderate_k1_dt025",
+                "target_backend": "cpp",
+                "dt": 0.25,
+                "steps": 10,
+                "initial_state": [0.2, 0.1, 0.3, 1.0, 1.0, 1.0, 0.0],
+                "invariants": [{"variable_name": "trace_error_abs", "assertion": "state[6] <= 1e-14", "tolerance": 1e-15}],
+            },
+            {
+                "contract_id": "c4_cayley_closed_reversible",
+                "target_backend": "cpp",
+                "dt": 0.05,
+                "steps": 10,
+                "initial_state": [0.2, 0.1, 0.3, 0.0, 1.0, 1.0, 0.0],
+                "invariants": [{"variable_name": "trace_error_abs", "assertion": "state[6] <= 1e-14", "tolerance": 1e-15}],
+            },
+        ],
+        "code_template": (
+            "def cayley_update(buf, dt):\n"
+            "    gamma = buf.data[3]\n"
+            "    buf.data[0] = buf.data[0] / (1.0 + gamma * dt)\n"
+            "def simulation_step(buf, dt):\n"
+            "    cayley_update(buf, dt)\n"
+            "    if buf.data[3] == 0.0:\n"
+            "        buf.data[6] = 0.0\n"
+        ),
+    }
+    bp = parse_blueprint(raw)
+    assert bp.target_research_stages == 3
+    assert len(bp.stage_objectives) == 3
+    san = sanitize_intrinsics(bp.code_template, contracts=[bp.contracts[0]], all_contracts=bp.contracts)
+    assert "gamma = 100000" not in san.code
+
+    raw_stage1_only = {
+        **raw,
+        "contracts": [
+            {**raw["contracts"][3], "contract_id": "stage1_closed_gamma0_dt005"},
+            {**raw["contracts"][2], "contract_id": "stage1_dissipative_gamma1_dt025"},
+            {**raw["contracts"][0], "contract_id": "stage1_stiff_gamma1e5_dt005"},
+        ],
+    }
+    bp2 = parse_blueprint(raw_stage1_only)
+    assert bp2.target_research_stages == 3
+    assert [c.contract_id for c in bp2.contracts] == [
+        "c3_closed_gamma0_dt005",
+        "c1_dissipative_gamma1_dt025",
+        "c2_stiff_gamma1e5_dt005",
+    ]
+
+
+
+

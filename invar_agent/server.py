@@ -265,14 +265,26 @@ class ServerState:
                     resp = await asyncio.to_thread(
                         client.complete, question,
                         max_tokens=max_tokens, temperature=0.2)
-                    return resp.content if resp else None
+                    content = resp.content if resp else None
+                    if not (content or "").strip() and tier == Tier.REASONING:
+                        fast_client = get_llm_client(
+                            provider=self.provider, tier=Tier.FAST,
+                            api_key=self.api_key or None,
+                            override=self.effective_tier_overrides().get(Tier.FAST.value),
+                        )
+                        if fast_client is not None:
+                            resp_fast = await asyncio.to_thread(
+                                fast_client.complete, question,
+                                max_tokens=8192, temperature=0.2)
+                            content = resp_fast.content if resp_fast else None
+                    return content
 
                 async def _reasoning_planner(question: str):
                     return await _planner(question, Tier.REASONING, 32768)
 
                 async def _fast_planner(question: str):
-                    # Tier-1 FAST: telemetry-guided query formulation is cheap.
-                    return await _planner(question, Tier.FAST, 2048)
+                    # Tier-1 FAST: query formulation + accretive stage synthesis.
+                    return await _planner(question, Tier.FAST, 8192)
 
                 # Literature search is LIVE by default in the server/CLI.
                 # Offline only when explicitly requested: INVAR_OFFLINE=1, or

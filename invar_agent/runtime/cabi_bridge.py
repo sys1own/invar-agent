@@ -264,7 +264,13 @@ class DynamicCABIBridge:
                str(cpp_path), "-o", str(so_path)]
         if "clang" in self.compiler:
             cmd[1:1] = ["-march=native"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except OSError as exc:
+            cpp_path.unlink(missing_ok=True)
+            raise KernelExecutionError(
+                f"C-ABI compilation failed ({self.compiler}):\n{exc}",
+                compile_error=True) from exc
         if proc.returncode != 0:
             cpp_path.unlink(missing_ok=True)
             raise KernelExecutionError(

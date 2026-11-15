@@ -195,12 +195,16 @@ def _tokenize(s: str) -> List[Tuple[str, str]]:
                 continue
             tokens.append(("cmd", m.group(1)))
             i += len(m.group(0))
-        elif ch.isdigit() or (ch == "." and i + 1 < n and s[i + 1].isdigit()):
+        elif (ch.isascii() and ch.isdigit()) or (ch == "." and i + 1 < n and s[i + 1].isascii() and s[i + 1].isdigit()):
             m = re.match(r"\d*\.?\d+", s[i:])
+            if not m:
+                raise _LatexParseError(f"unsupported numeric token {ch!r}")
             tokens.append(("num", m.group(0)))
             i += len(m.group(0))
-        elif ch.isalpha():
+        elif ch.isascii() and ch.isalpha():
             m = re.match(r"[A-Za-z]+", s[i:])
+            if not m:
+                raise _LatexParseError(f"unsupported identifier {ch!r}")
             tokens.append(("id", m.group(0)))
             i += len(m.group(0))
         elif ch in "+-*/^_{}()[]=,'":

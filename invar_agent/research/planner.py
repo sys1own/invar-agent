@@ -142,11 +142,12 @@ approximations).
   `5750.0` (m/s) — convert units exactly once, never round (5.75 km/s is NOT
   5800 m/s). Same for masses, altitudes, radii, densities and angles.
 - MULTI-STAGE ACCRETION: when the request or expert prompt describes a staged
-  model (e.g. "Stage 1 baseline, then Stage 2 accretion"), set
-  `target_research_stages >= 2` with one `stage_objectives` entry per stage,
-  and name each contract's stage clearly (prefix contract_ids with `c1_` /
-  `c2_` or `stage1_` / `stage2_`) so Stage 2 builds on the pinned Stage 1
-  layer instead of silently collapsing into one stage."""
+  model or multiple distinct verification regimes (e.g. baseline trace/positivity,
+  stiff entropy monotonicity, and closed-limit chiasmus reversibility), set
+  `target_research_stages: 3` (or `>= 2` matching the contract stage prefixes)
+  with one `stage_objectives` entry per stage, and name each contract's stage
+  clearly (prefix contract_ids with `c1_` / `c2_` / `c3_` or `stage1_` /
+  `stage2_` / `stage3_`) so every stage builds on the pinned verified layer."""
 
 PLANNER_PROMPT = """You are the Research Agent planner of a mathematically verified computational
 research engine. Produce ONE falsifiable research blueprint for the request.
@@ -160,12 +161,14 @@ Stagnation Heating'), falsifiable_hypothesis,
 search_queries (3-6 concise technical keyword queries of 2-4 terms each for
 arXiv/OpenAlex; NEVER full sentences, and never use filler words like
 'vs', 'versus', 'exact', 'using', 'between' or 'comparison'),
-target_research_stages (1-4; use 2-3 when the request describes a progression,
-e.g. "start by ... then integrate ..."), stage_objectives (one short objective per
-stage, stage 1 first), contracts (stage-1 contracts: list of {{contract_id,
-target_backend, timeout_seconds, invariants: [{{variable_name, assertion,
-tolerance}}], max_memory_mb, initial_state: [floats], dt, steps}}),
-code_template (the STAGE-1 module only, v9_transpiler_friendly Python),
+target_research_stages (1-4; use 3 when the request describes 3+ verification
+regimes or a multi-stage progression, e.g. "start by ... then integrate ..."),
+stage_objectives (one short objective per stage, stage 1 first), contracts
+(staged contracts across stages 1..target_research_stages, prefixed c1_...,
+c2_..., c3_...: list of {{contract_id, target_backend, timeout_seconds,
+invariants: [{{variable_name, assertion, tolerance}}], max_memory_mb,
+initial_state: [floats], dt, steps}}),
+code_template (the unified module implementing all staged contracts, v9_transpiler_friendly Python),
 variable_map ({{"<metric_with_units>": <buf.data index>}} for every numerical
 quantity the user requested), max_feedback_rounds (2-4). Across stages each named
 metric keeps ONE unique buf.data slot; never reuse an error/drift accumulator to
@@ -173,7 +176,9 @@ store a previous observable; compute val_before at the top and val_after at the
 bottom and update violations with `viol = max(0.0, val_after - val_before)`.
 Keep initial_state small (<= 16 slots unless the surrogate genuinely needs more,
 max 64) and steps <= 20000. initial_state must be the physical state of the
-surrogate model, never a repeating dummy vector.
+surrogate model, never a repeating dummy vector. Keep code_template concise
+(<= 80 lines of scalar Python implementing the primary reference integrator in
+simulation_step; do not embed duplicate Euler/RK4 state copies inside simulation_step).
 No markdown fences, no <think> blocks. Output JSON only.
 
 ## Feasibility context (authoritative)
@@ -337,18 +342,22 @@ title (concise human-readable, under 80 chars, e.g. 'Mars Atmospheric Entry &
 Stagnation Heating'), falsifiable_hypothesis,
 search_queries (3-6 concise technical keyword queries of 2-4 terms each for
 arXiv/OpenAlex; no full sentences, no 'vs'/'exact'/'using' filler),
-target_research_stages (1-4; use 2-3 when the request describes a progression),
+target_research_stages (1-4; use 3 when the request describes 3+ verification
+regimes or a progression),
 stage_objectives (one short objective per stage, stage 1 first), contracts
-(stage-1 contracts: list of {{contract_id, target_backend, timeout_seconds,
+(staged contracts across stages 1..target_research_stages, prefixed c1_...,
+c2_..., c3_...: list of {{contract_id, target_backend, timeout_seconds,
 invariants: [{{variable_name, assertion, tolerance}}], max_memory_mb,
-initial_state: [floats], dt, steps}}), code_template (the STAGE-1 module only,
-v9_transpiler_friendly Python), variable_map ({{"<metric_with_units>":
+initial_state: [floats], dt, steps}}), code_template (the unified module
+implementing all staged contracts, v9_transpiler_friendly Python), variable_map ({{"<metric_with_units>":
 <buf.data index>}} for every numerical quantity the user requested),
 max_feedback_rounds (2-4).
 Keep initial_state small (<= 16 slots unless the surrogate genuinely needs more,
 max 64) and steps <= 20000. initial_state must encode the physical state of the
-surrogate model, never a repeating dummy vector. If the verdict is
-REFORMULATED_SURROGATE, implement exactly the surrogate equations named in the
+surrogate model, never a repeating dummy vector. Keep code_template concise
+(<= 80 lines of scalar Python implementing the primary reference integrator in
+simulation_step; do not embed duplicate Euler/RK4 state copies inside simulation_step).
+If the verdict is REFORMULATED_SURROGATE, implement exactly the surrogate equations named in the
 reformulation.
 
 ## Executable-research requirements (ALL mandatory for quantitative problems)
@@ -793,7 +802,11 @@ def concept_bucket_key(name: str, assertion: str
     if not low:
         return None
     slots = _canon_slots_in_text(assertion or "")
-    if len(slots) != 1:
+    distinct_slots = sorted(set(slots))
+    if len(distinct_slots) != 1 or len(slots) != 1:
+        return None
+    slot = distinct_slots[0]
+    if slot in (0, 1, 2, 3):
         return None
     bound = re.search(r"(?:state|buf\.data|data)\[\d+\]\s*(?:<=|>=|<|>)\s*([0-9.eE+-]+)",
                       assertion or "")
@@ -818,11 +831,14 @@ def concept_bucket_key(name: str, assertion: str
             continue
         if bucket != "UNIT_UPPER_BOUND" and not is_zero_tol:
             continue
+        if bucket == "POSITIVITY_MIN_EIG" and any(
+                bad in low for bad in ("violation", "rk4", "euler")):
+            continue
         if not any(tok in low or tok in stem for tok in roots):
             continue
         if not any(tok in low for tok in tokens):
             continue
-        return bucket, direction, stem, slots[0]
+        return bucket, direction, stem, slot
     return None
 
 
@@ -856,8 +872,12 @@ def concept_bucket_slot_map(contracts: List[Dict[str, Any]]
             if key is None:
                 continue
             bucket, direction, _stem, slot = key
+            if slot in (0, 1, 2, 3):
+                continue
             claim = (bucket, direction)
             canonical = bucket_slot.setdefault(claim, slot)
+            if canonical in (0, 1, 2, 3):
+                continue
             if slot != canonical:
                 remap[slot] = canonical
                 notes.append(
@@ -983,10 +1003,15 @@ def canonicalize_contract_dicts(
             return
         assertion = str(inv.get("assertion") or "")
         slots = _canon_slots_in_text(assertion)
-        desired = slots[0] if slots else vm.get(name)
+        distinct_slots = sorted(set(slots))
+        if slots and len(distinct_slots) != 1:
+            return
+        desired = distinct_slots[0] if distinct_slots else vm.get(name)
         if desired is None:
             return
         desired = int(desired)
+        if desired in (0, 1, 2, 3):
+            return
         key = _canon_semantic_key(name, assertion)
         name_semantic.setdefault(name, key)
         canonical = semantic_slot.get(key)
@@ -1013,6 +1038,8 @@ def canonicalize_contract_dicts(
                 assign_for_inv(c, inv, record=not is_prior)
 
     for c, inv, old, new in remaps:
+        if old in (0, 1, 2, 3) or new in (0, 1, 2, 3):
+            continue
         inv["assertion"] = _canon_rewrite_slots(str(inv.get("assertion") or ""), old, new)
         notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
 
@@ -1021,6 +1048,9 @@ def canonicalize_contract_dicts(
     assigned_slots = set(name_slot.values()) | set(semantic_slot.values())
     new_vm: Dict[str, int] = {}
     for name, idx in vm.items():
+        if int(idx) in (0, 1, 2, 3):
+            new_vm[name] = int(idx)
+            continue
         canonical = None
         key = name_semantic.get(name)
         if key is not None:
@@ -1068,9 +1098,9 @@ def canonicalize_contract_dicts(
                 if not isinstance(inv, dict):
                     continue
                 nm = str(inv.get("variable_name") or "").strip()
-                slots = _canon_slots_in_text(str(inv.get("assertion") or ""))
-                if nm and slots and nm not in first:
-                    first[nm] = slots[0]
+                distinct_slots = sorted(set(_canon_slots_in_text(str(inv.get("assertion") or ""))))
+                if nm and len(distinct_slots) == 1 and nm not in first:
+                    first[nm] = distinct_slots[0]
         vm = dict(list(first.items())[:64]) or {f"state_{i}": i for i in range(4)}
     return contracts, vm, notes
 
@@ -1145,6 +1175,51 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(out.get("contracts"), list):
         out["contracts"], out["variable_map"], _ = canonicalize_contract_dicts(
             out["contracts"], out.get("variable_map"))
+        # If the LLM emitted >= 3 contracts all tagged stage 1 (e.g. stage1_...
+        # or c1_...) while requesting multi-stage verification, partition them
+        # across c1_, c2_, c3_ so each research stage has dedicated contracts.
+        c_stages = {
+            _canon_stage_index(str(c.get("contract_id") or ""))
+            for c in out["contracts"] if isinstance(c, dict)
+        }
+        dict_contracts = [c for c in out["contracts"] if isinstance(c, dict)]
+        if (
+            len(dict_contracts) >= 3
+            and c_stages == {1}
+            and int(out.get("target_research_stages") or 1) >= 2
+        ):
+            closed_re = re.compile(r"(closed|revers|chiasmus|gamma_?0)", re.IGNORECASE)
+            stage3_idxs = [
+                idx for idx, c in enumerate(dict_contracts)
+                if closed_re.search(str(c.get("contract_id") or ""))
+            ]
+            if not stage3_idxs or len(stage3_idxs) == len(dict_contracts):
+                stage3_idxs = [len(dict_contracts) - 1]
+            rem_idxs = [idx for idx in range(len(dict_contracts)) if idx not in stage3_idxs]
+            split = max(1, len(rem_idxs) // 2)
+            stage1_idxs = set(rem_idxs[:split])
+            stage2_idxs = set(rem_idxs[split:])
+            for idx, c in enumerate(dict_contracts):
+                cid = str(c.get("contract_id") or f"contract_{idx + 1}")
+                stem = _CANON_STAGE_RE.sub("", cid) or cid
+                s_num = 1 if idx in stage1_idxs else (2 if idx in stage2_idxs else 3)
+                c["contract_id"] = f"c{s_num}_{stem}"
+            c_stages = {1, 2, 3}
+        # If contracts carry explicit c3_/stage3_ prefixes while the LLM left
+        # target_research_stages at 2, align target_research_stages to 3 so
+        # Stage 3 contracts are executed rather than orphaned.
+        if max(c_stages, default=1) >= 3 and int(out.get("target_research_stages") or 1) == 2:
+            if {1, 2}.issubset(c_stages):
+                out["target_research_stages"] = 3
+                objs = list(out.get("stage_objectives") or [])
+                while len(objs) < 3:
+                    s_idx = len(objs) + 1
+                    c_ids = [
+                        str(c.get("contract_id")) for c in out["contracts"]
+                        if isinstance(c, dict) and _canon_stage_index(str(c.get("contract_id") or "")) >= s_idx
+                    ]
+                    objs.append(f"Stage {s_idx}: Verify contracts {', '.join(c_ids)}")
+                out["stage_objectives"] = objs
     return out
 
 

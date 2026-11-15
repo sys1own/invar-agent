@@ -817,7 +817,8 @@ def _format_accretion_exception(exc: BaseException) -> str:
 
 def _contracts_through_stage(bp: ResearchBlueprint, stage: int) -> List[VerificationContract]:
     """Cumulative contracts for stages 1..k (unprefixed contracts are stage 1)."""
-    if int(getattr(bp, "target_research_stages", 1) or 1) <= 1:
+    total = int(getattr(bp, "target_research_stages", 1) or 1)
+    if total <= 1 or stage >= total:
         return list(bp.contracts or [])
     return [c for c in (bp.contracts or []) if _contract_stage_index(c.contract_id) <= stage]
 
@@ -860,7 +861,15 @@ _PARAM_KAPPA_NAMES = {"kappa", "stiffness"}
 
 def _contract_is_closed_or_reversible(contract: VerificationContract) -> bool:
     cid = str(getattr(contract, "contract_id", "") or "").lower()
-    return "closed" in cid or "revers" in cid
+    if any(tok in cid for tok in ("closed", "revers", "chiasmus", "gamma0", "gamma_0")):
+        return True
+    if any(tok in cid for tok in ("dissipat", "stiff", "gamma1", "gamma_1")):
+        return False
+    for inv in (getattr(contract, "invariants", None) or []):
+        low = f"{getattr(inv, 'variable_name', '')} {getattr(inv, 'assertion', '')}".lower()
+        if any(tok in low for tok in ("closed", "revers", "chiasmus")):
+            return True
+    return False
 
 
 _PARAM_DISSIPATION_NAMES = {"gamma", "damping", "nu"}
@@ -894,7 +903,7 @@ def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
             warnings.append(
                 f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded "
                 f"{initial[slot]:.6g} for dt={dt}")
-        elif name in _PARAM_DISSIPATION_NAMES and (dissipation_contract or (not closed and dt >= 0.2)):
+        elif name in _PARAM_DISSIPATION_NAMES and not closed and (dissipation_contract or dt >= 0.2):
             initial[slot] = 1.0e5 if stiff_contract else 1.0
             warnings.append(
                 f"auto-init: dissipation parameter state[{slot}] ({name}) was 0.0; "
@@ -927,14 +936,19 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
             and initial[1] == 0.0 and initial[2] == 0.0):
         initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
         warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
-    # 1. Error/drift metrics initialize to 0.0.
+    # 1. Error/drift metrics initialize to 0.0 (only single-slot non-primary state slots >= 4).
     for inv in (contract.invariants or []):
-        m = re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", f"{inv.variable_name} {inv.assertion}")
-        if not m:
-            continue
-        k = int(m.group(1))
-        name = (inv.variable_name or "").lower()
         assertion = str(getattr(inv, "assertion", "") or "")
+        distinct_slots = {
+            int(x) for x in re.findall(
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
+        }
+        if len(distinct_slots) != 1:
+            continue
+        k = next(iter(distinct_slots))
+        if k in (0, 1, 2, 3):
+            continue
+        name = (inv.variable_name or "").lower()
         bound_match = re.search(
             r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*<=\s*([0-9.eE+-]+)", assertion)
         bound = float(bound_match.group(1)) if bound_match else None
@@ -953,6 +967,21 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                         f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
                         f"clamped from {initial[k]} to 1.0")
                     initial[k] = 1.0
+    # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
+    # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
+    # from buf.data[p] (p >= 4) and branches on it, seed initial[p] = 1.0.
+    if _contract_is_closed_or_reversible(contract):
+        for m_rev in re.finditer(
+                r"\b(rev|closed|is_closed|rev_flag|reversible)\s*=\s*"
+                r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
+            rev_var, rev_slot = m_rev.group(1), int(m_rev.group(2))
+            if rev_slot >= 4 and rev_slot < len(initial):
+                if re.search(rf"\bif\s+{re.escape(rev_var)}\b", py_code or ""):
+                    if initial[rev_slot] == 0.0:
+                        initial[rev_slot] = 1.0
+                        warnings.append(
+                            f"auto-init: reversibility flag state[{rev_slot}] ({rev_var}) "
+                            f"set to 1.0 for closed/reversibility contract '{contract.contract_id}'")
     # 2. Physical parameter slots must not start as silent zeros.
     _parameter_initial_defaults(py_code, contract, initial, warnings)
     # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed.
@@ -999,10 +1028,16 @@ def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
     contracts = getattr(bp, "contracts", None) or []
     for contract in contracts:
         for inv in (getattr(contract, "invariants", None) or []):
-            text = f"{inv.variable_name} {inv.assertion}"
-            m = re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", text)
-            if m and inv.variable_name:
-                mapping.setdefault(inv.variable_name, int(m.group(1)))
+            assertion = str(getattr(inv, "assertion", "") or "")
+            distinct_slots = {
+                int(x) for x in re.findall(
+                    r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
+            }
+            if len(distinct_slots) != 1:
+                continue
+            slot = next(iter(distinct_slots))
+            if inv.variable_name:
+                mapping.setdefault(inv.variable_name, slot)
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
@@ -1277,9 +1312,17 @@ class ResearchStateMachine:
             else:
                 # Blueprint contracts staged for this research stage (c2_/stage2_)
                 # are carried into the accretive round alongside synthesized ones.
-                contracts = [c for c in blueprint.contracts
-                             if blueprint.target_research_stages > 1
-                             and _contract_stage_index(c.contract_id) == stage]
+                # On the final stage, also include any contracts with stage index >= stage
+                # (e.g. c4_ when target_research_stages == 3) so no contract is orphaned.
+                contracts = [
+                    c for c in blueprint.contracts
+                    if blueprint.target_research_stages > 1
+                    and (
+                        _contract_stage_index(c.contract_id) == stage
+                        or (stage == blueprint.target_research_stages
+                            and _contract_stage_index(c.contract_id) >= stage)
+                    )
+                ]
             verified = False
 
             # HARD BOUND: exactly max_feedback_rounds attempts, never more.
@@ -1373,13 +1416,24 @@ class ResearchStateMachine:
                 # attempt never overwrites the best finite candidate.
                 attempt_results = state.results[pre_results_len:]
                 q_score = _attempt_quality_score(outcome, attempt_results)
+                used_candidate = outcome.get("candidate_code") or candidate_code
+                degraded_attempt = False
                 if best_score is None or q_score > best_score:
                     best_score = q_score
                     best_attempt = {
-                        "candidate_code": candidate_code,
+                        "candidate_code": used_candidate,
                         "results": list(attempt_results),
                         "status": outcome.get("result_status", "ERROR"),
+                        "failure": failure,
                     }
+                elif best_attempt is not None and q_score < best_score:
+                    # Fix 4: If a healing attempt degrades status (e.g. from FALSIFIED
+                    # finite to DIVERGED non-finite), immediately roll back the AST and
+                    # telemetry to the best finite attempt so the next attempt starts
+                    # from the valid finite AST rather than the broken AST.
+                    degraded_attempt = True
+                    candidate_code = best_attempt["candidate_code"]
+                    state.results[pre_results_len:] = list(best_attempt["results"])
                 state.memory.append({"round": round_idx, "research_stage": stage,
                                      "outcome": outcome["status"], "counterexample": failure})
                 state.blueprint = state.blueprint.model_copy(update={
@@ -1408,11 +1462,17 @@ class ResearchStateMachine:
                     "HEALING", "reasoning_dispatch",
                     f"{heal_tier} model synthesizing correction "
                     f"(Attempt {attempt + 1}/{max_attempts})...")
-                pre_heal_hash = code_hash(candidate_code or "")
+                base_heal_code = (best_attempt["candidate_code"]
+                                  if (degraded_attempt and best_attempt)
+                                  else used_candidate)
+                base_heal_failure = (best_attempt.get("failure") or failure
+                                     if (degraded_attempt and best_attempt)
+                                     else failure)
+                pre_heal_hash = code_hash(base_heal_code or "")
                 raw_heal = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
-                    candidate_code=outcome.get("candidate_code") or candidate_code,
-                    contracts=contracts, failure=failure,
+                    candidate_code=base_heal_code,
+                    contracts=contracts, failure=base_heal_failure,
                     attempt=attempt, max_attempts=max_attempts)
                 if isinstance(raw_heal, dict):
                     heal_outcome = raw_heal
@@ -1700,7 +1760,7 @@ class ResearchStateMachine:
         # 1. Ingest: live literature retrieval (never inside the sandbox).
         state.stage = "Ingest"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Ingest"})
-        if attempt == 1 and candidate_code is None:
+        if attempt == 1 and (stage == 1 or candidate_code is None):
             if stage == 1:
                 queries = list(bp.search_queries)
                 q_source = "blueprint"
@@ -2057,7 +2117,7 @@ class ResearchStateMachine:
             objective=kw["objective"],
             verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
             verified_contracts=verified_contracts, telemetry=kw["telemetry"],
-            literature=kw["literature"], failures=kw["failures"]), timeout=60.0)
+            literature=kw["literature"], failures=kw["failures"]), timeout=120.0)
 
     async def _heal_and_refine(self, *, stage: int, round_idx: int, objective: str,
                                candidate_code: Optional[str],
@@ -2237,18 +2297,21 @@ class ResearchStateMachine:
             except Exception:  # noqa: BLE001
                 hits = []
             if hits:
-                from .extractor import QuantitativeInsightExtractor, merge_evidence
-                evidence = QuantitativeInsightExtractor().extract(
-                    blueprint.falsifiable_hypothesis, hits)
-                merged = merge_evidence(
-                    getattr(blueprint, "structured_evidence", None), evidence)
-                if merged is not None:
-                    state.blueprint = blueprint.model_copy(update={
-                        "structured_evidence": merged,
-                        "extracted_constants": {
-                            **(getattr(blueprint, "extracted_constants", None) or {}),
-                            **{n: float(p.si_value)
-                               for n, p in evidence.parameters.items()}}})
+                try:
+                    from .extractor import QuantitativeInsightExtractor, merge_evidence
+                    evidence = QuantitativeInsightExtractor().extract(
+                        blueprint.falsifiable_hypothesis, hits)
+                    merged = merge_evidence(
+                        getattr(blueprint, "structured_evidence", None), evidence)
+                    if merged is not None:
+                        state.blueprint = blueprint.model_copy(update={
+                            "structured_evidence": merged,
+                            "extracted_constants": {
+                                **(getattr(blueprint, "extracted_constants", None) or {}),
+                                **{n: float(p.si_value)
+                                   for n, p in evidence.parameters.items()}}})
+                except Exception:  # noqa: BLE001
+                    pass
                 top = "; ".join(f"{h.title[:60]}" for h in hits[:3])
                 context_parts.append(
                     f"DIAGNOSTIC RE-SEARCH ({len(hits)} hits): {top}. "
@@ -2658,9 +2721,22 @@ def _egg_simplify(code: str) -> Tuple[str, List[str]]:
     def size(e: ast.AST) -> int:
         return sum(1 for _ in ast.walk(e))
 
+    def has_reducible(e: ast.AST) -> bool:
+        for sub in ast.walk(e):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, (int, float)) \
+                    and not isinstance(sub.value, bool) and float(sub.value) in (0.0, 1.0):
+                return True
+            if isinstance(sub, ast.UnaryOp) and isinstance(sub.op, ast.USub) \
+                    and isinstance(sub.operand, ast.UnaryOp) and isinstance(sub.operand.op, ast.USub):
+                return True
+            if isinstance(sub, ast.BinOp) and isinstance(sub.op, (ast.Sub, ast.Div)) \
+                    and ast.dump(sub.left) == ast.dump(sub.right):
+                return True
+        return False
+
     class _Simplify(ast.NodeTransformer):
         def visit_Assign(self, node):
-            u = to_uast(node.value)
+            u = to_uast(node.value) if has_reducible(node.value) else None
             if u is not None and u["type"] == "binop":
                 try:
                     out = json.loads(repair_uast_expression(json.dumps(u)))
