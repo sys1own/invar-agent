@@ -1173,6 +1173,13 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     elif variable_map is not None:
         out.pop("variable_map", None)
     if isinstance(out.get("contracts"), list):
+        if isinstance(out.get("code_template"), str) and out["code_template"].strip():
+            from ..healing.deterministic_ast import resolve_slot_collisions
+            new_code, new_contracts, _ = resolve_slot_collisions(
+                out["code_template"], out["contracts"], out["contracts"]
+            )
+            out["code_template"] = new_code
+            out["contracts"] = new_contracts
         out["contracts"], out["variable_map"], _ = canonicalize_contract_dicts(
             out["contracts"], out.get("variable_map"))
         # If the LLM emitted >= 3 contracts all tagged stage 1 (e.g. stage1_...

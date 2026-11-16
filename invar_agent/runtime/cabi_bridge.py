@@ -54,7 +54,15 @@ class KernelExecutionError(RuntimeError):
 
 
 _RUNNER_SOURCE = r'''
-import ctypes, json, math, sys, time
+import ctypes, json, math, os, sys, time
+
+if hasattr(os, "add_dll_directory"):
+    for _p in os.environ.get("PATH", "").split(os.pathsep):
+        if _p and os.path.isdir(_p):
+            try:
+                os.add_dll_directory(_p)
+            except OSError:
+                pass
 
 so_path, entry, initial_json, dt, steps = (
     sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), int(sys.argv[5]))
@@ -361,6 +369,14 @@ class DynamicCABIBridge:
         so_path = Path(so_path).resolve()
         if not so_path.is_file():
             raise KernelExecutionError(f"compiled kernel missing: {so_path}")
+        import os
+        if hasattr(os, "add_dll_directory"):
+            for _p in os.environ.get("PATH", "").split(os.pathsep):
+                if _p and os.path.isdir(_p):
+                    try:
+                        os.add_dll_directory(_p)
+                    except OSError:
+                        pass
         lib = ctypes.CDLL(str(so_path))
         fn = getattr(lib, entry, None)
         if fn is None:

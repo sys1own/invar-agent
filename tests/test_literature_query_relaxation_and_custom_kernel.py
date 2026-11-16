@@ -2136,5 +2136,232 @@ def test_stage_promotion_and_closed_dissipation_protection():
     ]
 
 
+LINDBLAD_CAYLEY_KRAUS_COLLISION_KERNEL = '''import math
+
+def _cayley_step(x, y, z, gx, gy, gz, omega, gamma, dt):
+    ax = gx * dt * 0.5
+    ay = gy * dt * 0.5
+    az = gz * dt * 0.5
+    c = math.cos(omega * dt)
+    s = math.sin(omega * dt)
+    xr = c * x - s * y
+    yr = s * x + c * y
+    x2 = (xr + ax * 0.0) / (1.0 + ax) if ax > 0.0 else xr
+    y2 = (yr + ay * 0.0) / (1.0 + ay) if ay > 0.0 else yr
+    z2 = ((z - az) / (1.0 + az)) if az > 0.0 else z
+    return x2, y2, z2
+
+def _rho_from_z(x, y, z):
+    r00 = 0.5 * (1.0 + z)
+    r11 = 0.5 * (1.0 - z)
+    r01r = 0.5 * x
+    r01i = -0.5 * y
+    return r00, r11, r01r, r01i
+
+def _purity(x, y, z):
+    return 0.5 * (1.0 + x * x + y * y + z * z)
+
+def _spohn(z, zss):
+    a = 0.5 * (1.0 + z)
+    b = 0.5 * (1.0 - z)
+    sa = 0.5 * (1.0 + zss)
+    sb = 0.5 * (1.0 - zss)
+    d = 0.0
+    if a > 0.0 and sa > 0.0:
+        d += a * math.log(a / sa) - a + sa
+    if b > 0.0 and sb > 0.0:
+        d += b * math.log(b / sb) - b + sb
+    if d < 0.0:
+        d = 0.0
+    return d
+
+def simulation_step(buf, dt):
+    x = buf.data[3]
+    y = buf.data[4]
+    z = buf.data[5]
+    gx = buf.data[6]
+    gy = buf.data[7]
+    gz = buf.data[8]
+    omega = buf.data[9]
+    mode = buf.data[10]
+    if mode > 0.5 and gx == 0.0 and gy == 0.0 and gz == 0.0:
+        xf = x
+        yf = y
+        zf = z
+        sbuf_data = [0.0] * 16
+        c = math.cos(omega * dt)
+        s = math.sin(omega * dt)
+        x1 = c * xf - s * yf
+        y1 = s * xf + c * yf
+        cb = math.cos(-omega * dt)
+        sb = math.sin(-omega * dt)
+        x2 = cb * x1 - sb * y1
+        y2 = sb * x1 + cb * y1
+        drift = math.sqrt((x2 - x) ** 2 + (y2 - y) ** 2 + (zf - z) ** 2)
+        if drift > buf.data[11]:
+            buf.data[11] = drift
+        buf.data[3] = x2
+        buf.data[4] = y2
+        buf.data[5] = zf
+    else:
+        x2, y2, z2 = _cayley_step(x, y, z, gx, gy, gz, omega, gz, dt)
+        buf.data[3] = x2
+        buf.data[4] = y2
+        buf.data[5] = z2
+    x = buf.data[3]
+    y = buf.data[4]
+    z = buf.data[5]
+    r00, r11, r01r, r01i = _rho_from_z(x, y, z)
+    tr = r00 + r11
+    buf.data[0] = abs(tr - 1.0)
+    if buf.data[0] > buf.data[12]:
+        buf.data[12] = buf.data[0]
+        buf.data[0] = buf.data[12]
+    det = r00 * r11 - (r01r * r01r + r01i * r01i)
+    disc = tr * tr - 4.0 * det
+    if disc < 0.0:
+        disc = -disc
+    lam = 0.5 * (tr - math.sqrt(disc))
+    if lam < buf.data[1]:
+        buf.data[1] = lam
+    pur = _purity(x, y, z)
+    if pur > buf.data[2]:
+        buf.data[2] = pur
+    zss = buf.data[13] if buf.data[13] != 0.0 else -1.0
+    dnow = _spohn(z, zss)
+    if dnow > buf.data[14]:
+        buf.data[4] = dnow - buf.data[14]
+    buf.data[14] = dnow
+    buf.data[11] = buf.data[11]
+'''
+
+
+def test_lindblad_cayley_kraus_slot_collision_and_bloch_guard(tmp_path):
+    """Phase 4: Verify dynamical-vs-metric slot collision resolution, Bloch R_max=1.0
+    contraction guard, chiasmus slot alignment, and 3-stage C++20 verification."""
+    import asyncio
+    from invar_agent.healing.deterministic_ast import (
+        classify_buffer_slots, sanitize_intrinsics, _detect_bloch_radius,
+    )
+    from invar_agent.schemas.research import ResearchBlueprint, VerificationContract
+    from invar_agent.research.state_machine import (
+        ResearchStateMachine, _guard_contract_initial_state, _lower_kernel,
+        _telemetry, _eval_invariant,
+    )
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+
+    raw_contracts = [
+        {
+            "contract_id": "c1_trace_positivity",
+            "target_backend": "cpp",
+            "dt": 0.05,
+            "steps": 5000,
+            "timeout_seconds": 30.0,
+            "max_memory_mb": 256,
+            "initial_state": [0.0, 0.0, 0.0, 0.25, 0.1, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "invariants": [
+                {"variable_name": "trace_drift", "assertion": "state[0] <= 1e-14", "tolerance": 1e-14},
+                {"variable_name": "positivity", "assertion": "state[1] >= -1e-15", "tolerance": 1e-15},
+                {"variable_name": "purity_below_one", "assertion": "state[2] <= 1.0 + 1e-14", "tolerance": 1e-14},
+                {"variable_name": "purity_positive", "assertion": "state[2] > 0.0", "tolerance": 1e-14},
+            ],
+        },
+        {
+            "contract_id": "c2_stiff_entropy",
+            "target_backend": "cpp",
+            "dt": 0.25,
+            "steps": 5000,
+            "timeout_seconds": 30.0,
+            "max_memory_mb": 256,
+            "initial_state": [0.0, 0.0, 0.0, 0.25, 0.1, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "invariants": [
+                {"variable_name": "entropy_monotone", "assertion": "state[4] <= 1e-15", "tolerance": 1e-15},
+                {"variable_name": "trace_drift", "assertion": "state[0] <= 1e-14", "tolerance": 1e-14},
+                {"variable_name": "positivity", "assertion": "state[1] >= -1e-15", "tolerance": 1e-15},
+                {"variable_name": "purity_bound", "assertion": "state[2] <= 1.0 + 1e-14", "tolerance": 1e-14},
+            ],
+        },
+        {
+            "contract_id": "c3_closed_reversibility",
+            "target_backend": "cpp",
+            "dt": 0.05,
+            "steps": 5000,
+            "timeout_seconds": 30.0,
+            "max_memory_mb": 256,
+            "initial_state": [0.0, 0.0, 0.0, 0.25, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "invariants": [
+                {"variable_name": "chiasmus", "assertion": "state[3] <= 1e-13", "tolerance": 1e-13},
+                {"variable_name": "trace_closed", "assertion": "state[0] <= 1e-14", "tolerance": 1e-14},
+                {"variable_name": "purity_closed", "assertion": "state[2] <= 1.0 + 1e-14", "tolerance": 1e-14},
+            ],
+        },
+    ]
+    vc = [VerificationContract.model_validate(c) for c in raw_contracts]
+
+    # 1. Assert dynamical_slots are [3, 4, 5] and R_max is 1.0
+    cls = classify_buffer_slots(LINDBLAD_CAYLEY_KRAUS_COLLISION_KERNEL, vc)
+    assert cls["dynamical_slots"] == [3, 4, 5]
+    assert {0, 1, 2}.issubset(set(cls["metric_slots"]))
+    assert _detect_bloch_radius(LINDBLAD_CAYLEY_KRAUS_COLLISION_KERNEL, vc) == 1.0
+
+    # 2. Run Tier-0 sanitizer and verify collision resolution + dead list pruning
+    san = sanitize_intrinsics(LINDBLAD_CAYLEY_KRAUS_COLLISION_KERNEL, contracts=vc, all_contracts=vc)
+    assert "sbuf_data" not in san.code
+
+    # Stage 2 entropy_monotone must be separated from Bloch coordinate y (state[4])
+    c2_entropy_inv = next(i for i in vc[1].invariants if i.variable_name == "entropy_monotone")
+    assert "state[4]" not in c2_entropy_inv.assertion
+    assert "state[25]" in c2_entropy_inv.assertion
+
+    # Stage 3 chiasmus must be remapped from dynamical state[3] to metric state[11]
+    c3_chiasmus_inv = next(i for i in vc[2].invariants if i.variable_name == "chiasmus")
+    assert c3_chiasmus_inv.assertion == "state[11] <= 1e-13"
+
+    # 3. Verify C-ABI execution across all 3 contracts
+    _uast, cpp = _lower_kernel(san.code)
+    bridge = DynamicCABIBridge(tmp_path / "cabi_collision")
+    (tmp_path / "cabi_collision").mkdir(parents=True, exist_ok=True)
+
+    for c in vc:
+        init, warns = _guard_contract_initial_state(san.code, c)
+        assert not any("seeding state[0] = 0.6" in w for w in warns)
+        assert init[0] == 0.0
+        if c.contract_id == "c3_closed_reversibility":
+            assert init[10] == 1.0, "mode flag initial_state[10] must be 1.0 for closed reversibility"
+        run = bridge.run(cpp, init, c.dt, c.steps, "execute_step",
+                         c.timeout_seconds, c.max_memory_mb, isolated=True)
+        assert run.get("fallback") is None, f"{c.contract_id} used Python fallback!"
+        assert run.get("finite") is True, f"{c.contract_id} diverged!"
+        st = run["state"]
+        tel = _telemetry(run, run.get("initial") or st)
+        assert st[1] >= -1e-15, f"{c.contract_id}: positivity state[1]={st[1]} < -1e-15"
+        assert 0.0 < st[2] <= 1.0 + 1e-14, f"{c.contract_id}: purity state[2]={st[2]} out of (0, 1]"
+        for inv in c.invariants:
+            env_extra = {"initial": st, "initial_state": st, "tol": inv.tolerance, "variants": {}}
+            assert _eval_invariant(inv.assertion, st, tel, env_extra), (
+                f"{c.contract_id}: invariant {inv.variable_name} ({inv.assertion}) failed! state={st}"
+            )
+
+    # 4. Also verify full 3-stage ResearchStateMachine run achieves VERIFIED (3/3 stages, cabi_fallback == 0)
+    bp = ResearchBlueprint.model_validate({
+        "blueprint_id": "lindblad_cayley_kraus",
+        "title": "Unsplit Cayley-Kraus Lindblad Integrator",
+        "falsifiable_hypothesis": "Cayley-Kraus preserves trace, positivity, purity, Spohn entropy, and chiasmus reversibility.",
+        "search_queries": ["GKSL Lindblad Cayley"],
+        "target_research_stages": 3,
+        "stage_objectives": ["Stage 1", "Stage 2", "Stage 3"],
+        "contracts": raw_contracts,
+        "code_template": LINDBLAD_CAYLEY_KRAUS_COLLISION_KERNEL,
+    })
+    sm = ResearchStateMachine(tmp_path / "ws" / "research", workspace_root=tmp_path / "ws")
+    state = asyncio.run(sm.run(bp))
+    assert state.status == "VERIFIED"
+    assert len(state.blueprint.verified_layers) == 3
+    for r in state.results:
+        assert r.status == "VERIFIED"
+        assert (r.telemetry or {}).get("cabi_fallback") is None
+
+
+
 
 

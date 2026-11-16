@@ -53,9 +53,10 @@ from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
                         request_healing_directives, synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
-    apply_healing_directives, enforce_conservation_projection,
-    enforce_lyapunov_sign, numeric_expr_equivalent, sanitize_intrinsics,
-    rewrite_monotone_drift)
+    _detect_bloch_radius, apply_healing_directives, classify_buffer_slots,
+    enforce_conservation_projection, enforce_lyapunov_sign,
+    numeric_expr_equivalent, resolve_slot_collisions, rewrite_monotone_drift,
+    sanitize_intrinsics)
 from .search import LiteratureSearchClient
 from .smt import check_invariants_consistent
 
@@ -916,9 +917,8 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
 
     1. Contract error/drift metrics (tolerance <= 1e-6) must start at 0.0 —
        never 1.0 — so an un-triggered stage metric cannot falsify step 0.
-    2. Dynamical slots state[0..2] must never ALL be zero (trivial fixed
-       point); seed slot 0 with 0.6 when they are. A polar state [0,0,z] is
-       seeded to [0.3,0,±0.8] so z-axis rotation has genuine 3D coupling.
+    2. Dynamical slots (classified from the AST, e.g. state[0..2] or state[3..5])
+       must never ALL be zero (trivial fixed point).
     3. The buffer is padded past the highest slot referenced by the kernel so
        Tier-0 scratch writes (e.g. buf.data[28]) stay in bounds.
     Returns (initial_state, warnings).
@@ -929,14 +929,25 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     while len(initial) < needed:
         initial.append(0.0)
     warnings: List[str] = []
+    cls = classify_buffer_slots(py_code, [contract])
+    dyn_slots = list(cls["dynamical_slots"])
+    metric_slots = set(cls["metric_slots"])
+    if len(dyn_slots) < 3 and not ({0, 1, 2} & metric_slots):
+        for i in range(3):
+            if i not in metric_slots and i not in dyn_slots:
+                dyn_slots.append(i)
+        dyn_slots.sort()
+    dyn_set = set(dyn_slots)
+
     # 1a. Stationary fixed-point guard: the maximally-mixed identity
     # rho = I/2 is a valid density matrix but a degenerate fixed point for
     # many channels; perturb it to a non-stationary positive state.
-    if (len(initial) >= 4 and initial[0] == 0.5 and initial[3] == 0.5
+    if (len(initial) >= 4 and not ({0, 1, 2, 3} & metric_slots)
+            and initial[0] == 0.5 and initial[3] == 0.5
             and initial[1] == 0.0 and initial[2] == 0.0):
         initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
         warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
-    # 1. Error/drift metrics initialize to 0.0 (only single-slot non-primary state slots >= 4).
+    # 1. Error/drift metrics initialize to 0.0 (only single-slot non-dynamical slots).
     for inv in (contract.invariants or []):
         assertion = str(getattr(inv, "assertion", "") or "")
         distinct_slots = {
@@ -946,7 +957,7 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
         if len(distinct_slots) != 1:
             continue
         k = next(iter(distinct_slots))
-        if k in (0, 1, 2, 3):
+        if k in dyn_set:
             continue
         name = (inv.variable_name or "").lower()
         bound_match = re.search(
@@ -969,33 +980,64 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                     initial[k] = 1.0
     # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
     # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
-    # from buf.data[p] (p >= 4) and branches on it, seed initial[p] = 1.0.
+    # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.
     if _contract_is_closed_or_reversible(contract):
         for m_rev in re.finditer(
-                r"\b(rev|closed|is_closed|rev_flag|reversible)\s*=\s*"
+                r"\b(rev|closed|is_closed|rev_flag|reversible|mode|flag|chiasmus)\s*=\s*"
                 r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
             rev_var, rev_slot = m_rev.group(1), int(m_rev.group(2))
-            if rev_slot >= 4 and rev_slot < len(initial):
+            if rev_slot not in dyn_set and rev_slot < len(initial):
                 if re.search(rf"\bif\s+{re.escape(rev_var)}\b", py_code or ""):
                     if initial[rev_slot] == 0.0:
                         initial[rev_slot] = 1.0
                         warnings.append(
                             f"auto-init: reversibility flag state[{rev_slot}] ({rev_var}) "
                             f"set to 1.0 for closed/reversibility contract '{contract.contract_id}'")
+        for p_slot, p_var in (cls.get("parameter_vars") or {}).items():
+            if p_var.lower() in {
+                "gx", "gy", "gz", "g", "g1", "g2", "gphi", "g_phi",
+                "gam", "gam1", "gam2", "gam_phi", "gamma", "gamma1",
+                "gamma2", "gamma_phi", "kappa", "stiffness", "damping", "nu",
+            }:
+                if p_slot < len(initial) and initial[p_slot] != 0.0:
+                    initial[p_slot] = 0.0
+                    warnings.append(
+                        f"auto-init: zeroed dissipation state[{p_slot}] ({p_var}) "
+                        f"for closed/reversibility contract '{contract.contract_id}'")
     # 2. Physical parameter slots must not start as silent zeros.
     _parameter_initial_defaults(py_code, contract, initial, warnings)
-    # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed.
-    if len(initial) >= 3 and initial[0] == 0.0 and initial[1] == 0.0 \
-            and abs(initial[2]) > 0.0:
-        initial[0] = 0.3
-        if abs(initial[2]) > 0.8:
-            initial[2] = math.copysign(0.8, initial[2])
-        warnings.append("auto-init: polar state[0..2]=[0,0,z] is stationary under "
-                        "z-rotation; seeded [0.3, 0.0, ±0.8]")
-    elif len(initial) >= 3 and all(abs(initial[i]) < 1e-12 for i in range(3)):
-        warnings.append("auto-init: state[0..2] all zero (trivial fixed point); "
-                        "seeding state[0] = 0.6")
-        initial[0] = 0.6
+    # 2b. Bloch ball initial norm contraction: ensure initial dynamical Bloch vector is physical.
+    r_max = _detect_bloch_radius(py_code, [contract])
+    if r_max is not None and len(dyn_slots) >= 3:
+        d0, d1, d2 = dyn_slots[0], dyn_slots[1], dyn_slots[2]
+        if max(d0, d1, d2) < len(initial):
+            r2 = initial[d0] ** 2 + initial[d1] ** 2 + initial[d2] ** 2
+            if r2 > r_max * r_max:
+                sc = (0.85 * r_max) / math.sqrt(r2)
+                initial[d0] *= sc
+                initial[d1] *= sc
+                initial[d2] *= sc
+                warnings.append(
+                    f"auto-init: initial Bloch norm sqrt({r2:.4g}) > {r_max}; "
+                    f"scaled state[{d0}..{d2}] inside Bloch ball")
+    # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed (only on dyn_slots).
+    if len(dyn_slots) >= 3:
+        d0, d1, d2 = dyn_slots[0], dyn_slots[1], dyn_slots[2]
+        if max(d0, d1, d2) < len(initial):
+            scale_ref = r_max if r_max is not None else 1.0
+            if initial[d0] == 0.0 and initial[d1] == 0.0 and abs(initial[d2]) > 0.0:
+                initial[d0] = 0.3 * scale_ref
+                if abs(initial[d2]) > 0.8 * scale_ref:
+                    initial[d2] = math.copysign(0.8 * scale_ref, initial[d2])
+                warnings.append(
+                    f"auto-init: polar state[{d0}..{d2}]=[0,0,z] is stationary under "
+                    "z-rotation; seeded non-polar state")
+            elif all(abs(initial[i]) < 1e-12 for i in (d0, d1, d2)):
+                seed_val = 0.6 * scale_ref
+                warnings.append(
+                    f"auto-init: state[{d0}..{d2}] all zero (trivial fixed point); "
+                    f"seeding state[{d0}] = {seed_val:g}")
+                initial[d0] = seed_val
     # 4. Warn (never silently pass) when a contract slot is never computed.
     missing = _kernel_assigns_slots(py_code, _contract_state_slots(contract))
     for k in missing:
@@ -1008,6 +1050,14 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
 
 def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
     """Enforce one canonical buf.data slot per named observable across stages."""
+    code = getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
+    if code.strip() and getattr(bp, "contracts", None):
+        new_code, _, coll_notes = resolve_slot_collisions(code, bp.contracts, bp.contracts)
+        if coll_notes:
+            if getattr(bp, "unified_module_code", None):
+                bp.unified_module_code = new_code
+            if getattr(bp, "code_template", None):
+                bp.code_template = new_code
     contracts = [c.model_dump() for c in getattr(bp, "contracts", None) or []]
     if not contracts:
         return
@@ -2442,7 +2492,10 @@ class ResearchStateMachine:
                         continue
             if contract.target_backend == "rust_hin":
                 telemetry.update(self._hin_check(uast))
-            if contract.target_backend == "multi_variant" and regression_of is None:
+            if contract.target_backend == "multi_variant" and (
+                regression_of is None
+                or any("variants" in str(getattr(i, "assertion", "") or "") for i in (contract.invariants or []))
+            ):
                 variants = await self._run_variants(cpp_code, entries, initial, contract, run)
                 extra["variants"] = variants
                 for name, v in variants.items():
