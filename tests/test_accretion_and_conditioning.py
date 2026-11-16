@@ -293,3 +293,75 @@ def simulation_step(buf, dt):
     assert 0.0 < b.data[8] <= 1.0 + 1e-14
     assert b.data[10] <= 1e-12
     assert b.data[11] <= 1e-13
+
+
+def test_prune_unused_helpers_preserves_read_before_write_and_no_post_return_conditioning():
+    """PRUNE_UNUSED_HELPERS must preserve `r00 = buf.data[0]` read before reassignment,
+    scalar helpers like `entropy_proxy(buf)` must not get post-return conditioning,
+    and running the module directly in Python for 100 steps must yield trace_error_max <= 1e-15."""
+    from invar_agent.healing.deterministic_ast import prune_unused_helpers
+
+    code = '''import math
+
+def entropy_proxy(buf):
+    p0 = max(1e-15, buf.data[0])
+    p1 = max(1e-15, buf.data[1])
+    return -p0 * math.log(p0) - p1 * math.log(p1)
+
+def cayley_step(buf, dt):
+    r00 = buf.data[0]
+    r11 = buf.data[1]
+    r01r = buf.data[2]
+    r01i = buf.data[3]
+    gain = 0.95
+    pop = r00 * gain
+    r00 = 0.5 * (pop + (1.0 - r11) * 0.5)
+    r11 = 1.0 - r00
+    buf.data[0] = r00
+    buf.data[1] = r11
+    buf.data[2] = r01r * 0.99
+    buf.data[3] = r01i * 0.99
+    buf.data[4] = abs((buf.data[0] + buf.data[1]) - 1.0)
+    buf.data[7] = entropy_proxy(buf)
+
+def layer_1_step(buf, dt):
+    cayley_step(buf, dt)
+
+def simulation_step(buf, dt):
+    layer_1_step(buf, dt)
+'''
+    contracts = [
+        {
+            "contract_id": "c1_trace_positivity",
+            "initial_state": [0.85, 0.15, 0.2, 0.1] + [0.0] * 12,
+            "invariants": [
+                {"variable_name": "trace_error_max", "assertion": "state[4] <= 1e-14"},
+                {"variable_name": "entropy_val", "assertion": "state[7] >= 0.0"},
+            ],
+        }
+    ]
+    direct_pruned = prune_unused_helpers(code, entrypoints=("simulation_step", "layer_1_step"))
+    assert "r00 = buf.data[0]" in direct_pruned.code
+
+    san = sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
+    pruned = prune_unused_helpers(san.code, entrypoints=("simulation_step", "layer_1_step"))
+    # Scalar helper entropy_proxy must not have conditioning after its return statement
+    ep_block = pruned.code.split("def entropy_proxy")[1].split("def ")[0]
+    assert "buf.data[7] =" not in ep_block
+
+    # Idempotency check: running sanitize_intrinsics a second time produces 0 changes
+    san2 = sanitize_intrinsics(pruned.code, contracts=contracts, all_contracts=contracts)
+    assert san2.code == pruned.code
+
+    ns = {}
+    exec(pruned.code, ns)
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+            self.size = len(data)
+
+    b = Buf([0.85, 0.15, 0.2, 0.1] + [0.0] * 12)
+    for _ in range(100):
+        ns["simulation_step"](b, 0.01)
+    assert b.data[4] <= 1e-15

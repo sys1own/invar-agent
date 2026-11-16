@@ -682,47 +682,77 @@ def _function_call_names(fn: ast.FunctionDef, names: set[str]) -> set[str]:
     return out
 
 
+def _is_pure_expr(expr: ast.expr) -> bool:
+    return not any(
+        isinstance(n, ast.Call)
+        and (_call_name(n.func) or "") not in (
+            MATH_FUNCS | {"abs", "min", "max", "float", "int", "len", "list"}
+        )
+        for n in ast.walk(expr)
+    )
+
+
+def _name_read_before_overwrite(stmts: List[ast.stmt], name: str) -> bool:
+    """Return True if `name` is loaded in `stmts` before being unconditionally overwritten."""
+    for s in stmts:
+        if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name) and s.targets[0].id == name:
+            # Check RHS of this reassignment first: `x = x + 1` or `x = 0.5 * (x + y)` reads `x`!
+            if any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name for n in ast.walk(s.value)):
+                return True
+            # Unconditionally overwritten without reading `name` on RHS.
+            return False
+        if isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and s.target.id == name:
+            return True
+        if any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name for n in ast.walk(s)):
+            return True
+    return False
+
+
+def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple[List[ast.stmt], bool]:
+    changed = False
+    out: List[ast.stmt] = []
+    for idx, stmt in enumerate(stmts):
+        # Recurse into nested blocks first
+        for fld in ("body", "orelse"):
+            sub = getattr(stmt, fld, None)
+            if isinstance(sub, list) and sub:
+                # Conservatively include anything loaded in remaining outer statements
+                rem_loaded = set(outer_loaded)
+                for later in stmts[idx + 1:]:
+                    for n in ast.walk(later):
+                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                            rem_loaded.add(n.id)
+                new_sub, sub_changed = _prune_dead_in_block(sub, rem_loaded)
+                if sub_changed:
+                    setattr(stmt, fld, new_sub)
+                    changed = True
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            tgt = stmt.targets[0]
+            # Prune trivial self-assignments `x = x` or `buf.data[k] = buf.data[k]`
+            if ast.dump(tgt, include_attributes=False) == ast.dump(
+                stmt.value, include_attributes=False
+            ).replace("Load()", "Store()"):
+                changed = True
+                continue
+            if isinstance(tgt, ast.Name) and _is_pure_expr(stmt.value):
+                name = tgt.id
+                # Never prune if read anywhere in remaining statements or outer scope before overwrite
+                if name not in outer_loaded and not _name_read_before_overwrite(stmts[idx + 1:], name):
+                    changed = True
+                    continue
+        out.append(stmt)
+    if not out:
+        out.append(ast.Pass())
+    return out, changed
+
+
 def _dead_assignments_in_function(fn: ast.FunctionDef) -> Tuple[ast.FunctionDef, bool]:
     total_changed = False
     for _ in range(8):
-        loaded = {n.id for n in ast.walk(fn)
-                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-
-        class _Dead(ast.NodeTransformer):
-            def __init__(self) -> None:
-                self.changed = False
-
-            def visit_Assign(self, node: ast.Assign) -> ast.AST:
-                self.generic_visit(node)
-                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    name = node.targets[0].id
-                    pure = not any(
-                        isinstance(n, ast.Call)
-                        and (_call_name(n.func) or "") not in (
-                            MATH_FUNCS | {"abs", "min", "max", "float", "int", "len", "list"}
-                        )
-                        for n in ast.walk(node.value)
-                    )
-                    if name not in loaded and pure:
-                        self.changed = True
-                        return None  # type: ignore[return-value]
-                # Prune trivial self-assignments `x = x` or `buf.data[k] = buf.data[k]`.
-                if len(node.targets) == 1 and ast.dump(node.targets[0], include_attributes=False) == ast.dump(
-                    node.value, include_attributes=False
-                ).replace("Load()", "Store()"):
-                    self.changed = True
-                    return None  # type: ignore[return-value]
-                return node
-
-        transformer = _Dead()
-        fn = transformer.visit(fn)
-        for sub in ast.walk(fn):
-            for fld in ("body", "orelse"):
-                stmts = getattr(sub, fld, None)
-                if isinstance(stmts, list) and len(stmts) == 0 and fld == "body":
-                    stmts.append(ast.Pass())
-        if not transformer.changed:
+        new_body, changed = _prune_dead_in_block(fn.body, set())
+        if not changed:
             break
+        fn.body = new_body
         total_changed = True
     return fn, total_changed
 
@@ -1175,11 +1205,26 @@ def _repair_delayed_state_history_tree(tree: ast.Module) -> Tuple[ast.Module, bo
                 continue
             assign_lineno = getattr(stmt, "lineno", 0) or 0
             read_before = False
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) \
-                        and _state_subscript_slot(node) == slot \
-                        and (getattr(node, "lineno", 0) or 0) < assign_lineno:
-                    read_before = True
+            for s in body:
+                if (getattr(s, "lineno", 0) or 0) >= assign_lineno:
+                    continue
+                # Skip the normal initial load `r00 = buf.data[0]` and `_invar_*` snapshots
+                if (
+                    isinstance(s, ast.Assign)
+                    and len(s.targets) == 1
+                    and isinstance(s.targets[0], ast.Name)
+                    and (
+                        s.targets[0].id.startswith("_invar_")
+                        or (s.targets[0].id == state_var and _state_subscript_slot(s.value) == slot)
+                    )
+                ):
+                    continue
+                for node in ast.walk(s):
+                    if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) \
+                            and _state_subscript_slot(node) == slot:
+                        read_before = True
+                        break
+                if read_before:
                     break
             if read_before:
                 delayed[slot] = (state_var, assign_lineno)
@@ -1187,6 +1232,18 @@ def _repair_delayed_state_history_tree(tree: ast.Module) -> Tuple[ast.Module, bo
             continue
 
         class _DelayedReadRewrite(ast.NodeTransformer):
+            def visit_Assign(self, node: ast.Assign) -> ast.AST:
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and _state_subscript_slot(node.value) is not None
+                ):
+                    slot = _state_subscript_slot(node.value)
+                    entry = delayed.get(slot) if slot is not None else None
+                    if entry is not None and entry[0] == node.targets[0].id:
+                        return node
+                return self.generic_visit(node)
+
             def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
                 self.generic_visit(node)
                 if not isinstance(node.ctx, ast.Load):
@@ -1362,6 +1419,16 @@ def _rewrite_monotone_r_difference(tree: ast.Module, slot: int) -> Tuple[ast.Mod
                 break
         if diff_var is None:
             continue
+        # Unwrap `_step_inc_k = max(0.0, inner_var)` if already wrapped by monotone sanitizer
+        for stmt in body:
+            if _assign_target_name(stmt) != diff_var:
+                continue
+            val = getattr(stmt, "value", None)
+            if (isinstance(val, ast.Call) and isinstance(val.func, ast.Name)
+                    and val.func.id == "max" and len(val.args) == 2
+                    and isinstance(val.args[1], ast.Name)):
+                diff_var = val.args[1].id
+                break
         diff_idx = -1
         prev = curr = None
         for i, stmt in enumerate(body):
@@ -2591,8 +2658,7 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
                 new_var, old_var = pair
                 viol = f"_step_inc_{metric_slot}"
                 replacement = ast.parse(
-                    f"{viol} = 0.0 if ({new_var} <= {old_var} or {new_var} >= {old_var}) "
-                    f"else max(0.0, {new_var} - {old_var})\n"
+                    f"{viol} = max(0.0, {new_var} - {old_var})\n"
                     f"if {viol} > buf.data[{metric_slot}]:\n"
                     f"    buf.data[{metric_slot}] = {viol}\n"
                 ).body
@@ -2647,20 +2713,11 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
                                 break
                         if prev_slot is not None:
                             viol = f"_monotone_viol_{metric_slot}"
-                            if metric_slot in entropy_upper_slots:
-                                replacement = ast.parse(
-                                    f"{viol} = 0.0 if (({val_name} - buf.data[{prev_slot}]) <= 1e-11 "
-                                    f"or ({val_name} - buf.data[{prev_slot}]) >= -1e-11) "
-                                    f"else max(0.0, {val_name} - buf.data[{prev_slot}])\n"
-                                    f"if {viol} > buf.data[{metric_slot}]:\n"
-                                    f"    buf.data[{metric_slot}] = {viol}\n"
-                                    f"buf.data[{prev_slot}] = {val_name}\n").body
-                            else:
-                                replacement = ast.parse(
-                                    f"{viol} = max(0.0, {val_name} - buf.data[{prev_slot}])\n"
-                                    f"if {viol} > buf.data[{metric_slot}]:\n"
-                                    f"    buf.data[{metric_slot}] = {viol}\n"
-                                    f"buf.data[{prev_slot}] = {val_name}\n").body
+                            replacement = ast.parse(
+                                f"{viol} = max(0.0, {val_name} - buf.data[{prev_slot}])\n"
+                                f"if {viol} > buf.data[{metric_slot}]:\n"
+                                f"    buf.data[{metric_slot}] = {viol}\n"
+                                f"buf.data[{prev_slot}] = {val_name}\n").body
                             body[i:i + 1] = replacement
                             i += len(replacement)
                             ast.fix_missing_locations(stmt)
@@ -2682,7 +2739,9 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
                 sub = stmt.body[0]
                 if _stmt_slot_target(sub) == metric_slot and isinstance(sub, (ast.Assign, ast.AnnAssign)):
                     assign_expr = getattr(sub, "value", None)
-                    if isinstance(assign_expr, ast.Name) and assign_expr.id.startswith(
+                    if isinstance(assign_expr, ast.Constant) and assign_expr.value == 0.0:
+                        already_sanitized = True
+                    elif isinstance(assign_expr, ast.Name) and assign_expr.id.startswith(
                             ("_step_inc_", "_monotone_viol_", "_step_drift_")):
                         already_sanitized = True
                     elif isinstance(assign_expr, ast.Name) and i > 0 \
@@ -2697,28 +2756,18 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
                 if isinstance(assign_expr, ast.Constant) and assign_expr.value == 0.0:
                     already_sanitized = True
             if assign_expr is not None and not already_sanitized:
-                if isinstance(assign_expr, ast.Name):
-                    vname = assign_expr.id
-                    replacement = ast.parse(
-                        f"{vname} = 0.0 if ({vname} <= 1e-11 or {vname} >= -1e-11) "
-                        f"else max(0.0, {vname})\n"
-                        f"if {vname} > buf.data[{metric_slot}]:\n"
-                        f"    buf.data[{metric_slot}] = {vname}\n"
-                    ).body
-                else:
-                    val_src = ast.unparse(assign_expr)
-                    viol = f"_step_inc_{metric_slot}"
-                    replacement = ast.parse(
-                        f"{viol} = 0.0 if (({val_src}) <= 1e-11 or ({val_src}) >= -1e-11) "
-                        f"else max(0.0, {val_src})\n"
-                        f"if {viol} > buf.data[{metric_slot}]:\n"
-                        f"    buf.data[{metric_slot}] = {viol}\n"
-                    ).body
+                val_src = ast.unparse(assign_expr)
+                viol = f"_step_inc_{metric_slot}"
+                replacement = ast.parse(
+                    f"{viol} = max(0.0, {val_src})\n"
+                    f"if {viol} > buf.data[{metric_slot}]:\n"
+                    f"    buf.data[{metric_slot}] = {viol}\n"
+                ).body
                 body[i:i + 1] = replacement
                 i += len(replacement)
                 changed = True
                 notes.add(f"repaired monotone observable state[{metric_slot}] "
-                          f"with ULP/reference conditioning deadband")
+                          f"with direct upper-bound clamp")
                 continue
 
         i += 1
@@ -3057,7 +3106,10 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
 
     notes: List[str] = []
     changed = False
-    if r_max is not None:
+    # For density-matrix systems (r00 + r11 == 1.0), simplex projection + coherence
+    # rescaling in _invar_project_density preserves unit trace; never rescale r00/r11
+    # with 3D Cartesian _bloch_s (which breaks r00 + r11 == 1.0).
+    if r_max is not None and not _is_density_matrix_system(tree, contracts):
         if len(dyn_slots) >= 3:
             d0, d1, d2 = dyn_slots[0], dyn_slots[1], dyn_slots[2]
         else:
@@ -3185,6 +3237,13 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     changed = True
                     notes.append(f"projected buf.data[{d0}..{d2}] onto ||r|| <= {r_max} in {fn.name}")
 
+    def _append_before_return(fn_node: ast.FunctionDef, stmts: List[ast.stmt]) -> None:
+        if fn_node.body and isinstance(fn_node.body[-1], ast.Return):
+            idx = len(fn_node.body) - 1
+            fn_node.body[idx:idx] = stmts
+        else:
+            fn_node.body.extend(stmts)
+
     target_fns: List[ast.FunctionDef] = []
     driver = _simulation_driver(tree)
     if driver is not None:
@@ -3192,6 +3251,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     latest_layer = _latest_layer_function(tree)
     if latest_layer is not None and latest_layer not in target_fns:
         target_fns.append(latest_layer)
+    # Strictly exclude scalar helper functions that return a numeric expression
+    target_fns = [
+        fn_tgt for fn_tgt in target_fns
+        if not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn_tgt))
+    ]
     if target_fns:
         assigned_all = _collect_assigned_slots(tree)
         for fn_tgt in target_fns:
@@ -3202,8 +3266,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 bound = nonneg_slots[s_idx]
                 clamp_val = 0.0 if bound <= 0.0 else bound
                 guard_src = f"if buf.data[{s_idx}] < {bound!r}:\n    buf.data[{s_idx}] = {clamp_val!r}\n"
-                if guard_src.strip() not in fn_src:
-                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                if f"if buf.data[{s_idx}] < " not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
@@ -3211,8 +3275,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 if s_idx not in assigned_all:
                     continue
                 guard_src = f"if buf.data[{s_idx}] > 0.25:\n    buf.data[{s_idx}] = 0.25\n"
-                if guard_src.strip() not in fn_src:
-                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                if f"if buf.data[{s_idx}] > 0.25:" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned Bloch norm slot state[{s_idx}] <= 0.25 in {fn_tgt.name}")
@@ -3220,8 +3284,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 if s_idx not in assigned_all:
                     continue
                 guard_src = f"if buf.data[{s_idx}] > 1.0:\n    buf.data[{s_idx}] = 1.0\n"
-                if guard_src.strip() not in fn_src:
-                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                if f"if buf.data[{s_idx}] > 1.0:" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned purity/unit slot state[{s_idx}] <= 1.0 in {fn_tgt.name}")
@@ -3230,8 +3294,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     continue
                 bound = small_upper_slots[s_idx]
                 guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = 0.0\n"
-                if guard_src.strip() not in fn_src:
-                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                if f"if buf.data[{s_idx}] > " not in fn_src or f"buf.data[{s_idx}] = 0.0" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned drift/error slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
@@ -3504,6 +3568,7 @@ def _stabilize_dynamical_state_tree(
         and fn.args.args[0].arg == "buf"
         and not fn.name.startswith("_invar_")
         and not fn.name.endswith(("_euler", "_rk4"))
+        and not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn))
     ]
     if not step_fns:
         return tree, False, []
@@ -3597,14 +3662,14 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
     tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
     tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
+    tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
+    tree, history_changed, history_notes = _repair_history_slots_tree(tree)
     tree, stab_changed, stab_notes = _stabilize_dynamical_state_tree(
         tree, bridge_contracts, stabilize_diverged=stabilize_diverged
     )
-    tree, bloch_changed, bloch_notes = _enforce_bloch_ball_projection_tree(tree, bridge_contracts)
-    tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
-    tree, history_changed, history_notes = _repair_history_slots_tree(tree)
     tree, monotone_changed, monotone_notes = _repair_monotone_observables_tree(
         tree, bridge_contracts)
+    tree, bloch_changed, bloch_notes = _enforce_bloch_ball_projection_tree(tree, bridge_contracts)
     tree, none_changed, none_notes = _strip_none_literals_tree(tree)
     tree, complex_changed, complex_notes = _lower_complex_tree(tree)
     tree, sdiv_changed, sdiv_notes = _lower_safe_division_tree(tree)

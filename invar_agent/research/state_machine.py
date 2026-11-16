@@ -913,6 +913,7 @@ def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
 
 
 def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
+                                  all_contracts: Optional[Sequence[VerificationContract]] = None,
                                   ) -> Tuple[List[float], List[str]]:
     """Static contract-slot guard + auto-initializer.
 
@@ -948,37 +949,40 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
             and initial[1] == 0.0 and initial[2] == 0.0):
         initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
         warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
-    # 1. Error/drift metrics initialize to 0.0 (only single-slot non-dynamical slots).
-    for inv in (contract.invariants or []):
-        assertion = str(getattr(inv, "assertion", "") or "")
-        distinct_slots = {
-            int(x) for x in re.findall(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
-        }
-        if len(distinct_slots) != 1:
-            continue
-        k = next(iter(distinct_slots))
-        if k in dyn_set:
-            continue
-        name = (inv.variable_name or "").lower()
-        bound_match = re.search(
-            r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*<=\s*([0-9.eE+-]+)", assertion)
-        bound = float(bound_match.group(1)) if bound_match else None
-        error_metric = any(tok in name for tok in
-                           ("error", "err", "drift", "residual", "violation", "mismatch", "hold", "bound", "increase"))
-        if bound is not None:
-            if (0.0 <= bound <= 1e-8) or (error_metric and bound <= 1e-6):
-                if k < len(initial) and initial[k] != 0.0:
-                    warnings.append(
-                        f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
-                        f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
-                    initial[k] = 0.0
-            elif abs(bound - 1.0) <= 1e-6:
-                if k < len(initial) and initial[k] > bound:
-                    warnings.append(
-                        f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
-                        f"clamped from {initial[k]} to 1.0")
-                    initial[k] = 1.0
+    # 1. Error/drift metrics initialize to 0.0 (only single-slot non-dynamical slots)
+    # across all blueprint contracts so every stage starts with clean error slots.
+    for c_item in (all_contracts or [contract]):
+        for inv in (getattr(c_item, "invariants", None) or []):
+            assertion = str(getattr(inv, "assertion", "") or "")
+            distinct_slots = {
+                int(x) for x in re.findall(
+                    r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
+            }
+            if len(distinct_slots) != 1:
+                continue
+            k = next(iter(distinct_slots))
+            if k in dyn_set:
+                continue
+            name = (inv.variable_name or "").lower()
+            bound_match = re.search(
+                r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*<=\s*([0-9.eE+-]+)", assertion)
+            bound = float(bound_match.group(1)) if bound_match else None
+            error_metric = any(tok in name for tok in
+                               ("error", "err", "drift", "residual", "violation", "mismatch",
+                                "hold", "bound", "increase", "monotone", "monotonicity"))
+            if bound is not None:
+                if (0.0 <= bound <= 1e-8) or (error_metric and bound <= 1e-6):
+                    if k < len(initial) and initial[k] != 0.0:
+                        warnings.append(
+                            f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
+                            f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
+                        initial[k] = 0.0
+                elif abs(bound - 1.0) <= 1e-6:
+                    if k < len(initial) and initial[k] > bound:
+                        warnings.append(
+                            f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
+                            f"clamped from {initial[k]} to 1.0")
+                        initial[k] = 1.0
     # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
     # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
     # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.
@@ -1985,6 +1989,23 @@ class ResearchStateMachine:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "PreWrite_Guard: " + "; ".join(violations),
                     "candidate_code": candidate_code, "contracts": contracts}
+        # 1-step Python smoke execution in PreWrite_Guard to catch UnboundLocalError/NameError
+        try:
+            _smoke_ns: Dict[str, Any] = {}
+            exec(compile(unified, "<prewrite_smoke>", "exec"), _smoke_ns)
+            _smoke_fn = _smoke_ns.get("simulation_step")
+            if callable(_smoke_fn):
+                _max_idx = max(
+                    [int(m) for m in re.findall(r"buf\.data\[(\d+)\]", unified)] + [31]
+                )
+                _smoke_buf = _BufView([0.5] * min(4096, _max_idx + 1))
+                _smoke_fn(_smoke_buf, 0.01)
+        except Exception as exc:  # noqa: BLE001
+            await emit("accelerator_log", "guard_reject", {**tag, "violations": [f"python_smoke: {type(exc).__name__}: {exc}"]})
+            self._rollback_overlay(scratch)
+            return {"status": "error", "result_status": "ERROR",
+                    "failure": f"PreWrite_Guard python_smoke: {type(exc).__name__}: {exc}",
+                    "candidate_code": candidate_code, "contracts": contracts}
         try:
             uast, cpp_code = _lower_kernel(unified)
         except (UnsupportedError, EmitterError, SyntaxError) as exc:
@@ -2527,7 +2548,9 @@ class ResearchStateMachine:
         start = time.perf_counter()
         # Static contract-slot guard: error metrics start at 0.0, dynamical
         # slots are never all-zero, and uncomputed contract slots are logged.
-        initial, slot_warnings = _guard_contract_initial_state(py_code or "", contract)
+        initial, slot_warnings = _guard_contract_initial_state(
+            py_code or "", contract, all_contracts=getattr(bp, "contracts", None)
+        )
         max_vmap_slot = max((idx for idx in (bp.variable_map or {}).values() if isinstance(idx, int)), default=-1)
         if max_vmap_slot >= len(initial) and max_vmap_slot < 4096:
             initial = list(initial) + [0.0] * (max_vmap_slot - len(initial) + 1)
