@@ -518,9 +518,16 @@ _PARAM_WITH_UNIT = re.compile(
 # Single-letter subscript state tokens (``z_k``, ``q_0``, ``x_n``, ``i_2``,
 # ``j_m``, ...) are code identifiers, never physical constants.
 _SUBSCRIPT_STATE_RE = re.compile(r"^[a-zA-Z]_[knij012m]$")
-_NAME_FILLER = {"the", "a", "an", "of", "is", "and", "with", "at", "to", "for",
-                "in", "on", "by", "about", "approximately", "roughly", "around",
-                "value", "equal", "equals", "be", "was", "were", "are", "its"}
+_NAME_FILLER = {
+    "the", "a", "an", "of", "is", "and", "or", "with", "at", "to", "for",
+    "in", "on", "by", "about", "approximately", "roughly", "around",
+    "value", "equal", "equals", "be", "was", "were", "are", "its",
+    "case", "literature", "violate", "violates", "diverge", "diverges",
+    "positivity", "when", "where", "if", "then", "else", "such", "that",
+    "which", "from", "into", "over", "under", "rich", "strict", "must",
+    "may", "can", "should", "limit", "closed", "open", "given", "using",
+    "let", "set", "assume", "assuming", "all",
+}
 
 
 def _parse_number(text: str) -> Optional[float]:
@@ -536,8 +543,16 @@ def _parse_number(text: str) -> Optional[float]:
 
 
 def _snake(text: str) -> str:
-    words = [w for w in re.findall(r"[A-Za-z0-9]+", text.lower())
-             if w not in _NAME_FILLER]
+    raw_words = re.findall(r"[A-Za-z0-9]+", (text or "").lower())
+    # Drop everything up to and including the last prose stopword/filler so
+    # clauses like `positivity or diverge kappa` reduce cleanly to `kappa`.
+    last_filler = -1
+    for i, w in enumerate(raw_words):
+        if w in _NAME_FILLER:
+            last_filler = i
+    if last_filler >= 0 and last_filler + 1 < len(raw_words):
+        raw_words = raw_words[last_filler + 1 :]
+    words = [w for w in raw_words if w not in _NAME_FILLER]
     return "_".join(words[-4:])
 
 

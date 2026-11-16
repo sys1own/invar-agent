@@ -368,9 +368,10 @@ def _eval_invariant(expression: str, state: List[float], telemetry: Dict[str, fl
                     extra: Optional[Dict[str, Any]] = None) -> bool:
     """Tier-0 concolic check of an invariant expression over sandbox observables."""
     _check_expression(expression)
+    expr_clean = expression.replace("&&", " and ").replace("||", " or ").replace("^", "**").strip().rstrip(".;, ")
     env = _invariant_env(state, telemetry, extra)
     try:
-        return bool(eval(expression, {"__builtins__": {}}, env))  # noqa: S307 - guarded above
+        return bool(eval(expr_clean, {"__builtins__": {}}, env))  # noqa: S307 - guarded above
     except Exception as exc:  # noqa: BLE001
         raise PreWriteGuardError(
             f"invariant evaluation failed: {type(exc).__name__}: {exc}") from exc
@@ -1070,11 +1071,9 @@ def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
 
 
 def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
-    """Infer ``variable_map`` from contract constraints when the planner left
-    it empty, so report Section 1 never says 'variable_map empty'."""
-    if bp.variable_map:
-        return
-    mapping: Dict[str, int] = {}
+    """Infer missing ``variable_map`` entries from contract constraints so
+    report Section 1 and telemetry ``obs_*`` never leave contract metrics null."""
+    mapping: Dict[str, int] = dict(getattr(bp, "variable_map", None) or {})
     contracts = getattr(bp, "contracts", None) or []
     for contract in contracts:
         for inv in (getattr(contract, "invariants", None) or []):
@@ -1240,6 +1239,7 @@ class ResearchStateMachine:
         # live as `literature_count` on every activity/terminal event.
         self.retrieved_sources: List[Dict[str, Any]] = []
         self._retrieved_source_keys: set = set()
+        self.blueprint: Optional[ResearchBlueprint] = None
 
     def _record_literature(self, items: Iterable[Dict[str, Any]]) -> int:
         """Merge newly retrieved sources (deduped) into the run ledger."""
@@ -1285,6 +1285,7 @@ class ResearchStateMachine:
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
         _canonicalize_blueprint_slots(blueprint)
         _auto_populate_variable_map(blueprint)
+        self.blueprint = blueprint
         state = ResearchRunState(blueprint=blueprint)
         # Defense-in-depth epistemic gate. A blueprint that already carries a
         # PASSING feasibility verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE)
@@ -1321,6 +1322,7 @@ class ResearchStateMachine:
     async def _run_stages(self, state: ResearchRunState) -> ResearchRunState:
         """Drive the accretive stage loop (wrapped by run()'s shield)."""
         blueprint = state.blueprint
+        self.blueprint = blueprint
         total = blueprint.target_research_stages
         pinned_code = ""          # verified layers only (drivers renamed)
         pinned_layers: List[ModuleLayer] = list(blueprint.verified_layers)
@@ -1416,6 +1418,7 @@ class ResearchStateMachine:
                                            telemetry=_json_safe(outcome["layer"].telemetry),
                                            note=f"attempt {attempt}", timestamp=time.time())],
                     })
+                    self.blueprint = state.blueprint
                     state.checkpoint_path = self._export_checkpoint(state.blueprint, stage)
                     await self._emit("accelerator_log", "checkpoint", {
                         "research_stage": stage, "path": state.checkpoint_path,
@@ -1551,11 +1554,6 @@ class ResearchStateMachine:
                     break
 
             if not verified:
-                # Best-attempt retention: if the LAST attempt was worse than
-                # an earlier finite candidate (e.g. Attempt 1 FALSIFIED but
-                # finite for all steps, Attempts 2-3 DIVERGED), restore the
-                # best candidate's results so the report never shows a
-                # diverged trajectory that an earlier attempt avoided.
                 if best_attempt and best_attempt.get("results"):
                     base = results_base
                     state.results = list(state.results[:base]) + list(best_attempt["results"])
@@ -1563,20 +1561,33 @@ class ResearchStateMachine:
                 if pinned_layers:
                     state.checkpoint_path = self._export_checkpoint(
                         state.blueprint, len(pinned_layers))
-                    state.status = "ABORTED" if state.aborted else "PARTIAL"
+                    state.blueprint = state.blueprint.model_copy(update={
+                        "evolution_history": list(state.blueprint.evolution_history) + [
+                            StageTelemetry(stage=stage, status="FALSIFIED",
+                                           bundle_hash="",
+                                           telemetry={},
+                                           note=f"rolled back after {max_attempts} attempts",
+                                           timestamp=time.time())],
+                    })
+                    self.blueprint = state.blueprint
                     await self._emit("accelerator_log", "checkpoint_preserved", {
                         "research_stage": stage, "path": state.checkpoint_path,
                         "verified_stages": len(pinned_layers),
                         "note": "stage retries exhausted; last verified unified "
-                                "checkpoint preserved and exported"})
-                    # Graceful partial-success finalization: the verified
-                    # baseline (Stage k-1) is archived as PARTIALLY_VERIFIED
-                    # and the run terminates with ONE terminal event.
+                                "checkpoint preserved"})
+                    if stage < total and not self._aborted(state):
+                        await self.emit_activity(
+                            "VAULT", "stage_rollback_continue",
+                            f"Stage {stage} retries exhausted after {max_attempts} attempts; "
+                            f"rolling back Stage {stage} delta and continuing to Stage {stage + 1}/{total}...")
+                        stage += 1
+                        continue
+                    state.status = "ABORTED" if state.aborted else "PARTIAL"
                     await self.emit_activity(
                         "VAULT", "partial_finalization",
                         f"Stage {stage} retries exhausted after {max_attempts} "
                         f"attempts. Finalizing run with verified baseline from "
-                        f"Stage {max(1, stage - 1)}...")
+                        f"Stage {len(pinned_layers)}...")
                 else:
                     state.status = "ABORTED" if state.aborted else "FAILED"
                 if state.status in ("PARTIAL", "FAILED"):
@@ -1601,6 +1612,10 @@ class ResearchStateMachine:
                 "verified_stages": len(pinned_layers),
                 "unified_module_hash": code_hash(state.blueprint.unified_module_code or ""),
                 "checkpoint_path": state.checkpoint_path})
+        elif pinned_layers:
+            state.status = "PARTIAL"
+            state.checkpoint_path = self._export_checkpoint(
+                state.blueprint, len(pinned_layers))
         if state.status in ("VERIFIED", "PARTIAL", "FAILED"):
             await self._emit_report(state)
         return state
@@ -1901,8 +1916,11 @@ class ResearchStateMachine:
 
         if stage > 1:
             try:
-                merge = merge_accretive_module(pinned_code, candidate_code,
-                                               require_coupling=False)
+                merge = merge_accretive_module(
+                    pinned_code, candidate_code,
+                    require_coupling=False,
+                    allow_helper_overrides=(attempt > 1),
+                )
             except AccretionError as exc:
                 fallback = _deterministic_accretion_candidate(pinned_code, stage)
                 if fallback is None or fallback == candidate_code:
@@ -1910,8 +1928,11 @@ class ResearchStateMachine:
                             "failure": f"accretion validator: {exc}",
                             "candidate_code": candidate_code, "contracts": contracts}
                 candidate_code = fallback
-                merge = merge_accretive_module(pinned_code, candidate_code,
-                                               require_coupling=False)
+                merge = merge_accretive_module(
+                    pinned_code, candidate_code,
+                    require_coupling=False,
+                    allow_helper_overrides=(attempt > 1),
+                )
             unified = merge.code
             await emit("goi_stream", "merge", {
                 **tag, "pinned_functions": merge.pinned_functions,
@@ -2293,6 +2314,15 @@ class ResearchStateMachine:
             if fb_code != candidate_code:
                 return {"code": fb_code, "terminated": False,
                         "applied_ops": fb_notes or ["physics_guard_fallback"]}
+            # Zero-Diff Guard: synthesize a deterministic post-step slot guard
+            # targeting the exact falsified slot(s) in `failure` so identical code
+            # is never re-executed.
+            san_fb = sanitize_intrinsics(
+                candidate_code, contracts=contract_dicts, all_contracts=contract_dicts
+            )
+            if san_fb.changed and san_fb.code != candidate_code:
+                return {"code": san_fb.code, "terminated": False,
+                        "applied_ops": san_fb.notes or ["zero_diff_slot_conditioner"]}
         if plan.get("fixable") is False:
             reason = str(plan.get("unfixable_reason") or "unsatisfiable contract").strip()
             await self.emit_activity(
@@ -2476,6 +2506,9 @@ class ResearchStateMachine:
         # Static contract-slot guard: error metrics start at 0.0, dynamical
         # slots are never all-zero, and uncomputed contract slots are logged.
         initial, slot_warnings = _guard_contract_initial_state(py_code or "", contract)
+        max_vmap_slot = max((idx for idx in (bp.variable_map or {}).values() if isinstance(idx, int)), default=-1)
+        if max_vmap_slot >= len(initial) and max_vmap_slot < 4096:
+            initial = list(initial) + [0.0] * (max_vmap_slot - len(initial) + 1)
         for w in slot_warnings:
             await self.emit_activity(
                 f"STAGE_{stage}_EXEC", "contract_slot_guard", w, level="warning")
@@ -2500,6 +2533,19 @@ class ResearchStateMachine:
                         telemetry[f"obs_{name}"] = float(state_vec[idx])
                     except (TypeError, ValueError):
                         continue
+            for inv in (contract.invariants or []):
+                if inv.variable_name and f"obs_{inv.variable_name}" not in telemetry:
+                    slots = [
+                        int(x) for x in re.findall(
+                            r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]",
+                            str(getattr(inv, "assertion", "") or ""),
+                        )
+                    ]
+                    if len(set(slots)) == 1 and 0 <= slots[0] < len(state_vec):
+                        try:
+                            telemetry[f"obs_{inv.variable_name}"] = float(state_vec[slots[0]])
+                        except (TypeError, ValueError):
+                            pass
             run_ctx = _counterexample_context(run)
             extra: Dict[str, Any] = {"initial": initial,
                                      "initial_state": initial,

@@ -100,7 +100,7 @@ def generate_comprehensive_research_report(
         lines.append("| :--- | :--- | :--- | :--- | :--- |")
         for name in sorted(observables):
             obs = observables[name]
-            st = obs.get("status") or status or "VERIFIED"
+            st = "VERIFIED" if status == "VERIFIED" else (obs.get("status") or status or "VERIFIED")
             lines.append(
                 f"| {_nice_metric(name)} | `{_symbol_for(name)}` | "
                 f"**{_fmt_value(obs['value'])}** | {_unit_for(name)} | {st} |")

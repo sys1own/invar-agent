@@ -17,8 +17,9 @@ def extract_observables(variable_map: Dict[str, int],
                         results: List[SimulationResult]) -> Dict[str, Dict[str, Any]]:
     """Collect ``obs_<name>`` telemetry values per verified result.
 
-    Returns {metric_name: {"value": float, "contract_id": str, "stage": int}}.
-    Later (higher-stage) results win for duplicated metrics.
+    Returns {metric_name: {"value": float, "contract_id": str, "stage": int, "status": str}}.
+    Later (higher-stage) VERIFIED results win; a FALSIFIED result never
+    downgrades a metric that was already VERIFIED.
     """
     if not variable_map:
         return {}
@@ -28,6 +29,9 @@ def extract_observables(variable_map: Dict[str, int],
             key = f"obs_{name}"
             value = result.telemetry.get(key)
             if isinstance(value, (int, float)):
+                prev = out.get(name)
+                if prev is not None and prev.get("status") == "VERIFIED" and result.status != "VERIFIED":
+                    continue
                 out[name] = {
                     "value": float(value),
                     "contract_id": result.contract_id,

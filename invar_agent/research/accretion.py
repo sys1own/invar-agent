@@ -128,7 +128,8 @@ def strip_driver(code: str) -> str:
 
 
 def merge_accretive_module(pinned_code: str, candidate_code: str,
-                           require_coupling: bool = True) -> MergeReport:
+                           require_coupling: bool = True,
+                           allow_helper_overrides: bool = False) -> MergeReport:
     """Merge a stage-k candidate into the pinned (verified) module.
 
     ``pinned_code`` contains only pinned layers (no ``simulation_step``).
@@ -147,10 +148,16 @@ def merge_accretive_module(pinned_code: str, candidate_code: str,
         raise AccretionError(f"candidate must define {DRIVER}(buf, dt)")
 
     reverted, restored, new_fns = [], [], []
+    overridden_helpers: Set[str] = set()
     for name, fn in cand_fns.items():
         if name in pinned_fns:
             if _norm(fn) != _norm(pinned_fns[name]):
-                reverted.append(name)
+                is_layer_driver = name.startswith("layer_") and name.endswith("_step")
+                if allow_helper_overrides and not is_layer_driver:
+                    overridden_helpers.add(name)
+                    new_fns.append(name)
+                else:
+                    reverted.append(name)
         elif name != DRIVER:
             new_fns.append(name)
     for name in pinned_fns:
@@ -170,7 +177,7 @@ def merge_accretive_module(pinned_code: str, candidate_code: str,
             body.append(imp)
     body.extend(pinned_consts.values())
     body.extend(n for k, n in cand_consts.items() if k not in pinned_consts)
-    body.extend(pinned_fns.values())
+    body.extend(fn for k, fn in pinned_fns.items() if k not in overridden_helpers)
     body.extend(cand_fns[n] for n in new_fns)
     body.append(cand_fns[DRIVER])
 

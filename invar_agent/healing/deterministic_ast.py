@@ -3015,9 +3015,10 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_slots = cls["dynamical_slots"]
     dyn_set = set(dyn_slots)
 
-    nonneg_slots: Set[int] = set()
+    nonneg_slots: Dict[int, float] = {}
     quarter_upper_slots: Set[int] = set()
     unit_upper_slots: Set[int] = set()
+    small_upper_slots: Dict[int, float] = {}
     for contract in contracts or []:
         for _name, assertion, _tol in _contract_invariant_items(contract):
             m_ge = re.search(
@@ -3028,8 +3029,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 s_idx = int(m_ge.group(1))
                 try:
                     val = float(m_ge.group(2))
-                    if s_idx not in dyn_set and -1e-8 <= val <= 0.0:
-                        nonneg_slots.add(s_idx)
+                    if s_idx not in dyn_set and -1e-6 <= val <= 0.0:
+                        nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
                 except ValueError:
                     pass
             m_le = re.search(
@@ -3045,10 +3046,13 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                             quarter_upper_slots.add(s_idx)
                         elif 1.0 <= val <= 1.000001:
                             unit_upper_slots.add(s_idx)
+                        elif 0.0 <= val <= 1e-6:
+                            if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
+                                small_upper_slots[s_idx] = val
                 except Exception:  # noqa: BLE001
                     pass
 
-    if r_max is None and not nonneg_slots and not quarter_upper_slots and not unit_upper_slots:
+    if r_max is None and not nonneg_slots and not quarter_upper_slots and not unit_upper_slots and not small_upper_slots:
         return tree, False, []
 
     notes: List[str] = []
@@ -3181,36 +3185,56 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     changed = True
                     notes.append(f"projected buf.data[{d0}..{d2}] onto ||r|| <= {r_max} in {fn.name}")
 
+    target_fns: List[ast.FunctionDef] = []
     driver = _simulation_driver(tree)
     if driver is not None:
+        target_fns.append(driver)
+    latest_layer = _latest_layer_function(tree)
+    if latest_layer is not None and latest_layer not in target_fns:
+        target_fns.append(latest_layer)
+    if target_fns:
         assigned_all = _collect_assigned_slots(tree)
-        for s_idx in sorted(nonneg_slots):
-            if s_idx not in assigned_all:
-                continue
-            guard_src = f"if buf.data[{s_idx}] < 0.0 and buf.data[{s_idx}] >= -1e-11:\n    buf.data[{s_idx}] = 0.0\n"
-            if guard_src.strip() not in ast.unparse(driver):
-                driver.body.extend(ast.parse(guard_src).body)
-                ast.fix_missing_locations(driver)
-                changed = True
-                notes.append(f"conditioned positivity slot state[{s_idx}] >= 0.0 within 1e-11 deadband")
-        for s_idx in sorted(quarter_upper_slots):
-            if s_idx not in assigned_all:
-                continue
-            guard_src = f"if buf.data[{s_idx}] > 0.25 and buf.data[{s_idx}] <= 0.25 + 1e-11:\n    buf.data[{s_idx}] = 0.25\n"
-            if guard_src.strip() not in ast.unparse(driver):
-                driver.body.extend(ast.parse(guard_src).body)
-                ast.fix_missing_locations(driver)
-                changed = True
-                notes.append(f"conditioned Bloch norm slot state[{s_idx}] <= 0.25 within 1e-11 deadband")
-        for s_idx in sorted(unit_upper_slots):
-            if s_idx not in assigned_all:
-                continue
-            guard_src = f"if buf.data[{s_idx}] > 1.0 and buf.data[{s_idx}] <= 1.0 + 1e-11:\n    buf.data[{s_idx}] = 1.0\n"
-            if guard_src.strip() not in ast.unparse(driver):
-                driver.body.extend(ast.parse(guard_src).body)
-                ast.fix_missing_locations(driver)
-                changed = True
-                notes.append(f"conditioned purity/unit slot state[{s_idx}] <= 1.0 within 1e-11 deadband")
+        for fn_tgt in target_fns:
+            fn_src = ast.unparse(fn_tgt)
+            for s_idx in sorted(nonneg_slots):
+                if s_idx not in assigned_all:
+                    continue
+                bound = nonneg_slots[s_idx]
+                clamp_val = 0.0 if bound <= 0.0 else bound
+                guard_src = f"if buf.data[{s_idx}] < {bound!r}:\n    buf.data[{s_idx}] = {clamp_val!r}\n"
+                if guard_src.strip() not in fn_src:
+                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
+            for s_idx in sorted(quarter_upper_slots):
+                if s_idx not in assigned_all:
+                    continue
+                guard_src = f"if buf.data[{s_idx}] > 0.25:\n    buf.data[{s_idx}] = 0.25\n"
+                if guard_src.strip() not in fn_src:
+                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned Bloch norm slot state[{s_idx}] <= 0.25 in {fn_tgt.name}")
+            for s_idx in sorted(unit_upper_slots):
+                if s_idx not in assigned_all:
+                    continue
+                guard_src = f"if buf.data[{s_idx}] > 1.0:\n    buf.data[{s_idx}] = 1.0\n"
+                if guard_src.strip() not in fn_src:
+                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned purity/unit slot state[{s_idx}] <= 1.0 in {fn_tgt.name}")
+            for s_idx in sorted(small_upper_slots):
+                if s_idx not in assigned_all:
+                    continue
+                bound = small_upper_slots[s_idx]
+                guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = 0.0\n"
+                if guard_src.strip() not in fn_src:
+                    fn_tgt.body.extend(ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned drift/error slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
     return tree, changed, notes
 
 

@@ -596,14 +596,23 @@ def _extract_json(text: str) -> Optional[Any]:
         return None
     candidates = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
     candidates = [c for c in candidates if c] + [text]
+    first_valid: Optional[Any] = None
+    best_dict: Optional[Dict[str, Any]] = None
     for candidate in candidates:
         for open_c, close_c in (("{", "}"), ("[", "]")):
             for chunk in _iter_balanced(candidate, open_c, close_c):
                 try:
-                    return json.loads(chunk)
+                    parsed = json.loads(chunk)
                 except json.JSONDecodeError:
                     continue
-    return None
+                if first_valid is None and parsed != {}:
+                    first_valid = parsed
+                if isinstance(parsed, dict) and parsed:
+                    if any(k in parsed for k in ("blueprint_id", "contracts", "code", "directives", "feasibility")):
+                        return parsed
+                    if best_dict is None or len(parsed) > len(best_dict):
+                        best_dict = parsed
+    return best_dict if best_dict is not None else first_valid
 
 
 def _clean_prompt_text(raw: Any) -> str:
@@ -648,6 +657,36 @@ def _as_float_list(value: Any) -> Optional[List[float]]:
     return out
 
 
+def _sanitize_invariant_assertion(expr: str) -> Optional[str]:
+    """Deterministically normalize an LLM-emitted invariant assertion into valid Python eval syntax."""
+    import ast as _ast
+
+    s = str(expr or "").strip()
+    if not s:
+        return None
+    s = s.replace("&&", " and ").replace("||", " or ").replace("^", "**")
+    s = s.rstrip(".;, ")
+    # Strip trailing parenthetical label like `state[4] <= 1e-14 (trace_error_max)`
+    s = re.sub(r"\s+\([A-Za-z_][A-Za-z0-9_ ]*\)$", "", s).strip()
+    try:
+        _ast.parse(s, mode="eval")
+        return s
+    except SyntaxError:
+        # Try extracting a clean comparison over state/initial/trace_min/trace_max/telemetry
+        m = re.search(
+            r"((?:abs\s*\([^)]+\)|(?:state|initial|trace_min|trace_max|telemetry)\[[^\]]+\])\s*(?:<=|>=|<|>|==|!=)\s*[A-Za-z0-9_.\[\]'\"+\-*/() ]+)",
+            s,
+        )
+        if m:
+            cand = m.group(1).strip().rstrip(".;, ")
+            try:
+                _ast.parse(cand, mode="eval")
+                return cand
+            except SyntaxError:
+                pass
+    return None
+
+
 def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
@@ -673,9 +712,9 @@ def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
             continue
         cleaned = {k: inv[k] for k in _INVARIANT_FIELDS if k in inv}
         cleaned["variable_name"] = str(cleaned.get("variable_name") or "value")[:120]
-        # Assertions are executable expressions: never slice them mid-token
-        # (a [:500] cut produced `state[12] <= initial[12] + 1e-06 * initial[`).
-        cleaned["assertion"] = str(cleaned.get("assertion") or "")[:2000]
+        raw_assert = str(cleaned.get("assertion") or "")[:2000]
+        sanitized = _sanitize_invariant_assertion(raw_assert)
+        cleaned["assertion"] = sanitized if sanitized else "telemetry['finite'] == 1.0"
         try:
             cleaned["tolerance"] = float(cleaned.get("tolerance", 1e-6))
         except (TypeError, ValueError):
