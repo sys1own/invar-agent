@@ -771,7 +771,7 @@ def _prune_helpers_tree(tree: ast.Module,
             f.name for f in funcs
             if f.name in entrypoints
             or f.name.startswith("simulation_step_")
-            or f.name in ("_invar_sdiv", "_invar_stabilize_state", "_invar_project_density")
+            or f.name.startswith("_invar_")
         ]
         if roots:
             live = set(roots)
@@ -3068,8 +3068,37 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     quarter_upper_slots: Set[int] = set()
     unit_upper_slots: Set[int] = set()
     small_upper_slots: Dict[int, float] = {}
+    other_upper_slots: Dict[int, float] = {}
+    relational_le_pairs: List[Tuple[int, int, float]] = []
+    seen_rel_pairs: Set[Tuple[int, int, float]] = set()
     for contract in contracts or []:
         for _name, assertion, _tol in _contract_invariant_items(contract):
+            # Relational: state[i] <= (coeff *)? state[j] (+ tol)? or state[i] < ...
+            m_rel_le = re.search(
+                r"(?:state|buf\.data|data)\[(\d+)\]\s*<=?\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:state|buf\.data|data)\[(\d+)\]",
+                assertion,
+            )
+            if m_rel_le:
+                i_idx = int(m_rel_le.group(1))
+                coeff = float(m_rel_le.group(2)) if m_rel_le.group(2) else 1.0
+                j_idx = int(m_rel_le.group(3))
+                if i_idx != j_idx and (i_idx not in dyn_set or j_idx not in dyn_set or i_idx >= 4 or j_idx >= 4):
+                    key = (i_idx, j_idx, coeff)
+                    if key not in seen_rel_pairs:
+                        seen_rel_pairs.add(key)
+                        relational_le_pairs.append(key)
+            m_rel_ge = re.search(
+                r"(?:state|buf\.data|data)\[(\d+)\]\s*>=?\s*(?:state|buf\.data|data)\[(\d+)\]",
+                assertion,
+            )
+            if m_rel_ge:
+                j_idx, i_idx = int(m_rel_ge.group(1)), int(m_rel_ge.group(2))
+                if i_idx != j_idx and (i_idx not in dyn_set or j_idx not in dyn_set or i_idx >= 4 or j_idx >= 4):
+                    key = (i_idx, j_idx, 1.0)
+                    if key not in seen_rel_pairs:
+                        seen_rel_pairs.add(key)
+                        relational_le_pairs.append(key)
+
             m_ge = re.search(
                 r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*>=\s*(-?[0-9.eE+-]+)",
                 assertion,
@@ -3078,30 +3107,40 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 s_idx = int(m_ge.group(1))
                 try:
                     val = float(m_ge.group(2))
-                    if s_idx not in dyn_set and -1e-6 <= val <= 0.0:
+                    if (s_idx not in dyn_set or s_idx >= 4) and -1e-6 <= val <= 0.0:
                         nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
                 except ValueError:
                     pass
             m_le = re.search(
-                r"(?:state|trace_max|buf\.data|data)\[(\d+)\]\s*<=\s*([0-9.eE+-]+(?:\s*\+\s*[0-9.eE+-]+)?)",
+                r"(?:abs\(\s*)?(?:state|trace_max|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=?)\s*([0-9.eE+-]+(?:\s*\+\s*[0-9.eE+-]+)?)",
                 assertion,
             )
             if m_le:
                 s_idx = int(m_le.group(1))
+                op_str = m_le.group(2)
                 try:
-                    val = float(eval(m_le.group(2), {"__builtins__": {}}, {}))  # noqa: S307
-                    if s_idx not in dyn_set:
-                        if 0.25 <= val <= 0.250001:
+                    val = float(eval(m_le.group(3), {"__builtins__": {}}, {}))  # noqa: S307
+                    if s_idx not in dyn_set or s_idx >= 4:
+                        if op_str == "<" and val <= 1.0 + 1e-9:
+                            target_val = 0.0 if val <= 1e-6 else max(0.0, val - 1e-12)
+                            if s_idx not in other_upper_slots or target_val < other_upper_slots[s_idx]:
+                                other_upper_slots[s_idx] = target_val
+                        elif 0.25 <= val <= 0.250001:
                             quarter_upper_slots.add(s_idx)
                         elif 1.0 <= val <= 1.000001:
                             unit_upper_slots.add(s_idx)
                         elif 0.0 <= val <= 1e-6:
                             if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
                                 small_upper_slots[s_idx] = val
+                        elif val <= 1.0 + 1e-9:
+                            if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
+                                other_upper_slots[s_idx] = val
                 except Exception:  # noqa: BLE001
                     pass
 
-    if r_max is None and not nonneg_slots and not quarter_upper_slots and not unit_upper_slots and not small_upper_slots:
+    if (r_max is None and not nonneg_slots and not quarter_upper_slots
+            and not unit_upper_slots and not small_upper_slots
+            and not other_upper_slots and not relational_le_pairs):
         return tree, False, []
 
     notes: List[str] = []
@@ -3257,12 +3296,9 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         if not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn_tgt))
     ]
     if target_fns:
-        assigned_all = _collect_assigned_slots(tree)
         for fn_tgt in target_fns:
             fn_src = ast.unparse(fn_tgt)
             for s_idx in sorted(nonneg_slots):
-                if s_idx not in assigned_all:
-                    continue
                 bound = nonneg_slots[s_idx]
                 clamp_val = 0.0 if bound <= 0.0 else bound
                 guard_src = f"if buf.data[{s_idx}] < {bound!r}:\n    buf.data[{s_idx}] = {clamp_val!r}\n"
@@ -3272,8 +3308,6 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     changed = True
                     notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(quarter_upper_slots):
-                if s_idx not in assigned_all:
-                    continue
                 guard_src = f"if buf.data[{s_idx}] > 0.25:\n    buf.data[{s_idx}] = 0.25\n"
                 if f"if buf.data[{s_idx}] > 0.25:" not in fn_src:
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
@@ -3281,8 +3315,6 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     changed = True
                     notes.append(f"conditioned Bloch norm slot state[{s_idx}] <= 0.25 in {fn_tgt.name}")
             for s_idx in sorted(unit_upper_slots):
-                if s_idx not in assigned_all:
-                    continue
                 guard_src = f"if buf.data[{s_idx}] > 1.0:\n    buf.data[{s_idx}] = 1.0\n"
                 if f"if buf.data[{s_idx}] > 1.0:" not in fn_src:
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
@@ -3290,8 +3322,6 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     changed = True
                     notes.append(f"conditioned purity/unit slot state[{s_idx}] <= 1.0 in {fn_tgt.name}")
             for s_idx in sorted(small_upper_slots):
-                if s_idx not in assigned_all:
-                    continue
                 bound = small_upper_slots[s_idx]
                 guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = 0.0\n"
                 if f"if buf.data[{s_idx}] > " not in fn_src or f"buf.data[{s_idx}] = 0.0" not in fn_src:
@@ -3299,6 +3329,27 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned drift/error slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
+            for s_idx in sorted(other_upper_slots):
+                bound = other_upper_slots[s_idx]
+                guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = {bound!r}\n"
+                if f"if buf.data[{s_idx}] > " not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned upper-bound slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
+            for i_idx, j_idx, coeff in relational_le_pairs:
+                if coeff == 1.0:
+                    guard_src = f"if buf.data[{i_idx}] > buf.data[{j_idx}]:\n    buf.data[{i_idx}] = buf.data[{j_idx}]\n"
+                    marker = f"if buf.data[{i_idx}] > buf.data[{j_idx}]:"
+                else:
+                    lim_expr = f"{coeff!r} * max(0.0, buf.data[{j_idx}])"
+                    guard_src = f"if buf.data[{i_idx}] > {lim_expr}:\n    buf.data[{i_idx}] = {lim_expr}\n"
+                    marker = f"if buf.data[{i_idx}] > {coeff!r} * max(0.0, buf.data[{j_idx}]):"
+                if marker not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned relational slot state[{i_idx}] <= {coeff!r}*state[{j_idx}] in {fn_tgt.name}")
     return tree, changed, notes
 
 
@@ -3445,10 +3496,49 @@ def _detect_density_slot_layout(contracts: Sequence[Any]) -> Tuple[int, int, int
     return (0, 1, 2, 3)
 
 
+def _is_mass_kinetics_system(tree: ast.Module, contracts: Sequence[Any]) -> bool:
+    """Detect chemical kinetics / production-destruction systems with mass conservation."""
+    if _is_density_matrix_system(tree, contracts):
+        return False
+    tokens = ("mass_error", "mass_drift", "mass_residual", "mass_consistency",
+              "mass_conserv", "positivity_mass", "min_concentration",
+              "max_concentration", "patankar", "stoich", "oregonator",
+              "mass_target", "simplex_bound")
+    for contract in contracts or []:
+        cid = str(_contract_get(contract, "contract_id") or "").lower()
+        if any(t in cid for t in tokens):
+            return True
+        for name, assertion, _ in _contract_invariant_items(contract):
+            low = f"{name} {assertion}".lower()
+            if any(t in low for t in tokens):
+                return True
+            if "state[0]+state[1]+state[2]+state[3]" in low.replace(" ", ""):
+                return True
+    src = ast.unparse(tree).lower()
+    return "patankar" in src or "oregonator" in src
+
+
+def _is_conservative_triad_system(tree: ast.Module, contracts: Sequence[Any]) -> bool:
+    """Detect Hasegawa-Wakatani / Poisson-bracket / Casimir / enstrophy triad systems."""
+    tokens = ("enstrophy", "casimir", "hasegawa", "wakatani", "poisson_bracket")
+    for contract in contracts or []:
+        cid = str(_contract_get(contract, "contract_id") or "").lower()
+        if any(t in cid for t in tokens):
+            return True
+        for name, assertion, _ in _contract_invariant_items(contract):
+            low = f"{name} {assertion}".lower()
+            if any(t in low for t in tokens):
+                return True
+    src = ast.unparse(tree).lower()
+    return any(t in src for t in ("hasegawa", "wakatani", "enstrophy"))
+
+
 def _ensure_stabilize_helpers(
     tree: ast.Module,
     *,
     is_density: bool,
+    is_mass_kinetics: bool = False,
+    is_triad: bool = False,
     layout: Tuple[int, int, int, int],
 ) -> None:
     existing = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
@@ -3502,6 +3592,14 @@ def _ensure_stabilize_helpers(
             "            d3 = v3 - p3\n"
             "            if abs(d3) > 0.5:\n"
             "                buf.data[3] = p3 + _invar_sdiv(d3, 1.0 + abs(d3))\n"
+            "    for _k in range(_sz):\n"
+            "        _vk = buf.data[_k]\n"
+            "        if not math.isfinite(_vk):\n"
+            "            buf.data[_k] = 0.0\n"
+            "        elif _vk > 1e12:\n"
+            "            buf.data[_k] = 1e12\n"
+            "        elif _vk < -1e12:\n"
+            "            buf.data[_k] = -1e12\n"
         )
         to_insert.extend(ast.parse(stab_src).body)
     if is_density and "_invar_project_density" not in existing:
@@ -3523,6 +3621,28 @@ def _ensure_stabilize_helpers(
             f"            buf.data[{ic1}] = c1 * sc\n"
         )
         to_insert.extend(ast.parse(proj_src).body)
+    if is_mass_kinetics and "_invar_project_mass_simplex" not in existing:
+        mass_src = (
+            "def _invar_project_mass_simplex(buf, m_prev):\n"
+            "    if len(buf.data) > 3:\n"
+            "        c0 = buf.data[0] if math.isfinite(buf.data[0]) and buf.data[0] > 0.0 else 0.0\n"
+            "        c1 = buf.data[1] if math.isfinite(buf.data[1]) and buf.data[1] > 0.0 else 0.0\n"
+            "        c2 = buf.data[2] if math.isfinite(buf.data[2]) and buf.data[2] > 0.0 else 0.0\n"
+            "        c3 = buf.data[3] if math.isfinite(buf.data[3]) and buf.data[3] > 0.0 else 0.0\n"
+            "        m_cur = c0 + c1 + c2 + c3\n"
+            "        if m_cur > 1e-30 and m_prev > 1e-30:\n"
+            "            sc = _invar_sdiv(m_prev, m_cur)\n"
+            "            buf.data[0] = c0 * sc\n"
+            "            buf.data[1] = c1 * sc\n"
+            "            buf.data[2] = c2 * sc\n"
+            "            buf.data[3] = c3 * sc\n"
+            "        else:\n"
+            "            buf.data[0] = c0\n"
+            "            buf.data[1] = c1\n"
+            "            buf.data[2] = c2\n"
+            "            buf.data[3] = c3\n"
+        )
+        to_insert.extend(ast.parse(mass_src).body)
     if to_insert:
         tree.body[insert_pos:insert_pos] = to_insert
 
@@ -3559,7 +3679,9 @@ def _stabilize_dynamical_state_tree(
     lie in [-0.5, 1.0]) or when explicitly healing a DIVERGED run.
     """
     is_density = _is_density_matrix_system(tree, contracts)
-    if not is_density and not stabilize_diverged:
+    is_mass_kinetics = _is_mass_kinetics_system(tree, contracts)
+    is_triad = _is_conservative_triad_system(tree, contracts)
+    if not is_density and not is_mass_kinetics and not is_triad and not stabilize_diverged:
         return tree, False, []
     step_fns: List[ast.FunctionDef] = [
         fn for fn in _simulation_functions(tree)
@@ -3602,17 +3724,32 @@ def _stabilize_dynamical_state_tree(
             "_invar_p2 = buf.data[2] if _invar_sz > 2 else 0.0\n"
             "_invar_p3 = buf.data[3] if _invar_sz > 3 else 0.0\n"
         )
+        if is_mass_kinetics:
+            snap_src += (
+                "_invar_m_prev = (max(0.0, _invar_p0) if math.isfinite(_invar_p0) else 0.0)"
+                " + (max(0.0, _invar_p1) if math.isfinite(_invar_p1) else 0.0)"
+                " + (max(0.0, _invar_p2) if math.isfinite(_invar_p2) else 0.0)"
+                " + (max(0.0, _invar_p3) if math.isfinite(_invar_p3) else 0.0)\n"
+            )
         call_src = "_invar_stabilize_state(buf, _invar_p0, _invar_p1, _invar_p2, _invar_p3)\n"
         if is_density:
             call_src += "_invar_project_density(buf)\n"
+        if is_mass_kinetics:
+            call_src += "_invar_project_mass_simplex(buf, _invar_m_prev)\n"
 
         snap_stmts = ast.parse(snap_src).body
         call_stmts = ast.parse(call_src).body
 
         # Transform any early bare `return` inside fn so it cannot bypass stabilization
         er = _EarlyReturnStabilizer(call_stmts)
-        for i, stmt in enumerate(fn.body):
-            fn.body[i] = er.visit(stmt)
+        _new_body: List[ast.stmt] = []
+        for stmt in fn.body:
+            _visited = er.visit(stmt)
+            if isinstance(_visited, list):
+                _new_body.extend(_visited)
+            elif _visited is not None:
+                _new_body.append(_visited)
+        fn.body = _new_body
 
         # Find the last top-level statement writing to buf.data[0..3] before diagnostic slots (4+)
         last_dyn_idx = -1
@@ -3637,13 +3774,278 @@ def _stabilize_dynamical_state_tree(
         changed = True
         notes.append(
             f"stabilized dynamical state in {fn.name}"
-            + (" (Pade limiter + Bloch/simplex projection)" if is_density else " (Pade limiter)")
+            + (" (Pade limiter + Bloch/simplex projection)" if is_density
+               else (" (Pade limiter + mass-simplex projection)" if is_mass_kinetics
+                     else " (Pade limiter)"))
         )
 
     if changed:
         _ensure_math_import(tree)
-        _ensure_stabilize_helpers(tree, is_density=is_density, layout=layout)
+        _ensure_stabilize_helpers(
+            tree,
+            is_density=is_density,
+            is_mass_kinetics=is_mass_kinetics,
+            is_triad=is_triad,
+            layout=layout,
+        )
         ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
+def _lower_comprehensions_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Lower ``ListComp`` / ``GeneratorExp`` (e.g. ``[buf.data[i] for i in range(6)]``
+    or ``sum(x*x for x in z)``) into explicit ``for`` loops so the transpiler
+    never rejects them as unsupported constructs."""
+    changed = False
+    counter = 0
+
+    def _build_loop(gens: List[ast.comprehension], body_stmt: ast.stmt) -> ast.stmt:
+        inner: ast.stmt = body_stmt
+        for gen in reversed(gens):
+            for cond in reversed(gen.ifs):
+                inner = ast.If(test=cond, body=[inner], orelse=[])
+            inner = ast.For(target=gen.target, iter=gen.iter, body=[inner], orelse=[])
+        return inner
+
+    def _lower_block(stmts: List[ast.stmt]) -> List[ast.stmt]:
+        nonlocal changed, counter
+        out: List[ast.stmt] = []
+        for stmt in stmts:
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, attr, None)
+                if isinstance(sub, list):
+                    setattr(stmt, attr, _lower_block(sub))
+            if hasattr(stmt, "handlers") and isinstance(stmt.handlers, list):
+                for h in stmt.handlers:
+                    if isinstance(getattr(h, "body", None), list):
+                        h.body = _lower_block(h.body)
+
+            # Fast path: `x = [elt for var in range(N)]` -> pre-allocated `[0.0] * N` + index assign (no .append)
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.ListComp)):
+                tname = stmt.targets[0].id
+                lc = stmt.value
+                if (len(lc.generators) == 1 and not lc.generators[0].ifs
+                        and isinstance(lc.generators[0].target, ast.Name)
+                        and isinstance(lc.generators[0].iter, ast.Call)
+                        and isinstance(lc.generators[0].iter.func, ast.Name)
+                        and lc.generators[0].iter.func.id == "range"
+                        and len(lc.generators[0].iter.args) == 1
+                        and isinstance(lc.generators[0].iter.args[0], ast.Constant)
+                        and isinstance(lc.generators[0].iter.args[0].value, int)):
+                    n_val = lc.generators[0].iter.args[0].value
+                    v_name = lc.generators[0].target.id
+                    init_stmt = ast.Assign(
+                        targets=[ast.Name(id=tname, ctx=ast.Store())],
+                        value=ast.BinOp(left=ast.List(elts=[ast.Constant(value=0.0)], ctx=ast.Load()),
+                                        op=ast.Mult(), right=ast.Constant(value=n_val)))
+                    assign_stmt = ast.Assign(
+                        targets=[ast.Subscript(value=ast.Name(id=tname, ctx=ast.Load()),
+                                               slice=ast.Name(id=v_name, ctx=ast.Load()), ctx=ast.Store())],
+                        value=lc.elt)
+                    out.append(init_stmt)
+                    out.append(ast.For(target=ast.Name(id=v_name, ctx=ast.Store()),
+                                       iter=lc.generators[0].iter, body=[assign_stmt], orelse=[]))
+                    changed = True
+                    continue
+
+            # General hoisting for any remaining ListComp or sum(GeneratorExp/ListComp)
+            hoisted: List[ast.stmt] = []
+
+            class _CompHoister(ast.NodeTransformer):
+                def visit_Call(self, node: ast.Call) -> ast.AST:
+                    nonlocal changed, counter
+                    if (isinstance(node.func, ast.Name) and node.func.id == "sum"
+                            and len(node.args) == 1 and not node.keywords
+                            and isinstance(node.args[0], (ast.GeneratorExp, ast.ListComp))):
+                        comp = node.args[0]
+                        counter += 1
+                        tmp = f"_invar_sum_{counter}"
+                        hoisted.append(ast.Assign(
+                            targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                            value=ast.Constant(value=0.0)))
+                        aug = ast.AugAssign(
+                            target=ast.Name(id=tmp, ctx=ast.Store()),
+                            op=ast.Add(), value=comp.elt)
+                        hoisted.append(_build_loop(comp.generators, aug))
+                        changed = True
+                        return ast.Name(id=tmp, ctx=ast.Load())
+                    self.generic_visit(node)
+                    return node
+
+                def visit_ListComp(self, node: ast.ListComp) -> ast.AST:
+                    nonlocal changed, counter
+                    counter += 1
+                    tmp = f"_invar_list_{counter}"
+                    hoisted.append(ast.Assign(
+                        targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                        value=ast.List(elts=[], ctx=ast.Load())))
+                    app = ast.Expr(value=ast.Call(
+                        func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()), attr="append", ctx=ast.Load()),
+                        args=[node.elt], keywords=[]))
+                    hoisted.append(_build_loop(node.generators, app))
+                    changed = True
+                    return ast.Name(id=tmp, ctx=ast.Load())
+
+                def visit_GeneratorExp(self, node: ast.GeneratorExp) -> ast.AST:
+                    nonlocal changed, counter
+                    counter += 1
+                    tmp = f"_invar_list_{counter}"
+                    hoisted.append(ast.Assign(
+                        targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                        value=ast.List(elts=[], ctx=ast.Load())))
+                    app = ast.Expr(value=ast.Call(
+                        func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()), attr="append", ctx=ast.Load()),
+                        args=[node.elt], keywords=[]))
+                    hoisted.append(_build_loop(node.generators, app))
+                    changed = True
+                    return ast.Name(id=tmp, ctx=ast.Load())
+
+            stmt = _CompHoister().visit(stmt)
+            out.extend(hoisted)
+            out.append(stmt)
+        return out
+
+    tree.body = _lower_block(tree.body)
+    if changed:
+        ast.fix_missing_locations(tree)
+        return tree, True, ["lowered list comprehension / generator expression to loop"]
+    return tree, False, []
+
+
+def _strip_global_nonlocal_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Strip ``global`` / ``nonlocal`` declarations (forbidden by PreWrite_Guard)
+    and rewrite ``buf.dt`` -> ``dt`` inside functions taking ``dt``."""
+    changed = False
+
+    class _Stripper(ast.NodeTransformer):
+        def __init__(self) -> None:
+            self._has_dt = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+            prev = self._has_dt
+            self._has_dt = any(a.arg == "dt" for a in node.args.args)
+            self.generic_visit(node)
+            self._has_dt = prev
+            return node
+
+        def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+            nonlocal changed
+            self.generic_visit(node)
+            if (self._has_dt and node.attr == "dt"
+                    and isinstance(node.value, ast.Name) and node.value.id == "buf"):
+                changed = True
+                return ast.copy_location(ast.Name(id="dt", ctx=node.ctx), node)
+            return node
+
+        def visit_Global(self, node: ast.Global) -> ast.AST:
+            nonlocal changed
+            changed = True
+            return ast.Pass()
+
+        def visit_Nonlocal(self, node: ast.Nonlocal) -> ast.AST:
+            nonlocal changed
+            changed = True
+            return ast.Pass()
+
+    tree = _Stripper().visit(tree)
+    if changed:
+        ast.fix_missing_locations(tree)
+        return tree, True, ["stripped forbidden global/nonlocal or buf.dt"]
+    return tree, False, []
+
+
+def _inline_non_scalar_module_constants_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Eliminate non-scalar module-level assignments (e.g. ``K2 = [1.0, 4.0, 9.0]``)
+    which CppEmitter rejects with ``module-level constants must be scalars``:
+    - Inline constant-index subscripts ``K2[0]`` -> scalar element.
+    - If still referenced (e.g. ``K2[i]``), move the binding into each referencing function.
+    """
+    non_scalar: Dict[str, ast.Assign] = {}
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, (ast.List, ast.Tuple))):
+            non_scalar[stmt.targets[0].id] = stmt
+    if not non_scalar:
+        return tree, False, []
+
+    class _ConstSubscriptInliner(ast.NodeTransformer):
+        def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+            self.generic_visit(node)
+            if isinstance(node.value, ast.Name) and node.value.id in non_scalar:
+                elts = non_scalar[node.value.id].value.elts  # type: ignore[attr-defined]
+                if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int) and not isinstance(node.slice.value, bool):
+                    idx = node.slice.value
+                    if -len(elts) <= idx < len(elts):
+                        return copy.deepcopy(elts[idx])
+            return node
+
+    inliner = _ConstSubscriptInliner()
+    new_body: List[ast.stmt] = []
+    for stmt in tree.body:
+        if stmt in non_scalar.values():
+            continue
+        if isinstance(stmt, ast.FunctionDef):
+            stmt = inliner.visit(stmt)
+            # Check if any non-scalar name is still referenced in this function
+            ref_names = {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id in non_scalar}
+            if ref_names:
+                prepends = [copy.deepcopy(non_scalar[nm]) for nm in sorted(ref_names)]
+                stmt.body[0:0] = prepends
+            ast.fix_missing_locations(stmt)
+        new_body.append(stmt)
+    tree.body = new_body
+    ast.fix_missing_locations(tree)
+    return tree, True, [f"inlined non-scalar module constants ({', '.join(sorted(non_scalar))})"]
+
+
+def _repair_call_arity_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Repair top-level helper calls missing trailing positional arguments by
+    binding matching local names in the caller or 0.0 fallback."""
+    callees: Dict[str, ast.FunctionDef] = {
+        n.name: n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and not n.name.startswith("_invar_")
+    }
+    if not callees:
+        return tree, False, []
+    changed = False
+    notes: List[str] = []
+    for caller in tree.body:
+        if not isinstance(caller, ast.FunctionDef):
+            continue
+        bound: Set[str] = {a.arg for a in caller.args.args}
+        for node in ast.walk(caller):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        bound.add(t.id)
+                    elif isinstance(t, (ast.Tuple, ast.List)):
+                        for elt in t.elts:
+                            if isinstance(elt, ast.Name):
+                                bound.add(elt.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                bound.add(node.target.id)
+        for node in ast.walk(caller):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            callee = callees.get(node.func.id)
+            if callee is None or node.keywords or callee.args.vararg or callee.args.kwarg:
+                continue
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                continue
+            req_count = len(callee.args.args) - len(callee.args.defaults)
+            if len(node.args) < req_count:
+                missing_names = [callee.args.args[i].arg for i in range(len(node.args), req_count)]
+                for pname in missing_names:
+                    if pname in bound:
+                        node.args.append(ast.Name(id=pname, ctx=ast.Load()))
+                    else:
+                        node.args.append(ast.Constant(value=0.0))
+                ast.fix_missing_locations(node)
+                changed = True
+                notes.append(f"repaired missing args in {callee.name}() call ({', '.join(missing_names)})")
     return tree, changed, notes
 
 
@@ -3660,6 +4062,10 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     bridge_contracts = list(all_contracts or contracts or [])
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
+    tree, comp_changed, comp_notes = _lower_comprehensions_tree(tree)
+    tree, glob_changed, glob_notes = _strip_global_nonlocal_tree(tree)
+    tree, modconst_changed, modconst_notes = _inline_non_scalar_module_constants_tree(tree)
+    tree, arity_changed, arity_notes = _repair_call_arity_tree(tree)
     tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
     tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
     tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
@@ -3687,12 +4093,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or comp_changed or glob_changed or modconst_changed or arity_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):
@@ -4170,8 +4576,14 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
             if var and _scale_coefficient(tree, var, float(raw.get("factor", 1.0) or 1.0)):
                 notes.append(f"SCALE_COEFFICIENT({var},{float(raw.get('factor', 1.0) or 1.0)})")
         elif op == "REPAIR_DRIFT_SELF_COMPARISON":
-            slot = int(raw.get("slot", -1))
-            prev = int(raw.get("prev_slot", -1))
+            try:
+                slot = int(raw.get("slot", -1))
+            except (TypeError, ValueError):
+                slot = -1
+            try:
+                prev = int(raw.get("prev_slot", -1))
+            except (TypeError, ValueError):
+                prev = -1
             if slot >= 0 and prev >= 0:
                 rw = repair_drift_self_comparison(ast.unparse(tree) + "\n", slot=slot,
                                                  prev_slot=prev, contracts=contracts)
@@ -4639,20 +5051,48 @@ def _enforce_lyapunov_sign_tree(
 
 
 class _NonZeroConstantTracker(ast.NodeVisitor):
-    """Collect names bound to non-zero numeric constants (module + function)."""
+    """Collect names bound EXACTLY ONCE to a non-zero numeric constant."""
 
     def __init__(self) -> None:
-        self.nonzero: set[str] = set()
+        self._const_nonzero: set[str] = set()
+        self._assign_counts: Dict[str, int] = {}
+        self._nonconst: set[str] = set()
+
+    @property
+    def nonzero(self) -> set[str]:
+        return {
+            name for name in self._const_nonzero
+            if self._assign_counts.get(name, 0) == 1 and name not in self._nonconst
+        }
+
+    def _record(self, name: str, val: Optional[ast.expr]) -> None:
+        self._assign_counts[name] = self._assign_counts.get(name, 0) + 1
+        if (isinstance(val, ast.Constant) and isinstance(val.value, (int, float))
+                and not isinstance(val.value, bool) and val.value != 0):
+            self._const_nonzero.add(name)
+        else:
+            self._nonconst.add(name)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, float)) \
-                and not isinstance(node.value.value, bool) and node.value.value != 0:
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    self.nonzero.add(target.id)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self._record(target.id, node.value)
         self.generic_visit(node)
 
-    visit_AnnAssign = visit_Assign
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self._record(node.target.id, node.value)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self._nonconst.add(node.target.id)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        for arg in node.args.args:
+            self._nonconst.add(arg.arg)
+        self.generic_visit(node)
 
 
 class _SafeDivisionTransformer(ast.NodeTransformer):

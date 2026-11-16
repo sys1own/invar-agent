@@ -365,3 +365,129 @@ def simulation_step(buf, dt):
     for _ in range(100):
         ns["simulation_step"](b, 0.01)
     assert b.data[4] <= 1e-15
+
+
+def test_relational_invariant_auto_init_and_unassigned_slot_bridging():
+    """Relational invariants (state[7] <= state[8] + 1e-12) must condition both
+    initial_state (raising mass_target_M0 to M0 and resetting running max) and
+    simulation_step even when state[8] is never assigned in the kernel."""
+    from invar_agent.research.state_machine import _guard_contract_initial_state
+    from invar_agent.schemas.research import InvariantConstraint, VerificationContract
+
+    kernel = '''def simulation_step(buf, dt):
+    c0 = buf.data[0]
+    c1 = buf.data[1]
+    c2 = buf.data[2]
+    c3 = buf.data[3]
+    buf.data[7] = max(buf.data[7], c0, c1, c2, c3)
+'''
+    c1 = VerificationContract(
+        contract_id="c1_positivity_mass",
+        target_backend="cpp",
+        dt=0.05,
+        steps=100,
+        initial_state=[1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.5, 0.5, 0.0],
+        invariants=[
+            InvariantConstraint(variable_name="max_concentration_bound", assertion="state[7] <= state[8] + 1e-12"),
+            InvariantConstraint(variable_name="mass_error_max", assertion="state[9] <= 1e-14"),
+        ],
+    )
+    san = sanitize_intrinsics(kernel, contracts=[c1], all_contracts=[c1])
+    assert "if buf.data[7] > buf.data[8]:" in san.code
+
+    init, _ = _guard_contract_initial_state(san.code, c1, all_contracts=[c1])
+    assert init[7] <= init[8] + 1e-12
+    assert init[8] >= 1.5 - 1e-12
+
+
+def test_mass_simplex_stabilization_and_safe_division_in_patankar_step():
+    """Patankar kinetics with c2=0 at t=0 must lower all raw divisions to _invar_sdiv
+    (even if c2=1.0 appeared elsewhere), preserve _invar_sdiv under pruning, and
+    project c0..c3 onto the mass simplex M0=1.5 across 5000 steps."""
+    from invar_agent.healing.deterministic_ast import prune_unused_helpers
+
+    code = '''def helper_ref():
+    c2 = 1.0
+    return c2
+
+def patankar_step(buf, dt):
+    c1 = buf.data[0]
+    c2 = buf.data[1]
+    c3 = buf.data[2]
+    c4 = buf.data[3]
+    M = c1 + c2 + c3 + c4
+    d1 = 100.0 * c1
+    d2 = 50.0 * c2
+    tot_d = d1 / c1 * (c1 / M) + d2 / c2 * (c2 / M)
+    buf.data[0] = c1 - 0.1 * dt * tot_d
+    buf.data[1] = c2 + 0.05 * dt * c1
+    buf.data[2] = c3 + 0.02 * dt * c1
+    buf.data[3] = c4 - 0.01 * dt * c4
+    buf.data[9] = abs((buf.data[0] + buf.data[1] + buf.data[2] + buf.data[3]) - 1.5)
+
+def simulation_step(buf, dt):
+    patankar_step(buf, dt)
+'''
+    contracts = [
+        {
+            "contract_id": "c1_positivity_mass",
+            "initial_state": [1.0, 0.0, 0.0, 0.5] + [0.0] * 12,
+            "invariants": [
+                {"variable_name": "min_concentration", "assertion": "state[6] >= 0.0"},
+                {"variable_name": "mass_error_max", "assertion": "state[9] <= 1e-14"},
+            ],
+        }
+    ]
+    san = sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
+    pruned = prune_unused_helpers(san.code, entrypoints=("simulation_step",))
+    assert "def _invar_sdiv(" in pruned.code
+    assert "_invar_sdiv(d2, c2)" in pruned.code
+    assert "_invar_project_mass_simplex" in pruned.code
+
+    ns = {}
+    exec(pruned.code, ns)
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+            self.size = len(data)
+
+    b = Buf([1.0, 0.0, 0.0, 0.5] + [0.0] * 12)
+    for _ in range(500):
+        ns["simulation_step"](b, 0.25)
+        assert all(v >= 0.0 for v in b.data[:4])
+        assert abs(sum(b.data[:4]) - 1.5) <= 1e-13
+    assert b.data[9] <= 1e-14
+
+
+@pytest.mark.asyncio
+async def test_feasibility_gate_overrides_refusal_on_hasegawa_wakatani():
+    """Epistemic Feasibility Gate must convert LLM REFUSED_IMPOSSIBLE on
+    computational dynamical benchmarks (like Hasegawa-Wakatani) into REFORMULATED_SURROGATE."""
+    from invar_agent.research.feasibility import evaluate_research_feasibility
+
+    hw_prompt = (
+        "Structure-Preserving Poisson-Bracket Integrator for Stiff Collisional "
+        "Hasegawa-Wakatani Drift-Wave Turbulence: derive an unsplit Midpoint-Cayley "
+        "discrete update operator conserving potential enstrophy W and generalized energy E."
+    )
+
+    async def mock_refusal_llm(_prompt: str) -> str:
+        return '{"verdict": "REFUSED_IMPOSSIBLE", "rationale": "Triad coefficients overconstrained.", "violated_boundary": "conservation", "reformulation": "Use symmetric coupling."}'
+
+    res = await evaluate_research_feasibility(hw_prompt, llm_complete=mock_refusal_llm, use_llm=True)
+    assert res.verdict.value == "REFORMULATED_SURROGATE"
+
+
+def test_registry_does_not_match_materials_thermophysics_on_kinetics_prompt():
+    """Word-boundary matching prevents 'typical'/'replicate' from matching 'pica' in materials_thermophysics."""
+    from invar_agent.research.extractor import classify_registry_domains
+
+    text = (
+        "Positivity- and Stoichiometry-Preserving Exponential Patankar Integrator for "
+        "Stiff Autocatalytic Oregonator Kinetics. Typical explicit schemes replicate negative "
+        "concentrations in stiff chemical kinetics."
+    )
+    domains = classify_registry_domains(text)
+    assert "materials_thermophysics" not in domains
+    assert "chemical_kinetics" in domains

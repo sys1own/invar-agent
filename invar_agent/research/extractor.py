@@ -954,7 +954,9 @@ _REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
                             "plasma sail", "solar wind", "aurora",
                             "lorentz plasma"),
     "materials_thermophysics": ("tungsten", "pica", "carbide", "titanium",
-                                "ablative", "heat shield", "phenolic",
+                                "ablative", "ablation", "heat shield",
+                                "thermal protection", "heat conduction",
+                                "fourier", "q_in", "phenolic",
                                 "ceramic matrix"),
     "nonlinear_dynamics": ("duffing", "van der pol", "lorenz", "lotka",
                            "volterra", "henon", "circle map", "standard map"),
@@ -980,7 +982,7 @@ def classify_registry_domains(text: str) -> List[str]:
         anchors = _REGISTRY_ANCHORS.get(name)
         if anchors is None:
             anchors = tuple(spec.get("keywords") or ())
-        if any(a in t for a in anchors):
+        if any(re.search(rf"\b{re.escape(a)}\b", t) for a in anchors):
             out.append(name)
     return out
 
