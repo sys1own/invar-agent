@@ -741,7 +741,7 @@ def _prune_helpers_tree(tree: ast.Module,
             f.name for f in funcs
             if f.name in entrypoints
             or f.name.startswith("simulation_step_")
-            or f.name == "_invar_sdiv"
+            or f.name in ("_invar_sdiv", "_invar_stabilize_state", "_invar_project_density")
         ]
         if roots:
             live = set(roots)
@@ -3333,10 +3333,260 @@ def _seed_dissipation_parameters_tree(tree: ast.Module, contracts: Sequence[Any]
     return tree, changed, notes
 
 
+def _is_density_matrix_system(tree: ast.Module, contracts: Sequence[Any]) -> bool:
+    cls = classify_buffer_slots(tree, contracts)
+    dyn_slots = set(cls.get("dynamical_slots") or [])
+    if not {0, 1, 2, 3}.issubset(dyn_slots):
+        return False
+    has_density_layout = False
+    for contract in contracts or []:
+        init = _contract_get(contract, "initial_state")
+        if isinstance(init, (list, tuple)) and len(init) >= 4:
+            try:
+                v0, v1, v2, v3 = (float(init[i]) for i in range(4))
+            except (TypeError, ValueError):
+                continue
+            if (abs((v0 + v1) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v1 <= 1.0) or (
+                abs((v0 + v3) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v3 <= 1.0
+            ):
+                has_density_layout = True
+                break
+    if not has_density_layout:
+        return False
+    if _detect_bloch_radius(tree, contracts) is not None:
+        return True
+    tokens = ("trace_error", "min_eigenvalue", "lambda_min", "purity",
+              "rho00", "rho11", "rho01", "spohn", "positivity", "bloch")
+    for contract in contracts or []:
+        for name, assertion, _ in _contract_invariant_items(contract):
+            low = f"{name} {assertion}".lower()
+            if any(t in low for t in tokens):
+                return True
+    return False
+
+
+def _detect_density_slot_layout(contracts: Sequence[Any]) -> Tuple[int, int, int, int]:
+    """Identify (idx_p0, idx_p1, idx_c0, idx_c1) in 0..3 from contract initial_state."""
+    for contract in contracts or []:
+        init = _contract_get(contract, "initial_state")
+        if isinstance(init, (list, tuple)) and len(init) >= 4:
+            try:
+                vals = [float(init[i]) for i in range(4)]
+            except (TypeError, ValueError):
+                continue
+            if abs((vals[0] + vals[1]) - 1.0) < 1e-6 and 0.0 <= vals[0] <= 1.0 and 0.0 <= vals[1] <= 1.0:
+                return (0, 1, 2, 3)
+            if abs((vals[0] + vals[3]) - 1.0) < 1e-6 and 0.0 <= vals[0] <= 1.0 and 0.0 <= vals[3] <= 1.0:
+                return (0, 3, 1, 2)
+    return (0, 1, 2, 3)
+
+
+def _ensure_stabilize_helpers(
+    tree: ast.Module,
+    *,
+    is_density: bool,
+    layout: Tuple[int, int, int, int],
+) -> None:
+    existing = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    insert_pos = 0
+    for i, stmt in enumerate(tree.body):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            insert_pos = i + 1
+
+    to_insert: List[ast.stmt] = []
+    if _SAFE_DIV_HELPER not in existing:
+        sdiv_src = (
+            "def _invar_sdiv(a, b):\n"
+            "    mag = abs(b) if abs(b) >= 1e-12 else 1e-12\n"
+            "    denom = -mag if b < 0.0 else mag\n"
+            "    return a / denom\n"
+        )
+        to_insert.extend(ast.parse(sdiv_src).body)
+    if "_invar_stabilize_state" not in existing:
+        stab_src = (
+            "def _invar_stabilize_state(buf, p0, p1, p2, p3):\n"
+            "    _sz = len(buf.data)\n"
+            "    if _sz > 0:\n"
+            "        v0 = buf.data[0]\n"
+            "        if not math.isfinite(v0):\n"
+            "            buf.data[0] = p0\n"
+            "        else:\n"
+            "            d0 = v0 - p0\n"
+            "            if abs(d0) > 0.5:\n"
+            "                buf.data[0] = p0 + _invar_sdiv(d0, 1.0 + abs(d0))\n"
+            "    if _sz > 1:\n"
+            "        v1 = buf.data[1]\n"
+            "        if not math.isfinite(v1):\n"
+            "            buf.data[1] = p1\n"
+            "        else:\n"
+            "            d1 = v1 - p1\n"
+            "            if abs(d1) > 0.5:\n"
+            "                buf.data[1] = p1 + _invar_sdiv(d1, 1.0 + abs(d1))\n"
+            "    if _sz > 2:\n"
+            "        v2 = buf.data[2]\n"
+            "        if not math.isfinite(v2):\n"
+            "            buf.data[2] = p2\n"
+            "        else:\n"
+            "            d2 = v2 - p2\n"
+            "            if abs(d2) > 0.5:\n"
+            "                buf.data[2] = p2 + _invar_sdiv(d2, 1.0 + abs(d2))\n"
+            "    if _sz > 3:\n"
+            "        v3 = buf.data[3]\n"
+            "        if not math.isfinite(v3):\n"
+            "            buf.data[3] = p3\n"
+            "        else:\n"
+            "            d3 = v3 - p3\n"
+            "            if abs(d3) > 0.5:\n"
+            "                buf.data[3] = p3 + _invar_sdiv(d3, 1.0 + abs(d3))\n"
+        )
+        to_insert.extend(ast.parse(stab_src).body)
+    if is_density and "_invar_project_density" not in existing:
+        ip0, ip1, ic0, ic1 = layout
+        proj_src = (
+            "def _invar_project_density(buf):\n"
+            f"    if len(buf.data) > {max(ip0, ip1, ic0, ic1)}:\n"
+            f"        p0 = max(0.0, min(1.0, buf.data[{ip0}]))\n"
+            f"        p1 = 1.0 - p0\n"
+            f"        buf.data[{ip0}] = p0\n"
+            f"        buf.data[{ip1}] = p1\n"
+            f"        c0 = buf.data[{ic0}]\n"
+            f"        c1 = buf.data[{ic1}]\n"
+            "        coh2 = c0 * c0 + c1 * c1\n"
+            "        max_coh2 = max(0.0, p0 * p1)\n"
+            "        if coh2 > max_coh2 and coh2 > 1e-30:\n"
+            "            sc = math.sqrt(_invar_sdiv(max_coh2, coh2))\n"
+            f"            buf.data[{ic0}] = c0 * sc\n"
+            f"            buf.data[{ic1}] = c1 * sc\n"
+        )
+        to_insert.extend(ast.parse(proj_src).body)
+    if to_insert:
+        tree.body[insert_pos:insert_pos] = to_insert
+
+
+class _EarlyReturnStabilizer(ast.NodeTransformer):
+    """Ensure bare `return` inside step functions runs stabilization before returning."""
+
+    def __init__(self, call_stmts: List[ast.stmt]) -> None:
+        self.call_stmts = call_stmts
+        self.changed = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        return node
+
+    def visit_Return(self, node: ast.Return):
+        if node.value is None:
+            self.changed = True
+            return [copy.deepcopy(s) for s in self.call_stmts] + [node]
+        return node
+
+
+def _stabilize_dynamical_state_tree(
+    tree: ast.Module,
+    contracts: Sequence[Any],
+    *,
+    stabilize_diverged: bool = False,
+) -> Tuple[ast.Module, bool, List[str]]:
+    """Tier-0 Dynamical State Divergence Shield:
+    1. Pre-step snapshot + Rational Pade step-size limiter on buf.data[0..3].
+    2. Simplex & Bloch ball positivity projection for density-matrix systems.
+    3. Guards early `return`s and runs unconditionally in simulation_step & layer_*_step.
+
+    Applies to density-matrix/Bloch systems (where physical populations/coherences
+    lie in [-0.5, 1.0]) or when explicitly healing a DIVERGED run.
+    """
+    is_density = _is_density_matrix_system(tree, contracts)
+    if not is_density and not stabilize_diverged:
+        return tree, False, []
+    step_fns: List[ast.FunctionDef] = [
+        fn for fn in _simulation_functions(tree)
+        if isinstance(fn, ast.FunctionDef)
+        and fn.args.args
+        and fn.args.args[0].arg == "buf"
+        and not fn.name.startswith("_invar_")
+        and not fn.name.endswith(("_euler", "_rk4"))
+    ]
+    if not step_fns:
+        return tree, False, []
+
+    layout = _detect_density_slot_layout(contracts)
+    changed = False
+    notes: List[str] = []
+
+    for fn in step_fns:
+        fn_src = ast.unparse(fn)
+        if "_invar_p0" in fn_src:
+            continue
+        # Only instrument functions that write to buf.data or delegate to layer_*_step
+        writes_buf = any(
+            _state_subscript_slot(n) is not None
+            for n in ast.walk(fn)
+        )
+        calls_step = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id.endswith("_step")
+            for n in ast.walk(fn)
+        )
+        if not writes_buf and not calls_step:
+            continue
+
+        snap_src = (
+            "_invar_sz = len(buf.data)\n"
+            "_invar_p0 = buf.data[0] if _invar_sz > 0 else 0.0\n"
+            "_invar_p1 = buf.data[1] if _invar_sz > 1 else 0.0\n"
+            "_invar_p2 = buf.data[2] if _invar_sz > 2 else 0.0\n"
+            "_invar_p3 = buf.data[3] if _invar_sz > 3 else 0.0\n"
+        )
+        call_src = "_invar_stabilize_state(buf, _invar_p0, _invar_p1, _invar_p2, _invar_p3)\n"
+        if is_density:
+            call_src += "_invar_project_density(buf)\n"
+
+        snap_stmts = ast.parse(snap_src).body
+        call_stmts = ast.parse(call_src).body
+
+        # Transform any early bare `return` inside fn so it cannot bypass stabilization
+        er = _EarlyReturnStabilizer(call_stmts)
+        for i, stmt in enumerate(fn.body):
+            fn.body[i] = er.visit(stmt)
+
+        # Find the last top-level statement writing to buf.data[0..3] before diagnostic slots (4+)
+        last_dyn_idx = -1
+        for idx, stmt in enumerate(fn.body):
+            slots_written = {
+                _stmt_slot_target(n)
+                for n in ast.walk(stmt)
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            }
+            if any(s is not None and 0 <= s <= 3 for s in slots_written):
+                last_dyn_idx = idx
+
+        fn.body[0:0] = snap_stmts
+        if last_dyn_idx >= 0 and last_dyn_idx + len(snap_stmts) < len(fn.body) - 1:
+            ins_at = last_dyn_idx + len(snap_stmts) + 1
+            fn.body[ins_at:ins_at] = [copy.deepcopy(s) for s in call_stmts]
+        # Always also append at the end of fn.body (unless fn.body ends with Return)
+        if not isinstance(fn.body[-1], ast.Return):
+            fn.body.extend([copy.deepcopy(s) for s in call_stmts])
+
+        ast.fix_missing_locations(fn)
+        changed = True
+        notes.append(
+            f"stabilized dynamical state in {fn.name}"
+            + (" (Pade limiter + Bloch/simplex projection)" if is_density else " (Pade limiter)")
+        )
+
+    if changed:
+        _ensure_math_import(tree)
+        _ensure_stabilize_helpers(tree, is_density=is_density, layout=layout)
+        ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
 def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         eps: float = 1e-300,
                         contracts: Sequence[Any] = (),
-                        all_contracts: Sequence[Any] = ()) -> SanitizerResult:
+                        all_contracts: Sequence[Any] = (),
+                        stabilize_diverged: bool = False) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
         tree = ast.parse(code)
@@ -3347,6 +3597,9 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
     tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
     tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
+    tree, stab_changed, stab_notes = _stabilize_dynamical_state_tree(
+        tree, bridge_contracts, stabilize_diverged=stabilize_diverged
+    )
     tree, bloch_changed, bloch_notes = _enforce_bloch_ball_projection_tree(tree, bridge_contracts)
     tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
     tree, history_changed, history_notes = _repair_history_slots_tree(tree)
@@ -3369,7 +3622,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(coll_notes) | set(rev_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)

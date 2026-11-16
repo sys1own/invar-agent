@@ -103,10 +103,11 @@ def test_live_lindblad_three_stage_verified(tmp_path, monkeypatch):
 
     state, events = asyncio.run(run_flow())
     assert state is not None
-    # 1. Zero AttributeError during accretion
+    # 1. Zero AttributeError or TimeoutError during accretion
     for ev in events:
         msg = str(ev.get("message") or "")
         assert "AttributeError" not in msg, f"Accretion AttributeError observed: {msg}"
+        assert "TimeoutError" not in msg, f"Accretion TimeoutError observed: {msg}"
 
     # 2 & 3. All stages verified -> final status VERIFIED
     assert state.status == "VERIFIED", (

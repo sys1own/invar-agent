@@ -1943,6 +1943,15 @@ class ResearchStateMachine:
         else:
             unified = candidate_code
 
+        if stage > 1:
+            san_u = sanitize_intrinsics(
+                unified,
+                contracts=contracts,
+                all_contracts=cumulative_dicts or contracts,
+            )
+            if san_u.changed:
+                unified = san_u.code
+
         # 3. Wavefront_Schedule: GoI nilpotent schedule, SMW delta for new contracts.
         state.stage = "Wavefront_Schedule"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Wavefront_Schedule"})
@@ -2213,12 +2222,23 @@ class ResearchStateMachine:
             raise RuntimeError("accretive stages require a Tier-1 FAST LLM "
                                "(configure a provider) or a stage synthesizer")
         pinned_code = kw["pinned_code"]
-        return await asyncio.wait_for(synthesize_accretive_stage(
-            synth_llm, stage=kw["stage"], total=kw["total"],
-            objective=kw["objective"],
-            verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
-            verified_contracts=verified_contracts, telemetry=kw["telemetry"],
-            literature=kw["literature"], failures=kw["failures"]), timeout=120.0)
+        concise_lit = list((kw.get("literature") or [])[:3])
+        try:
+            return await asyncio.wait_for(synthesize_accretive_stage(
+                synth_llm, stage=kw["stage"], total=kw["total"],
+                objective=kw["objective"],
+                verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
+                verified_contracts=verified_contracts, telemetry=kw["telemetry"],
+                literature=concise_lit, failures=kw["failures"]), timeout=45.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            fb = _deterministic_accretion_candidate(pinned_code, kw["stage"])
+            if fb is not None:
+                return {
+                    "code": fb,
+                    "contracts": [],
+                    "rationale": f"Tier-0 deterministic accretion fallback for Stage {kw['stage']} after 45s LLM timeout",
+                }
+            raise
 
     async def _heal_and_refine(self, *, stage: int, round_idx: int, objective: str,
                                candidate_code: Optional[str],
@@ -2298,9 +2318,10 @@ class ResearchStateMachine:
         patched = apply_healing_directives(candidate_code, directives,
                                            contracts=contract_dicts)
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
-        fallback_needed = ("falsified" in str(failure or "").lower()
-                           and (not ops or not patched.changed
-                                or patched.code == candidate_code))
+        fallback_needed = (
+            ("falsified" in str(failure or "").lower() or "diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower())
+            and (not ops or not patched.changed or patched.code == candidate_code)
+        )
         if fallback_needed:
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
                 candidate_code, contract_dicts)
@@ -2318,7 +2339,8 @@ class ResearchStateMachine:
             # targeting the exact falsified slot(s) in `failure` so identical code
             # is never re-executed.
             san_fb = sanitize_intrinsics(
-                candidate_code, contracts=contract_dicts, all_contracts=contract_dicts
+                candidate_code, contracts=contract_dicts, all_contracts=contract_dicts,
+                stabilize_diverged=("diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower()),
             )
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,

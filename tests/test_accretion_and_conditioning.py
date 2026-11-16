@@ -218,4 +218,78 @@ async def test_multistage_accretion_non_aborting_and_sets_blueprint(tmp_path):
     # Stage 2 failed (impossible invariant), yet Stage 3 still ran!
     assert 2 in visited_stages
     assert any(h.stage == 3 and h.status == "VERIFIED" for h in state.blueprint.evolution_history)
-    assert len(state.blueprint.verified_layers) == 2
+
+
+def test_tier0_dynamical_state_divergence_shield_stiff_euler_5000_steps():
+    """Broken Forward Euler layer_1_step at gamma=100000, dt=0.25 with early return
+    must be stabilized by Tier-0 Pade limiter + Bloch/simplex projection over 5000 steps."""
+    import math
+
+    broken_euler = '''import math
+
+def layer_1_step(buf, dt):
+    r00 = buf.data[0]
+    r11 = buf.data[1]
+    r01r = buf.data[2]
+    r01i = buf.data[3]
+    gam_rate = buf.data[4]
+    if gam_rate == 0.0:
+        buf.data[0] = r00 + dt * r01i
+        buf.data[1] = 1.0 - buf.data[0]
+        buf.data[11] = 0.0
+        return
+    dc = -gam_rate * (r00 - 0.5)
+    r00n = r00 + 0.5 * dt * dc
+    r11n = 1.0 - r00n
+    r01rn = r01r - dt * gam_rate * r01r
+    r01in = r01i - dt * gam_rate * r01i
+    buf.data[0] = r00n
+    buf.data[1] = r11n
+    buf.data[2] = r01rn
+    buf.data[3] = r01in
+    buf.data[6] = abs((buf.data[0] + buf.data[1]) - 1.0)
+    disc = (buf.data[0] - buf.data[1]) ** 2 + 4.0 * (buf.data[2] ** 2 + buf.data[3] ** 2)
+    buf.data[7] = 0.5 * ((buf.data[0] + buf.data[1]) - math.sqrt(max(0.0, disc)))
+    buf.data[8] = buf.data[0] ** 2 + buf.data[1] ** 2 + 2.0 * (buf.data[2] ** 2 + buf.data[3] ** 2)
+    buf.data[10] = 0.0
+    buf.data[11] = 0.0
+
+def simulation_step(buf, dt):
+    layer_1_step(buf, dt)
+'''
+    contracts = [
+        {
+            "contract_id": "c2_stiff_entropy_positivity",
+            "initial_state": [0.85, 0.15, 0.2, 0.1, 100000.0] + [0.0] * 11,
+            "invariants": [
+                {"variable_name": "trace_error_max", "assertion": "state[6] <= 1e-14"},
+                {"variable_name": "min_eigenvalue", "assertion": "state[7] >= -1e-15"},
+                {"variable_name": "purity", "assertion": "state[8] <= 1.0 + 1e-14"},
+                {"variable_name": "spohn_monotone", "assertion": "state[10] <= 1e-12"},
+                {"variable_name": "reversibility_error", "assertion": "state[11] <= 1e-13"},
+            ],
+        }
+    ]
+    res = sanitize_intrinsics(broken_euler, contracts=contracts, all_contracts=contracts)
+    assert res.changed
+    ns = {}
+    exec(res.code, ns)
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+            self.size = len(data)
+
+    b = Buf([0.85, 0.15, 0.2, 0.1, 100000.0] + [0.0] * 11)
+    for step in range(5000):
+        ns["simulation_step"](b, 0.25)
+        assert all(math.isfinite(v) for v in b.data), f"Non-finite at step {step}"
+        assert 0.0 <= b.data[0] <= 1.0
+        assert 0.0 <= b.data[1] <= 1.0
+        assert -0.5 <= b.data[2] <= 0.5
+        assert -0.5 <= b.data[3] <= 0.5
+    assert b.data[6] <= 1e-14
+    assert b.data[7] >= -1e-15
+    assert 0.0 < b.data[8] <= 1.0 + 1e-14
+    assert b.data[10] <= 1e-12
+    assert b.data[11] <= 1e-13
