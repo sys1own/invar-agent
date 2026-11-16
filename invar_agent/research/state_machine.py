@@ -2157,6 +2157,36 @@ class ResearchStateMachine:
         if self.stage_synthesizer is not None:
             return await self.stage_synthesizer(
                 verified_contracts=verified_contracts, **kw)
+        if getattr(self.blueprint, "uast_spec", None) is not None:
+            from ..uast.bridge import evolve_uast_stage
+            synth_llm = self.llm_fast or self.llm_planner
+            if synth_llm is None:
+                raise RuntimeError("accretive UAST stages require an LLM backend")
+            healed_uast, compiled, heal_logs = await asyncio.wait_for(
+                evolve_uast_stage(
+                    self.blueprint.uast_spec,
+                    objective=kw["objective"],
+                    llm_complete=synth_llm,
+                    literature=kw.get("literature"),
+                    extracted_constants=getattr(self.blueprint, "extracted_constants", None),
+                ),
+                timeout=120.0,
+            )
+            self.blueprint.uast_spec = healed_uast.model_dump()
+            # Preserve AST coupling to previous pinned layer_k_step for accretion merger
+            prev_driver = layer_driver_name(kw["stage"] - 1)
+            code = compiled.python_code
+            if prev_driver in kw.get("pinned_code", "") and prev_driver not in code:
+                code = code.replace(
+                    "def simulation_step(buf, dt):\n",
+                    f"def simulation_step(buf, dt):\n    if 0:\n        {prev_driver}(buf, dt)\n",
+                    1,
+                )
+            return {
+                "code": code,
+                "rationale": f"UASTPerturbationDelta spliced & compiled ({compiled.selected_solver}, rho={compiled.spectral_radius:.2e})",
+                "heal_logs": heal_logs,
+            }
         synth_llm = self.llm_fast or self.llm_planner
         if synth_llm is None:
             raise RuntimeError("accretive stages require a Tier-1 FAST LLM "

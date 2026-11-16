@@ -187,6 +187,8 @@ class ResearchBlueprint(BaseModel):
     # SI-normalized parameter dictionary derived from structured_evidence
     # (name -> si_value); consumed by the vault and the Builder context.
     extracted_constants: Dict[str, float] = Field(default_factory=dict, max_length=128)
+    # Declarative ResearchComputeUAST specification (when synthesized via UAST/HIN pipeline).
+    uast_spec: Optional[Dict[str, Any]] = None
 
 
 class ExtractedParameter(BaseModel):

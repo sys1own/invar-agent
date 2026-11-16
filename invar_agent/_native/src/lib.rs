@@ -10,6 +10,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+mod adjoint;
+mod csel_egraph;
 mod deterministic_healer;
 mod egraph_healer;
 mod goi_matrix;
@@ -18,8 +20,11 @@ mod goi_wavefront;
 mod hin_arena;
 mod hin_engine;
 mod his;
+mod holographic_hin;
 mod uast;
 
+use adjoint::PyAdjointHin;
+use csel_egraph::{csel_egraph_optimize, desugar_math_to_csel, resolve_symbol_fuzzy};
 use deterministic_healer::DeterministicHealerCore;
 use egraph_healer::{repair_uast_expression, align_return_type, ASTRewritePatch, PreWriteHealer};
 use goi_matrix::{GoIProofNet, GoIWavefrontSolverNative};
@@ -28,6 +33,7 @@ use goi_wavefront::PyGoIWavefrontScheduler;
 use hin_arena::{reduce_hin_uast, PyHinEngine as PyHinArenaEngine};
 use hin_engine::HinEngineCore;
 use his::HisBoundaryCore;
+use holographic_hin::PyHolographicHin;
 use uast::{PyGraphPolyglotMaterializer, PyUASTGraph, PyUASTKind};
 
 fn to_set(items: Vec<String>) -> HashSet<String> {
@@ -242,5 +248,11 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ASTRewritePatch>()?;
     m.add_class::<PreWriteHealer>()?;
     m.add_function(wrap_pyfunction!(reduce_hin_uast, m)?)?;
+    // UAST/HIN Research Compute Engine v2 (Holographic HIN, Adjoint HIN, CSEL E-Graph)
+    m.add_class::<PyHolographicHin>()?;
+    m.add_class::<PyAdjointHin>()?;
+    m.add_function(wrap_pyfunction!(csel_egraph_optimize, m)?)?;
+    m.add_function(wrap_pyfunction!(desugar_math_to_csel, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_symbol_fuzzy, m)?)?;
     Ok(())
 }

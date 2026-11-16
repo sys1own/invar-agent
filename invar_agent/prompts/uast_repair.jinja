@@ -1,0 +1,13 @@
+[SYSTEM: TIER-1 REPAIR] The Symbolic Governance Map successfully verified all nodes except node f_k ({{ target_equation_name }}). The proposed CSEL expression: {{ failed_expression }} violates the Invariant Contract.
+
+Diagnostic Witness:
+
+  - State Vector mapping to failure: {{ counterexample_vector }}
+  - Sub-Expression Trace: {{ sub_expression_trace }}
+  - Dimensional Mismatch: {{ dimension_residual }}
+  - SMT Contradiction: {{ smt_assertion_failed }}
+  - Jacobian Spectrum: {{ jacobian_spectrum }}
+
+TASK: Provide the corrected CSEL expression for node f_k only. You are restricted to the following variables: {{ available_ontology_keys }}. Ensure the expression aligns with SI target dimensions {{ target_si_vector }}.
+
+OUTPUT FORMAT: {"target_node_id": "{{ target_equation_name }}", "new_csel_expression": "..."}
