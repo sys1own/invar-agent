@@ -962,23 +962,73 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
         for inv in (getattr(c_item, "invariants", None) or []):
             assertion = str(getattr(inv, "assertion", "") or "")
             name = (inv.variable_name or "").lower()
-            # Relational invariant: state[i] <= state[j] (+ tol) or state[j] >= state[i] (- tol)
+            # Relational invariant: weak (<= / >=) vs strict (< / > / positive margin)
             m_rel_le = re.search(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*<=?\s*"
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(<=|<)\s*"
                 r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]",
                 assertion,
             )
             m_rel_ge = re.search(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*>=?\s*"
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]",
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(>=|>)\s*"
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\](?:\s*\+\s*([0-9.eE+-]+))?",
                 assertion,
             )
-            if m_rel_le or m_rel_ge:
-                if m_rel_le:
-                    i_idx, j_idx = int(m_rel_le.group(1)), int(m_rel_le.group(2))
+            m_rel_diff = re.search(
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*-\s*"
+                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(>|>=)\s*([0-9.eE+-]+)",
+                assertion,
+            )
+            if m_rel_le or m_rel_ge or m_rel_diff:
+                is_strict_rel = False
+                rel_margin = 0.0
+                if m_rel_diff:
+                    j_idx, i_idx = int(m_rel_diff.group(1)), int(m_rel_diff.group(2))
+                    rel_margin = max(0.0, float(m_rel_diff.group(4)))
+                    is_strict_rel = (m_rel_diff.group(3) == ">") or (rel_margin > 0.0)
+                elif m_rel_le:
+                    i_idx, op_r, j_idx = int(m_rel_le.group(1)), m_rel_le.group(2), int(m_rel_le.group(3))
+                    is_strict_rel = (op_r == "<")
                 else:
-                    j_idx, i_idx = int(m_rel_ge.group(1)), int(m_rel_ge.group(2))
+                    assert m_rel_ge is not None
+                    j_idx, op_r, i_idx = int(m_rel_ge.group(1)), m_rel_ge.group(2), int(m_rel_ge.group(3))
+                    rel_margin = float(m_rel_ge.group(4)) if m_rel_ge.group(4) else 0.0
+                    is_strict_rel = (op_r == ">") or (rel_margin > 0.0)
+
                 if i_idx != j_idx and max(i_idx, j_idx) < len(initial):
+                    if is_strict_rel:
+                        if j_idx not in dyn_set:
+                            # If unassigned and concept shares array/gen/total/power with another slot > lo, bridge first
+                            concept_toks = [tok for tok in ("array", "gen", "total", "power") if tok in name]
+                            bridged_val = None
+                            if concept_toks and j_idx in missing_set:
+                                for c2 in (all_contracts or [contract]):
+                                    for inv2 in (getattr(c2, "invariants", None) or []):
+                                        n2 = (getattr(inv2, "variable_name", "") or "").lower()
+                                        if any(tok in n2 for tok in concept_toks):
+                                            for s2_txt in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", str(getattr(inv2, "assertion", "") or "")):
+                                                s2 = int(s2_txt)
+                                                if s2 != j_idx and s2 != i_idx and s2 < len(initial) and initial[s2] > initial[i_idx] + rel_margin:
+                                                    bridged_val = initial[s2]
+                                                    break
+                                        if bridged_val is not None:
+                                            break
+                                    if bridged_val is not None:
+                                        break
+                            if bridged_val is not None and initial[j_idx] <= initial[i_idx] + rel_margin:
+                                old_j = initial[j_idx]
+                                initial[j_idx] = bridged_val
+                                warnings.append(
+                                    f"auto-init: strict relational slot state[{j_idx}] ({inv.variable_name}) "
+                                    f"bridged from {old_j} to {bridged_val}")
+                            elif initial[j_idx] <= initial[i_idx] + rel_margin:
+                                old_j = initial[j_idx]
+                                bump = max(rel_margin + 1e-6, max(1.0, abs(initial[i_idx]) * 0.001))
+                                target_j = initial[i_idx] + bump
+                                initial[j_idx] = target_j
+                                warnings.append(
+                                    f"auto-init: strict relational slot state[{j_idx}] ({inv.variable_name}) "
+                                    f"raised from {old_j} to {target_j}")
+                        continue
                     if i_idx not in dyn_set and ("max" in name or "bound" in name or "peak" in name):
                         if initial[i_idx] > 0.0 and (initial[i_idx] > initial[j_idx] or i_idx not in missing_set):
                             old_i = initial[i_idx]
@@ -1226,6 +1276,31 @@ def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
         for i in range(4):
             mapping[f"state_{i}"] = i
     bp.variable_map = dict(list(mapping.items())[:64])
+
+
+def _apply_backup_slots_to_vmap(bp: Optional[ResearchBlueprint],
+                                backup_map: Dict[str, int],
+                                code_text: str = "") -> None:
+    """Update `bp.variable_map` so backed-up input parameters point to their backup slots."""
+    if not backup_map or bp is None:
+        return
+    vm = dict(getattr(bp, "variable_map", None) or {})
+    # Map each backup_slot -> orig_slot by parsing `_invar_psz_<orig>` assignments if code provided.
+    orig_by_bak: Dict[int, int] = {}
+    if code_text:
+        for m in re.finditer(r"buf\.data\[(\d+)\]\s*=\s*buf\.data\[(\d+)\]", code_text):
+            orig_by_bak[int(m.group(1))] = int(m.group(2))
+    for var_in, bak_slot in backup_map.items():
+        bak_i = int(bak_slot)
+        orig_i = orig_by_bak.get(bak_i)
+        vlow = var_in.lower().rstrip("s")
+        for existing_k, existing_v in list(vm.items()):
+            if orig_i is not None and existing_v == orig_i:
+                klow = existing_k.lower().rstrip("s")
+                if klow == vlow or klow.startswith(vlow + "_") or vlow.startswith(klow + "_"):
+                    vm[existing_k] = bak_i
+        vm[var_in] = bak_i
+    bp.variable_map = dict(list(vm.items())[:64])
 
 
 def _json_safe(tel: Dict[str, float]) -> Dict[str, float]:
@@ -2115,6 +2190,7 @@ class ResearchStateMachine:
         cumulative_dicts = [c.model_dump() for c in _contracts_through_stage(bp, stage)]
         san = sanitize_intrinsics(candidate_code, contracts=contracts,
                                   all_contracts=all_bp_dicts or cumulative_dicts or contracts)
+        _apply_backup_slots_to_vmap(bp, getattr(san, "backup_slot_map", {}), san.code)
         if san.changed:
             candidate_code = san.code
             await self.emit_activity(
@@ -2157,6 +2233,7 @@ class ResearchStateMachine:
                 contracts=contracts,
                 all_contracts=all_bp_dicts or cumulative_dicts or contracts,
             )
+            _apply_backup_slots_to_vmap(bp, getattr(san_u, "backup_slot_map", {}), san_u.code)
             if san_u.changed:
                 unified = san_u.code
 
@@ -2618,8 +2695,26 @@ class ResearchStateMachine:
         directives = plan.get("directives") or []
         if not isinstance(directives, list):
             directives = []
+        if stage > 1 and all_contract_dicts:
+            prior_slots: Set[int] = set()
+            for _cd in all_contract_dicts:
+                if _canon_stage_index(str(_cd.get("contract_id") or "")) < stage:
+                    for _iv in (_cd.get("invariants") or []):
+                        for _m_s in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", str(_iv.get("assertion") or "")):
+                            prior_slots.add(int(_m_s))
+            filtered_dirs = []
+            for _d in directives:
+                if isinstance(_d, dict) and str(_d.get("op") or "") in ("BIND_SLOT_TO_VAR", "UNIFY_CONCEPT_SLOTS"):
+                    try:
+                        _dslot = int(_d.get("slot", -1))
+                    except (TypeError, ValueError):
+                        _dslot = -1
+                    if _dslot in prior_slots:
+                        continue
+                filtered_dirs.append(_d)
+            directives = filtered_dirs
         patched = apply_healing_directives(candidate_code, directives,
-                                           contracts=contract_dicts)
+                                           contracts=all_contract_dicts or contract_dicts)
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
         _is_final_heal = (attempt >= max_attempts)
         _missing_eq_slot = (

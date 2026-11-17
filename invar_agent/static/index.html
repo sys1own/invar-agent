@@ -1478,6 +1478,8 @@ function renderResearchFailure(msg) {
   const viewBtn = card.querySelector('#btn-view-partial');
   if (viewBtn) viewBtn.onclick = () => { switchSidebarTab('research'); loadVault(); };
 }
+let lastSeenResearchSeq = 0;
+const seenResearchBanners = new Set();
 function openResearchStream() {
   if (researchSource) researchSource.close();
   researchSource = new EventSource('/api/v1/research/stream');
@@ -1489,6 +1491,13 @@ function openResearchStream() {
   };
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.event === 'run_start') {
+      seenResearchBanners.clear();
+      if (typeof msg.seq === 'number') lastSeenResearchSeq = msg.seq;
+    } else if (typeof msg.seq === 'number') {
+      if (msg.seq <= lastSeenResearchSeq) return;
+      lastSeenResearchSeq = msg.seq;
+    }
     const ch = msg.channel || 'accelerator_log';
     if (ch === 'activity_log' && msg.event === 'activity') {
       // Dedicated live activity feed + stepper; not duplicated into the drawer logs.
@@ -1538,7 +1547,11 @@ function openResearchStream() {
       setDrawerSummary(`Stage ${msg.research_stage}/${msg.total_stages}: ${msg.objective || msg.mode || ''}`);
     }
     if (msg.event === 'checkpoint') {
-      addMsg('system', `📌 Stage ${msg.research_stage} verified & pinned. Checkpoint: ${msg.bundle_hash || ''} (${(msg.pinned_layers || []).join(', ')})`);
+      const ckKey = `checkpoint:${msg.research_stage}:${msg.bundle_hash || ''}`;
+      if (!seenResearchBanners.has(ckKey)) {
+        seenResearchBanners.add(ckKey);
+        addMsg('system', `📌 Stage ${msg.research_stage} verified & pinned. Checkpoint: ${msg.bundle_hash || ''} (${(msg.pinned_layers || []).join(', ')})`);
+      }
       loadVault();  // intermediate checkpoints refresh the Research Explorer
     }
     if (msg.event === 'checkpoint_preserved') {
@@ -1563,6 +1576,7 @@ function openResearchStream() {
       addResearchReportCard(msg.report, msg.report_path || '', msg.run_id || '');
       renderResearchCompletion(msg.run_id || '', msg.status || '');
       loadVault();
+      if (researchSource) { researchSource.close(); researchSource = null; }
     }
     if (msg.event === 'research_failed') {
       statusEl.textContent = `research halted: ${String(msg.error || '').slice(0, 120)}`;
@@ -1571,6 +1585,7 @@ function openResearchStream() {
       finishRunLogCard('HALTED');
       renderResearchFailure(msg);
       loadVault();  // partial verified results stay visible in the Explorer
+      if (researchSource) { researchSource.close(); researchSource = null; }
     }
     if (msg.event === 'vault_updated') {
       // Vault contents changed on disk — refresh the explorer immediately.
@@ -1582,7 +1597,11 @@ function openResearchStream() {
       addResearchReportCard(msg.report, '', '');
     }
     if (msg.event === 'research_complete') {
-      addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
+      const rcKey = `research_complete:${msg.verified_stages || ''}:${msg.unified_module_hash || ''}`;
+      if (!seenResearchBanners.has(rcKey)) {
+        seenResearchBanners.add(rcKey);
+        addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
+      }
     }
     if (msg.event === 'refused' && msg.feasibility) {
       renderResearchRefusal(msg.feasibility);
@@ -1597,7 +1616,11 @@ function openResearchStream() {
       setDrawerSummary(`Run ${msg.status || 'done'}`);
     }
     if (msg.event === 'commit') {
-      addMsg('system', '✅ Research run committed. Bundle: ' + (msg.bundle_hash || '').slice(0, 16));
+      const isFinalCommit = !msg.research_stage || !msg.total_stages || msg.research_stage >= msg.total_stages;
+      if (isFinalCommit && !seenResearchBanners.has('commit_final')) {
+        seenResearchBanners.add('commit_final');
+        addMsg('system', '✅ Research run committed. Bundle: ' + (msg.bundle_hash || '').slice(0, 16));
+      }
     }
     if (msg.event === 'rollback') {
       addMsg('system', '↩ Adjoint rollback — looping with feedback.');

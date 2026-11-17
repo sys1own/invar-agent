@@ -484,7 +484,65 @@ def fetch_shbt_repo_readme(repo: str, timeout: float = 3.0) -> Optional[str]:
     return None
 
 
-def _build_evidence_markdown(specs: Sequence[SHBTDomainSpec]) -> str:
+_SUBMODULE_KEYWORD_GATES: Dict[str, Tuple[str, ...]] = {
+    # shbt-precision specialized sub-modules
+    "bekenstein_saturation": ("bekenstein", "horizon", "entropy bound"),
+    "omega_dm_0": ("cosmolog", "dark matter", "omega_dm"),
+    "wzw_level_su2": ("wzw", "26", "su(2)", "central charge", "dynkin", "weil"),
+    "wzw_level_su3": ("wzw", "su(3)", "central charge", "dynkin", "weil"),
+    "wzw_level_so10": ("wzw", "so(10)", "312", "central charge", "dynkin", "weil"),
+    "central_charge_visible": ("central charge", "wzw", "virasoro"),
+    "central_charge_parent": ("central charge", "wzw", "virasoro"),
+    # shbt-swarm specialized sub-modules
+    "void_loiter_power_w": ("void", "loiter", "dark-zpe", "zpe", "dark-sector", "187.75"),
+    "void_loiter_debt_ratio": ("void", "loiter", "dark-zpe", "zpe", "dark-sector", "187.75"),
+    "dark_os_conductor": ("dark-os", "crt", "362670", "alu"),
+    "dark_os_tick_s": ("dark-os", "kz", "knizhnik", "17.01"),
+    "braid_bound_nats": ("braid", "sugawara", "framing", "38.19"),
+    # shbt-recon specialized sub-modules
+    "sram_arena_bytes": ("sram", "2112", "2,112", "arena", "640"),
+    "virasoro_weight_shift": ("virasoro", "coset", "spinor", "45/64", "weight"),
+    "shbt_sten_latency_s": ("sten", "54.432", "pt-goi"),
+    # shbt-warp Tier-2 5th-Gen MAR-312X
+    "mar_312x_gross_w": ("mar-312", "312x", "25.00 ew", "warp", "alcubierre", "wormhole"),
+    "eta_actuation": ("dec-x", "actuation", "0.992", "mar-312", "warp"),
+    "sensible_heat_fraction": ("sensible heat fraction", "mar-312", "warp"),
+}
+
+_EQUATION_KEYWORD_GATES: Dict[str, Tuple[str, ...]] = {
+    "R_void": ("void", "loiter", "dark-zpe", "zpe", "dark-sector", "187.75"),
+    "M_seed": ("ghost", "seed", "congestion", "alpha_seed"),
+    "delta_fr": ("framing", "delta_fr"),
+}
+
+
+def filter_shbt_spec_for_prompt(
+    spec: SHBTDomainSpec, prompt: str = ""
+) -> Tuple[Tuple[SHBTConstant, ...], Tuple[SHBTEquation, ...], Tuple[str, ...]]:
+    """Filter SHBT constants, equations, and invariants to those relevant to `prompt`."""
+    low = (prompt or "").strip().lower()
+    if not low:
+        return spec.constants, spec.equations, spec.invariants
+    kept_consts = tuple(
+        c for c in spec.constants
+        if c.name not in _SUBMODULE_KEYWORD_GATES
+        or any(kw in low for kw in _SUBMODULE_KEYWORD_GATES[c.name])
+    )
+    if not kept_consts:
+        kept_consts = spec.constants
+    kept_eqs = tuple(
+        eq for eq in spec.equations
+        if not any(
+            sym in eq.python_expr and not any(kw in low for kw in kws)
+            for sym, kws in _EQUATION_KEYWORD_GATES.items()
+        )
+    )
+    if not kept_eqs:
+        kept_eqs = spec.equations
+    return kept_consts, kept_eqs, spec.invariants
+
+
+def _build_evidence_markdown(specs: Sequence[SHBTDomainSpec], prompt: str = "") -> str:
     if not specs:
         return ""
     lines: List[str] = [
@@ -494,14 +552,16 @@ def _build_evidence_markdown(specs: Sequence[SHBTDomainSpec]) -> str:
         "|---|---|---:|---|---|",
     ]
     for spec in specs:
-        for c in spec.constants:
+        consts, _eqs, _invs = filter_shbt_spec_for_prompt(spec, prompt)
+        for c in consts:
             lines.append(f"| `{spec.repo}` | `{c.symbol}` | `{c.si_value:.12g}` | `{c.si_unit}` | {c.description} |")
     lines.append("")
     lines.append("**Governing SHBT Equations & Invariants:**")
     for spec in specs:
-        for eq in spec.equations:
+        _consts, eqs, invs = filter_shbt_spec_for_prompt(spec, prompt)
+        for eq in eqs:
             lines.append(f"- `{spec.repo}`: `${eq.latex}$` (`{eq.python_expr}`) — {eq.description}")
-        for inv in spec.invariants:
+        for inv in invs:
             lines.append(f"- Invariant (`{spec.repo}`): `{inv}`")
     return "\n".join(lines)
 
@@ -545,7 +605,7 @@ def resolve_shbt_solvability(query_or_prompt: str,
         reason=f"Activated SHBT frontier solvability across {len(specs)} repo(s): {', '.join(s.repo for s in specs)}",
         matched_repos=specs,
         verdict_override="OPTIMAL_DIRECT",
-        evidence_markdown=_build_evidence_markdown(specs),
+        evidence_markdown=_build_evidence_markdown(specs, text),
     )
 
 

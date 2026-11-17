@@ -675,7 +675,9 @@ _PARAM_STOPWORDS = {
     "closure", "model", "stage", "part", "step", "and", "or", "the", "a",
     "an", "is", "are", "was", "were", "as", "on", "per", "below", "above",
     "under", "over", "down", "up", "into", "onto", "than", "then", "max", "min",
-    "service", "covering", "drop", "cell", "accuracy",
+    "service", "servicing", "covering", "drop", "cell", "accuracy",
+    "calculating", "computing", "modeling", "verifying", "coupling",
+    "overcoming", "connecting", "incorporating", "shunting", "via",
 }
 
 
@@ -690,6 +692,9 @@ def extract_parameters_from_text(text: str, source: str = "",
     def _add(name_raw: str, num_raw: str, unit_raw: str, span: Tuple[int, int]) -> None:
         if any(a <= span[0] < b for a, b in seen_spans):
             return
+        # Ignore ratio expressions like `10:23` matched as `name 10 : 23`.
+        if name_raw and re.search(r"\d$", name_raw.strip()) and ":" in text[span[0]:span[1]]:
+            return
         value = _parse_number(num_raw)
         if value is None:
             return
@@ -701,7 +706,11 @@ def extract_parameters_from_text(text: str, source: str = "",
         name = _snake(cleaned_raw)
         if not name or re.match(r"^\d", name):
             return
-        if source == "user_prompt" and (len(name) <= 1 or name in _PARAM_STOPWORDS):
+        if len(name) <= 1 and not unit:
+            return
+        if name in _PARAM_STOPWORDS:
+            return
+        if source == "user_prompt" and len(name) <= 1:
             return
         # Subscripted state tokens (``z_k``, ``q_0``, ``x_n``, ...) extracted
         # from code-like prompt fragments are not physical constants.
@@ -724,7 +733,7 @@ def extract_parameters_from_text(text: str, source: str = "",
         if not is_known_unit(unit):
             continue
         before = text[max(0, m.start() - 48):m.start()]
-        before = re.split(r"[.;,()\n]|>=|<=|==", before)[-1].strip()
+        before = re.split(r"[.;,()\n=]|>=|<=", before)[-1].strip()
         # Strip trailing stopwords/prepositions/operators; if empty, inspect trailing noun phrase.
         words = [
             w for w in re.split(r"\s+", before)
@@ -1253,22 +1262,23 @@ class QuantitativeInsightExtractor:
                 if p.name not in params:
                     params[p.name] = p
             # 3b. Non-intrusive SHBT Frontier Federation (activates ONLY on unsolvable/frontier SHBT domains).
-            from .shbt_federation import resolve_shbt_solvability
+            from .shbt_federation import filter_shbt_spec_for_prompt, resolve_shbt_solvability
             shbt_res = resolve_shbt_solvability(prompt or "")
             if shbt_res.should_activate:
                 for spec in shbt_res.matched_repos:
                     domains.append(spec.repo)
-                    for sc in spec.constants:
+                    rel_consts, rel_eqs, rel_invs = filter_shbt_spec_for_prompt(spec, prompt or "")
+                    for sc in rel_consts:
                         add_param(ExtractedParameter(
                             name=sc.name, symbol=sc.symbol, raw_value=float(sc.si_value),
                             raw_unit=sc.si_unit, si_value=float(sc.si_value), si_unit=sc.si_unit,
                             source=f"SHBT: {spec.repo}", confidence=0.99,
                         ))
-                    for seq in spec.equations:
+                    for seq in rel_eqs:
                         eq_obj = parse_equation(seq.latex, source=f"SHBT: {spec.repo}", description=seq.description)
                         if eq_obj is not None:
                             equations.append(eq_obj)
-                    invariants.extend(spec.invariants)
+                    invariants.extend(rel_invs)
             equations.extend(r_eqs)
             benchmarks.extend(r_bench)
             invariants.extend(r_inv)

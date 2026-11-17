@@ -11,7 +11,7 @@ import ast
 import copy
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 MATH_FUNCS = {
@@ -36,6 +36,7 @@ class SanitizerResult:
     code: str
     notes: List[str]
     changed: bool
+    backup_slot_map: Dict[str, int] = field(default_factory=dict)
 
 
 def _defined_names(tree: ast.Module) -> set[str]:
@@ -1505,6 +1506,24 @@ def _collect_var_deps(body: List[ast.stmt], stop_idx: int) -> Dict[str, Set[str]
     return deps
 
 
+def _collect_parameter_backup_map(tree: ast.Module) -> Dict[str, int]:
+    """Extract `var_in -> bak_slot` from `_invar_psz_*` parameter backup blocks in `tree`."""
+    mapping: Dict[str, int] = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id.startswith("_invar_psz_")):
+            for sub in node.body:
+                if (isinstance(sub, ast.Assign) and len(sub.targets) == 1
+                        and isinstance(sub.targets[0], ast.Name)
+                        and isinstance(sub.value, ast.Subscript)):
+                    b_slot = _state_subscript_slot(sub.value)
+                    if b_slot is not None and not sub.targets[0].id.startswith("_invar_"):
+                        mapping[sub.targets[0].id] = b_slot
+    return mapping
+
+
 def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                                   ) -> Tuple[ast.Module, bool, List[str]]:
     changed = False
@@ -1513,11 +1532,35 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
     for c in contracts or []:
         used.update(_contract_state_slots(c))
     allow_kappa = _contracts_allow_kappa_default(contracts)
-    for fn in _simulation_functions(tree):
+    sim_fns = _simulation_functions(tree)
+
+    # Pre-index writes across all simulation/layer functions so we detect
+    # overwrites both within the same function (even nested) and across layers.
+    fn_slot_reads: Dict[int, Set[int]] = {}
+    fn_slot_writes: Dict[int, List[Tuple[int, ast.stmt]]] = {}
+    for fi, fn_item in enumerate(sim_fns):
+        r_set: Set[int] = set()
+        w_list: List[Tuple[int, ast.stmt]] = []
+        for sub in ast.walk(fn_item):
+            if isinstance(sub, ast.Subscript) and isinstance(sub.ctx, ast.Load):
+                sl = _state_subscript_slot(sub)
+                if sl is not None:
+                    r_set.add(sl)
+            elif isinstance(sub, (ast.Assign, ast.AugAssign)):
+                sl = _stmt_slot_target(sub)
+                if sl is not None:
+                    w_list.append((sl, sub))
+        fn_slot_reads[fi] = r_set
+        fn_slot_writes[fi] = w_list
+
+    for fi, fn in enumerate(sim_fns):
         body = fn.body
         reads: List[Tuple[int, str, int, ast.stmt]] = []
         param_slot_backups: List[Tuple[int, str, int, ast.stmt, int, int, float]] = []
         fn_src = ast.unparse(fn)
+        # Track slots already backed up in this function so zero-guards don't
+        # collide or rewrite backed-up writes to scratch slots.
+        backed_up_slots: Set[int] = set()
         for idx, stmt in enumerate(body):
             name = _assign_target_name(stmt)
             if name is None or not isinstance(stmt.value, ast.Subscript):
@@ -1525,51 +1568,91 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
             slot = _state_subscript_slot(stmt.value)
             if slot is None:
                 continue
-            if _is_parameter_name(name):
-                reads.append((idx, name, slot, stmt))
-                continue
-            # Also detect non-coordinate input variables read from buf.data[slot]
-            # and overwritten later in the same step by an unrelated expression.
-            if name.lower() in _STEPPED_COORD_NAMES or name.startswith("_invar_"):
+            if name.startswith("_invar_"):
                 continue
             if f"_invar_psz_{slot}" in fn_src:
                 continue
-            later_overwrites: List[Tuple[int, ast.stmt]] = []
-            for j in range(idx + 1, len(body)):
-                s_later = body[j]
-                if isinstance(s_later, ast.Assign) and _stmt_slot_target(s_later) == slot:
-                    later_overwrites.append((j, s_later))
-            if not later_overwrites:
-                continue
-            j_ow, ow_stmt = later_overwrites[0]
-            rhs_val = ow_stmt.value
-            if isinstance(rhs_val, ast.Name) and rhs_val.id == name:
-                continue
-            deps = _collect_var_deps(body, j_ow + 1)
-            rhs_refs = {n.id for n in ast.walk(rhs_val) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-            trans_refs = set(rhs_refs)
-            for rr in list(rhs_refs):
-                trans_refs.update(deps.get(rr, ()))
-            if name in trans_refs:
-                continue
-            # Check that `name` is actually read in downstream expressions.
-            is_used = any(
-                isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
-                for s_downstream in body[idx + 1:]
-                for n in ast.walk(s_downstream)
+
+            # Detect input-parameter reads whose slot is overwritten by an unrelated expression.
+            # Note: if a named parameter is only overwritten inside this same function and
+            # `slot` is NOT referenced in any contract, let the existing `later_writes`
+            # branch below redirect the unrelated write to a scratch slot so the parameter
+            # stays cleanly in `buf.data[slot]` (and keeps its zero-guard).
+            has_contract_slot = any(
+                slot in _contract_state_slots_from_text(a)
+                for c in (contracts or [])
+                for _, a, _ in _contract_invariant_items(c)
             )
-            if not is_used:
-                continue
-            bak = _scratch_slot(used, {slot})
-            flag = _scratch_slot(used | {bak}, {slot})
-            used.update({bak, flag})
-            fb_val = 0.0
-            for c in contracts or []:
-                init_l = _get_contract_initial_list(c)
-                if slot < len(init_l) and init_l[slot] != 0.0:
-                    fb_val = float(init_l[slot])
-                    break
-            param_slot_backups.append((idx, name, slot, stmt, bak, flag, fb_val))
+            should_backup = False
+            if name.lower() not in _STEPPED_COORD_NAMES:
+                # 1. Check later writes inside this same function (including nested if/for).
+                same_fn_backup = False
+                later_same_fn: List[Tuple[int, ast.Assign]] = []
+                for j in range(idx + 1, len(body)):
+                    for sub in ast.walk(body[j]):
+                        if isinstance(sub, ast.Assign) and _stmt_slot_target(sub) == slot:
+                            later_same_fn.append((j, sub))
+                for j_ow, ow_stmt in later_same_fn:
+                    rhs_val = ow_stmt.value
+                    if isinstance(rhs_val, ast.Name) and rhs_val.id == name:
+                        continue
+                    deps = _collect_var_deps(body, j_ow + 1)
+                    rhs_refs = {n.id for n in ast.walk(rhs_val) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                    trans_refs = set(rhs_refs)
+                    for rr in list(rhs_refs):
+                        trans_refs.update(deps.get(rr, ()))
+                    if name not in trans_refs:
+                        is_used = any(
+                            isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
+                            for s_downstream in body[idx + 1:]
+                            for n in ast.walk(s_downstream)
+                        )
+                        if is_used or _is_parameter_name(name):
+                            same_fn_backup = True
+                            break
+
+                # 2. Check overwrites in OTHER layers / simulation_step where that other
+                # function writes buf.data[slot] without evolving `slot` from itself.
+                cross_fn_backup = False
+                for fj, fn2 in enumerate(sim_fns):
+                    if fj == fi or slot in fn_slot_reads.get(fj, set()):
+                        continue
+                    for w_sl, w_stmt in fn_slot_writes.get(fj, []):
+                        if w_sl != slot or not isinstance(w_stmt, ast.Assign):
+                            continue
+                        rhs2 = w_stmt.value
+                        if isinstance(rhs2, ast.Name) and rhs2.id == name:
+                            continue
+                        is_used_here = any(
+                            isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
+                            for s_downstream in body[idx + 1:]
+                            for n in ast.walk(s_downstream)
+                        )
+                        if is_used_here or _is_parameter_name(name):
+                            cross_fn_backup = True
+                            break
+                    if cross_fn_backup:
+                        break
+
+                if cross_fn_backup:
+                    should_backup = True
+                elif same_fn_backup and (has_contract_slot or not _is_parameter_name(name)):
+                    should_backup = True
+
+            if should_backup:
+                bak = _scratch_slot(used, {slot})
+                flag = _scratch_slot(used | {bak}, {slot})
+                used.update({bak, flag})
+                backed_up_slots.add(slot)
+                fb_val = 0.0
+                for c in contracts or []:
+                    init_l = _get_contract_initial_list(c)
+                    if slot < len(init_l) and init_l[slot] != 0.0:
+                        fb_val = float(init_l[slot])
+                        break
+                param_slot_backups.append((idx, name, slot, stmt, bak, flag, fb_val))
+            elif _is_parameter_name(name):
+                reads.append((idx, name, slot, stmt))
 
         if param_slot_backups:
             new_body_bak: List[ast.stmt] = []
@@ -2394,9 +2477,16 @@ def _resolve_slot_collisions_tree(
             fn.body = new_body
             ast.fix_missing_locations(fn)
 
-    # Remap contracts referencing collided dynamical slots (Case A).
+    # Remap contracts referencing collided dynamical slots (Case A),
+    # while never mutating already-verified Stage 1 contracts during multi-stage accretion.
+    has_later_stage = any(
+        _contract_stage_index(str(_contract_get(cc, "contract_id", "") or "")) > 1
+        for cc in unique_contracts
+    )
     if colliding_remap:
         for c in unique_contracts:
+            if has_later_stage and _contract_stage_index(str(_contract_get(c, "contract_id", "") or "")) == 1:
+                continue
             init = _get_contract_initial_list(c)
             for old_s, new_s in colliding_remap.items():
                 while len(init) <= new_s:
@@ -3545,6 +3635,9 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     seen_diff_eqs: Set[Tuple[int, int]] = set()
     relational_le_pairs: List[Tuple[int, int, float]] = []
     seen_rel_pairs: Set[Tuple[int, int, float]] = set()
+    relational_strict_gt_pairs: List[Tuple[int, int, float, float]] = []
+    seen_strict_rel_pairs: Set[Tuple[int, int, float, float]] = set()
+    slot_var_names: Dict[int, str] = {}
 
     def _record_lower(s_idx: int, op_ge: str, val: float) -> None:
         if s_idx in dyn_set and s_idx < 4:
@@ -3580,33 +3673,58 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
                 other_upper_slots[s_idx] = val
 
+    def _add_strict_gt(hi_idx: int, lo_idx: int, coeff: float = 1.0, margin: float = 0.0) -> None:
+        if hi_idx != lo_idx and (hi_idx not in dyn_set or lo_idx not in dyn_set or hi_idx >= 4 or lo_idx >= 4):
+            key = (hi_idx, lo_idx, float(coeff), float(margin))
+            if key not in seen_strict_rel_pairs:
+                seen_strict_rel_pairs.add(key)
+                relational_strict_gt_pairs.append(key)
+
     for contract in contracts or []:
         for _name, assertion, _tol in _contract_invariant_items(contract):
-            # 1. Relational regex checks (retained for complex coefficients/nested expressions)
+            for _s_decl in _contract_state_slots_from_text(assertion):
+                if _name and _s_decl not in slot_var_names:
+                    slot_var_names[_s_decl] = str(_name)
+            # 1. Relational regex checks (weak <= / >= vs strict < / > separated cleanly)
             m_rel_le = re.search(
-                r"(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?\s*<=?\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?",
+                r"(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=|<)\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?",
                 assertion,
             )
             if m_rel_le:
                 i_idx = int(m_rel_le.group(1))
-                coeff = float(m_rel_le.group(2)) if m_rel_le.group(2) else 1.0
-                j_idx = int(m_rel_le.group(3))
-                if i_idx != j_idx and (i_idx not in dyn_set or j_idx not in dyn_set or i_idx >= 4 or j_idx >= 4):
+                op_r = m_rel_le.group(2)
+                coeff = float(m_rel_le.group(3)) if m_rel_le.group(3) else 1.0
+                j_idx = int(m_rel_le.group(4))
+                if op_r == "<":
+                    _add_strict_gt(j_idx, i_idx, 1.0 / coeff if coeff > 0.0 else 1.0, 0.0)
+                elif i_idx != j_idx and (i_idx not in dyn_set or j_idx not in dyn_set or i_idx >= 4 or j_idx >= 4):
                     key = (i_idx, j_idx, coeff)
                     if key not in seen_rel_pairs:
                         seen_rel_pairs.add(key)
                         relational_le_pairs.append(key)
             m_rel_ge = re.search(
-                r"(?:state|buf\.data|data)\[(\d+)\]\s*>=?\s*(?:state|buf\.data|data)\[(\d+)\]",
+                r"(?:state|buf\.data|data)\[(\d+)\]\s*(>=|>)\s*(?:state|buf\.data|data)\[(\d+)\](?:\s*\+\s*([0-9.eE+-]+))?",
                 assertion,
             )
             if m_rel_ge:
-                j_idx, i_idx = int(m_rel_ge.group(1)), int(m_rel_ge.group(2))
-                if i_idx != j_idx and (i_idx not in dyn_set or j_idx not in dyn_set or i_idx >= 4 or j_idx >= 4):
-                    key = (i_idx, j_idx, 1.0)
+                hi_idx, op_r, lo_idx = int(m_rel_ge.group(1)), m_rel_ge.group(2), int(m_rel_ge.group(3))
+                margin = float(m_rel_ge.group(4)) if m_rel_ge.group(4) else 0.0
+                if op_r == ">" or margin > 0.0:
+                    _add_strict_gt(hi_idx, lo_idx, 1.0, margin)
+                elif hi_idx != lo_idx and (hi_idx not in dyn_set or lo_idx not in dyn_set or hi_idx >= 4 or lo_idx >= 4):
+                    key = (lo_idx, hi_idx, 1.0)
                     if key not in seen_rel_pairs:
                         seen_rel_pairs.add(key)
                         relational_le_pairs.append(key)
+            m_diff_gt = re.search(
+                r"(?:state|buf\.data|data)\[(\d+)\]\s*-\s*(?:state|buf\.data|data)\[(\d+)\]\s*(>|>=)\s*([0-9.eE+-]+)",
+                assertion,
+            )
+            if m_diff_gt:
+                hi_idx, lo_idx = int(m_diff_gt.group(1)), int(m_diff_gt.group(2))
+                op_d, rhs_d = m_diff_gt.group(3), float(m_diff_gt.group(4))
+                if op_d == ">" or rhs_d > 0.0:
+                    _add_strict_gt(hi_idx, lo_idx, 1.0, max(0.0, rhs_d))
 
             # 2. Structured AST parsing (recursively handles `A and B`, chained comparisons, and `abs(...)`)
             atomic_nodes = _iter_atomic_invariant_nodes(assertion)
@@ -3752,6 +3870,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             and not positive_lower_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
             and not other_upper_slots and not relational_le_pairs
+            and not relational_strict_gt_pairs
             and not eq_target_slots and not sum_partition_targets
             and not diff_eq_targets):
         return tree, False, []
@@ -3988,6 +4107,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned upper-bound slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
+            assigned_in_tgt = _collect_assigned_slots(fn_tgt)
             for i_idx, j_idx, coeff in relational_le_pairs:
                 if coeff == 1.0:
                     guard_src = f"if buf.data[{i_idx}] > buf.data[{j_idx}]:\n    buf.data[{i_idx}] = buf.data[{j_idx}]\n"
@@ -4001,6 +4121,41 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned relational slot state[{i_idx}] <= {coeff!r}*state[{j_idx}] in {fn_tgt.name}")
+            for hi_idx, lo_idx, coeff, margin in relational_strict_gt_pairs:
+                lo_term = f"buf.data[{lo_idx}]" if coeff == 1.0 else f"{coeff!r} * buf.data[{lo_idx}]"
+                rhs_expr = lo_term if margin <= 0.0 else f"({lo_term} + {margin!r})"
+                step_floor = max(1.0, margin + 1e-6) if margin > 0.0 else 1.0
+                # Concept-alias bridging when hi_idx is unassigned while an array/gen/total slot holds the value
+                bridge_src = ""
+                if hi_idx not in assigned_in_tgt:
+                    hi_name = (slot_var_names.get(hi_idx) or "").lower()
+                    key_tokens = [tok for tok in ("array", "gen", "total", "power") if tok in hi_name]
+                    if key_tokens:
+                        for src_slot in sorted(assigned_in_tgt):
+                            if src_slot in (hi_idx, lo_idx):
+                                continue
+                            src_name = (slot_var_names.get(src_slot) or "").lower()
+                            if any(tok in src_name for tok in key_tokens):
+                                bridge_src = (
+                                    f"if not math.isfinite(buf.data[{hi_idx}]) or buf.data[{hi_idx}] <= {rhs_expr}:\n"
+                                    f"    if math.isfinite(buf.data[{src_slot}]) and buf.data[{src_slot}] > {rhs_expr}:\n"
+                                    f"        buf.data[{hi_idx}] = buf.data[{src_slot}]\n"
+                                )
+                                break
+                guard_src = (
+                    bridge_src
+                    + f"if not math.isfinite(buf.data[{hi_idx}]) or not math.isfinite(buf.data[{lo_idx}]) "
+                    f"or buf.data[{hi_idx}] <= {rhs_expr}:\n"
+                    f"    buf.data[{hi_idx}] = {rhs_expr} + max({step_floor!r}, abs({rhs_expr}) * 0.001)\n"
+                )
+                guard_stmts = ast.parse(guard_src).body
+                marker = ast.unparse(guard_stmts[-1].test)  # type: ignore[attr-defined]
+                if marker not in ast.unparse(fn_tgt):
+                    _append_before_return(fn_tgt, guard_stmts)
+                    ast.fix_missing_locations(fn_tgt)
+                    _ensure_math_import(tree)
+                    changed = True
+                    notes.append(f"conditioned strict relational slot state[{hi_idx}] > {rhs_expr} in {fn_tgt.name}")
             for s_idx in sorted(eq_target_slots):
                 tgt, tol, is_strict = eq_target_slots[s_idx]
                 cmp_op = ">=" if is_strict else ">"
@@ -4995,7 +5150,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, cons_changed, cons_notes = _enforce_conservation_projection_tree(
         tree, bridge_contracts)
     tree, lyap_changed, lyap_notes = _enforce_lyapunov_sign_tree(tree, bridge_contracts)
-    tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, contracts)
+    tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, bridge_contracts)
     tree, diss_changed, diss_notes = _seed_dissipation_parameters_tree(tree, contracts)
     transformer = _IntrinsicTransformer()
     transformer.defined = _defined_names(tree)
@@ -5029,7 +5184,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
             notes.append("guarded math domains (log/sqrt/asin/acos)")
             changed = True
     out = ast.unparse(tree) + ("\n" if code.endswith("\n") or not code.endswith("\n") else "")
-    return SanitizerResult(out, notes, changed)
+    return SanitizerResult(out, notes, changed, backup_slot_map=_collect_parameter_backup_map(tree))
 
 
 class _DomainGuardTransformer(ast.NodeTransformer):

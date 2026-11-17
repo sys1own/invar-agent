@@ -351,3 +351,132 @@ def test_extractor_filters_shbt_prompt_noise():
     for p in params:
         assert not p.name[0].isdigit()
         assert p.symbol not in (">=", "<=", ">", "<", "=", "==")
+
+
+def test_strict_relational_inequality_auto_init_and_sanitizer():
+    from invar_agent.research.state_machine import _guard_contract_initial_state
+    from invar_agent.schemas.research import VerificationContract
+
+    kernel = (
+        "def layer_1_step(buf, dt):\n"
+        "    buf.data[17] = 906000.0\n\n"
+        "def layer_2_step(buf, dt):\n"
+        "    pass\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    layer_1_step(buf, dt)\n"
+        "    layer_2_step(buf, dt)\n"
+    )
+    vc = VerificationContract.model_validate({
+        "contract_id": "c2_teg_kapitza",
+        "target_backend": "cpp",
+        "initial_state": [0.0] * 17 + [906000.0, 0.0, 0.0],
+        "dt": 0.01,
+        "steps": 5,
+        "invariants": [
+            {"variable_name": "array_above_debt", "assertion": "state[16] > state[17]", "tolerance": 0.0},
+        ],
+    })
+    init, _warns = _guard_contract_initial_state(kernel, vc)
+    assert init[16] > init[17], f"auto-init must keep strict > (got {init[16]} <= {init[17]})"
+
+    san = sanitize_intrinsics(kernel, contracts=[vc])
+    assert san.changed
+    san2 = sanitize_intrinsics(san.code, contracts=[vc])
+    assert san2.changed is False
+
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
+            self.size = len(self.data)
+
+    ns = {}
+    exec(compile(san.code, "<strict_rel>", "exec"), ns)
+    b = _Buf(list(init) + [0.0] * 10)
+    b.data[16] = 906000.0
+    b.data[17] = 906000.0
+    ns["simulation_step"](b, 0.01)
+    assert b.data[16] > b.data[17]
+
+
+def test_overwritten_input_slots_backed_up_and_vmap_updated():
+    from invar_agent.research.state_machine import _apply_backup_slots_to_vmap
+
+    kernel = (
+        "def layer_1_step(buf, dt):\n"
+        "    n_cell = buf.data[6]\n"
+        "    u_eff = buf.data[7]\n"
+        "    buf.data[3] = n_cell * 555.03\n"
+        "    buf.data[4] = u_eff * 1.0\n"
+        "    dT_Kapitza = 3.546\n"
+        "    headroom = 31.254\n"
+        "    buf.data[6] = dT_Kapitza\n"
+        "    buf.data[7] = headroom\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    layer_1_step(buf, dt)\n"
+    )
+    contracts = [
+        {
+            "contract_id": "c1_test",
+            "target_backend": "cpp",
+            "initial_state": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1800.0, 5.64735e-17] + [0.0] * 12,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "dT_Kapitza", "assertion": "abs(state[6] - 3.546) <= 0.01", "tolerance": 0.01},
+                {"variable_name": "headroom", "assertion": "state[7] >= 11.79", "tolerance": 1e-6},
+            ],
+        }
+    ]
+    bp = ResearchBlueprint(
+        blueprint_id="backup_vmap_test",
+        title="Backup Vmap Test",
+        falsifiable_hypothesis="H",
+        search_queries=["test"],
+        code_template=kernel,
+        variable_map={"n_cell": 6, "u_eff": 7, "dT_Kapitza": 6, "headroom": 7},
+        contracts=contracts,
+    )
+    san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
+    assert "n_cell" in san.backup_slot_map and "u_eff" in san.backup_slot_map
+    _apply_backup_slots_to_vmap(bp, san.backup_slot_map, san.code)
+    assert bp.variable_map["n_cell"] != 6
+    assert bp.variable_map["u_eff"] != 7
+    assert bp.variable_map["dT_Kapitza"] == 6
+    assert bp.variable_map["headroom"] == 7
+
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
+            self.size = len(self.data)
+
+    ns = {}
+    exec(compile(san.code, "<bak>", "exec"), ns)
+    b = _Buf([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1800.0, 5.64735e-17] + [0.0] * 32)
+    for _ in range(5):
+        ns["simulation_step"](b, 0.01)
+    assert b.data[bp.variable_map["n_cell"]] == pytest.approx(1800.0)
+    assert b.data[bp.variable_map["u_eff"]] == pytest.approx(5.64735e-17)
+    assert b.data[6] == pytest.approx(3.546)
+    assert b.data[7] == pytest.approx(31.254)
+    assert b.data[3] == pytest.approx(999054.0)
+
+
+def test_relevance_filtered_shbt_and_arxiv_generic_tokens():
+    from invar_agent.research.extractor import QuantitativeInsightExtractor
+    prompt = (
+        "Floquet-Adler-Wiser dynamic dielectric screening U_eff = 352.48 eV across "
+        "1,800-module Ni-H LANR array (555.03 W) servicing 906.00 kW Landauer debt, "
+        "Kapitza 3.546 K, MgB2 11.79 K, clamping 10.9989 nW to <= 1.01 nW at 4.2 K via "
+        "10:23 bipartite Stinespring boundary."
+    )
+    ev = QuantitativeInsightExtractor().extract(
+        prompt,
+        [{"source": "arxiv", "title": "ArXiv test", "summary": "with m = 1 and servicing = 906000 W"}],
+    )
+    assert "void_loiter_power_w" not in ev.parameters
+    assert "sram_arena_bytes" not in ev.parameters
+    assert "dark_os_conductor" not in ev.parameters
+    assert "symplectic_shunt_ratio" in ev.parameters
+    assert "floquet_screening_ev" in ev.parameters
+    assert "m" not in ev.parameters
+    assert "servicing" not in ev.parameters
