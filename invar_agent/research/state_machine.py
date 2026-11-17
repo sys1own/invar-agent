@@ -348,6 +348,7 @@ def _invariant_env(state: List[float], telemetry: Dict[str, float],
                 "initial": state, "initial_state": state,
                 "trace_min": state, "trace_max": state,
                 "telemetry": telemetry, "math": math,
+                "bool": bool, "isfinite": math.isfinite,
                 "variants": _VariantsView(variants), "tol": 0.0})
     if extra:
         env.update(extra)
@@ -371,7 +372,7 @@ def _eval_invariant(expression: str, state: List[float], telemetry: Dict[str, fl
     expr_clean = expression.replace("&&", " and ").replace("||", " or ").replace("^", "**").strip().rstrip(".;, ")
     env = _invariant_env(state, telemetry, extra)
     try:
-        return bool(eval(expr_clean, {"__builtins__": {}}, env))  # noqa: S307 - guarded above
+        return bool(eval(expr_clean, {"__builtins__": {}, **env}))  # noqa: S307 - guarded above
     except Exception as exc:  # noqa: BLE001
         raise PreWriteGuardError(
             f"invariant evaluation failed: {type(exc).__name__}: {exc}") from exc
@@ -389,7 +390,7 @@ def _observed_terms(expression: str, env: Dict[str, Any]) -> Dict[str, Any]:
             text = ast.unparse(node)
             try:
                 val = eval(compile(ast.Expression(node), "<inv>", "eval"),  # noqa: S307
-                           {"__builtins__": {}}, env)
+                           {"__builtins__": {}, **env})
                 if isinstance(val, (int, float)):
                     out[text] = round(float(val), 10)
             except Exception:  # noqa: BLE001
@@ -422,7 +423,7 @@ _STATE_SLOT_BASES = {"state", "data", "buf.data"}
 def _eval_subscript(node: ast.AST, env: Dict[str, Any]) -> Optional[float]:
     try:
         val = eval(compile(ast.Expression(node), "<reconcile>", "eval"),  # noqa: S307
-                   {"__builtins__": {}}, env)
+                   {"__builtins__": {}, **env})
     except Exception:  # noqa: BLE001
         return None
     return float(val) if isinstance(val, (int, float)) else None
@@ -1026,6 +1027,16 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                             f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
                             f"clamped from {initial[k]} to 1.0")
                         initial[k] = 1.0
+            gt_match = re.search(
+                r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*>\s*(-?[0-9.eE+-]+)", assertion)
+            if gt_match and k >= 4:
+                gt_bound = float(gt_match.group(1))
+                if -1e-6 <= gt_bound <= 1.0 and k < len(initial) and initial[k] <= gt_bound:
+                    new_v = (gt_bound + 1e-3) if gt_bound >= 0.0 else (gt_bound * 0.5)
+                    warnings.append(
+                        f"auto-init: strict positivity slot state[{k}] ({inv.variable_name}) "
+                        f"raised from {initial[k]} to {new_v}")
+                    initial[k] = new_v
     # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
     # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
     # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.

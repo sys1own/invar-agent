@@ -491,3 +491,99 @@ def test_registry_does_not_match_materials_thermophysics_on_kinetics_prompt():
     domains = classify_registry_domains(text)
     assert "materials_thermophysics" not in domains
     assert "chemical_kinetics" in domains
+
+
+def test_eval_invariant_generator_expression_no_nameerror():
+    """Generator expressions inside eval() must resolve math/state/range via merged globals."""
+    from invar_agent.research.state_machine import _eval_invariant
+
+    state = [0.1, -0.2, 0.3, 0.4, -0.5, 0.6]
+    assert _eval_invariant("all(math.isfinite(state[i]) for i in range(6))", state, {})
+    assert not _eval_invariant("all(math.isfinite(state[i]) for i in range(6))", [0.1, float("nan"), 0.0, 0.0, 0.0, 0.0], {})
+
+
+def test_strict_gt_conditioning_6slot_triad_and_local_var_resync():
+    """Strict inequality (state[17] > 0.0), 6-slot triad stabilization, and local variable
+    re-sync after _invar_project_mass_simplex must all work deterministically."""
+    triad_code = '''def simulation_step(buf, dt):
+    z1 = buf.data[0]
+    z2 = buf.data[1]
+    z3 = buf.data[2]
+    n1 = buf.data[3]
+    n2 = buf.data[4]
+    n3 = buf.data[5]
+    buf.data[0] = z1 + 100.0 * dt * z2
+    buf.data[1] = z2 - 100.0 * dt * z1
+    buf.data[2] = z3
+    buf.data[3] = n1
+    buf.data[4] = n2 + 100.0 * dt * n3
+    buf.data[5] = n3 - 100.0 * dt * n2
+'''
+    triad_contracts = [
+        {
+            "contract_id": "c1_ideal_casimir",
+            "initial_state": [0.1] * 6 + [0.0] * 14,
+            "invariants": [
+                {"variable_name": "enstrophy_drift", "assertion": "state[6] <= 1e-14"},
+                {"variable_name": "energy_positive", "assertion": "state[17] > 0.0"},
+            ],
+        }
+    ]
+    san_triad = sanitize_intrinsics(triad_code, contracts=triad_contracts, all_contracts=triad_contracts)
+    assert "_invar_stabilize_state_6" in san_triad.code
+    assert "if buf.data[17] <= 0.0:" in san_triad.code
+
+    patankar_code = '''def simulation_step(buf, dt):
+    n1 = buf.data[0] + 0.5
+    n2 = buf.data[1] + 0.2
+    n3 = buf.data[2] + 0.1
+    n4 = buf.data[3] + 0.2
+    buf.data[0] = n1
+    buf.data[1] = n2
+    buf.data[2] = n3
+    buf.data[3] = n4
+    M = n1 + n2 + n3 + n4
+    buf.data[8] = abs(M - 1.5)
+'''
+    pat_contracts = [
+        {
+            "contract_id": "c1_positivity_mass",
+            "initial_state": [1.0, 0.0, 0.0, 0.5] + [0.0] * 10,
+            "invariants": [{"variable_name": "mass_error_max", "assertion": "state[8] <= 1e-14"}],
+        }
+    ]
+    san_pat = sanitize_intrinsics(patankar_code, contracts=pat_contracts, all_contracts=pat_contracts)
+    ns = {}
+    exec(san_pat.code, ns)
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+            self.size = len(data)
+
+    b = Buf([1.0, 0.0, 0.0, 0.5] + [0.0] * 10)
+    ns["simulation_step"](b, 0.1)
+    assert b.data[8] <= 1e-14
+
+
+def test_latex_normalizer_repairs_escapes_wraps_bare_math_and_balances_braces():
+    """latex_normalizer must heal control-char escapes, wrap bare math, canonicalize
+    ASCII-math operators/scientific notation, and balance unmatched braces."""
+    from invar_agent.latex_normalizer import normalize_report_latex, repair_json_control_escapes
+
+    corrupted = "\x0crac{1}{2} + \x08eta + \x09heta + \x0dho"
+    assert repair_json_control_escapes(corrupted) == r"\frac{1}{2} + \beta + \theta + \rho"
+
+    md = (
+        "**Hypothesis:** $F(c_{n+1}) <= F(c_n) + 1e-15$ and \\frac{a}{b + {c} "
+        "with `code_var <= 1e-14`.\n\n"
+        "| Name | Equation |\n|---|---|\n| Rate | \\frac{V_{max} S}{K_m + S} |\n"
+    )
+    norm = normalize_report_latex(md)
+    assert r"\le" in norm
+    assert r"10^{-15}" in norm
+    assert "`code_var <= 1e-14`" in norm
+    assert "| Rate | $" in norm
+    # No unpaired braces inside $...$
+    for seg in norm.split("$")[1::2]:
+        assert seg.count("{") == seg.count("}")

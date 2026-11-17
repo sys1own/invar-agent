@@ -188,7 +188,10 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         data = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        from ..latex_normalizer import repair_json_strings
+        return repair_json_strings(data)
+    return None
 
 
 def truncate_at_sentence(text: str, limit: int = 1200) -> str:

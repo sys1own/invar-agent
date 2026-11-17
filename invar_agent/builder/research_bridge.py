@@ -770,7 +770,7 @@ def _eval_invariant(expr, state, trace_min, trace_max, telemetry, initial):
     for name, idx in PACKET["variable_map"].items():
         if name not in env and 0 <= idx < len(state):
             env[name] = float(state[idx])
-    return bool(eval(expr, {{"__builtins__": {{}}}}, env))  # noqa: S307
+    return bool(eval(expr, {{"__builtins__": {{}}, **env}}))  # noqa: S307
 
 
 def test_research_constants_preserved():

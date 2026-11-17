@@ -6,6 +6,8 @@
 <link rel="icon" type="image/png" href="/static/assets/logo.png">
 <title>invar-agent — Verified Agent Chat</title>
 <script src="/static/vendor/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
 <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
 <script src="/static/vendor/xterm.min.js"></script>
 <script src="/static/vendor/addon-fit.min.js"></script>
@@ -511,18 +513,48 @@ function addMsg(cls, text) {
   const m = el(`<div class="msg ${cls}"></div>`);
   m.textContent = text; chat.appendChild(m); scrollChat(); return m;
 }
+function _renderKatexExpr(expr, isDisplay) {
+  if (typeof katex !== 'undefined' && katex && typeof katex.renderToString === 'function') {
+    try {
+      return katex.renderToString(expr, { displayMode: isDisplay, throwOnError: false, strict: false });
+    } catch (e) { /* fall through to escaped text */ }
+  }
+  return isDisplay ? `$$${escapeHtml(expr)}$$` : `$${escapeHtml(expr)}$`;
+}
 function renderMarkdown(text) {
+  const src = String(text || '');
+  const codeTokens = [];
+  let masked = src
+    .replace(/```[\s\S]*?```/g, m => { const id = `@@INVAR_CODE_${codeTokens.length}@@`; codeTokens.push(m); return id; })
+    .replace(/`[^`\n]+`/g, m => { const id = `@@INVAR_CODE_${codeTokens.length}@@`; codeTokens.push(m); return id; });
+  const mathTokens = [];
+  masked = masked
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_, expr) => { const id = `@@INVAR_MATH_D_${mathTokens.length}@@`; mathTokens.push({ d: true, expr }); return id; })
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => { const id = `@@INVAR_MATH_D_${mathTokens.length}@@`; mathTokens.push({ d: true, expr }); return id; })
+    .replace(/\$(?:\\.|[^$\n])+?\$/g, m => { const id = `@@INVAR_MATH_I_${mathTokens.length}@@`; mathTokens.push({ d: false, expr: m.slice(1, -1) }); return id; })
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => { const id = `@@INVAR_MATH_I_${mathTokens.length}@@`; mathTokens.push({ d: false, expr }); return id; });
+  for (let i = 0; i < codeTokens.length; i++) {
+    masked = masked.replace(`@@INVAR_CODE_${i}@@`, () => codeTokens[i]);
+  }
+  let html;
   if (typeof marked !== 'undefined') {
     try {
       if (marked.setOptions) marked.setOptions({breaks: true, gfm: true});
       const tmp = document.createElement('div');
-      tmp.innerHTML = marked.parse(text);
+      tmp.innerHTML = marked.parse(masked);
       // Strip active content from model output before injecting.
       tmp.querySelectorAll('script,iframe,object,embed').forEach(n => n.remove());
-      return tmp.innerHTML;
-    } catch (e) { /* fall through to plain text */ }
+      html = tmp.innerHTML;
+    } catch (e) { html = escapeHtml(masked).replace(/\n/g, '<br>'); }
+  } else {
+    html = escapeHtml(masked).replace(/\n/g, '<br>');
   }
-  return escapeHtml(text).replace(/\n/g, '<br>');
+  for (let i = 0; i < mathTokens.length; i++) {
+    const tok = mathTokens[i];
+    const key = tok.d ? `@@INVAR_MATH_D_${i}@@` : `@@INVAR_MATH_I_${i}@@`;
+    html = html.split(key).join(_renderKatexExpr(tok.expr, tok.d));
+  }
+  return html;
 }
 function addCopilotMsg(markdown) {
   const m = el(`<div class="msg copilot"><div class="md"></div></div>`);
@@ -1248,7 +1280,7 @@ function renderResearchCard(bp) {
   clearResearchCards();
   const card = el(`<div class="rcard">
     <h4>🔬 Research Plan: ${escapeHtml(bp.title || bp.blueprint_id)} ${verdictBadge((bp.feasibility || {}).verdict)}</h4>
-    <div class="rcard-sub">${escapeHtml(bp.falsifiable_hypothesis || '')}</div>
+    <div class="rcard-sub">${renderMarkdown(bp.falsifiable_hypothesis || '')}</div>
     <textarea class="rcard-ta" style="min-height:200px"></textarea>
     <div class="row">
       <button class="btn-approve" id="approve-research">⚡ Approve &amp; Run Deep Research</button>

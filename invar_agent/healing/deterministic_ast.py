@@ -3065,6 +3065,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_set = set(dyn_slots)
 
     nonneg_slots: Dict[int, float] = {}
+    strict_gt_slots: Dict[int, float] = {}
     quarter_upper_slots: Set[int] = set()
     unit_upper_slots: Set[int] = set()
     small_upper_slots: Dict[int, float] = {}
@@ -3100,15 +3101,20 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                         relational_le_pairs.append(key)
 
             m_ge = re.search(
-                r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*>=\s*(-?[0-9.eE+-]+)",
+                r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*(>=?)\s*(-?[0-9.eE+-]+)",
                 assertion,
             )
             if m_ge:
                 s_idx = int(m_ge.group(1))
+                op_ge = m_ge.group(2)
                 try:
-                    val = float(m_ge.group(2))
-                    if (s_idx not in dyn_set or s_idx >= 4) and -1e-6 <= val <= 0.0:
-                        nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
+                    val = float(m_ge.group(3))
+                    if s_idx not in dyn_set or s_idx >= 4:
+                        if op_ge == ">=" and -1e-6 <= val <= 0.0:
+                            nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
+                        elif op_ge == ">" and -1e-6 <= val <= 1.0:
+                            if s_idx not in strict_gt_slots or val > strict_gt_slots[s_idx]:
+                                strict_gt_slots[s_idx] = val
                 except ValueError:
                     pass
             m_le = re.search(
@@ -3138,7 +3144,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 except Exception:  # noqa: BLE001
                     pass
 
-    if (r_max is None and not nonneg_slots and not quarter_upper_slots
+    if (r_max is None and not nonneg_slots and not strict_gt_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
             and not other_upper_slots and not relational_le_pairs):
         return tree, False, []
@@ -3307,6 +3313,15 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
+            for s_idx in sorted(strict_gt_slots):
+                bound = strict_gt_slots[s_idx]
+                clamp_val = (bound + 1e-3) if bound >= 0.0 else (bound * 0.5)
+                guard_src = f"if buf.data[{s_idx}] <= {bound!r}:\n    buf.data[{s_idx}] = {clamp_val!r}\n"
+                if f"if buf.data[{s_idx}] <= {bound!r}:" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned strict positivity slot state[{s_idx}] > {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(quarter_upper_slots):
                 guard_src = f"if buf.data[{s_idx}] > 0.25:\n    buf.data[{s_idx}] = 0.25\n"
                 if f"if buf.data[{s_idx}] > 0.25:" not in fn_src:
@@ -3602,6 +3617,29 @@ def _ensure_stabilize_helpers(
             "            buf.data[_k] = -1e12\n"
         )
         to_insert.extend(ast.parse(stab_src).body)
+    if is_triad and "_invar_stabilize_state_6" not in existing:
+        stab6_src = (
+            "def _invar_stabilize_state_6(buf, p0, p1, p2, p3, p4, p5):\n"
+            "    _invar_stabilize_state(buf, p0, p1, p2, p3)\n"
+            "    _sz = len(buf.data)\n"
+            "    if _sz > 4:\n"
+            "        v4 = buf.data[4]\n"
+            "        if not math.isfinite(v4):\n"
+            "            buf.data[4] = p4\n"
+            "        else:\n"
+            "            d4 = v4 - p4\n"
+            "            if abs(d4) > 0.5:\n"
+            "                buf.data[4] = p4 + _invar_sdiv(d4, 1.0 + abs(d4))\n"
+            "    if _sz > 5:\n"
+            "        v5 = buf.data[5]\n"
+            "        if not math.isfinite(v5):\n"
+            "            buf.data[5] = p5\n"
+            "        else:\n"
+            "            d5 = v5 - p5\n"
+            "            if abs(d5) > 0.5:\n"
+            "                buf.data[5] = p5 + _invar_sdiv(d5, 1.0 + abs(d5))\n"
+        )
+        to_insert.extend(ast.parse(stab6_src).body)
     if is_density and "_invar_project_density" not in existing:
         ip0, ip1, ic0, ic1 = layout
         proj_src = (
@@ -3724,6 +3762,11 @@ def _stabilize_dynamical_state_tree(
             "_invar_p2 = buf.data[2] if _invar_sz > 2 else 0.0\n"
             "_invar_p3 = buf.data[3] if _invar_sz > 3 else 0.0\n"
         )
+        if is_triad:
+            snap_src += (
+                "_invar_p4 = buf.data[4] if _invar_sz > 4 else 0.0\n"
+                "_invar_p5 = buf.data[5] if _invar_sz > 5 else 0.0\n"
+            )
         if is_mass_kinetics:
             snap_src += (
                 "_invar_m_prev = (max(0.0, _invar_p0) if math.isfinite(_invar_p0) else 0.0)"
@@ -3731,7 +3774,11 @@ def _stabilize_dynamical_state_tree(
                 " + (max(0.0, _invar_p2) if math.isfinite(_invar_p2) else 0.0)"
                 " + (max(0.0, _invar_p3) if math.isfinite(_invar_p3) else 0.0)\n"
             )
-        call_src = "_invar_stabilize_state(buf, _invar_p0, _invar_p1, _invar_p2, _invar_p3)\n"
+        call_src = (
+            "_invar_stabilize_state_6(buf, _invar_p0, _invar_p1, _invar_p2, _invar_p3, _invar_p4, _invar_p5)\n"
+            if is_triad else
+            "_invar_stabilize_state(buf, _invar_p0, _invar_p1, _invar_p2, _invar_p3)\n"
+        )
         if is_density:
             call_src += "_invar_project_density(buf)\n"
         if is_mass_kinetics:
@@ -3751,7 +3798,8 @@ def _stabilize_dynamical_state_tree(
                 _new_body.append(_visited)
         fn.body = _new_body
 
-        # Find the last top-level statement writing to buf.data[0..3] before diagnostic slots (4+)
+        # Find the last top-level statement writing to buf.data[0..3] (or 0..5 for triad) before diagnostic slots
+        max_dyn_slot = 5 if is_triad else 3
         last_dyn_idx = -1
         for idx, stmt in enumerate(fn.body):
             slots_written = {
@@ -3759,13 +3807,30 @@ def _stabilize_dynamical_state_tree(
                 for n in ast.walk(stmt)
                 if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
             }
-            if any(s is not None and 0 <= s <= 3 for s in slots_written):
+            if any(s is not None and 0 <= s <= max_dyn_slot for s in slots_written):
                 last_dyn_idx = idx
 
         fn.body[0:0] = snap_stmts
         if last_dyn_idx >= 0 and last_dyn_idx + len(snap_stmts) < len(fn.body) - 1:
             ins_at = last_dyn_idx + len(snap_stmts) + 1
-            fn.body[ins_at:ins_at] = [copy.deepcopy(s) for s in call_stmts]
+            # Re-sync local variables written into buf.data[0..max_dyn_slot] so downstream
+            # diagnostics (e.g. M = n1 + n2 + n3 + n4, F = ...) use stabilized/projected values.
+            resync_vars: Dict[int, str] = {}
+            for pre_stmt in fn.body[:ins_at]:
+                if (isinstance(pre_stmt, ast.Assign) and len(pre_stmt.targets) == 1
+                        and isinstance(pre_stmt.value, ast.Name)
+                        and not pre_stmt.value.id.startswith("_invar_")):
+                    tgt_slot = _state_subscript_slot(pre_stmt.targets[0])
+                    if tgt_slot is not None and 0 <= tgt_slot <= max_dyn_slot:
+                        resync_vars[tgt_slot] = pre_stmt.value.id
+            resync_stmts: List[ast.stmt] = []
+            if resync_vars:
+                resync_src = "\n".join(
+                    f"{vname} = buf.data[{slot}]"
+                    for slot, vname in sorted(resync_vars.items())
+                )
+                resync_stmts = ast.parse(resync_src).body
+            fn.body[ins_at:ins_at] = [copy.deepcopy(s) for s in call_stmts] + resync_stmts
         # Always also append at the end of fn.body (unless fn.body ends with Return)
         if not isinstance(fn.body[-1], ast.Return):
             fn.body.extend([copy.deepcopy(s) for s in call_stmts])

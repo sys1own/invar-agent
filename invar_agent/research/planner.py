@@ -609,10 +609,15 @@ def _extract_json(text: str) -> Optional[Any]:
                     first_valid = parsed
                 if isinstance(parsed, dict) and parsed:
                     if any(k in parsed for k in ("blueprint_id", "contracts", "code", "directives", "feasibility")):
-                        return parsed
+                        from ..latex_normalizer import repair_json_strings
+                        return repair_json_strings(parsed)
                     if best_dict is None or len(parsed) > len(best_dict):
                         best_dict = parsed
-    return best_dict if best_dict is not None else first_valid
+    chosen = best_dict if best_dict is not None else first_valid
+    if chosen is not None:
+        from ..latex_normalizer import repair_json_strings
+        return repair_json_strings(chosen)
+    return None
 
 
 def _clean_prompt_text(raw: Any) -> str:
@@ -1168,6 +1173,8 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("blueprint_id", "title", "falsifiable_hypothesis", "code_template"):
         if key in out and out[key] is not None:
             out[key] = str(out[key])
+    if "code_template" in out and out["code_template"] is None:
+        out["code_template"] = "def simulation_step(buf, dt):\n    pass\n"
     for key in ("search_queries", "stage_objectives"):
         if key in out:
             val = out[key]

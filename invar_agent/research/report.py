@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from ..latex_normalizer import format_contract_constraint_math, normalize_report_latex
 from ..schemas.research import ResearchBlueprint, SimulationResult
 
 
@@ -144,6 +145,13 @@ def build_research_report(state) -> str:
             lines.append(f"- **Surrogate / reformulation:** {feasibility.reformulation}")
     else:
         lines.append("- No feasibility assessment recorded.")
+    if getattr(bp, "contracts", None):
+        lines.append("")
+        lines.append("**Governing Contract Constraints:**")
+        for c in bp.contracts:
+            for inv in (getattr(c, "invariants", None) or []):
+                math_expr = format_contract_constraint_math(inv.assertion, variable_map)
+                lines.append(f"- `{c.contract_id}` / `{inv.variable_name}`: {math_expr} (`{inv.assertion}`)")
     lines.append("")
 
     # 3. Literature & governing equations used
@@ -190,4 +198,4 @@ def build_research_report(state) -> str:
     lines.append("---")
     lines.append("_Generated deterministically from verified sandbox telemetry; "
                  "no values are extrapolated._")
-    return "\n".join(lines)
+    return normalize_report_latex("\n".join(lines))

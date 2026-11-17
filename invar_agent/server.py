@@ -838,6 +838,24 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         detail = ResearchVaultManager(state.workspace_root).get_run(run_id)
         if detail is None:
             raise HTTPException(status_code=404, detail=f"research run not found: {run_id}")
+        from invar_agent.latex_normalizer import normalize_report_latex
+        for rkey in ("report_md", "report_markdown", "report"):
+            if isinstance(detail.get(rkey), str) and detail[rkey]:
+                detail[rkey] = normalize_report_latex(detail[rkey])
+        meta = detail.get("metadata")
+        if isinstance(meta, dict) and isinstance(meta.get("governing_equations"), list):
+            meta["governing_equations"] = [
+                normalize_report_latex(str(eq)) for eq in meta["governing_equations"]
+            ]
+        bp = detail.get("blueprint")
+        if isinstance(bp, dict):
+            if isinstance(bp.get("falsifiable_hypothesis"), str):
+                bp["falsifiable_hypothesis"] = normalize_report_latex(bp["falsifiable_hypothesis"])
+            feas = bp.get("feasibility")
+            if isinstance(feas, dict):
+                for fkey in ("rationale", "violated_boundary", "reformulation"):
+                    if isinstance(feas.get(fkey), str):
+                        feas[fkey] = normalize_report_latex(feas[fkey])
         return detail
 
     @app.delete("/api/v1/research/vault/{run_id}")
