@@ -675,6 +675,7 @@ _PARAM_STOPWORDS = {
     "closure", "model", "stage", "part", "step", "and", "or", "the", "a",
     "an", "is", "are", "was", "were", "as", "on", "per", "below", "above",
     "under", "over", "down", "up", "into", "onto", "than", "then", "max", "min",
+    "service", "covering", "drop", "cell", "accuracy",
 }
 
 
@@ -696,8 +697,9 @@ def extract_parameters_from_text(text: str, source: str = "",
         if unit and not is_known_unit(unit):
             # A trailing word was captured as a unit; keep only if dimensionless.
             unit = ""
-        name = _snake(name_raw)
-        if not name or re.fullmatch(r"\d+(?:_\d+)*", name):
+        cleaned_raw = re.sub(r"(?:>=|<=|==|!=|~=|[<>=\u2264\u2265])", " ", name_raw or "").strip()
+        name = _snake(cleaned_raw)
+        if not name or re.match(r"^\d", name):
             return
         if source == "user_prompt" and (len(name) <= 1 or name in _PARAM_STOPWORDS):
             return
@@ -706,9 +708,11 @@ def extract_parameters_from_text(text: str, source: str = "",
         if source == "user_prompt" and _SUBSCRIPT_STATE_RE.fullmatch(name):
             return
         si_value, si_unit = normalize_to_si(value, unit)
-        symbol = name_raw.strip().split()[-1] if name_raw.strip() else ""
+        toks = [t for t in cleaned_raw.split() if re.search(r"[A-Za-z]", t)]
+        last_tok = toks[-1] if toks else ""
+        symbol = last_tok if (last_tok and len(last_tok) <= 8 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", last_tok)) else ""
         params.append(ExtractedParameter(
-            name=name, symbol=symbol if len(symbol) <= 8 else "",
+            name=name, symbol=symbol,
             raw_value=value, raw_unit=unit, si_value=si_value, si_unit=si_unit,
             source=source, confidence=confidence))
         seen_spans.append(span)
@@ -720,13 +724,29 @@ def extract_parameters_from_text(text: str, source: str = "",
         if not is_known_unit(unit):
             continue
         before = text[max(0, m.start() - 48):m.start()]
-        before = re.split(r"[.;,()\n]", before)[-1].strip()
-        # Strip trailing stopwords/prepositions/modifiers; if empty, inspect trailing noun phrase.
-        words = [w for w in re.split(r"\s+", before) if w]
-        while words and words[-1].lower() in _PARAM_STOPWORDS:
+        before = re.split(r"[.;,()\n]|>=|<=|==", before)[-1].strip()
+        # Strip trailing stopwords/prepositions/operators; if empty, inspect trailing noun phrase.
+        words = [
+            w for w in re.split(r"\s+", before)
+            if w and not re.fullmatch(r"(?:>=|<=|==|!=|~=|[<>=\u2264\u2265]+)", w)
+        ]
+        while words and (words[-1].lower() in _PARAM_STOPWORDS or re.match(r"^\d", words[-1])):
             words.pop()
+        if source == "user_prompt":
+            # Filter out long un-assigned prose phrases (e.g. "visible sensory reset dissipation")
+            # while keeping genuine variable identifiers or compact 1-2 word parameter names.
+            has_ident = any("_" in w or any(ch.isupper() for ch in w[1:]) for w in words[-3:])
+            if len(words) >= 3 and not has_ident:
+                words = words[-2:]
+            while words and words[-1].lower() in _PARAM_STOPWORDS:
+                words.pop()
+            if len(words) >= 2 and all(w.islower() and "_" not in w for w in words):
+                # Multi-word lowercase prose captured before a unit without '='
+                continue
         candidate_name = " ".join(words[-4:]) if words else ""
-        if not candidate_name or candidate_name.lower() in _PARAM_STOPWORDS:
+        if not candidate_name or candidate_name.lower() in _PARAM_STOPWORDS or re.match(r"^\d", candidate_name):
+            if source == "user_prompt":
+                continue
             after = text[m.end():min(len(text), m.end() + 48)]
             after = re.split(r"[.;,()\n]", after)[0].strip()
             awords = [w for w in re.split(r"\s+", after) if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", w)]

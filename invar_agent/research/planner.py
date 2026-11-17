@@ -181,6 +181,10 @@ surrogate model, never a repeating dummy vector. Keep code_template concise
 simulation_step; do not embed duplicate Euler/RK4 state copies inside simulation_step).
 Use a single canonical, DISJOINT `buf.data[k]` slot layout across all contracts
 and sub-models (never reuse the same slot index for different physical observables).
+Each variable/invariant has a dedicated global `buf.data[idx]` slot. Write every
+computed quantity to its exact assigned `buf.data[idx]` slot on every step. NEVER
+branch on `buf.size` or `len(buf.data)` (e.g. `if buf.size > 10:`), and NEVER
+overwrite input parameter slots (`N_cells`, `P_cell`, etc.) with output observables.
 No markdown fences, no <think> blocks. Output JSON only.
 
 ## Feasibility context (authoritative)
@@ -209,7 +213,11 @@ blueprint evolution, stage {stage} of {total}).
   compiled module, so do not change the meaning of shared buffer slots used by
   verified layers; use new slots (append beyond the existing ones) for new state.
 - Canonical slot map (MANDATORY): every named observable/metric has exactly one
-  buf.data slot across ALL stages. Never reuse an error/drift accumulator slot to
+  buf.data slot across ALL stages. Each variable/invariant has a dedicated global
+  `buf.data[idx]` slot. Write every computed quantity to its exact assigned
+  `buf.data[idx]` slot on every step. NEVER branch on `buf.size` or
+  `len(buf.data)`, and NEVER overwrite input parameter slots (`N_cells`,
+  `P_cell`, etc.) with output observables. Never reuse an error/drift accumulator slot to
   store a previous observable. For step-to-step drift compute val_before at the
   top and val_after at the bottom, then `viol = max(0.0, val_after - val_before)`;
   update the error slot only when `viol` is larger. Helper calls must receive the
@@ -264,6 +272,10 @@ no `a, b = ...` unpacking, no multi-value returns), classes, exceptions, dicts,
 sets, comprehensions, nested function definitions, string operations, imports
 other than `import math`. If the failure mentions "unsupported construct: tuples",
 eliminate EVERY tuple from the module.
+Each variable/invariant has a dedicated global `buf.data[idx]` slot. Write every
+computed quantity to its exact assigned `buf.data[idx]` slot on every step. NEVER
+branch on `buf.size` or `len(buf.data)` (e.g. `if buf.size > 10:`), and NEVER
+overwrite input parameter slots (`N_cells`, `P_cell`, etc.) with output observables.
 
 {tools}
 
@@ -390,6 +402,11 @@ reformulation.
 6. **v9_transpiler_friendly code**: code_template uses ONLY the allowed subset
    (pure functions, simulation_step(buf, dt), math.* only, no classes,
    exceptions, dynamic imports, dicts/sets/tuples/comprehensions, strings).
+   Each variable/invariant MUST have a dedicated globally DISJOINT `buf.data[idx]`
+   slot across ALL contracts `c1..cN`. Write every computed quantity to its exact
+   assigned `buf.data[idx]` slot on every step. NEVER branch on `buf.size` or
+   `len(buf.data)` (e.g. `if buf.size > 10:`), and NEVER overwrite input
+   parameter slots (`N_cells`, `P_cell`, etc.) with output observables.
 
 ## Few-shot exemplar (aerothermodynamics entry)
 Request: "600 kg probe, 5.8 km/s entry, 1.4 m spherical-segment aeroshell
@@ -1040,6 +1057,9 @@ def canonicalize_contract_dicts(
     slot_owner: Dict[int, str] = {}
     slot_owner_contract: Dict[int, str] = {}
     slot_eq_target: Dict[int, float] = {}
+    slot_sum_target: Dict[int, float] = {}
+    slot_lower: Dict[int, float] = {}
+    slot_upper: Dict[int, float] = {}
     slot_init_val: Dict[int, float] = {}
     name_order: List[str] = []
     remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
@@ -1057,6 +1077,92 @@ def canonicalize_contract_dicts(
         except Exception:
             return None
 
+    def _extract_sum_target(expr: str) -> Optional[float]:
+        m = re.search(
+            r"abs\(\s*\(?\s*(?:state|buf\.data|data)\[\d+\]\s*\+\s*(?:state|buf\.data|data)\[\d+\]\s*\)?\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
+            expr or "",
+        )
+        if not m:
+            return None
+        try:
+            val = eval(m.group(1), {"__builtins__": {}}, {})
+            return float(val)
+        except Exception:
+            return None
+
+    def _extract_interval(expr: str, slot_idx: int) -> Tuple[Optional[float], Optional[float]]:
+        lo: Optional[float] = None
+        hi: Optional[float] = None
+        pat_slot = rf"(?:state|buf\.data|data|trace_min|trace_max)\[{slot_idx}\]"
+        for m in re.finditer(pat_slot + r"\s*(>=?|<=?)\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?(?:\s*(?:$|&&|\|\||and\b|or\b|[<>]))", expr or ""):
+            op, rhs = m.group(1), m.group(2)
+            try:
+                v = float(eval(rhs, {"__builtins__": {}}, {}))
+            except Exception:
+                continue
+            if op in (">", ">="):
+                lo = v if lo is None else max(lo, v)
+            else:
+                hi = v if hi is None else min(hi, v)
+        return lo, hi
+
+    def _has_cross_contract_clash(
+        slot_idx: int,
+        c_id: str,
+        name: str,
+        assertion: str,
+        init_v: Optional[float],
+    ) -> bool:
+        prev_cid = slot_owner_contract.get(slot_idx)
+        prev_owner = slot_owner.get(slot_idx)
+        if prev_cid is None or prev_cid == c_id or prev_owner == name:
+            return False
+        if slot_idx not in (0, 1, 2, 3):
+            return True
+        prev_t = slot_eq_target.get(slot_idx)
+        prev_sum = slot_sum_target.get(slot_idx)
+        prev_iv = slot_init_val.get(slot_idx)
+        prev_lo = slot_lower.get(slot_idx)
+        prev_hi = slot_upper.get(slot_idx)
+        eq_target = _extract_eq_target(assertion)
+        sum_target = _extract_sum_target(assertion)
+        lo_new, hi_new = _extract_interval(assertion, slot_idx)
+        init_clash = (init_v is not None and prev_iv is not None and abs(init_v - prev_iv) > 1e-6)
+        target_clash = (
+            (eq_target is not None and (prev_t is None or abs(prev_t - eq_target) > 1e-3))
+            or (prev_t is not None and eq_target is None and (
+                (hi_new is not None and hi_new < prev_t - 1e-6)
+                or (lo_new is not None and lo_new > prev_t + 1e-6)
+                or True
+            ))
+        )
+        partition_clash = (prev_sum is not None and sum_target is None) or (
+            sum_target is not None and prev_sum is not None and abs(sum_target - prev_sum) > 1e-3
+        ) or (sum_target is not None and prev_sum is None)
+        interval_clash = (
+            (lo_new is not None and prev_hi is not None and lo_new > prev_hi + 1e-9)
+            or (hi_new is not None and prev_lo is not None and hi_new < prev_lo - 1e-9)
+            or (prev_hi is not None and hi_new is not None and (prev_hi <= 1e-6) != (hi_new <= 1e-6))
+        )
+        return bool(init_clash or target_clash or partition_clash or interval_clash)
+
+    def _record_slot_claim(slot_idx: int, c_id: str, name: str, assertion: str, init_v: Optional[float]) -> None:
+        slot_owner.setdefault(slot_idx, name)
+        slot_owner_contract.setdefault(slot_idx, c_id)
+        eq_t = _extract_eq_target(assertion)
+        sum_t = _extract_sum_target(assertion)
+        lo, hi = _extract_interval(assertion, slot_idx)
+        if eq_t is not None:
+            slot_eq_target.setdefault(slot_idx, eq_t)
+        if sum_t is not None:
+            slot_sum_target.setdefault(slot_idx, sum_t)
+        if lo is not None:
+            slot_lower[slot_idx] = max(slot_lower.get(slot_idx, lo), lo)
+        if hi is not None:
+            slot_upper[slot_idx] = min(slot_upper.get(slot_idx, hi), hi)
+        if init_v is not None:
+            slot_init_val.setdefault(slot_idx, init_v)
+
     def assign_for_inv(c: Dict[str, Any], inv: Dict[str, Any], record: bool) -> None:
         c_id = str(c.get("contract_id") or "")
         name = str(inv.get("variable_name") or "").strip()
@@ -1065,53 +1171,50 @@ def canonicalize_contract_dicts(
         assertion = str(inv.get("assertion") or "")
         slots = _canon_slots_in_text(assertion)
         distinct_slots = sorted(set(slots))
+        c_init = c.get("initial_state") if isinstance(c.get("initial_state"), list) else []
         if slots and len(distinct_slots) != 1:
             for s in distinct_slots:
-                if s in (0, 1, 2, 3):
-                    slot_owner.setdefault(s, name)
-                    slot_owner_contract.setdefault(s, c_id)
+                init_s = float(c_init[s]) if s < len(c_init) else None
+                if _has_cross_contract_clash(s, c_id, name, assertion, init_s):
+                    alloc_used = set(name_slot.values()) | set(semantic_slot.values()) | set(slot_owner)
+                    new_s = _canon_alloc_slot(alloc_used, reserved)
+                    reserved.add(new_s)
+                    if record:
+                        remaps.append((c, inv, s, new_s))
+                    _record_slot_claim(new_s, c_id, name, _canon_rewrite_slots(assertion, s, new_s), init_s)
+                    notes.append(f"canonical multi-slot conflict: {name} state[{s}] -> state[{new_s}]")
+                else:
+                    _record_slot_claim(s, c_id, name, assertion, init_s)
             return
         desired = distinct_slots[0] if distinct_slots else vm.get(name)
         if desired is None:
             return
         desired = int(desired)
-        eq_target = _extract_eq_target(assertion)
-        c_init = c.get("initial_state") if isinstance(c.get("initial_state"), list) else []
         init_v = float(c_init[desired]) if desired < len(c_init) else None
         if desired in (0, 1, 2, 3):
-            prev_t = slot_eq_target.get(desired)
-            prev_cid = slot_owner_contract.get(desired)
-            prev_owner = slot_owner.get(desired)
-            prev_iv = slot_init_val.get(desired)
-            init_clash = (init_v is not None and prev_iv is not None and abs(init_v - prev_iv) > 1e-6)
-            target_clash = (eq_target is not None and (prev_t is None or abs(prev_t - eq_target) > 1e-3))
-            if prev_cid is not None and prev_cid != c_id and prev_owner != name and (target_clash or init_clash):
-                pass  # Mutually exclusive / cross-contract target or initial value on 0..3 -> remap below
+            if _has_cross_contract_clash(desired, c_id, name, assertion, init_v):
+                pass  # Clashing cross-contract usage on 0..3 -> remap below
             else:
-                if eq_target is not None:
-                    slot_eq_target.setdefault(desired, eq_target)
-                if init_v is not None:
-                    slot_init_val.setdefault(desired, init_v)
-                slot_owner.setdefault(desired, name)
-                slot_owner_contract.setdefault(desired, c_id)
+                _record_slot_claim(desired, c_id, name, assertion, init_v)
                 return
         key = _canon_semantic_key(name, assertion)
         name_semantic.setdefault(name, key)
         canonical = semantic_slot.get(key)
+        if canonical is not None and _has_cross_contract_clash(int(canonical), c_id, name, assertion, init_v):
+            canonical = None
         if canonical is None:
-            owner = slot_owner.get(desired)
-            owner_cid = slot_owner_contract.get(desired)
-            if owner is not None and owner != name and owner_cid != c_id:
-                canonical = _canon_alloc_slot(set(name_slot.values()) | set(semantic_slot.values()), reserved)
+            if _has_cross_contract_clash(desired, c_id, name, assertion, init_v):
+                alloc_used = set(name_slot.values()) | set(semantic_slot.values()) | set(slot_owner)
+                canonical = _canon_alloc_slot(alloc_used, reserved)
+                reserved.add(int(canonical))
                 notes.append(f"canonical slot conflict: {name} state[{desired}] -> state[{canonical}]")
             else:
                 canonical = desired
             semantic_slot[key] = canonical
-            slot_owner.setdefault(canonical, name)
-            slot_owner_contract.setdefault(canonical, c_id)
+            _record_slot_claim(int(canonical), c_id, name, assertion, init_v)
             if name not in name_order:
                 name_order.append(name)
-        name_slot.setdefault(name, int(canonical))
+        name_slot[name] = int(canonical)
         if desired != canonical and record:
             remaps.append((c, inv, desired, canonical))
 
@@ -1128,9 +1231,10 @@ def canonicalize_contract_dicts(
         inv["assertion"] = _canon_rewrite_slots(str(inv.get("assertion") or ""), old, new)
         c_init = c.get("initial_state")
         if isinstance(c_init, list):
+            was_missing = new >= len(c_init)
             while len(c_init) <= new:
                 c_init.append(0.0)
-            if old < len(c_init) and c_init[new] == 0.0 and c_init[old] != 0.0:
+            if old < len(c_init) and (was_missing or c_init[new] == 0.0) and c_init[old] != 0.0:
                 c_init[new] = c_init[old]
         notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
 
@@ -1139,20 +1243,16 @@ def canonicalize_contract_dicts(
     assigned_slots = set(name_slot.values()) | set(semantic_slot.values())
     new_vm: Dict[str, int] = {}
     for name, idx in vm.items():
-        if int(idx) in (0, 1, 2, 3):
+        if int(idx) in (0, 1, 2, 3) and name not in name_slot:
             new_vm[name] = int(idx)
             continue
-        canonical = None
-        key = name_semantic.get(name)
-        if key is not None:
-            canonical = semantic_slot.get(key)
+        canonical = name_slot.get(name)
         if canonical is None:
-            canonical = name_slot.get(name)
+            key = name_semantic.get(name)
+            if key is not None:
+                canonical = semantic_slot.get(key)
         if canonical is None:
-            if name in name_slot:
-                canonical = name_slot[name]
-            else:
-                canonical = int(idx)
+            canonical = int(idx)
             slot_owner.setdefault(int(canonical), name)
             assigned_names.add(name)
         canonical = int(canonical)
@@ -1169,6 +1269,7 @@ def canonicalize_contract_dicts(
     concept_remap, concept_notes = concept_bucket_slot_map(all_contracts)
     if concept_remap:
         apply_concept_bucket_remap(all_contracts, concept_remap)
+        vm = {k: concept_remap.get(v, v) for k, v in vm.items()}
         notes.extend(concept_notes)
 
     if not vm:
@@ -1501,7 +1602,15 @@ async def generate_plan_with_feasibility(question: str,
     from .shbt_federation import resolve_shbt_solvability
     shbt_res = resolve_shbt_solvability(question)
     if shbt_res.should_activate and shbt_res.evidence_markdown:
-        prompt += "\n\n" + shbt_res.evidence_markdown
+        prompt += (
+            "\n\n"
+            + shbt_res.evidence_markdown
+            + "\n\nAUTHORITATIVE SHBT SOLVABILITY DIRECTIVE: This frontier physics "
+            "problem is SOLVABLE in open-boundary physics via the SHBT Frontier Knowledge "
+            "Federation (`verdict`: `OPTIMAL_DIRECT`). Do NOT output `REFUSED_IMPOSSIBLE` "
+            "and NEVER set `blueprint` to null; you MUST emit both `feasibility` and the "
+            "complete `blueprint` JSON object using the verified SHBT equations and SI constants above."
+        )
     if extra_context:
         prompt += "\n\n" + extra_context
     raw = await llm_complete(prompt)
@@ -1512,10 +1621,10 @@ async def generate_plan_with_feasibility(question: str,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
                     "planner_error": "combined planner returned no JSON object"}
         raise RuntimeError("research plan synthesis failed: combined planner returned no JSON object")
-    feasibility = _coerce_feasibility(data.get("feasibility")) or heuristic
-    if shbt_res.should_activate:
-        feasibility = heuristic
-    if feasibility.verdict.startswith("REFUSED"):
+    llm_feas = _coerce_feasibility(data.get("feasibility"))
+    feasibility = heuristic if shbt_res.should_activate else (llm_feas or heuristic)
+    llm_refused = bool(llm_feas and llm_feas.verdict.startswith("REFUSED"))
+    if feasibility.verdict.startswith("REFUSED") or (shbt_res.should_activate and (llm_refused or not isinstance(data.get("blueprint"), dict))):
         if shbt_res.should_activate:
             feasibility = heuristic
             if not isinstance(data.get("blueprint"), dict):
@@ -1523,12 +1632,14 @@ async def generate_plan_with_feasibility(question: str,
                     prompt
                     + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "
                     "via the SHBT Frontier Knowledge Federation (`OPTIMAL_DIRECT`). Do NOT "
-                    "refuse. Output a complete valid blueprint JSON using the exact SHBT "
-                    "equations, SI constants, and invariants provided above."
+                    "refuse and NEVER set `blueprint` to null. Output a complete valid `blueprint` "
+                    "JSON object using the exact SHBT equations, SI constants, and invariants provided above."
                 )
                 raw2 = await llm_complete(shbt_prompt)
                 data2 = _extract_json(str(raw2))
                 if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
+                    data = data2
+                elif isinstance(data2, dict) and isinstance(data2.get("contracts"), list) and data2.get("title"):
                     data = data2
         elif is_computational_dynamical_benchmark(question):
             feasibility = override_refusal_for_computational_benchmark(question, feasibility)

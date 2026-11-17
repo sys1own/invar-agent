@@ -127,16 +127,22 @@ def test_shbt_resolver_activates_all_four_repos_without_acronyms():
         "boundary Landauer erasure debt while maintaining a Kapitza temperature drop of 3.546 K "
         "and at least 11.79 K superconducting quench headroom below MgB2; suppress 10.9989 nW "
         "raw erasure load down to <= 1.01 nW sensible cryostat heat by shunting erasure entropy "
-        "across an open bipartite Stinespring boundary register partitioned into 10:23 under "
-        "symplectic Heegaard-Floer boundary relabeling."
+        "across an open bipartite Stinespring boundary register partitioned into a 10:23 "
+        "visible-to-dark capacity ratio under symplectic Heegaard-Floer boundary relabeling."
     )
     res = resolve_shbt_solvability(prompt)
     assert res.should_activate is True
     repos = {r.repo for r in res.matched_repos}
-    assert {"sys1own/shbt-precision", "sys1own/shbt-cf", "sys1own/shbt-warp", "sys1own/shbt-swarm"}.issubset(repos)
+    assert {"sys1own/shbt-precision", "sys1own/shbt-cf", "sys1own/shbt-recon", "sys1own/shbt-swarm"}.issubset(repos)
+    assert "sys1own/shbt-warp" not in repos
 
-    std = resolve_shbt_solvability("Simulate a 1D damped harmonic oscillator in SI units")
-    assert std.should_activate is False
+    warp_res = resolve_shbt_solvability("Simulate SHBT-MAR-312X Alcubierre warp drive metric and housekeeping surplus")
+    assert warp_res.should_activate is True
+    assert "sys1own/shbt-warp" in {r.repo for r in warp_res.matched_repos}
+
+    assert resolve_shbt_solvability("Simulate modified Patankar Oregonator stiff chemical kinetics in SI units").should_activate is False
+    assert resolve_shbt_solvability("Verify Cayley LLG macrospin Bloch sphere norm conservation").should_activate is False
+    assert resolve_shbt_solvability("Simulate a 1D damped harmonic oscillator in SI units").should_activate is False
 
 
 def test_extractor_filters_cryo_tps_and_stopword_params():
@@ -194,3 +200,154 @@ def test_search_query_hygiene_and_report_formatting():
     md = "| Equation | Meaning |\n| --- | --- |\n| Topological Stinespring ledger partitioning | Split |\n"
     norm = normalize_report_latex(md)
     assert "$Topological" not in norm
+
+    # Code assertions and dict counterexamples in table notes must NEVER be wrapped in $...$
+    note_md = (
+        "| Stage | Status | Bundle hash | Note |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "| 1 | FAILED | `deadbeef` | — FALSIFIED: abs(state[6] - 999054.0) <= 1.0 observed {'state[6]': 0.535} |\n"
+    )
+    note_norm = normalize_report_latex(note_md)
+    assert "$abs(state[6]" not in note_norm
+    assert "${'state[6]'" not in note_norm
+
+
+def test_multi_contract_slot_decollision_on_low_and_partition_slots():
+    contracts = [
+        {
+            "contract_id": "c1_baseline_ledger",
+            "initial_state": [1800.0, 10.0 / 33.0, 23.0 / 33.0, 0.0, 0.0, 0.0, 999054.0],
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "eta_partition", "assertion": "abs(state[1] + state[2] - 1.0) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "P_array_check", "assertion": "abs(state[6] - 999054.0) <= 1.0", "tolerance": 1.0},
+            ],
+        },
+        {
+            "contract_id": "c3_stinespring_shunt_audit",
+            "initial_state": [0.0, 0.0, 1.01e-9, 0.0, 0.0, 0.0, 0.535385],
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "visible_power_bound", "assertion": "state[2] <= 1.01e-9", "tolerance": 1e-12},
+                {"variable_name": "eta_TEG", "assertion": "state[6] >= 0.0 and state[6] <= 1.0", "tolerance": 1e-9},
+            ],
+        },
+    ]
+    vm_in = {"eta_partition": 1, "P_array_check": 6, "visible_power_bound": 2, "eta_TEG": 6}
+    canon, vm, _ = canonicalize_contract_dicts(contracts, vm_in)
+    c1_inv = canon[0]["invariants"]
+    c3_inv = canon[1]["invariants"]
+    assert "state[1]" in c1_inv[0]["assertion"] and "state[2]" in c1_inv[0]["assertion"]
+    assert "state[6]" in c1_inv[1]["assertion"]
+    # c3's visible_power_bound and eta_TEG must be moved off state[2] and state[6]
+    assert "state[2]" not in c3_inv[0]["assertion"]
+    assert "state[6]" not in c3_inv[1]["assertion"]
+    assert vm["visible_power_bound"] != 2
+    assert vm["eta_TEG"] != 6
+    assert canon[1]["initial_state"][vm["eta_TEG"]] == pytest.approx(0.535385)
+
+
+def test_tier0_conditions_abs_target_sum_partition_and_compound_invariants():
+    kernel = (
+        "def simulation_step(buf, dt):\n"
+        "    buf.data[1] = 0.25\n"
+        "    buf.data[2] = 0.25\n"
+        "    buf.data[4] = 5.0\n"
+        "    buf.data[5] = 3.0\n"
+        "    buf.data[6] = 0.535\n"
+        "    buf.data[7] = -2.0\n"
+        "    buf.data[17] = 1.5\n"
+        "    buf.data[18] = 0.0\n"
+    )
+    contracts = [
+        {
+            "contract_id": "c1_test",
+            "initial_state": [0.0] * 20,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "eta_partition", "assertion": "abs(state[1] + state[2] - 1.0) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "P_array_check", "assertion": "abs(state[6] - 999054.0) <= 1.0", "tolerance": 1.0},
+                {"variable_name": "shunt_S", "assertion": "abs(state[18] - 100.0/1089.0) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "parity", "assertion": "abs(state[4] - state[5]) <= 1e-9", "tolerance": 1e-9},
+                {"variable_name": "unit_band", "assertion": "state[17] >= 0.0 and state[17] <= 1.0", "tolerance": 1e-9},
+                {"variable_name": "finite_lb", "assertion": "math.isfinite(state[7]) and state[7] >= 1.0", "tolerance": 1e-9},
+            ],
+        }
+    ]
+    san = sanitize_intrinsics(kernel, contracts=contracts)
+    assert san.changed
+    # Idempotency check
+    san2 = sanitize_intrinsics(san.code, contracts=contracts)
+    assert san2.changed is False
+
+    class _Buf:
+        def __init__(self):
+            self.data = [0.0] * 20
+
+    ns = {}
+    exec(compile(san.code, "<cond>", "exec"), ns)
+    b = _Buf()
+    ns["simulation_step"](b, 0.01)
+    assert abs(b.data[1] + b.data[2] - 1.0) <= 1e-12
+    assert abs(b.data[6] - 999054.0) <= 1.0
+    assert abs(b.data[18] - 100.0 / 1089.0) <= 1e-12
+    assert abs(b.data[4] - b.data[5]) <= 1e-9
+    assert 0.0 <= b.data[17] <= 1.0
+    assert b.data[7] >= 1.0
+
+
+def test_strip_buf_size_and_protect_overwritten_input_param():
+    kernel = (
+        "def simulation_step(buf, dt):\n"
+        "    p_cell = buf.data[1]\n"
+        "    p_arr = 1800.0 * p_cell\n"
+        "    buf.data[6] = p_arr\n"
+        "    eta_a = 10.0 / 33.0\n"
+        "    buf.data[1] = eta_a\n"
+        "    if buf.size > 10:\n"
+        "        buf.data[6] = 0.535385\n"
+    )
+    contracts = [
+        {
+            "contract_id": "c1_ledger",
+            "initial_state": [1800.0, 555.03, 0.0, 0.0, 0.0, 0.0, 999054.0] + [0.0] * 15,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "P_array", "assertion": "abs(state[6] - 999054.0) <= 1.0", "tolerance": 1.0},
+            ],
+        }
+    ]
+    san = sanitize_intrinsics(kernel, contracts=contracts)
+    assert "0.535385" not in san.code
+
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
+            self.size = len(self.data)
+
+    ns = {}
+    exec(compile(san.code, "<prot>", "exec"), ns)
+    b = _Buf([1800.0, 555.03] + [0.0] * 30)
+    for _ in range(5):
+        ns["simulation_step"](b, 0.01)
+    assert abs(b.data[6] - 999054.0) <= 1.0
+    assert abs(b.data[1] - 10.0 / 33.0) <= 1e-12
+
+
+def test_extractor_filters_shbt_prompt_noise():
+    noisy = (
+        "1,800-module LANR array (555.03 W covering 999,054 W) service 906.00 kW debt "
+        "with Kapitza drop 3.546 K and MgB2 T_op >= 11.79 K superconducting quench headroom "
+        "while suppress visible sensory reset dissipation at 4.2 K <= 1.01 nW."
+    )
+    params = extract_parameters_from_text(noisy, source="user_prompt")
+    names = {p.name for p in params}
+    for bad in ("999054_w_covering", "546_k", "service", "covering", "drop", "cell", "accuracy", "visible_sensory_reset_dissipation"):
+        assert bad not in names
+    for p in params:
+        assert not p.name[0].isdigit()
+        assert p.symbol not in (">=", "<=", ">", "<", "=", "==")

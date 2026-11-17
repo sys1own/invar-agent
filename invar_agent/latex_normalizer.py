@@ -207,6 +207,11 @@ _BARE_FORMULA_RE = re.compile(
 )
 
 
+_CODE_EXPRESSION_RE = re.compile(
+    r"\b(?:state|initial|trace_min|trace_max|telemetry|buf\.data)\[|\{['\"]"
+)
+
+
 def _wrap_table_equation_cells(text: str) -> str:
     """Wrap bare math cells under LaTeX/Equation columns in markdown tables."""
     lines = text.splitlines()
@@ -234,6 +239,7 @@ def _wrap_table_equation_cells(text: str) -> str:
                         c = cells[idx]
                         if (c and not c.startswith("$") and not c.startswith("@@INVAR_CODE_")
                                 and c not in ("-", "n/a", "—")
+                                and not _CODE_EXPRESSION_RE.search(c)
                                 and re.search(r"[=\\^_<>]", c)):
                             cells[idx] = f"${_balance_math_expr(canonicalize_math_content(c))}$"
                 line = "| " + " | ".join(cells) + " |"
@@ -256,7 +262,7 @@ def _wrap_bare_math_in_prose(text: str) -> str:
 
         def _wrap_match(m: re.Match[str]) -> str:
             raw = m.group(0).strip()
-            if "@@INVAR_CODE_" in raw or not raw:
+            if "@@INVAR_CODE_" in raw or not raw or _CODE_EXPRESSION_RE.search(raw):
                 return m.group(0)
             return f"${_balance_math_expr(canonicalize_math_content(raw))}$"
 
@@ -273,9 +279,12 @@ def balance_math_delimiters_and_braces(text: str) -> str:
 
     text = re.sub(r"\$\$([\s\S]*?)\$\$", _fix_display, text)
 
-    # Canonicalize inline math $...$ (avoid matching $$)
+    # Canonicalize inline math $...$ (avoid matching $$); keep code assertions in backticks
     def _fix_inline(m: re.Match[str]) -> str:
-        inner = _balance_math_expr(canonicalize_math_content(m.group(1)))
+        raw_inner = m.group(1)
+        if _CODE_EXPRESSION_RE.search(raw_inner):
+            return f"`{raw_inner.strip()}`"
+        inner = _balance_math_expr(canonicalize_math_content(raw_inner))
         return f"${inner}$"
 
     text = re.sub(r"(?<!\$)\$(?!\$)((?:\\.|[^$\n])+?)(?<!\$)\$(?!\$)", _fix_inline, text)
@@ -323,5 +332,7 @@ def format_contract_constraint_math(assertion: str, var_map: Dict[str, int] | No
         return f"s_{{{idx}}}" if prefix == "state" else f"s_{{{idx},0}}"
 
     expr = re.sub(r"\b(state|initial|buf\.data|data)\[(\d+)\]", _sub_slot, expr)
+    expr = re.sub(r"\bmath\.isfinite\(([^)]+)\)", r"\\mathrm{finite}(\1)", expr)
+    expr = re.sub(r"\band\b", r"\\land", expr)
     expr = _balance_math_expr(canonicalize_math_content(expr))
     return f"${expr}$"

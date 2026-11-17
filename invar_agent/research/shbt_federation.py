@@ -150,7 +150,7 @@ SHBT_REPOSITORIES: Dict[str, SHBTDomainSpec] = {
         ),
         constants=(
             SHBTConstant("floquet_screening_ev", "U_eff_eV", 352.48, "eV", "Floquet-Adler-Wiser effective screening potential (352.48 eV)"),
-            SHBTConstant("floquet_screening_j", "U_eff", 5.64735e-17, "J", "Floquet-Adler-Wiser screening (352.48 eV)"),
+            SHBTConstant("floquet_screening_j", "U_eff", 5.6473522e-17, "J", "Floquet-Adler-Wiser screening (352.48 eV)"),
             SHBTConstant("coherent_lattice_branching", "B_lat", 0.999999994, "dimensionless", "Coherent lattice branching fraction"),
             SHBTConstant("lanr_cell_power_w", "P_cell", 555.03, "W", "Net DC power per LANR cell"),
             SHBTConstant("lanr_module_count", "N_cells", 1800.0, "dimensionless", "1,800-module Ni-H LANR baseload array"),
@@ -431,13 +431,11 @@ _SIGNAL_PATTERNS: Dict[str, Tuple[re.Pattern[str], ...]] = {
     ),
     "sys1own/shbt-recon": (
         re.compile(r"\b2,?112[- ]byte\b|\b640\s*b\b.*\b1,?472\s*b\b|\b230[- ]space[- ]group\b", re.I),
-        re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b.*\b10\s*:\s*23\b", re.I),
+        re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b|\bstinespring\b.*\b(?:10\s*:\s*23|10/33|23/33|100/1089)\b", re.I),
     ),
     "sys1own/shbt-warp": (
-        re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw\s+teg|33,?104|81,?104|93,?054)\b", re.I),
-        re.compile(r"\b(?:906(?:\.0+)?\s*kw|906,?000)\b.*\b(?:lanr|lattice[- ]assisted|cryogenic|cryostat|avionics|teg|housekeeping)\b", re.I),
-        re.compile(r"\b(?:housekeeping|teg\s+heat\s+recovery)\b.*\b(?:1,?800[- ](?:cell|module)|lanr|906)\b", re.I),
-        re.compile(r"\b(?:dec-x|alcubierre|adm\s+foliation|mar-312|25\.00\s*ew)\b", re.I),
+        re.compile(r"\b(?:warp(?:\s+(?:drive|metric|bubble))?|alcubierre|wormhole|mar[- ]?312[cx]?|ew[- ]?312|superluminal|dec[- ]x)\b", re.I),
+        re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg|33,?104|81,?104|25\.00\s*ew)\b", re.I),
     ),
     "sys1own/shbt-swarm": (
         re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I),
@@ -520,8 +518,9 @@ def resolve_shbt_solvability(query_or_prompt: str,
         return SHBTResolution(should_activate=False, reason="empty query")
 
     matched_keys: List[str] = []
+    text_low = text.lower()
     for repo, pats in _SIGNAL_PATTERNS.items():
-        if any(p.search(text) for p in pats):
+        if repo.lower() in text_low or any(p.search(text) for p in pats):
             matched_keys.append(repo)
 
     explicit = bool(_EXPLICIT_SHBT_RE.search(text))

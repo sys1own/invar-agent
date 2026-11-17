@@ -1001,6 +1001,43 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                         initial[i_idx] = initial[j_idx]
                 continue
 
+            from ..healing.deterministic_ast import (
+                _eval_const_ast,
+                _eval_numeric_const_expr,
+                _iter_atomic_invariant_nodes,
+                _match_abs_affine,
+                _unwrap_abs_call,
+            )
+            import ast as _ast
+            for _node in _iter_atomic_invariant_nodes(assertion):
+                if isinstance(_node, _ast.Compare):
+                    _lhs = _node.left
+                    for _cmp_op, _rhs in zip(_node.ops, _node.comparators):
+                        if isinstance(_cmp_op, (_ast.LtE, _ast.Lt)):
+                            _abs_in = _unwrap_abs_call(_lhs)
+                            _tol_v = _eval_const_ast(_rhs) if _abs_in is not None else None
+                            if _abs_in is not None and _tol_v is not None and _tol_v >= 0.0:
+                                _single_t, _sum_t, _diff_p = _match_abs_affine(_abs_in)
+                                if _single_t is not None and c_item is contract:
+                                    _si, _tgt = _single_t
+                                    if _si < len(initial) and abs(initial[_si] - _tgt) > _tol_v:
+                                        warnings.append(
+                                            f"auto-init: target equality slot state[{_si}] ({inv.variable_name}) "
+                                            f"set from {initial[_si]} to {_tgt}")
+                                        initial[_si] = _tgt
+                                elif _sum_t is not None and c_item is contract:
+                                    _i_s, _j_s, _tgt = _sum_t
+                                    if max(_i_s, _j_s) < len(initial) and abs(initial[_i_s] + initial[_j_s] - _tgt) > _tol_v:
+                                        if min(0.0, _tgt) <= initial[_i_s] <= max(0.0, _tgt):
+                                            initial[_j_s] = _tgt - initial[_i_s]
+                                        else:
+                                            initial[_i_s] = 0.5 * _tgt
+                                            initial[_j_s] = 0.5 * _tgt
+                                        warnings.append(
+                                            f"auto-init: sum partition slots state[{_i_s}]+state[{_j_s}] "
+                                            f"initialized to {_tgt}")
+                        _lhs = _rhs
+
             distinct_slots = {
                 int(x) for x in re.findall(
                     r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
@@ -1036,7 +1073,6 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                 assertion,
             )
             if gt_match and k >= 4:
-                from ..healing.deterministic_ast import _eval_numeric_const_expr
                 op_gt = gt_match.group(1)
                 gt_bound = _eval_numeric_const_expr(gt_match.group(2))
                 if gt_bound is not None:
@@ -2324,7 +2360,8 @@ class ResearchStateMachine:
         # Non-intrusive SHBT Frontier Federation: only activates if blueprint requires SHBT.
         bp_text = ""
         if getattr(self, "blueprint", None) is not None:
-            bp_text = f"{self.blueprint.title} {self.blueprint.falsifiable_hypothesis}"
+            feas_rat = getattr(getattr(self.blueprint, "feasibility", None), "rationale", "") or ""
+            bp_text = f"{self.blueprint.title} {self.blueprint.falsifiable_hypothesis} {feas_rat}"
         from .shbt_federation import resolve_shbt_solvability, shbt_literature_dicts
         shbt_res = resolve_shbt_solvability(f"{bp_text} {' '.join(queries)}")
         if shbt_res.should_activate:
