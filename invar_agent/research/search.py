@@ -654,6 +654,30 @@ class LiteratureSearchClient:
         # Stable order: keep connector grouping deterministic for caching/tests.
         order = {s: i for i, s in enumerate(sources)}
         results.sort(key=lambda r: order.get(r.source, 99))
+
+        # Non-intrusive SHBT Federation: inject only when SHBTSolvabilityResolver activates.
+        from .shbt_federation import resolve_shbt_solvability, shbt_literature_dicts
+        shbt_res = resolve_shbt_solvability(
+            prompt_or_query or raw_query, allow_remote_fetch=not self.offline
+        )
+        if shbt_res.should_activate:
+            shbt_items = [
+                LiteratureResult(
+                    source=d["source"],
+                    title=d["title"],
+                    url=d["url"],
+                    year=d["year"],
+                    summary=d["summary"],
+                    badge=d["badge"],
+                    tldr=d["tldr"],
+                    equations=d["equations"],
+                    constants=d["constants"],
+                    benchmarks=d["benchmarks"],
+                )
+                for d in shbt_literature_dicts(shbt_res)
+            ]
+            channel_counts["shbt_federation"] = len(shbt_items)
+            results = shbt_items + results
         results = results[: max(limit * 2, limit)]
         # Diagnostic telemetry for search_log query_done events.
         self.last_query_meta = {

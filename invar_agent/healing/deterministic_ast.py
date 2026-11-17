@@ -718,6 +718,10 @@ def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple
             if isinstance(sub, list) and sub:
                 # Conservatively include anything loaded in remaining outer statements
                 rem_loaded = set(outer_loaded)
+                if isinstance(stmt, (ast.While, ast.For)):
+                    for n in ast.walk(stmt):
+                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                            rem_loaded.add(n.id)
                 for later in stmts[idx + 1:]:
                     for n in ast.walk(later):
                         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
@@ -771,6 +775,7 @@ def _prune_helpers_tree(tree: ast.Module,
             f.name for f in funcs
             if f.name in entrypoints
             or f.name.startswith("simulation_step_")
+            or f.name.startswith("layer_")
             or f.name.startswith("_invar_")
         ]
         if roots:
@@ -799,6 +804,57 @@ def _prune_helpers_tree(tree: ast.Module,
                 notes.append(f"PRUNE_UNUSED_HELPERS(dead assignments in {node.name})")
             tree.body[tree.body.index(node)] = new_node
     ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
+def _init_conditional_locals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Zero-initialize locals read before an unconditional top-level assignment."""
+    changed = False
+    notes: List[str] = []
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("_invar_"):
+            continue
+        params = {a.arg for a in fn.args.args}
+        assigned_in_fn: Set[str] = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                assigned_in_fn.add(n.id)
+        local_targets = assigned_in_fn - params
+        if not local_targets:
+            continue
+        definitely_assigned = set(params)
+        needs_init: Set[str] = set()
+        for stmt in fn.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                for n in ast.walk(stmt.value):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                        if n.id in local_targets and n.id not in definitely_assigned:
+                            needs_init.add(n.id)
+                definitely_assigned.add(stmt.targets[0].id)
+            else:
+                # Skip pure `for target in iter:` target-only loads? No, Name in target is Store,
+                # so any Load in stmt of a local not yet definitely_assigned is unsafe if branch/loop skips.
+                for n in ast.walk(stmt):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                        if n.id in local_targets and n.id not in definitely_assigned:
+                            needs_init.add(n.id)
+        if needs_init:
+            insert_idx = 0
+            if (fn.body and isinstance(fn.body[0], ast.Expr)
+                    and isinstance(fn.body[0].value, ast.Constant)
+                    and isinstance(fn.body[0].value.value, str)):
+                insert_idx = 1
+            inits = [
+                ast.Assign(
+                    targets=[ast.Name(id=v, ctx=ast.Store())],
+                    value=ast.Constant(value=0.0),
+                )
+                for v in sorted(needs_init)
+            ]
+            fn.body[insert_idx:insert_idx] = inits
+            ast.fix_missing_locations(fn)
+            changed = True
+            notes.append(f"initialized conditional locals {sorted(needs_init)} in {fn.name}")
     return tree, changed, notes
 
 
@@ -1756,6 +1812,7 @@ _STEPPED_COORD_NAMES = _COORD_VAR_NAMES | {
     "x_new", "y_new", "z_new", "q_new", "p_new", "q1", "p1",
     "h_new", "v_new", "gamma_new",
     "rho00_new", "rho11_new", "rho0r2", "rho0i2", "rho0r3", "rho0i3",
+    "r00n", "r11n", "r01rn", "r01in",
 }
 _PARAM_FLAG_VAR_NAMES = {
     "gx", "gy", "gz", "g", "g1", "g2", "gphi", "g_phi",
@@ -2069,6 +2126,10 @@ def _resolve_slot_collisions_tree(
         if not isinstance(fn, ast.FunctionDef):
             continue
         body = fn.body
+        top_assigned = {
+            _stmt_slot_target(s0) for s0 in body
+            if isinstance(s0, (ast.Assign, ast.AugAssign))
+        }
         new_body: List[ast.stmt] = []
         for idx, stmt in enumerate(body):
             if isinstance(stmt, ast.If) and not stmt.orelse:
@@ -2078,7 +2139,7 @@ def _resolve_slot_collisions_tree(
                 for sub in stmt.body:
                     if isinstance(sub, ast.Assign):
                         s = _stmt_slot_target(sub)
-                        if s in dyn_slots:
+                        if s in dyn_slots and s not in top_assigned:
                             rhs = sub.value
                             if not (isinstance(rhs, ast.Name) and rhs.id.lower() in _STEPPED_COORD_NAMES):
                                 collided_k = s
@@ -3139,7 +3200,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                         relational_le_pairs.append(key)
 
             m_ge = re.search(
-                r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*(>=?)\s*([0-9.eE+\-\s*/()]+?)(?:\s*(?:$|&&|\|\||and\b|or\b|>|<))",
+                r"(?:^|(?:&&|\|\||\band\b|\bor\b)\s*)(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*(>=?)\s*([0-9.eE+\-\s*/()]+?)(?:\s*(?:$|&&|\|\||and\b|or\b|>|<))",
                 assertion,
             )
             if m_ge:
@@ -3157,13 +3218,13 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                         if s_idx not in positive_lower_slots or adj_val > positive_lower_slots[s_idx]:
                             positive_lower_slots[s_idx] = adj_val
             m_le = re.search(
-                r"(?:abs\(\s*)?(?:state|trace_max|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=?)\s*([0-9.eE+-]+(?:\s*[+\-]\s*[0-9.eE+-]+)?)",
+                r"(?:^|(?:&&|\|\||\band\b|\bor\b)\s*)(?:abs\(\s*(?:state|trace_max|buf\.data|data)\[(\d+)\]\s*\)|(?:state|trace_max|buf\.data|data)\[(\d+)\])\s*(<=?)\s*([0-9.eE+-]+(?:\s*[+\-]\s*[0-9.eE+-]+)?)(?:\s*(?:$|&&|\|\||\band\b|\bor\b))",
                 assertion,
             )
             if m_le:
-                s_idx = int(m_le.group(1))
-                op_str = m_le.group(2)
-                val = _eval_numeric_const_expr(m_le.group(3))
+                s_idx = int(m_le.group(1) or m_le.group(2))
+                op_str = m_le.group(3)
+                val = _eval_numeric_const_expr(m_le.group(4))
                 if val is not None and (s_idx not in dyn_set or s_idx >= 4):
                     if op_str == "<" and val <= 1.0 + 1e-9:
                         target_val = 0.0 if val <= 1e-6 else max(0.0, val - 1e-12)
@@ -3174,8 +3235,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     elif 1.0 <= val <= 1.000001:
                         unit_upper_slots.add(s_idx)
                     elif 0.0 <= val <= 1e-6:
-                        if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
-                            small_upper_slots[s_idx] = val
+                        init_list = _get_contract_initial_list(contract)
+                        init_v = float(init_list[s_idx]) if s_idx < len(init_list) else 0.0
+                        if abs(init_v) <= 1e-4:
+                            if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
+                                small_upper_slots[s_idx] = val
                     elif val <= 1.0 + 1e-9:
                         if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
                             other_upper_slots[s_idx] = val
@@ -3542,9 +3606,10 @@ def _is_density_matrix_system(tree: ast.Module, contracts: Sequence[Any]) -> boo
                 v0, v1, v2, v3 = (float(init[i]) for i in range(4))
             except (TypeError, ValueError):
                 continue
-            if (abs((v0 + v1) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v1 <= 1.0) or (
-                abs((v0 + v3) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v3 <= 1.0
-            ):
+            if (all(-1.0 - 1e-6 <= v <= 1.0 + 1e-6 for v in (v0, v1, v2, v3))
+                    and ((abs((v0 + v1) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v1 <= 1.0) or (
+                        abs((v0 + v3) - 1.0) < 1e-6 and 0.0 <= v0 <= 1.0 and 0.0 <= v3 <= 1.0
+                    ))):
                 has_density_layout = True
                 break
     if not has_density_layout:
@@ -3552,11 +3617,14 @@ def _is_density_matrix_system(tree: ast.Module, contracts: Sequence[Any]) -> boo
     if _detect_bloch_radius(tree, contracts) is not None:
         return True
     tokens = ("trace_error", "min_eigenvalue", "lambda_min", "purity",
-              "rho00", "rho11", "rho01", "spohn", "positivity", "bloch")
+              "rho00", "rho11", "rho01", "spohn", "positivity", "bloch",
+              "lindblad", "kraus")
+    non_density_tokens = ("power", "surplus", "watt", "erasure", "landauer",
+                          "void", "loiter", "array", "teg", "avionics", "cryo")
     for contract in contracts or []:
         for name, assertion, _ in _contract_invariant_items(contract):
             low = f"{name} {assertion}".lower()
-            if any(t in low for t in tokens):
+            if any(t in low for t in tokens) and not any(b in low for b in non_density_tokens):
                 return True
     return False
 
@@ -4349,12 +4417,13 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, glob_changed, glob_notes = _strip_global_nonlocal_tree(tree)
     tree, modconst_changed, modconst_notes = _inline_non_scalar_module_constants_tree(tree)
     tree, arity_changed, arity_notes = _repair_call_arity_tree(tree)
+    tree, init_loc_changed, init_loc_notes = _init_conditional_locals_tree(tree)
     tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
     tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
     tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
     tree, history_changed, history_notes = _repair_history_slots_tree(tree)
     tree, stab_changed, stab_notes = _stabilize_dynamical_state_tree(
-        tree, bridge_contracts, stabilize_diverged=stabilize_diverged
+        tree, list(contracts or bridge_contracts), stabilize_diverged=stabilize_diverged
     )
     tree, monotone_changed, monotone_notes = _repair_monotone_observables_tree(
         tree, bridge_contracts)
@@ -4376,12 +4445,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):
@@ -4833,7 +4902,12 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
                 notes.append("GUARD_MATH_DOMAINS")
             tree = guarded
         elif op == "REWRITE_MONOTONE_DRIFT":
-            slot = int(raw.get("slot", -1))
+            _raw_slot = raw.get("slot", -1)
+            try:
+                slot = int(_raw_slot)
+            except (TypeError, ValueError):
+                _m_slot = re.search(r"(\d+)", str(_raw_slot or ""))
+                slot = int(_m_slot.group(1)) if _m_slot else -1
             if slot >= 0:
                 # Re-render through the dedicated rewriter for precise notes.
                 rw = rewrite_monotone_drift(ast.unparse(tree) + "\n", slot=slot,

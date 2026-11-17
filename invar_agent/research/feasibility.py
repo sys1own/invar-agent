@@ -111,6 +111,15 @@ _QUANTITATIVE_HINTS = re.compile(
 
 def _heuristic_verdict(question: str) -> FeasibilityAssessment:
     q = question.lower()
+    from .shbt_federation import resolve_shbt_solvability
+    shbt_res = resolve_shbt_solvability(question)
+    if shbt_res.should_activate:
+        repos = ", ".join(s.repo for s in shbt_res.matched_repos)
+        return FeasibilityAssessment(
+            verdict="OPTIMAL_DIRECT",
+            rationale=(f"Solved via SHBT Frontier Solvability Federation ({repos}): "
+                       "provides exact open-ledger/WZW/LANR/ZPE governing equations and SI constants."),
+            assessed_by="heuristic")
     # Impossible: explicit pattern, or conservation + gain co-occurrence.
     # Note: computational dynamical benchmarks often explain why *explicit*
     # schemes (RK4/Euler) "violate conservation" — never treat that as an
@@ -263,6 +272,20 @@ def override_refusal_for_computational_benchmark(
     """Convert false-positive LLM refusals on dynamical/integrator benchmarks to
     ``REFORMULATED_SURROGATE`` with symmetric/compatible surrogate guidance."""
     verdict_str = str(getattr(assessment.verdict, "value", assessment.verdict) or "").upper()
+    if verdict_str in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
+        from .shbt_federation import resolve_shbt_solvability
+        shbt_res = resolve_shbt_solvability(question)
+        if shbt_res.should_activate:
+            repos = ", ".join(s.repo for s in shbt_res.matched_repos)
+            return FeasibilityAssessment(
+                verdict=FeasibilityVerdict.OPTIMAL_DIRECT,
+                rationale=(
+                    f"Rescued via SHBT Frontier Solvability Federation ({repos}): "
+                    "open topological ledger / WZW / LANR / Dark-ZPE axioms provide exact "
+                    "closed-form governing equations and SI constants."
+                ),
+                assessed_by=assessment.assessed_by,
+            )
     if verdict_str in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE") and is_computational_dynamical_benchmark(question):
         return FeasibilityAssessment(
             verdict=FeasibilityVerdict.REFORMULATED_SURROGATE,

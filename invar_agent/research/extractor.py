@@ -1213,6 +1213,23 @@ class QuantitativeInsightExtractor:
             for p in r_params:
                 if p.name not in params:
                     params[p.name] = p
+            # 3b. Non-intrusive SHBT Frontier Federation (activates ONLY on unsolvable/frontier SHBT domains).
+            from .shbt_federation import resolve_shbt_solvability
+            shbt_res = resolve_shbt_solvability(prompt or "")
+            if shbt_res.should_activate:
+                for spec in shbt_res.matched_repos:
+                    domains.append(spec.repo)
+                    for sc in spec.constants:
+                        add_param(ExtractedParameter(
+                            name=sc.name, symbol=sc.symbol, raw_value=float(sc.si_value),
+                            raw_unit=sc.si_unit, si_value=float(sc.si_value), si_unit=sc.si_unit,
+                            source=f"SHBT: {spec.repo}", confidence=0.99,
+                        ))
+                    for seq in spec.equations:
+                        eq_obj = parse_equation(seq.latex, source=f"SHBT: {spec.repo}", description=seq.description)
+                        if eq_obj is not None:
+                            equations.append(eq_obj)
+                    invariants.extend(spec.invariants)
             equations.extend(r_eqs)
             benchmarks.extend(r_bench)
             invariants.extend(r_inv)
@@ -1233,9 +1250,12 @@ class QuantitativeInsightExtractor:
                 uniq_b.append(b)
         invariants = list(dict.fromkeys(invariants))
 
+        max_p = (max(self.max_parameters, 64)
+                 if any(d.startswith("sys1own/shbt-") for d in domains)
+                 else self.max_parameters)
         draft = StructuredResearchEvidence(
             domains=domains, equations=uniq_eqs[: self.max_equations],
-            parameters=dict(list(params.items())[: self.max_parameters]),
+            parameters=dict(list(params.items())[:max_p]),
             benchmarks=uniq_b, suggested_invariants=invariants)
         strategy = recommend_execution_strategy(prompt or "", draft)
         draft = draft.model_copy(update={

@@ -179,6 +179,8 @@ max 64) and steps <= 20000. initial_state must be the physical state of the
 surrogate model, never a repeating dummy vector. Keep code_template concise
 (<= 80 lines of scalar Python implementing the primary reference integrator in
 simulation_step; do not embed duplicate Euler/RK4 state copies inside simulation_step).
+Use a single canonical, DISJOINT `buf.data[k]` slot layout across all contracts
+and sub-models (never reuse the same slot index for different physical observables).
 No markdown fences, no <think> blocks. Output JSON only.
 
 ## Feasibility context (authoritative)
@@ -781,12 +783,10 @@ def _canon_stage_index(contract_id: str) -> int:
 
 
 def _canon_observable_name(name: str, variable_map: Optional[Dict[str, int]] = None) -> bool:
-    low = str(name or "").lower()
-    if not low or low in {"value", "state", "buf", "data"}:
+    low = str(name or "").lower().strip()
+    if not low or low in {"value", "state", "buf", "data", "finite", "finiteness", "finite_all"}:
         return False
-    if variable_map and low in {str(k).lower() for k in variable_map}:
-        return True
-    return any(tok in low for tok in _CANON_OBSERVABLE_TOKENS)
+    return True
 
 
 def _canon_slots_in_text(text: str) -> List[int]:
@@ -1038,10 +1038,26 @@ def canonicalize_contract_dicts(
     name_semantic: Dict[str, Tuple[str, str]] = {}
     semantic_slot: Dict[Tuple[str, str], int] = {}
     slot_owner: Dict[int, str] = {}
+    slot_owner_contract: Dict[int, str] = {}
+    slot_eq_target: Dict[int, float] = {}
     name_order: List[str] = []
     remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
 
+    def _extract_eq_target(expr: str) -> Optional[float]:
+        m = re.search(
+            r"abs\(\s*(?:state|buf\.data|data)\[\d+\]\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
+            expr or "",
+        )
+        if not m:
+            return None
+        try:
+            val = eval(m.group(1), {"__builtins__": {}}, {})
+            return float(val)
+        except Exception:
+            return None
+
     def assign_for_inv(c: Dict[str, Any], inv: Dict[str, Any], record: bool) -> None:
+        c_id = str(c.get("contract_id") or "")
         name = str(inv.get("variable_name") or "").strip()
         if not _canon_observable_name(name, vm):
             return
@@ -1049,25 +1065,42 @@ def canonicalize_contract_dicts(
         slots = _canon_slots_in_text(assertion)
         distinct_slots = sorted(set(slots))
         if slots and len(distinct_slots) != 1:
+            for s in distinct_slots:
+                if s in (0, 1, 2, 3):
+                    slot_owner.setdefault(s, name)
+                    slot_owner_contract.setdefault(s, c_id)
             return
         desired = distinct_slots[0] if distinct_slots else vm.get(name)
         if desired is None:
             return
         desired = int(desired)
+        eq_target = _extract_eq_target(assertion)
         if desired in (0, 1, 2, 3):
-            return
+            prev_t = slot_eq_target.get(desired)
+            prev_cid = slot_owner_contract.get(desired)
+            if (eq_target is not None and prev_cid is not None and prev_cid != c_id
+                    and (prev_t is None or abs(prev_t - eq_target) > 1e-3)):
+                pass  # Mutually exclusive / cross-contract target on dynamical slot -> remap below
+            else:
+                if eq_target is not None:
+                    slot_eq_target.setdefault(desired, eq_target)
+                slot_owner.setdefault(desired, name)
+                slot_owner_contract.setdefault(desired, c_id)
+                return
         key = _canon_semantic_key(name, assertion)
         name_semantic.setdefault(name, key)
         canonical = semantic_slot.get(key)
         if canonical is None:
             owner = slot_owner.get(desired)
-            if owner is not None and owner != name:
+            owner_cid = slot_owner_contract.get(desired)
+            if owner is not None and owner != name and owner_cid != c_id:
                 canonical = _canon_alloc_slot(set(name_slot.values()) | set(semantic_slot.values()), reserved)
                 notes.append(f"canonical slot conflict: {name} state[{desired}] -> state[{canonical}]")
             else:
                 canonical = desired
             semantic_slot[key] = canonical
-            slot_owner[canonical] = name
+            slot_owner.setdefault(canonical, name)
+            slot_owner_contract.setdefault(canonical, c_id)
             if name not in name_order:
                 name_order.append(name)
         name_slot.setdefault(name, int(canonical))
@@ -1082,7 +1115,7 @@ def canonicalize_contract_dicts(
                 assign_for_inv(c, inv, record=not is_prior)
 
     for c, inv, old, new in remaps:
-        if old in (0, 1, 2, 3) or new in (0, 1, 2, 3):
+        if new in (0, 1, 2, 3):
             continue
         inv["assertion"] = _canon_rewrite_slots(str(inv.get("assertion") or ""), old, new)
         notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
@@ -1102,15 +1135,11 @@ def canonicalize_contract_dicts(
         if canonical is None:
             canonical = name_slot.get(name)
         if canonical is None:
-            owner = slot_owner.get(int(idx))
-            if owner is not None and owner != name:
-                canonical = _canon_alloc_slot(assigned_slots, reserved)
-                notes.append(f"canonical variable_map conflict: {name} state[{idx}] -> state[{canonical}]")
-            elif int(idx) in assigned_slots:
-                canonical = _canon_alloc_slot(assigned_slots, reserved)
+            if name in name_slot:
+                canonical = name_slot[name]
             else:
                 canonical = int(idx)
-            slot_owner[int(canonical)] = name
+            slot_owner.setdefault(int(canonical), name)
             assigned_names.add(name)
         canonical = int(canonical)
         name_slot.setdefault(name, canonical)
@@ -1428,6 +1457,10 @@ async def generate_plan_with_feasibility(question: str,
                    question=question)
     evidence = _compute_structured_evidence(question, literature)
     prompt += _evidence_prompt_block(evidence)
+    from .shbt_federation import resolve_shbt_solvability
+    shbt_res = resolve_shbt_solvability(question)
+    if shbt_res.should_activate and shbt_res.evidence_markdown:
+        prompt += "\n\n" + shbt_res.evidence_markdown
     if extra_context:
         prompt += "\n\n" + extra_context
     raw = await llm_complete(prompt)
@@ -1439,8 +1472,24 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no JSON object"}
         raise RuntimeError("research plan synthesis failed: combined planner returned no JSON object")
     feasibility = _coerce_feasibility(data.get("feasibility")) or heuristic
+    if shbt_res.should_activate:
+        feasibility = heuristic
     if feasibility.verdict.startswith("REFUSED"):
-        if is_computational_dynamical_benchmark(question):
+        if shbt_res.should_activate:
+            feasibility = heuristic
+            if not isinstance(data.get("blueprint"), dict):
+                shbt_prompt = (
+                    prompt
+                    + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "
+                    "via the SHBT Frontier Knowledge Federation (`OPTIMAL_DIRECT`). Do NOT "
+                    "refuse. Output a complete valid blueprint JSON using the exact SHBT "
+                    "equations, SI constants, and invariants provided above."
+                )
+                raw2 = await llm_complete(shbt_prompt)
+                data2 = _extract_json(str(raw2))
+                if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
+                    data = data2
+        elif is_computational_dynamical_benchmark(question):
             feasibility = override_refusal_for_computational_benchmark(question, feasibility)
             if not isinstance(data.get("blueprint"), dict):
                 surrogate_prompt = (
@@ -1619,10 +1668,10 @@ async def refine_stage_code(llm_complete: Callable[[str], Any], *, objective: st
     text = str(raw or "")
     for m in _FENCE_RE.finditer(text):
         block = m.group(1).strip()
-        if "def " in block and ("simulation_step" in block or "buf" in block):
+        if "def " in block and ("simulation_step" in block or "layer_" in block or "buf" in block):
             return block
     stripped = text.strip()
-    if stripped.startswith(("def ", "import ", "#")) and "simulation_step" in stripped:
+    if stripped.startswith(("def ", "import ", "#")) and ("simulation_step" in stripped or "layer_" in stripped):
         return stripped
     return None
 

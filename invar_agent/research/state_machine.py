@@ -31,6 +31,7 @@ import logging
 import math
 import re
 import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -51,7 +52,8 @@ from .accretion import (AccretionError, code_hash, layer_driver_name,
                         strip_driver, unified_from_layers)
 from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
-                        request_healing_directives, synthesize_accretive_stage)
+                        refine_stage_code, request_healing_directives,
+                        synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
     _detect_bloch_radius, apply_healing_directives, classify_buffer_slots,
     enforce_conservation_projection, enforce_lyapunov_sign,
@@ -952,7 +954,8 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
         initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
         warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
     # 1. Error/drift metrics & relational accumulators initialize cleanly
-    # across all blueprint contracts so every stage starts with valid bounds.
+    # across contracts; only reset error metrics for THIS contract so another
+    # stage's slot layout cannot zero out non-zero inputs here.
     missing_set = set(_kernel_assigns_slots(py_code, _contract_state_slots(contract)))
     m0_sum = sum(max(0.0, initial[d]) for d in dyn_slots if d < len(initial))
     for c_item in (all_contracts or [contract]):
@@ -1015,7 +1018,7 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
             error_metric = any(tok in name for tok in
                                ("error", "err", "drift", "residual", "violation", "mismatch",
                                 "hold", "bound", "increase", "monotone", "monotonicity"))
-            if bound is not None:
+            if bound is not None and c_item is contract:
                 if (0.0 <= bound <= 1e-8) or (error_metric and bound <= 1e-6):
                     if k < len(initial) and initial[k] != 0.0:
                         warnings.append(
@@ -1405,10 +1408,24 @@ class ResearchStateMachine:
                 state.blueprint = blueprint
                 bp_verdict = "REFORMULATED_SURROGATE"
             else:
-                state.status = "REFUSED"
-                state.refusal = blueprint.feasibility.model_dump()
-                await self._emit("search_log", "refused", {"feasibility": state.refusal})
-                return state
+                from .shbt_federation import resolve_shbt_solvability
+                shbt_res = resolve_shbt_solvability(f"{blueprint.title}. {blueprint.falsifiable_hypothesis}")
+                if shbt_res.should_activate:
+                    from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict
+                    rescued = FeasibilityAssessment(
+                        verdict=FeasibilityVerdict.OPTIMAL_DIRECT,
+                        rationale=shbt_res.reason,
+                        assessed_by="heuristic",
+                    )
+                    blueprint = blueprint.model_copy(update={"feasibility": rescued})
+                    self.blueprint = blueprint
+                    state.blueprint = blueprint
+                    bp_verdict = "OPTIMAL_DIRECT"
+                else:
+                    state.status = "REFUSED"
+                    state.refusal = blueprint.feasibility.model_dump()
+                    await self._emit("search_log", "refused", {"feasibility": state.refusal})
+                    return state
         else:
             gate = _heuristic_verdict(f"{blueprint.title}. {blueprint.falsifiable_hypothesis}")
             if str(gate.verdict.value).upper().startswith("REFUSED"):
@@ -1998,7 +2015,10 @@ class ResearchStateMachine:
                 prior_contract_dicts = [c.model_dump() for layer in pinned_layers
                                         for c in layer.contracts]
                 synth["contracts"], _, _ = canonicalize_contract_dicts(
-                    synth.get("contracts") or [], prior_contracts=prior_contract_dicts)
+                    synth.get("contracts") or [],
+                    variable_map=getattr(bp, "variable_map", None),
+                    prior_contracts=prior_contract_dicts,
+                )
                 staged = list(contracts)
                 contracts = [VerificationContract.model_validate(c) for c in synth["contracts"]]
                 seen = {c.contract_id for c in contracts}
@@ -2133,7 +2153,21 @@ class ResearchStateMachine:
                     [int(m) for m in re.findall(r"buf\.data\[(\d+)\]", unified)] + [31]
                 )
                 _smoke_buf = _BufView([0.5] * min(4096, _max_idx + 1))
-                _smoke_fn(_smoke_buf, 0.01)
+                _smoke_steps = 0
+
+                def _smoke_trace(frame, event, arg):
+                    nonlocal _smoke_steps
+                    _smoke_steps += 1
+                    if _smoke_steps > 500_000:
+                        raise TimeoutError("python_smoke exceeded 500k steps (possible infinite loop)")
+                    return _smoke_trace
+
+                _old_trace = sys.gettrace()
+                sys.settrace(_smoke_trace)
+                try:
+                    _smoke_fn(_smoke_buf, 0.01)
+                finally:
+                    sys.settrace(_old_trace)
         except Exception as exc:  # noqa: BLE001
             await emit("accelerator_log", "guard_reject", {**tag, "violations": [f"python_smoke: {type(exc).__name__}: {exc}"]})
             self._rollback_overlay(scratch)
@@ -2273,6 +2307,19 @@ class ResearchStateMachine:
                                                          "note": "search client disabled"})
             return []
         out: List[Dict[str, Any]] = []
+        # Non-intrusive SHBT Frontier Federation: only activates if blueprint requires SHBT.
+        bp_text = ""
+        if getattr(self, "blueprint", None) is not None:
+            bp_text = f"{self.blueprint.title} {self.blueprint.falsifiable_hypothesis}"
+        from .shbt_federation import resolve_shbt_solvability, shbt_literature_dicts
+        shbt_res = resolve_shbt_solvability(f"{bp_text} {' '.join(queries)}")
+        if shbt_res.should_activate:
+            for item in shbt_literature_dicts(shbt_res):
+                out.append(item)
+                await self._emit("search_log", "paper", {
+                    **tag, "query": "shbt_federation", "source": item["source"],
+                    "badge": item["badge"], "title": item["title"][:200],
+                    "year": item["year"], "url": item["url"], "citation_count": None})
         for q in queries:
             await self._emit("search_log", "query", {**tag, "query": q})
             await self.emit_activity("INGEST", "literature_query",
@@ -2452,7 +2499,7 @@ class ResearchStateMachine:
         await self._emit("goi_stream", "heal", {
             "round": round_idx, "research_stage": stage, "tier": 0,
             "applied": bool(applied_ops), "notes": applied_ops or ["no Tier-0 repair applicable"]})
-        if applied_ops:
+        if applied_ops and not (attempt >= 2 and "falsified" in fail_text):
             await self.emit_activity(
                 "HEALING", "deterministic_reflex",
                 "[HEALING_DIRECTIVE] Applied deterministic ops: "
@@ -2491,9 +2538,19 @@ class ResearchStateMachine:
         patched = apply_healing_directives(candidate_code, directives,
                                            contracts=contract_dicts)
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
+        _is_final_heal = (attempt >= 2 or attempt + 1 >= max_attempts)
+        _missing_eq_slot = (
+            _is_final_heal
+            and plan.get("fixable") is not False
+            and any(
+                f"buf.data[{m.group(1)}] =" not in (patched.code or "")
+                and f"buf.data[{m.group(1)}]=" not in (patched.code or "")
+                for m in re.finditer(r"abs\(state\[(\d+)\]\s*-", str(failure or ""))
+            )
+        )
         fallback_needed = (
             ("falsified" in str(failure or "").lower() or "diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower())
-            and (not ops or not patched.changed or patched.code == candidate_code)
+            and (not ops or not patched.changed or patched.code == candidate_code or _missing_eq_slot)
         )
         if fallback_needed:
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
@@ -2520,6 +2577,28 @@ class ResearchStateMachine:
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,
                         "applied_ops": san_fb.notes or ["zero_diff_slot_conditioner"]}
+            if _is_final_heal and plan.get("fixable") is not False:
+                tier2_llm = self.llm_planner or llm
+                refined = None
+                try:
+                    refined = await asyncio.wait_for(
+                        refine_stage_code(
+                            tier2_llm,
+                            objective=objective,
+                            code=healed,
+                            contracts=contract_dicts,
+                            failure=str(failure),
+                        ),
+                        timeout=90.0,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    refined = None
+                if refined and refined.strip() and refined.strip() != candidate_code.strip():
+                    await self.emit_activity(
+                        "HEALING", "tier2_refine",
+                        "[TIER2_REFINE] Tier-2 planner synthesized full-kernel repair from counterexample.")
+                    return {"code": refined, "terminated": False,
+                            "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
         if plan.get("fixable") is False:
             reason = str(plan.get("unfixable_reason") or "unsatisfiable contract").strip()
             await self.emit_activity(
