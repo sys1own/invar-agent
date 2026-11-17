@@ -2,203 +2,192 @@
 
 Formally Grounded Autonomous Software Engineering Kernel and Computational Research Platform.
 
-invar-agent is an autonomous engineering and scientific discovery system. Every mutation proposed by an agent passes through a 9-stage formal verification state machine before touching disk or entering source control. The platform combines a high-performance native core written in Rust (PyO3) with an extensible Python kernel, providing dual operational modes: a polyglot software engineering Builder Agent and an accretive computational Research Agent.
+`invar-agent` combines a Rust/PyO3 native verification and algebraic-rewriting core (`invar_agent._native`), a deterministic Python/C++20/Z3 verification substrate (`invar_agent/`), and an interactive FastAPI + SSE web console (`invar_agent/server.py`, `invar_agent/static/index.html`) to synthesize, formally verify, and execute numerical simulation kernels and software modules with zero unverified claims.
 
 ---
 
-## Architectural Overview
+## 1. Architectural Overview
 
-invar-agent enforces transactional correctness and mathematical consistency across three coordinated subsystems:
+`invar-agent` is structured into three tightly coupled layers:
 
-* Native Acceleration Core (`invar_agent/_native`): High-throughput Rust engine implementing Girard Geometry of Interaction (GoI) nilpotency solving, an arena-allocated Lafont-style Hierarchical Interaction Net (HIN) engine, zero-token deterministic rewrite heuristics, and content-addressed BLAKE3 state registers.
-* Kernel and Verification Substrate (`invar_agent/`): Python runtime managing Pydantic v2 schemas, transactional Copy-on-Write (CoW) overlays, algebraic adjoint rollbacks, a three-tier cognitive router, and the Precision Shield.
-* Interactive Web Platform (`invar_agent/server.py` + `static/index.html`): FastAPI and Server-Sent Events (SSE) single-page application featuring partitioned codebase and research explorers, center-stage research inspection, plan-approval action cards, and an integrated xterm.js workspace terminal drawer.
+1. **Native Acceleration Core (`invar_agent/_native`)**:
+   Rust crate (`invar_agent_native`) compiled via `maturin` and exposed to Python through PyO3:
+   - **Girard GoI Wavefront Solver (`goi_wavefront.rs`, `goi_solver.rs`, `goi_matrix.rs`)**: Computes execution matrices `EX(M, U) = (I - U * M)^(-1) * U`, checks nilpotency (`rho(U * M) < 1`), partitions acyclic DAGs into parallelizable wavefronts, and performs Sherman-Morrison-Woodbury rank-k incremental updates.
+   - **Holographic Interaction Net (HIN) Arena (`hin_arena.rs`, `hin_engine.rs`, `holographic_hin.rs`)**: Flat arena graph reducer supporting MELL linear typing (`tau_wire = (MELLType, SIDimensionVector, IntervalBound)`), automatic promotion/dereliction, and causal fault slicing.
+   - **Reverse-Mode Adjoint HIN (`adjoint.rs`)**: Symbolic Jacobian differentiation `J_ij = df_i / dx_j` and spectrum/stiffness analysis.
+   - **`egg` E-Graph Reflex Healer (`csel_egraph.rs`, `deterministic_healer.rs`)**: Sub-2 ms Tier-0 algebraic canonicalization, CSEL desugaring, and syntax/import reflex repair.
+   - **Holographic Interface Signatures (`his.rs`)**: BLAKE3 structural digests that track public signature boundaries independently of private body edits.
+   - **Declarative UAST (`uast.rs`)**: Typed representation for `ResearchComputeUAST` and Closed Symbolic Expression Language (CSEL).
+
+2. **Kernel and Verification Substrate (`invar_agent/`)**:
+   - **9-Stage Verification State Machine (`invar_agent/research/state_machine.py`)**: Orchestrates literature ingestion, GoI scheduling, copy-on-write overlay mutation, PreWrite guards, Z3 SMT/concolic verification, C++20 C-ABI sandbox execution, Tier-0/1/2 healing, and adjoint commit/rollback.
+   - **Tier-0 Deterministic AST Sanitizer (`invar_agent/healing/deterministic_ast.py`)**: Rewrites domains, signatures, comprehensions, tuple unpacking, relational contracts, and manifold projections before compilation or execution.
+   - **Polyglot Transpiler & C-ABI Bridge (`invar_agent/transpiler/`, `invar_agent/runtime/cabi_bridge.py`)**: Lowers restricted Python (`v9_transpiler_friendly`) to UAST and C++20 shared libraries (`-O3 -std=c++20`), with isolated subprocess execution and deterministic Python fallback.
+   - **Deterministic LaTeX Canonicalizer (`invar_agent/latex_normalizer.py`)**: Repairs JSON control-character escapes, wraps bare equations, canonicalizes ASCII-math hybrids, and balances delimiters/braces.
+
+3. **Interactive Web Platform (`invar_agent/server.py`, `invar_agent/static/index.html`)**:
+   - FastAPI backend with 3-channel SSE streaming (`search_log`, `goi_stream`, `accelerator_log`), Research Vault persistence, zip export/import, Markdown-protected KaTeX rendering, and an integrated `xterm.js` workspace terminal.
 
 ---
 
-## The 9-Stage Verified State Machine
+## 2. The 9-Stage Verified State Machine
 
-Every task progresses through an invariant-preserving lifecycle:
+Every research stage and software mutation traverses the same deterministic 9-stage pipeline:
 
-```
-[ Ingest ]
-  |
-  v
-[ GoI_Plan ]
-  |
-  v
-[ Wavefront_Schedule ] ----- (Nilpotency Check: rho(U * M) < 1)
-  |
-  v
-[ Overlay_Mutate ] ------- (Transactional Copy-on-Write Scratch)
-  |
-  v
-[ PreWrite_Guard ] ------- (AST Policy Firewall & Import Checks)
-  |
-  v
-[ SMT_Concolic_Verify ] -- (Z3 Constraint & Boundary Validation)
-  |
-  v
-[ Sandbox_Execute ] ------ (Resource-Limited Isolated Subprocess: RLIMIT_CPU / RLIMIT_AS)
-  |
-  v
-[ Reflex_Heal ] ---------- (Tier-0 In-Memory Structural Repair)
-  |
-  v
-[ Adjoint_Commit_or_Rollback ]
+```text
+  [1. Ingest]
+       |
+       v
+  [2. GoI_Plan] ---> [3. Wavefront_Schedule] ---> [4. Overlay_Mutate]
+                                                         |
+                                                         v
+  [8. Reflex_Heal] <--- [7. Sandbox_Execute] <--- [6. SMT_Concolic_Verify] <--- [5. PreWrite_Guard]
+       |                                                 |
+       +----------------------> [9. Adjoint_Commit_or_Rollback]
 ```
 
-1. Ingest: Validates user specifications, empirical data, or literature findings into strictly typed Pydantic schemas.
-2. GoI_Plan: Formulates task dependencies, causal contracts, and execution assertions as a directed proof net.
-3. Wavefront_Schedule: Solves the linear execution system `EX(M, U) = (I - U * M)^(-1) * U`. Enforces the spectral radius nilpotency invariant `rho(U * M) < 1` to guarantee acyclic execution and absence of deadlocks.
-4. Overlay_Mutate: Mounts an isolated tmpfs Copy-on-Write directory, ensuring baseline project files remain untouched during compilation and execution.
-5. PreWrite_Guard: Performs static AST analysis enforcing `v9_transpiler_friendly` constraints, rejecting unauthorized system imports, network socket allocations, and unbounded iteration.
-6. SMT_Concolic_Verify: Z3 SMT solver validates concrete types, structural invariant contracts, and numerical boundary conditions.
-7. Sandbox_Execute: Executes compiled artifacts (`rust_hin`, C-ABI C++, or Python) within short-lived isolated subprocesses constrained by CPU and memory rlimits (`RLIMIT_CPU`, `RLIMIT_AS`).
-8. Reflex_Heal: Applies deterministic E-graph equality saturation and syntactic rewrites without consuming LLM tokens when recoverable errors occur.
-9. Adjoint_Commit_or_Rollback: If all verification contracts pass, changes commit transactionally to the active workspace. If verification fails, an algebraic adjoint rollback cleanly unlinks scratch directories and restores the last verified state.
+1. **Ingest**: Canonicalizes blueprint slots, auto-populates `variable_map`, and indexes workspace/literature evidence.
+2. **GoI_Plan**: Evaluates epistemic feasibility, queries federated literature channels, and plans stage contracts.
+3. **Wavefront_Schedule**: Verifies nilpotency (`rho(U * M) < 1`) over regression and new-stage contracts via the GoI solver, computing Sherman-Morrison-Woodbury rank-k delta updates.
+4. **Overlay_Mutate**: Materializes the candidate `unified_module.py` inside an isolated copy-on-write scratch directory (`round_<k>`).
+5. **PreWrite_Guard**: Enforces the SHACL/Chiasmus firewall (`v9_transpiler_friendly` subset), runs a 1-step Python smoke execution (`simulation_step(buf, 0.01)`), and lowers Python -> UAST -> C++20.
+6. **SMT_Concolic_Verify**: Checks contract satisfiability and invariant expressions using Z3 and safe merged-globals concolic evaluation (`all(math.isfinite(state[i]) for i in range(N))`).
+7. **Sandbox_Execute**: Compiles and executes the C++20 C-ABI kernel (or isolated Python fallback) across all stage and regression contracts (`dt`, `steps`, `initial_state` guarded by `auto-init`).
+8. **Reflex_Heal**: On `FALSIFIED` / `DIVERGED` / `ERROR`, applies Tier-0 deterministic AST repairs (`< 2 ms`, 0 tokens), Tier-1 structured directives, and Tier-2 counterexample-guided refinement.
+9. **Adjoint_Commit_or_Rollback**: Pins verified layers into `unified_module.py` and persists checkpoints to the Research Vault, or rolls back failed stage deltas without discarding earlier verified stages.
 
 ---
 
-## Dual Agent Modalities
+## 3. Declarative UAST, Totalized Semantics, and Tier-0 Stabilization
 
-### 1. Research Agent
+To prevent runtime domain errors (`ZeroDivisionError`, `ValueError`, `OverflowError`) and numerical blowups (`NaN`, `Inf`), `invar-agent` enforces totalized semantics and Tier-0 stabilization:
 
-The Research Agent conducts computational scientific research where findings are validated through native simulation:
-
-* Epistemic Feasibility Gate: Evaluates research requests prior to execution, classifying tasks into four operational regimes:
-  * `OPTIMAL_DIRECT`: Quantitative problems with explicit governing equations and testable invariants.
-  * `REFORMULATED_SURROGATE`: High-dimensional or macro-scale systems downscaled into rigorous 0D/1D asymptotic models.
-  * `REFUSED_IMPOSSIBLE`: Problems violating axiomatic physical laws (such as net-positive energy with closed-loop Hamiltonian invariants). Execution halts immediately without generating ungrounded simulations.
-  * `REFUSED_UNSUITABLE`: Subjective or non-computational questions lacking formal state variables, prevented to avoid synthetic math-washing.
-* Multi-Channel Literature Federation: Retrieves domain equations, parameters, and benchmark values across arXiv, ar5iv (HTML5 equation extraction), OpenAlex, Semantic Scholar (TLDR extraction), Wikipedia wikitext (`<math>` and infobox extraction), Wikidata quantities, OEIS (integer sequences and recurrence relations), and PubChem (molecular properties).
-* Zero-Token SI Normalization: Deterministically converts mixed physical units to standard SI base units (m, kg, s, K, Pa, W/m^2, J) prior to code generation, preventing parameter scaling errors.
-* Multi-Variant Pareto Benchmarking: Compiles and evaluates competing numerical integrators and closures concurrently (e.g., standard explicit RK4 versus semi-implicit Euler on stiff kinetics), selecting optimal formulations along Pareto frontiers of execution latency versus invariant residual error.
-* Cumulative Blueprint Evolution: Verified computational kernels are checkpointed as pinned module layers. Follow-up research rounds integrate higher-order terms into the same unified computation module (`unified_module.py`).
-* Adjoint Delta Rollback: If an added physical term causes divergence or invariant falsification, an adjoint rollback unlinks the active delta, preserves the verified baseline checkpoint, and feeds the numerical counterexample to the planner.
-* User-Uploaded Research Ingestion: Ingests external research documents (`.md`, `.tex`, `.txt`, `.py`, `.json`, `.csv`, `.zip`) into `.invar/research_vault/<run_id>/`, extracting governing equations and SI constants via the `QuantitativeInsightExtractor`.
-
-### 2. Builder Agent
-
-The Builder Agent generates, verifies, and packages multi-file software projects:
-
-* Polyglot Compilation: Synthesizes and tests code across Rust (Cargo crates with PyO3 bindings), C++ (C-ABI zero-copy shared libraries compiled via Clang++ with `-O3 -std=c++20 -fPIC -shared`), and Python.
-* Research-to-Software Bridge: Ingests completed or uploaded research runs from the Research Vault and classifies build intent into one of seven software archetypes:
-  1. `SCIENTIFIC_SDK_LIBRARY`: Reusable Python package with optional native C++ or Rust accelerators, typed interfaces, and test suites.
-  2. `CLI_SIMULATOR_SWEEP`: Standalone command-line application supporting parameter sweeps, invariant guards, and structured export.
-  3. `INTERACTIVE_WEB_SIMULATOR`: FastAPI and HTML5/JS dashboard exposing simulation steppers with real-time controls.
-  4. `INVERSE_DESIGN_OPTIMIZER`: Constrained parameter optimization harness wrapping the verified forward research kernel.
-  5. `MULTI_SOLVER_BENCHMARK`: Benchmarking harness comparing accuracy, convergence, and execution latency across parameter regimes.
-  6. `TELEMETRY_DIGITAL_TWIN`: Streaming data processor and real-time invariant anomaly detector grounded in research equations.
-  7. `STANDALONE_NATIVE_CRATE`: Zero-Python C++20 or Rust standalone library and binary.
-* Three-Tier Research Resolution: Resolves research context in both Direct Build and Plan modes via explicit `@research:<id>` tags, semantic keyword matching, or implicit reference to the most recently completed research run.
-* Automated Research-Parity Verification: Compiles and executes `tests/test_research_parity.py` during builds, asserting that the synthesized software preserves all SI constants and reproduces verified research metrics within tolerance.
-* Precision Shield: Enforces boundary verification via Fock-Space Graph Encoding (FoGE), concolic Z3 checks, and the Chiasmus firewall.
+- **Declarative UAST & CSEL**: Compute kernels operate over flat scalar buffers (`buf.data[i]`) and pure helper functions (`v9_transpiler_friendly`), excluding classes, dynamic imports, comprehensions, tuple unpacking, `global`/`nonlocal`, and exceptions.
+- **Totalized Algebraic Semantics**:
+  - `_invar_sdiv(a, b)` / `div_eps(a, b) = a / (sgn(b) * max(|b|, eps))` (with `eps = 1e-12` or `1e-30`) replaces unsafe divisions across all helper and step functions.
+  - Domain-guarded `safe_sqrt`, `safe_log`, `safe_exp`, `safe_pow`, and `smooth_clamp` prevent negative-argument `ValueError` and exponential overflow.
+- **Tier-0 Dynamical State Divergence Shield (`_invar_stabilize_state` / `_invar_stabilize_state_6`)**:
+  - Snapshots pre-step primary state slots (`0..3` or `0..5` for 6-mode triads) and applies a Rational Pade step limiter `p + _invar_sdiv(d, 1.0 + |d|)` whenever `|d| > 0.5`, plus full-buffer non-finite clamping (`[-1e12, 1e12]`) and local-variable re-sync for downstream diagnostics.
+- **Physical Manifold Projectors**:
+  - **Density-Matrix Bloch/Simplex Projector (`_invar_project_density`)**: Enforces unit trace (`p0 + p1 = 1.0`, `p0, p1 >= 0.0`) and coherence positivity `c0^2 + c1^2 <= p0 * p1`.
+  - **Stoichiometric Mass-Simplex Projector (`_invar_project_mass_simplex`)**: Clamps species concentrations `buf.data[0..3] >= 0.0` and rescales by `_invar_sdiv(M_prev, M_cur)` to preserve exact total mass `M_0`.
+  - **Unit-Sphere `S^2` Projector (`_invar_project_sphere_s2`)**: Normalizes 3-component spin/magnetization vectors `(m_x, m_y, m_z)` onto `||m||_2 = 1.0`.
+- **Universal Contract-Slot Conditioning & Signature Normalization**:
+  - Normalizes 1-arg `simulation_step(buf)` to `(buf, dt=0.01)` (rewriting `buf.dt -> dt`) and defaults trailing args `> 2` to `0.0`.
+  - Evaluates constant-expression bounds (`3.0 - 1e-12`), unifies lower bounds across stages, preserves running-minimum sentinels, and conditions single-slot (`<=`, `<`, `>=`, `>`) and relational (`state[i] <= coeff * state[j]`) invariants across all blueprint contracts.
+- **Automatic Stiffness Detection & Counterexample-Guided Re-Prompting**:
+  - Detects stiff/dissipative regimes (`kappa >> 1`, `alpha * dt >> 1`) and routes exact falsified counterexamples (`observed {...}`) into targeted literature re-search and Tier-1/Tier-2 healing.
 
 ---
 
-## Workspace Platform and Web Console
+## 4. Dual Agent Modalities and Context Architecture
 
-The web interface (`http://localhost:8000`) provides an integrated development and research environment:
+### Research Agent
+- **Epistemic Feasibility Gate (`invar_agent/research/feasibility.py`)**: Classifies requests into `OPTIMAL_DIRECT`, `REFORMULATED_SURROGATE`, `REFUSED_IMPOSSIBLE`, or `REFUSED_UNSUITABLE`. Automatically converts over-constrained computational physics/chemistry/engineering benchmarks into `REFORMULATED_SURROGATE` with compatible surrogate coupling parameters.
+- **Multi-Channel Literature Federation**: Queries arXiv, bioRxiv/medRxiv, Crossref, OpenAlex, Semantic Scholar, and Wikipedia with automatic query relaxation.
+- **Zero-Token SI Normalization & Reference Registry (`invar_agent/research/extractor.py`)**: Extracts empirical constants and equations with word-boundary domain gating (preventing cross-domain pollution).
+- **Multi-Variant Pareto Benchmarking**: Evaluates competing numerical schemes (e.g., Cayley/Patankar vs. RK4/Euler) under identical contract grids.
+- **Cumulative Blueprint Evolution & Non-Aborting Rollback**: Stages `1..N` accrete new capabilities onto pinned verified layers; exhausted retries on stage `k` roll back only stage `k`'s delta without aborting subsequent stages.
+- **Deterministic LaTeX Canonicalization (`invar_agent/latex_normalizer.py`)**: Repairs JSON control-character escapes (`\x0crac -> \frac`, `\x08eta -> \beta`, `\x09heta -> \theta`, `\x0dho -> \rho`), auto-wraps bare math, canonicalizes ASCII-math hybrids, and balances `{}` and `\left`/`\right`.
+- **Stateless Direct Research vs. Context-Aware Planner Mode**:
+  - **Direct Research Mode (`/api/v1/research/run`)**: Strictly task-scoped and stateless; receives only the active research prompt (and explicitly attached `@research:<id>` items), never prior chat history or unrelated vault runs.
+  - **Planner Mode (`/api/v1/research/plan`, `/api/v1/research/plan-prompt`)**: Context-aware; receives chat context plus a structured Research Vault digest (`@research:<id>`, hypothesis, verified status, metrics, invariants) for follow-up planning.
 
-* Partitioned File Explorers: Strict separation between the Software Codebase (`[Codebase]`) and the Research Vault (`[Research Vault]`). Research runs are isolated under `.invar/research_vault/<run_id>/`, keeping the codebase root clean.
-* Center-Stage Research Viewer: Dedicated inspector interface providing full-text search across research runs, executive metric summaries, governing equation and constant cards, and verified `unified_module.py` kernels. Includes one-click context forwarding (`Build Software from this Research`) to the Builder Agent.
-* One-Click Software and Vault Archive Management:
-  * Export Software Codebase: Generates a sanitized `.zip` containing project source files, test suites, and build manifests while excluding scratch directories and virtual environments.
-  * Import Software Codebase: Extracts uploaded `.zip` archives with integrated Zip-Slip path-traversal validation.
-  * Export/Import Research Vault: Exports individual research runs or entire vault bundles as portable `.zip` archives, and ingests user research archives directly into the vault.
-* Integrated Workspace Terminal: Full-featured interactive terminal drawer powered by xterm.js, connected via WebSocket (`/api/v1/terminal/ws`) to a non-blocking asynchronous PTY process anchored in the active workspace directory.
-
----
-
-## Native Core Implementation Details
-
-The native core (`invar_agent._native`) executes performance-critical verification algorithms:
-
-* Girard GoI Wavefront Solver: Solves `EX(M, U) = (I - U * M)^(-1) * U`. When task graphs update incrementally, rank-k updates are evaluated via the Sherman-Morrison-Woodbury formula:
-  `K' = K + K * U * P * (I - Q^T * K * U * P)^(-1) * Q^T * K`
-  where `K = (I - U * M)^(-1)` and `Delta M = P * Q^T`. Includes condition number validation (kappa > 1e8 triggers a full recomputation) to protect against numerical instability.
-* Hierarchical Interaction Net (HIN) Arena: Slab-allocated, zero-heap interaction-net arena supporting active-pair reduction with the Python GIL released and no dynamic heap allocations.
-* MELL Linear Typing: Wires carry Multiplicative-Exponential Linear Logic types (`I`, `Tensor`, `Implication`, `Bang`), tracking resource consumption and preserving linearity.
-* Reflex Healer: Employs equality saturation (E-graphs) via the `egg` framework to simplify arithmetic expressions and repair ASTs deterministically without invoking LLMs.
+### Builder Agent
+- **Polyglot Compilation**: Synthesizes and verifies Python, C++20 C-ABI, and Rust targets.
+- **Research-to-Software Bridge (`invar_agent/builder/research_bridge.py`)**: Binds verified Research Vault artifacts across all 7 scientific/engineering archetypes using Three-Tier Research Resolution (explicit `@research:<id>`, keyword match, or implicit recent verified run).
+- **Automated Research-Parity Verification (`tests/test_research_parity.py`)**: Generates and executes `test_research_parity.py` asserting that software constants and invariants match the verified research bundle within tolerance.
+- **Precision Shield**: Enforces `math.isfinite`, bounded residuals, and zero unverified numerical drift during software builds.
 
 ---
 
-## Cognitive Router
+## 5. Workspace Platform and Web Console
 
-Operations are routed across a three-tier cognitive hierarchy:
-
-| Tier | Engine | Responsibilities |
-|---|---|---|
-| Tier-2 Pro | LLM (Reasoning) | Upfront planning, research hypothesis synthesis, final report formulation, and complex software scaffolding. |
-| Tier-1 Flash | LLM (Fast) | Search query formulation, parameter extraction, and bounded AST hole completion. |
-| Tier-0 Reflex | Rust Native & Z3 | 0-token operations: AST parsing, SMT checks, C-ABI/HIN compilation, execution, and E-graph repair. |
-
-Supported LLM providers include Gemini, OpenAI, DeepSeek, and OpenRouter.
+- **Partitioned File Explorers**: Separate `[Codebase]` workspace tree and `[Research Vault]` archive browser.
+- **Center-Stage Research Viewer**: Displays verified numerical metrics tables, extracted constants, governing equations, unified kernel code, and full reports with Markdown-protected KaTeX rendering (`katex.renderToString` after masking code spans and math delimiters).
+- **One-Click Software & Vault Archive Management**: Zip export/import for both software workspaces and `.invar/research_vault/` bundles.
+- **Zero-Leak Multi-Run Lifecycle**: Every run instantiates an isolated `ResearchStateMachine`, clears SSE replay history (`clear_history()`) on start so prior commit banners never bleed across runs, unloads compiled C-ABI shared library handles (`FreeLibrary`/`dlclose`), removes temporary `.cpp`/`.so`/`.dll` build artifacts in `finally:`, and runs `gc.collect()`.
+- **Integrated Workspace Terminal**: Embedded `xterm.js` terminal with fit addon for direct shell inspection.
 
 ---
 
-## Quickstart
+## 6. Native Core Implementation Details
+
+- **Girard GoI Wavefront Solver**: Constructs dependency adjacency matrix `M` and feedback/control matrix `U`, verifies `rho(U * M) < 1`, and executes rank-k Sherman-Morrison-Woodbury updates `(A + P * Q^T)^(-1) = A^(-1) - A^(-1) * P * (I + Q^T * A^(-1) * P)^(-1) * Q^T * A^(-1)` when adding stage contracts.
+- **Holographic Interaction Net (HIN) Arena**: Fixed-index arena nodes with active-pair interaction rules (annihilation, commutation), MELL exponential promotion/dereliction, and 3-hop causal fault slicing.
+- **Reverse-Mode Adjoint HIN**: Computes exact symbolic partial derivatives `J_ij = df_i / dx_j` and eigenvalue/stiffness bounds for ODE/PDE systems.
+- **MELL Linear Typing & `egg` E-Graph Reflex Healer**: Enforces linear resource usage and dimensional consistency (`SIDimensionVector`) alongside `egg` equality saturation for algebraic simplification (`log1p`, stiff IMEX forms) and sub-2 ms syntax/import healing.
+
+---
+
+## 7. Cognitive Router
+
+| Tier | Role | Default Model Routing | Typical Latency / Cost |
+|---|---|---|---|
+| **Tier-2 Pro** | Blueprint synthesis, Stage `2..N` accretion, final healing | Reasoning model (e.g., `deepseek-v4-pro`, `gemini-2.5-pro`) | Complex synthesis |
+| **Tier-1 Flash** | Planning, feasibility gate, literature queries, fast healing directives | Fast model (e.g., `deepseek-flash`, `gemini-2.5-flash`) | Low latency |
+| **Tier-0 Reflex** | `egg` e-graph, AST sanitizer, manifold projectors, contract conditioning | Deterministic Rust + Python AST | `< 2 ms` \| `0 Tokens` |
+
+Supported LLM providers (`invar_agent/llm/`): **DeepSeek**, **Gemini**, **OpenAI**, and **OpenRouter**.
+
+---
+
+## 8. Quickstart and Verification Suites
 
 ### Prerequisites
-
-* Python 3.10+
-* Rust toolchain (Cargo)
-* Clang++ with C++20 support
-* `uv` (recommended) or `pip`
+- Python 3.12+
+- Rust toolchain (`cargo`, `rustc`) and `maturin`
+- C++20 compiler (`clang++` or `g++`) on `PATH` for native C-ABI kernel execution
 
 ### Installation
-
 ```bash
-# Clone the repository
-git clone https://github.com/sys1own/invar-agent.git
-cd invar-agent
-
-# Set up virtual environment
-uv venv .venv --python 3.10
-source .venv/bin/activate
-
-# Install dependencies and build native extension
-uv pip install -e .
+python -m venv .venv
+# Windows: .venv\Scripts\activate  |  Linux/macOS: source .venv/bin/activate
+pip install maturin
 maturin develop --release
+pip install -e .
 ```
 
-### Launching the Workspace
+### Environment Variables
+Set one or more provider keys (or configure them in the Web Console settings modal):
+- `DEEPSEEK_API_KEY`
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
+- `OPENROUTER_API_KEY`
 
+### Launch the Web Console
 ```bash
-# Start the web console serving a workspace directory
-invar-agent serve ./my-workspace
-
-# Start with a specific provider preselected
-invar-agent serve ./my-workspace --provider deepseek
+uvicorn invar_agent.server:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://localhost:8000` in a browser. Configure API keys in the settings modal or export them in your shell environment:
-
+### Run Verification Suites
 ```bash
-export DEEPSEEK_API_KEY="your-api-key"
-export INVAR_LLM_PROVIDER="deepseek"
+# Rust native core tests
+cargo test --lib
+
+# Python unit and integration tests (offline/deterministic suite)
+pytest -q
 ```
 
----
-
-## Verification Suite
-
-Run the formal verification and integration test suite:
-
-```bash
-# Run Rust native unit tests
-cargo test --manifest-path invar_agent/_native/Cargo.toml
-
-# Run Python kernel and verification tests
-pytest -v -m "not live"
-
-# Run live provider end-to-end smoke test (requires API key)
-pytest -v -m live tests/test_llm_live.py
+### Repository Directory Tree
+```text
+invar-agent/
+├── Cargo.toml
+├── pyproject.toml
+├── README.md
+├── invar_agent/
+│   ├── _native/                  # Rust PyO3 crate (GoI, HIN, Adjoint, CSEL egg, HIS, Healer)
+│   ├── builder/                  # Research-to-Software Bridge & parity test generator
+│   ├── guards/                   # PreWrite_Guard, SHACL/Chiasmus, import pruner
+│   ├── healing/                  # Tier-0 deterministic AST sanitizer & reflex healer
+│   ├── llm/                      # Provider clients (DeepSeek, Gemini, OpenAI, OpenRouter)
+│   ├── research/                 # State machine, feasibility, planner, extractor, report, vault
+│   ├── runtime/                  # C-ABI bridge & isolated sandbox runner
+│   ├── schemas/                  # Pydantic v2 models for blueprints, contracts, and telemetry
+│   ├── static/                   # Web UI (index.html, marked, KaTeX, xterm.js)
+│   ├── transpiler/               # Python -> UAST -> C++20 / HIN emitters
+│   ├── verification/             # Z3 SMT & concolic verification
+│   ├── latex_normalizer.py       # Deterministic JSON escape repair & LaTeX canonicalizer
+│   └── server.py                 # FastAPI + SSE server
+└── tests/                        # Unit, regression, parity, and live integration tests
 ```
-
----
-
-## License
-
-This project is licensed under the MIT License. See LICENSE for details.

@@ -1313,6 +1313,12 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         has_llm = bool(state.api_key)
         prior_verdict = str((req.prior_feasibility or {}).get("verdict") or "")
         assume_feasible = prior_verdict in ("OPTIMAL_DIRECT", "REFORMULATED_SURROGATE")
+        # Direct Research Mode is strictly task-scoped & stateless: only pass
+        # explicit user-attached research IDs, never prior session/vault history.
+        direct_ctx = (
+            _research_vault_context(req.question, req.attached_research_ids)
+            if req.attached_research_ids else ""
+        )
         try:
             outcome = await generate_plan_with_feasibility(
                 req.question,
@@ -1320,7 +1326,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                 fallback=not has_llm,
                 assume_feasible=assume_feasible,
-                extra_context=_research_vault_context(req.question, req.attached_research_ids),
+                extra_context=direct_ctx,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

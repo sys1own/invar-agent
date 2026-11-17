@@ -47,6 +47,11 @@ class ResearchEventBroadcaster:
             if q in self._subscribers:
                 self._subscribers.remove(q)
 
+    def clear_history(self) -> None:
+        """Clear replayed event history so a new run never leaks prior commit banners."""
+        with self._lock:
+            self._history.clear()
+
     def publish(self, channel: str, event: str, data: Dict[str, Any]) -> None:
         """Thread-safe fan-out; safe to call from any thread/loop."""
         with self._lock:
@@ -93,6 +98,7 @@ class ResearchRunManager:
         if bp is None:
             return False
         self._abort.clear()
+        self.broadcaster.clear_history()
         machine = ResearchStateMachine(
             self.workspace_root / "research", progress_cb=self._progress,
             llm_planner=self.llm_planner, llm_fast=self.llm_fast,

@@ -278,11 +278,12 @@ _INVARIANT_FUNCS = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum,
 class _BufView:
     """Namespace shim giving invariant assertions ``buf.data`` / ``buf.size``."""
 
-    __slots__ = ("data", "size")
+    __slots__ = ("data", "size", "dt")
 
-    def __init__(self, state: List[float]):
+    def __init__(self, state: List[float], dt: float = 0.01):
         self.data = state
         self.size = len(state)
+        self.dt = dt
 
 
 _VARIANT_FALLBACK = {"residual": 0.0, "drift": 1e-3, "energy_drift": 1e-3,
@@ -1028,15 +1029,28 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                             f"clamped from {initial[k]} to 1.0")
                         initial[k] = 1.0
             gt_match = re.search(
-                r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*>\s*(-?[0-9.eE+-]+)", assertion)
+                r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*(>=?)\s*([0-9.eE+\-\s*/()]+?)(?:\s*(?:$|&&|\|\||and\b|or\b|>|<))",
+                assertion,
+            )
             if gt_match and k >= 4:
-                gt_bound = float(gt_match.group(1))
-                if -1e-6 <= gt_bound <= 1.0 and k < len(initial) and initial[k] <= gt_bound:
-                    new_v = (gt_bound + 1e-3) if gt_bound >= 0.0 else (gt_bound * 0.5)
-                    warnings.append(
-                        f"auto-init: strict positivity slot state[{k}] ({inv.variable_name}) "
-                        f"raised from {initial[k]} to {new_v}")
-                    initial[k] = new_v
+                from ..healing.deterministic_ast import _eval_numeric_const_expr
+                op_gt = gt_match.group(1)
+                gt_bound = _eval_numeric_const_expr(gt_match.group(2))
+                if gt_bound is not None:
+                    if op_gt == ">" and -1e-6 <= gt_bound <= 1.0:
+                        new_v = (gt_bound + 1e-3) if gt_bound >= 0.0 else (gt_bound * 0.5)
+                        if k < len(initial) and initial[k] <= gt_bound:
+                            warnings.append(
+                                f"auto-init: strict positivity slot state[{k}] ({inv.variable_name}) "
+                                f"raised from {initial[k]} to {new_v}")
+                            initial[k] = new_v
+                    elif gt_bound > 0.0:
+                        req_v = (gt_bound + 1e-12) if op_gt == ">" else gt_bound
+                        if k < len(initial) and initial[k] < req_v:
+                            warnings.append(
+                                f"auto-init: unified lower bound slot state[{k}] ({inv.variable_name}) "
+                                f"raised from {initial[k]} to {req_v}")
+                            initial[k] = req_v
     # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
     # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
     # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.
@@ -1129,8 +1143,9 @@ def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
 
 
 def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
-    """Infer missing ``variable_map`` entries from contract constraints so
-    report Section 1 and telemetry ``obs_*`` never leave contract metrics null."""
+    """Infer missing ``variable_map`` entries from contract constraints and AST
+    buffer bindings so report Section 1 and telemetry ``obs_*`` never leave
+    contract metrics null."""
     mapping: Dict[str, int] = dict(getattr(bp, "variable_map", None) or {})
     contracts = getattr(bp, "contracts", None) or []
     for contract in contracts:
@@ -1145,6 +1160,29 @@ def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
             slot = next(iter(distinct_slots))
             if inv.variable_name:
                 mapping.setdefault(inv.variable_name, slot)
+    # Also scan simulation_step / layer_1_step AST for `<var> = buf.data[idx]` and `buf.data[idx] = <var>`
+    src = getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
+    if src.strip():
+        try:
+            tree = ast.parse(src)
+            for fn in tree.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                if fn.name not in ("simulation_step", "layer_1_step"):
+                    continue
+                for stmt in ast.walk(fn):
+                    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                        tgt, val = stmt.targets[0], stmt.value
+                        if isinstance(tgt, ast.Name) and isinstance(val, ast.Subscript):
+                            m_idx = re.search(r"\[(\d+)\]", ast.unparse(val))
+                            if m_idx and not tgt.id.startswith("_invar_"):
+                                mapping.setdefault(tgt.id, int(m_idx.group(1)))
+                        elif isinstance(val, ast.Name) and isinstance(tgt, ast.Subscript):
+                            m_idx = re.search(r"\[(\d+)\]", ast.unparse(tgt))
+                            if m_idx and not val.id.startswith("_invar_"):
+                                mapping.setdefault(val.id, int(m_idx.group(1)))
+        except SyntaxError:
+            pass
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
@@ -1387,6 +1425,14 @@ class ResearchStateMachine:
             return await self._run_stages(state)
         except Exception as exc:  # noqa: BLE001 - bulletproof exception shield
             return await self._handle_loop_exception(state, exc)
+        finally:
+            try:
+                if hasattr(self.bridge, "cleanup_scratch"):
+                    self.bridge.cleanup_scratch()
+            except Exception:  # noqa: BLE001
+                pass
+            import gc as _gc
+            _gc.collect()
 
     async def _run_stages(self, state: ResearchRunState) -> ResearchRunState:
         """Drive the accretive stage loop (wrapped by run()'s shield)."""

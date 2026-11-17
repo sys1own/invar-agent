@@ -587,3 +587,109 @@ def test_latex_normalizer_repairs_escapes_wraps_bare_math_and_balances_braces():
     # No unpaired braces inside $...$
     for seg in norm.split("$")[1::2]:
         assert seg.count("{") == seg.count("}")
+
+
+def test_1arg_signature_normalization_auto_variable_map_and_s2_projection():
+    """1-arg simulation_step(buf) with buf.dt must normalize to (buf, dt=0.01),
+    _auto_populate_variable_map must recover slot mappings from AST, and
+    S^2 unit-sphere projection must keep ||m||_2 == 1.0."""
+    from invar_agent.research.state_machine import _auto_populate_variable_map
+    from invar_agent.schemas.research import InvariantConstraint, ResearchBlueprint, VerificationContract
+
+    code = '''def simulation_step(buf):
+    dt = buf.dt
+    mx = buf.data[0]
+    my = buf.data[1]
+    mz = buf.data[2]
+    buf.data[0] = mx + 0.1 * dt * my
+    buf.data[1] = my - 0.1 * dt * mx
+    buf.data[2] = mz + 0.05 * dt
+    buf.data[6] = abs(buf.data[0]**2 + buf.data[1]**2 + buf.data[2]**2 - 1.0)
+'''
+    c1 = VerificationContract(
+        contract_id="c1_llg_sphere_norm",
+        target_backend="cpp",
+        dt=0.05,
+        steps=100,
+        initial_state=[0.6, 0.0, 0.8] + [0.0] * 7,
+        invariants=[InvariantConstraint(variable_name="sphere_norm_drift_max", assertion="state[6] <= 1e-14")],
+    )
+    san = sanitize_intrinsics(code, contracts=[c1], all_contracts=[c1])
+    assert "def simulation_step(buf, dt=0.01):" in san.code
+    assert "buf.dt" not in san.code
+    assert "_invar_project_sphere_s2" in san.code
+
+    bp = ResearchBlueprint(
+        blueprint_id="cayley_llg_macrospin",
+        title="LLG Macrospin",
+        falsifiable_hypothesis="S2 norm conserved",
+        search_queries=["llg macrospin"],
+        code_template=san.code,
+        contracts=[c1],
+        variable_map={},
+    )
+    _auto_populate_variable_map(bp)
+    assert bp.variable_map.get("sphere_norm_drift_max") == 6
+    assert bp.variable_map.get("mx") == 0
+
+    ns = {}
+    exec(san.code, ns)
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+            self.size = len(data)
+
+    b = Buf([0.6, 0.0, 0.8] + [0.0] * 7)
+    for _ in range(100):
+        ns["simulation_step"](b, 0.05)
+    norm2 = b.data[0] ** 2 + b.data[1] ** 2 + b.data[2] ** 2
+    assert abs(norm2 - 1.0) <= 1e-14
+
+
+def test_const_expr_lower_bound_running_min_sentinel_and_tuple_unpacking_cpp(tmp_path):
+    """Constant-expression lower bounds (state[9] >= 3.0 - 1e-12) must fold,
+    running-min sentinel `if buf.data[9] == 0.0` must rewrite to <= 3.0, and
+    tuple unpacking must desugar cleanly for C++20 lowering."""
+    from invar_agent.research.state_machine import _guard_contract_initial_state, _lower_kernel
+    from invar_agent.schemas.research import InvariantConstraint, VerificationContract
+
+    code = '''def simulation_step(buf, dt):
+    qx = buf.data[0]
+    qy = buf.data[1]
+    px = buf.data[2]
+    py = buf.data[3]
+    buf.data[0], buf.data[1], buf.data[2], buf.data[3] = (qx + dt * px, qy + dt * py, px, py)
+    r = (buf.data[0] * buf.data[0] + buf.data[1] * buf.data[1]) ** 0.5
+    if buf.data[9] == 0.0 or r < buf.data[9]:
+        buf.data[9] = r
+'''
+    c1 = VerificationContract(
+        contract_id="c1_kepler", target_backend="cpp", dt=0.02, steps=100,
+        initial_state=[3.5, 0.0, 0.0, 0.5] + [0.0] * 8,
+        invariants=[InvariantConstraint(variable_name="radius_positive", assertion="state[9] > 0.0")],
+    )
+    c2 = VerificationContract(
+        contract_id="c2_isco", target_backend="cpp", dt=0.2, steps=100,
+        initial_state=[3.5, 0.0, 0.0, 0.5] + [0.0] * 8,
+        invariants=[InvariantConstraint(variable_name="min_radius", assertion="state[9] >= 3.0 - 1e-12")],
+    )
+    san = sanitize_intrinsics(code, contracts=[c1], all_contracts=[c1, c2])
+    assert "_invar_tup_1" in san.code
+    assert "if buf.data[9] < 2.999999999999:" in san.code
+    _uast, cpp_code = _lower_kernel(san.code)
+    assert "simulation_step" in cpp_code
+
+    init, _ = _guard_contract_initial_state(san.code, c1, all_contracts=[c1, c2])
+    assert init[9] >= 3.0 - 1e-12
+
+
+def test_broadcaster_clear_history_prevents_cross_run_banner_leak():
+    """Clearing broadcaster history on a new run prevents Run 1 banners from replaying in Run 2."""
+    from invar_agent.research.broadcaster import ResearchEventBroadcaster
+
+    b = ResearchEventBroadcaster()
+    b.publish("accelerator_log", "stage_committed", {"blueprint_id": "hw_triad_poisson_integrator"})
+    b.clear_history()
+    q = b.subscribe()
+    assert q.empty()

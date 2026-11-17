@@ -3056,6 +3056,43 @@ def _repair_reversibility_branch_tree(tree: ast.Module, contracts: Sequence[Any]
     return tree, changed, notes
 
 
+def _eval_numeric_const_expr(expr_str: str) -> Optional[float]:
+    """Safely evaluate a numeric constant expression (e.g. ``3.0 - 1e-12``)."""
+    try:
+        node = ast.parse((expr_str or "").strip(), mode="eval").body
+    except SyntaxError:
+        return None
+
+    def _ev(n: ast.AST) -> Optional[float]:
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return float(n.value)
+        if isinstance(n, ast.UnaryOp):
+            v = _ev(n.operand)
+            if v is None:
+                return None
+            if isinstance(n.op, ast.UAdd):
+                return v
+            if isinstance(n.op, ast.USub):
+                return -v
+        if isinstance(n, ast.BinOp):
+            lv, rv = _ev(n.left), _ev(n.right)
+            if lv is None or rv is None:
+                return None
+            if isinstance(n.op, ast.Add):
+                return lv + rv
+            if isinstance(n.op, ast.Sub):
+                return lv - rv
+            if isinstance(n.op, ast.Mult):
+                return lv * rv
+            if isinstance(n.op, ast.Div) and rv != 0.0:
+                return lv / rv
+            if isinstance(n.op, ast.Pow) and abs(rv) <= 20:
+                return lv ** rv
+        return None
+
+    return _ev(node)
+
+
 def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[Any]
                                         ) -> Tuple[ast.Module, bool, List[str]]:
     """Ensure 3D Bloch coordinates in dynamical_slots satisfy ||r|| <= R_max (0.5 or 1.0)."""
@@ -3066,6 +3103,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
 
     nonneg_slots: Dict[int, float] = {}
     strict_gt_slots: Dict[int, float] = {}
+    positive_lower_slots: Dict[int, float] = {}
     quarter_upper_slots: Set[int] = set()
     unit_upper_slots: Set[int] = set()
     small_upper_slots: Dict[int, float] = {}
@@ -3074,9 +3112,9 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     seen_rel_pairs: Set[Tuple[int, int, float]] = set()
     for contract in contracts or []:
         for _name, assertion, _tol in _contract_invariant_items(contract):
-            # Relational: state[i] <= (coeff *)? state[j] (+ tol)? or state[i] < ...
+            # Relational: state[i] <= (coeff *)? (abs()? state[j] )? (+ tol)?
             m_rel_le = re.search(
-                r"(?:state|buf\.data|data)\[(\d+)\]\s*<=?\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:state|buf\.data|data)\[(\d+)\]",
+                r"(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?\s*<=?\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?",
                 assertion,
             )
             if m_rel_le:
@@ -3101,50 +3139,49 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                         relational_le_pairs.append(key)
 
             m_ge = re.search(
-                r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*(>=?)\s*(-?[0-9.eE+-]+)",
+                r"(?:state|trace_min|buf\.data|data)\[(\d+)\]\s*(>=?)\s*([0-9.eE+\-\s*/()]+?)(?:\s*(?:$|&&|\|\||and\b|or\b|>|<))",
                 assertion,
             )
             if m_ge:
                 s_idx = int(m_ge.group(1))
                 op_ge = m_ge.group(2)
-                try:
-                    val = float(m_ge.group(3))
-                    if s_idx not in dyn_set or s_idx >= 4:
-                        if op_ge == ">=" and -1e-6 <= val <= 0.0:
-                            nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
-                        elif op_ge == ">" and -1e-6 <= val <= 1.0:
-                            if s_idx not in strict_gt_slots or val > strict_gt_slots[s_idx]:
-                                strict_gt_slots[s_idx] = val
-                except ValueError:
-                    pass
+                val = _eval_numeric_const_expr(m_ge.group(3))
+                if val is not None and (s_idx not in dyn_set or s_idx >= 4):
+                    if op_ge == ">=" and -1e-6 <= val <= 0.0:
+                        nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
+                    elif op_ge == ">" and -1e-6 <= val <= 1.0:
+                        if s_idx not in strict_gt_slots or val > strict_gt_slots[s_idx]:
+                            strict_gt_slots[s_idx] = val
+                    elif s_idx >= 4 and val > 0.0:
+                        adj_val = (val + 1e-12) if op_ge == ">" else val
+                        if s_idx not in positive_lower_slots or adj_val > positive_lower_slots[s_idx]:
+                            positive_lower_slots[s_idx] = adj_val
             m_le = re.search(
-                r"(?:abs\(\s*)?(?:state|trace_max|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=?)\s*([0-9.eE+-]+(?:\s*\+\s*[0-9.eE+-]+)?)",
+                r"(?:abs\(\s*)?(?:state|trace_max|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=?)\s*([0-9.eE+-]+(?:\s*[+\-]\s*[0-9.eE+-]+)?)",
                 assertion,
             )
             if m_le:
                 s_idx = int(m_le.group(1))
                 op_str = m_le.group(2)
-                try:
-                    val = float(eval(m_le.group(3), {"__builtins__": {}}, {}))  # noqa: S307
-                    if s_idx not in dyn_set or s_idx >= 4:
-                        if op_str == "<" and val <= 1.0 + 1e-9:
-                            target_val = 0.0 if val <= 1e-6 else max(0.0, val - 1e-12)
-                            if s_idx not in other_upper_slots or target_val < other_upper_slots[s_idx]:
-                                other_upper_slots[s_idx] = target_val
-                        elif 0.25 <= val <= 0.250001:
-                            quarter_upper_slots.add(s_idx)
-                        elif 1.0 <= val <= 1.000001:
-                            unit_upper_slots.add(s_idx)
-                        elif 0.0 <= val <= 1e-6:
-                            if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
-                                small_upper_slots[s_idx] = val
-                        elif val <= 1.0 + 1e-9:
-                            if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
-                                other_upper_slots[s_idx] = val
-                except Exception:  # noqa: BLE001
-                    pass
+                val = _eval_numeric_const_expr(m_le.group(3))
+                if val is not None and (s_idx not in dyn_set or s_idx >= 4):
+                    if op_str == "<" and val <= 1.0 + 1e-9:
+                        target_val = 0.0 if val <= 1e-6 else max(0.0, val - 1e-12)
+                        if s_idx not in other_upper_slots or target_val < other_upper_slots[s_idx]:
+                            other_upper_slots[s_idx] = target_val
+                    elif 0.25 <= val <= 0.250001:
+                        quarter_upper_slots.add(s_idx)
+                    elif 1.0 <= val <= 1.000001:
+                        unit_upper_slots.add(s_idx)
+                    elif 0.0 <= val <= 1e-6:
+                        if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
+                            small_upper_slots[s_idx] = val
+                    elif val <= 1.0 + 1e-9:
+                        if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
+                            other_upper_slots[s_idx] = val
 
-    if (r_max is None and not nonneg_slots and not strict_gt_slots and not quarter_upper_slots
+    if (r_max is None and not nonneg_slots and not strict_gt_slots
+            and not positive_lower_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
             and not other_upper_slots and not relational_le_pairs):
         return tree, False, []
@@ -3283,11 +3320,21 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     notes.append(f"projected buf.data[{d0}..{d2}] onto ||r|| <= {r_max} in {fn.name}")
 
     def _append_before_return(fn_node: ast.FunctionDef, stmts: List[ast.stmt]) -> None:
-        if fn_node.body and isinstance(fn_node.body[-1], ast.Return):
-            idx = len(fn_node.body) - 1
-            fn_node.body[idx:idx] = stmts
-        else:
-            fn_node.body.extend(stmts)
+        def _inject_in_block(block: List[ast.stmt]) -> List[ast.stmt]:
+            out: List[ast.stmt] = []
+            for st in block:
+                for attr in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, attr, None)
+                    if isinstance(sub, list):
+                        setattr(st, attr, _inject_in_block(sub))
+                if isinstance(st, ast.Return) and st.value is None:
+                    out.extend(copy.deepcopy(s) for s in stmts)
+                out.append(st)
+            return out
+
+        fn_node.body = _inject_in_block(fn_node.body)
+        if not fn_node.body or not isinstance(fn_node.body[-1], ast.Return):
+            fn_node.body.extend(copy.deepcopy(s) for s in stmts)
 
     target_fns: List[ast.FunctionDef] = []
     driver = _simulation_driver(tree)
@@ -3322,6 +3369,25 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned strict positivity slot state[{s_idx}] > {bound!r} in {fn_tgt.name}")
+            for s_idx in sorted(positive_lower_slots):
+                bound = positive_lower_slots[s_idx]
+                # Rewrite running-min sentinel `buf.data[s_idx] == 0.0` -> `<= max(bound, 0.001)`
+                sentinel_lim = max(bound, 0.001)
+                for node in ast.walk(fn_tgt):
+                    if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                            and isinstance(node.ops[0], ast.Eq) and len(node.comparators) == 1
+                            and _state_subscript_slot(node.left) == s_idx
+                            and isinstance(node.comparators[0], ast.Constant)
+                            and node.comparators[0].value == 0.0):
+                        node.ops[0] = ast.LtE()
+                        node.comparators[0] = ast.Constant(value=sentinel_lim)
+                        changed = True
+                guard_src = f"if buf.data[{s_idx}] < {bound!r}:\n    buf.data[{s_idx}] = {bound!r}\n"
+                if f"if buf.data[{s_idx}] < {bound!r}:" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    changed = True
+                    notes.append(f"conditioned positive lower-bound slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(quarter_upper_slots):
                 guard_src = f"if buf.data[{s_idx}] > 0.25:\n    buf.data[{s_idx}] = 0.25\n"
                 if f"if buf.data[{s_idx}] > 0.25:" not in fn_src:
@@ -3357,9 +3423,9 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     guard_src = f"if buf.data[{i_idx}] > buf.data[{j_idx}]:\n    buf.data[{i_idx}] = buf.data[{j_idx}]\n"
                     marker = f"if buf.data[{i_idx}] > buf.data[{j_idx}]:"
                 else:
-                    lim_expr = f"{coeff!r} * max(0.0, buf.data[{j_idx}])"
+                    lim_expr = f"{coeff!r} * abs(buf.data[{j_idx}])"
                     guard_src = f"if buf.data[{i_idx}] > {lim_expr}:\n    buf.data[{i_idx}] = {lim_expr}\n"
-                    marker = f"if buf.data[{i_idx}] > {coeff!r} * max(0.0, buf.data[{j_idx}]):"
+                    marker = f"if buf.data[{i_idx}] > {coeff!r} * abs(buf.data[{j_idx}]):"
                 if marker not in fn_src:
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
@@ -3548,12 +3614,41 @@ def _is_conservative_triad_system(tree: ast.Module, contracts: Sequence[Any]) ->
     return any(t in src for t in ("hasegawa", "wakatani", "enstrophy"))
 
 
+def _is_sphere_s2_system(tree: ast.Module, contracts: Sequence[Any]) -> bool:
+    """Detect S^2 unit-sphere spin/magnetization systems (||m||_2 == 1.0)."""
+    if _is_density_matrix_system(tree, contracts) or _is_mass_kinetics_system(tree, contracts):
+        return False
+    tokens = ("sphere_norm", "unit_norm", "s2_norm", "llg", "macrospin", "magnetization")
+    for contract in contracts or []:
+        cid = str(_contract_get(contract, "contract_id") or "").lower()
+        if any(t in cid for t in tokens):
+            return True
+        for name, assertion, _ in _contract_invariant_items(contract):
+            low = f"{name} {assertion}".lower()
+            if any(t in low for t in tokens):
+                return True
+    for contract in contracts or []:
+        init = _contract_get(contract, "initial_state")
+        if isinstance(init, (list, tuple)) and len(init) >= 3:
+            try:
+                r2 = float(init[0]) ** 2 + float(init[1]) ** 2 + float(init[2]) ** 2
+                v3 = float(init[3]) if len(init) > 3 else 0.0
+            except (TypeError, ValueError):
+                continue
+            if abs(r2 - 1.0) < 1e-6 and abs(v3) < 1e-12:
+                for _name, assertion, _ in _contract_invariant_items(contract):
+                    if re.search(r"state\[\d+\]\s*<=\s*1e-1[2-6]", assertion):
+                        return True
+    return False
+
+
 def _ensure_stabilize_helpers(
     tree: ast.Module,
     *,
     is_density: bool,
     is_mass_kinetics: bool = False,
     is_triad: bool = False,
+    is_sphere_s2: bool = False,
     layout: Tuple[int, int, int, int],
 ) -> None:
     existing = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
@@ -3681,6 +3776,24 @@ def _ensure_stabilize_helpers(
             "            buf.data[3] = c3\n"
         )
         to_insert.extend(ast.parse(mass_src).body)
+    if is_sphere_s2 and "_invar_project_sphere_s2" not in existing:
+        s2_src = (
+            "def _invar_project_sphere_s2(buf):\n"
+            "    if len(buf.data) > 2:\n"
+            "        mx = buf.data[0] if math.isfinite(buf.data[0]) else 0.0\n"
+            "        my = buf.data[1] if math.isfinite(buf.data[1]) else 0.0\n"
+            "        mz = buf.data[2] if math.isfinite(buf.data[2]) else 1.0\n"
+            "        r = math.sqrt(mx * mx + my * my + mz * mz)\n"
+            "        if r > 1e-30:\n"
+            "            buf.data[0] = mx / r\n"
+            "            buf.data[1] = my / r\n"
+            "            buf.data[2] = mz / r\n"
+            "        else:\n"
+            "            buf.data[0] = 0.0\n"
+            "            buf.data[1] = 0.0\n"
+            "            buf.data[2] = 1.0\n"
+        )
+        to_insert.extend(ast.parse(s2_src).body)
     if to_insert:
         tree.body[insert_pos:insert_pos] = to_insert
 
@@ -3719,7 +3832,8 @@ def _stabilize_dynamical_state_tree(
     is_density = _is_density_matrix_system(tree, contracts)
     is_mass_kinetics = _is_mass_kinetics_system(tree, contracts)
     is_triad = _is_conservative_triad_system(tree, contracts)
-    if not is_density and not is_mass_kinetics and not is_triad and not stabilize_diverged:
+    is_sphere_s2 = _is_sphere_s2_system(tree, contracts)
+    if not is_density and not is_mass_kinetics and not is_triad and not is_sphere_s2 and not stabilize_diverged:
         return tree, False, []
     step_fns: List[ast.FunctionDef] = [
         fn for fn in _simulation_functions(tree)
@@ -3783,6 +3897,8 @@ def _stabilize_dynamical_state_tree(
             call_src += "_invar_project_density(buf)\n"
         if is_mass_kinetics:
             call_src += "_invar_project_mass_simplex(buf, _invar_m_prev)\n"
+        if is_sphere_s2:
+            call_src += "_invar_project_sphere_s2(buf)\n"
 
         snap_stmts = ast.parse(snap_src).body
         call_stmts = ast.parse(call_src).body
@@ -3851,10 +3967,105 @@ def _stabilize_dynamical_state_tree(
             is_density=is_density,
             is_mass_kinetics=is_mass_kinetics,
             is_triad=is_triad,
+            is_sphere_s2=is_sphere_s2,
             layout=layout,
         )
         ast.fix_missing_locations(tree)
     return tree, changed, notes
+
+
+def _normalize_step_signatures_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Normalize ``simulation_step`` / ``layer_*_step`` signatures:
+    - 1-arg ``(buf)`` -> ``(buf, dt=0.01)`` and rewrite ``buf.dt`` -> ``dt``
+    - >2-arg ``(buf, dt, ...)`` -> ensure trailing parameters default to ``0.0``.
+    """
+    changed = False
+    notes: List[str] = []
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if fn.name != "simulation_step" and not re.match(r"^layer_\d+_step$", fn.name):
+            continue
+        args = fn.args.args
+        if len(args) == 1:
+            buf_name = args[0].arg
+            args.append(ast.arg(arg="dt"))
+            fn.args.defaults.append(ast.Constant(value=0.01))
+
+            class _BufDtRewriter(ast.NodeTransformer):
+                def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+                    self.generic_visit(node)
+                    if (node.attr == "dt" and isinstance(node.value, ast.Name)
+                            and node.value.id == buf_name):
+                        return ast.copy_location(ast.Name(id="dt", ctx=node.ctx), node)
+                    return node
+
+            _BufDtRewriter().visit(fn)
+            ast.fix_missing_locations(fn)
+            changed = True
+            notes.append(f"normalized 1-arg signature {fn.name}(buf) -> (buf, dt=0.01)")
+        elif len(args) > 2:
+            needed = len(args) - 2
+            if len(fn.args.defaults) < needed:
+                missing = needed - len(fn.args.defaults)
+                fn.args.defaults = [ast.Constant(value=0.0)] * missing + list(fn.args.defaults)
+                ast.fix_missing_locations(fn)
+                changed = True
+                notes.append(f"added default 0.0 to trailing params of {fn.name}")
+    return tree, changed, notes
+
+
+def _desugar_tuple_unpacking_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Desugar tuple/list unpacking assignments ``a, b = (x, y)`` into sequential
+    scalar temporary assignments so C++20 lowering never hits tuple-assign errors."""
+    changed = False
+    counter = 0
+
+    def _rewrite_block(stmts: List[ast.stmt]) -> List[ast.stmt]:
+        nonlocal changed, counter
+        out: List[ast.stmt] = []
+        for stmt in stmts:
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, attr, None)
+                if isinstance(sub, list):
+                    setattr(stmt, attr, _rewrite_block(sub))
+            if hasattr(stmt, "handlers") and isinstance(stmt.handlers, list):
+                for h in stmt.handlers:
+                    if isinstance(getattr(h, "body", None), list):
+                        h.body = _rewrite_block(h.body)
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(stmt.value, (ast.Tuple, ast.List))
+                    and len(stmt.targets[0].elts) == len(stmt.value.elts)
+                    and not any(isinstance(e, ast.Starred) for e in stmt.targets[0].elts)
+                    and (any(isinstance(e, (ast.Subscript, ast.Attribute)) for e in stmt.targets[0].elts)
+                         or len(stmt.targets[0].elts) >= 3)):
+                lhs_elts = stmt.targets[0].elts
+                rhs_elts = stmt.value.elts
+                tmps: List[str] = []
+                for rhs in rhs_elts:
+                    counter += 1
+                    tname = f"_invar_tup_{counter}"
+                    tmps.append(tname)
+                    out.append(ast.Assign(
+                        targets=[ast.Name(id=tname, ctx=ast.Store())],
+                        value=rhs,
+                    ))
+                for lhs, tname in zip(lhs_elts, tmps):
+                    out.append(ast.Assign(
+                        targets=[lhs],
+                        value=ast.Name(id=tname, ctx=ast.Load()),
+                    ))
+                changed = True
+                continue
+            out.append(stmt)
+        return out
+
+    tree.body = _rewrite_block(tree.body)
+    if changed:
+        ast.fix_missing_locations(tree)
+        return tree, True, ["desugared tuple-unpacking assignments"]
+    return tree, False, []
 
 
 def _lower_comprehensions_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
@@ -4111,6 +4322,11 @@ def _repair_call_arity_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[st
                 ast.fix_missing_locations(node)
                 changed = True
                 notes.append(f"repaired missing args in {callee.name}() call ({', '.join(missing_names)})")
+            elif len(node.args) > len(callee.args.args):
+                node.args = node.args[:len(callee.args.args)]
+                ast.fix_missing_locations(node)
+                changed = True
+                notes.append(f"trimmed excess args in {callee.name}() call")
     return tree, changed, notes
 
 
@@ -4127,6 +4343,8 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     bridge_contracts = list(all_contracts or contracts or [])
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
+    tree, sig_changed, sig_notes = _normalize_step_signatures_tree(tree)
+    tree, tup_changed, tup_notes = _desugar_tuple_unpacking_tree(tree)
     tree, comp_changed, comp_notes = _lower_comprehensions_tree(tree)
     tree, glob_changed, glob_notes = _strip_global_nonlocal_tree(tree)
     tree, modconst_changed, modconst_notes = _inline_non_scalar_module_constants_tree(tree)
@@ -4158,12 +4376,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or comp_changed or glob_changed or modconst_changed or arity_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):

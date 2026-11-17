@@ -378,29 +378,54 @@ class DynamicCABIBridge:
                     except OSError:
                         pass
         lib = ctypes.CDLL(str(so_path))
-        fn = getattr(lib, entry, None)
-        if fn is None:
-            raise KernelExecutionError(f"entry point {entry} not exported")
-        fn.argtypes = [ctypes.POINTER(SimulationBuffer)]
-        fn.restype = None
-        n = len(initial_state)
-        data = (ctypes.c_double * n)(*initial_state)
-        buf = SimulationBuffer(size=n, dt=dt, steps=0, data=data)
-        run_start = time.perf_counter()
-        for _ in range(steps):
-            fn(ctypes.byref(buf))
-        run_ms = (time.perf_counter() - run_start) * 1000.0
-        state = list(data)
-        finite = all(math.isfinite(v) for v in state)
-        return {
-            "state": state,
-            "steps": int(buf.steps),
-            "finite": finite,
-            "execution_time_ms": run_ms,
-            "run_ms": run_ms + compile_ms,
-            "compile_ms": compile_ms,
-            "bundle_hash": key,
-        }
+        try:
+            fn = getattr(lib, entry, None)
+            if fn is None:
+                raise KernelExecutionError(f"entry point {entry} not exported")
+            fn.argtypes = [ctypes.POINTER(SimulationBuffer)]
+            fn.restype = None
+            n = len(initial_state)
+            data = (ctypes.c_double * n)(*initial_state)
+            buf = SimulationBuffer(size=n, dt=dt, steps=0, data=data)
+            run_start = time.perf_counter()
+            for _ in range(steps):
+                fn(ctypes.byref(buf))
+            run_ms = (time.perf_counter() - run_start) * 1000.0
+            state = list(data)
+            finite = all(math.isfinite(v) for v in state)
+            return {
+                "state": state,
+                "steps": int(buf.steps),
+                "finite": finite,
+                "execution_time_ms": run_ms,
+                "run_ms": run_ms + compile_ms,
+                "compile_ms": compile_ms,
+                "bundle_hash": key,
+            }
+        finally:
+            handle = getattr(lib, "_handle", None)
+            del lib
+            if handle is not None:
+                try:
+                    import _ctypes
+                    if os.name == "nt":
+                        _ctypes.FreeLibrary(handle)
+                    else:
+                        _ctypes.dlclose(handle)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def cleanup_scratch(self) -> None:
+        """Remove temporary C-ABI build files in cache_dir to prevent disk/handle leaks."""
+        cache = getattr(self, "cache_dir", None)
+        if cache is None or not Path(cache).is_dir():
+            return
+        for p in Path(cache).iterdir():
+            if p.is_file() and p.suffix in (".cpp", ".so", ".dll", ".pyd", ".exp", ".lib", ".o"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     # -- isolated subprocess (Sandbox_Execute) ------------------------------
     def _run_subprocess(self, so_path: Path, entry: str, initial_state,
