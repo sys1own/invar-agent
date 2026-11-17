@@ -1040,6 +1040,7 @@ def canonicalize_contract_dicts(
     slot_owner: Dict[int, str] = {}
     slot_owner_contract: Dict[int, str] = {}
     slot_eq_target: Dict[int, float] = {}
+    slot_init_val: Dict[int, float] = {}
     name_order: List[str] = []
     remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
 
@@ -1075,15 +1076,22 @@ def canonicalize_contract_dicts(
             return
         desired = int(desired)
         eq_target = _extract_eq_target(assertion)
+        c_init = c.get("initial_state") if isinstance(c.get("initial_state"), list) else []
+        init_v = float(c_init[desired]) if desired < len(c_init) else None
         if desired in (0, 1, 2, 3):
             prev_t = slot_eq_target.get(desired)
             prev_cid = slot_owner_contract.get(desired)
-            if (eq_target is not None and prev_cid is not None and prev_cid != c_id
-                    and (prev_t is None or abs(prev_t - eq_target) > 1e-3)):
-                pass  # Mutually exclusive / cross-contract target on dynamical slot -> remap below
+            prev_owner = slot_owner.get(desired)
+            prev_iv = slot_init_val.get(desired)
+            init_clash = (init_v is not None and prev_iv is not None and abs(init_v - prev_iv) > 1e-6)
+            target_clash = (eq_target is not None and (prev_t is None or abs(prev_t - eq_target) > 1e-3))
+            if prev_cid is not None and prev_cid != c_id and prev_owner != name and (target_clash or init_clash):
+                pass  # Mutually exclusive / cross-contract target or initial value on 0..3 -> remap below
             else:
                 if eq_target is not None:
                     slot_eq_target.setdefault(desired, eq_target)
+                if init_v is not None:
+                    slot_init_val.setdefault(desired, init_v)
                 slot_owner.setdefault(desired, name)
                 slot_owner_contract.setdefault(desired, c_id)
                 return
@@ -1118,6 +1126,12 @@ def canonicalize_contract_dicts(
         if new in (0, 1, 2, 3):
             continue
         inv["assertion"] = _canon_rewrite_slots(str(inv.get("assertion") or ""), old, new)
+        c_init = c.get("initial_state")
+        if isinstance(c_init, list):
+            while len(c_init) <= new:
+                c_init.append(0.0)
+            if old < len(c_init) and c_init[new] == 0.0 and c_init[old] != 0.0:
+                c_init[new] = c_init[old]
         notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
 
     # Canonicalize explicit variable_map entries against contract-owned names.
@@ -1180,11 +1194,38 @@ def canonicalize_contract_dicts(
 
 def canonical_slot_map_text(contracts: List[Dict[str, Any]],
                             variable_map: Optional[Dict[str, int]] = None) -> str:
-    """Human-readable canonical slot table for synthesis prompts."""
-    _, vm, _ = canonicalize_contract_dicts(contracts, variable_map)
-    if not vm:
+    """Human-readable Canonical Global State Slot Table for synthesis prompts."""
+    canon_contracts, vm, _ = canonicalize_contract_dicts(contracts, variable_map)
+    slot_info: Dict[int, Dict[str, Any]] = {}
+    for name, idx in sorted(vm.items()):
+        slot_info.setdefault(int(idx), {"names": [], "init": None, "bounds": []})
+        if name not in slot_info[int(idx)]["names"]:
+            slot_info[int(idx)]["names"].append(name)
+    for c in canon_contracts:
+        init = c.get("initial_state") if isinstance(c.get("initial_state"), list) else []
+        for inv in (c.get("invariants") or []):
+            if not isinstance(inv, dict):
+                continue
+            nm = str(inv.get("variable_name") or "").strip()
+            expr = str(inv.get("assertion") or "").strip()
+            for s in sorted(set(_canon_slots_in_text(expr))):
+                entry = slot_info.setdefault(s, {"names": [], "init": None, "bounds": []})
+                if nm and nm not in entry["names"]:
+                    entry["names"].append(nm)
+                if entry["init"] is None and s < len(init):
+                    entry["init"] = init[s]
+                if expr and expr not in entry["bounds"]:
+                    entry["bounds"].append(expr)
+    if not slot_info:
         return "(no named observables)"
-    return "\n".join(f"- `{name}` -> state[{idx}]" for name, idx in sorted(vm.items()))
+    lines = []
+    for idx in sorted(slot_info):
+        info = slot_info[idx]
+        nm = "/".join(info["names"][:2]) or f"slot_{idx}"
+        iv = info["init"] if info["init"] is not None else 0.0
+        bnds = "; ".join(info["bounds"][:2]) or "unconstrained"
+        lines.append(f"- `state[{idx}]`: `{nm}` (initial={iv}, invariants: {bnds})")
+    return "\n".join(lines)
 
 
 def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1656,7 +1697,10 @@ async def refine_stage_code(llm_complete: Callable[[str], Any], *, objective: st
                             code: str, contracts: List[Dict[str, Any]],
                             failure: str) -> Optional[str]:
     """Tier-2: repair failing kernel code using the counterexample (contracts fixed)."""
-    prompt = _fill(REFINE_PROMPT, tools=TOOLS_CONTEXT, objective=objective, code=code.strip(),
+    slot_table = canonical_slot_map_text(contracts)
+    prompt = _fill(REFINE_PROMPT, tools=TOOLS_CONTEXT,
+                   objective=f"{objective}\n\n## Canonical Global State Slot Table\n{slot_table}",
+                   code=code.strip(),
                    contracts=json.dumps(contracts, indent=1)[:6000], failure=failure[:3000])
     raw = await llm_complete(prompt)
     data = _extract_json(str(raw))

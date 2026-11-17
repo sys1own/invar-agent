@@ -1041,17 +1041,51 @@ class _IntrinsicTransformer(ast.NodeTransformer):
         return node
 
 
-def _insert_intrinsic_helpers(tree: ast.Module, names: Iterable[str]) -> bool:
-    defs = _intrinsic_defs(names)
-    if not defs:
-        return False
-    idx = 0
-    for i, node in enumerate(tree.body):
+def _hoist_intrinsic_helpers(tree: ast.Module) -> bool:
+    """Ensure all _invar_* and safe_* FunctionDefs sit after imports and before all Assign/FunctionDefs."""
+    intrinsic_prefixes = ("_invar_", "safe_")
+    intrinsic_names = {"div_eps", "smooth_clamp"}
+    imports: List[ast.stmt] = []
+    helpers: List[ast.stmt] = []
+    rest: List[ast.stmt] = []
+    seen_helpers: Set[str] = set()
+    for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            idx = i + 1
-    tree.body[idx:idx] = defs
+            imports.append(node)
+        elif isinstance(node, ast.FunctionDef) and (
+            node.name.startswith(intrinsic_prefixes) or node.name in intrinsic_names
+        ):
+            if node.name not in seen_helpers:
+                seen_helpers.add(node.name)
+                helpers.append(node)
+        else:
+            rest.append(node)
+    new_body = imports + helpers + rest
+    if len(new_body) == len(tree.body) and all(a is b for a, b in zip(new_body, tree.body)):
+        return False
+    tree.body = new_body
     ast.fix_missing_locations(tree)
     return True
+
+
+def _insert_intrinsic_helpers(tree: ast.Module, names: Iterable[str]) -> bool:
+    existing_fns = {
+        n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    defs = [d for d in _intrinsic_defs(names) if getattr(d, "name", None) not in existing_fns]
+    changed = False
+    if defs:
+        idx = 0
+        for i, node in enumerate(tree.body):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                idx = i + 1
+        tree.body[idx:idx] = defs
+        changed = True
+    if _hoist_intrinsic_helpers(tree):
+        changed = True
+    if changed:
+        ast.fix_missing_locations(tree)
+    return changed
 
 
 # -- simulation_step slot repairs -------------------------------------------
@@ -3244,6 +3278,17 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                         if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
                             other_upper_slots[s_idx] = val
 
+    for s_idx in list(positive_lower_slots):
+        lb = positive_lower_slots[s_idx]
+        if s_idx in small_upper_slots and small_upper_slots[s_idx] < lb:
+            del positive_lower_slots[s_idx]
+        elif s_idx in other_upper_slots and other_upper_slots[s_idx] < lb:
+            del positive_lower_slots[s_idx]
+        elif s_idx in unit_upper_slots and 1.0 < lb:
+            del positive_lower_slots[s_idx]
+        elif s_idx in quarter_upper_slots and 0.25 < lb:
+            del positive_lower_slots[s_idx]
+
     if (r_max is None and not nonneg_slots and not strict_gt_slots
             and not positive_lower_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
@@ -4891,7 +4936,16 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
         op = str(raw.get("op") or "")
         if op == "INLINE_INTRINSIC":
             name = str(raw.get("name") or "")
-            if name in INTRINSIC_ALIASES:
+            if name == _SAFE_DIV_HELPER:
+                has_fn = any(
+                    isinstance(n, ast.FunctionDef) and n.name == _SAFE_DIV_HELPER
+                    for n in tree.body
+                )
+                if not has_fn:
+                    tree.body.insert(0, ast.parse(_SAFE_DIV_SRC).body[0])
+                _hoist_intrinsic_helpers(tree)
+                notes.append(f"INLINE_INTRINSIC({name})")
+            elif name in INTRINSIC_ALIASES:
                 patched = _insert_intrinsic_helpers(tree, [name])
                 if patched:
                     notes.append(f"INLINE_INTRINSIC({name})")
@@ -5494,11 +5548,23 @@ def _lower_safe_division_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[
     tracker.visit(tree)
     transformer = _SafeDivisionTransformer(tracker.nonzero)
     tree = transformer.visit(tree)
-    if transformer.changed and _SAFE_DIV_HELPER not in _module_level_names(tree):
+    uses_sdiv = transformer.changed or any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == _SAFE_DIV_HELPER
+        for n in ast.walk(tree)
+    )
+    has_sdiv_def = any(
+        isinstance(n, ast.FunctionDef) and n.name == _SAFE_DIV_HELPER
+        for n in tree.body
+    )
+    hoisted = False
+    if uses_sdiv and not has_sdiv_def:
         tree.body.insert(0, ast.parse(_SAFE_DIV_SRC).body[0])
         _ensure_math_import(tree)
+        hoisted = True
+    if _hoist_intrinsic_helpers(tree):
+        hoisted = True
     ast.fix_missing_locations(tree)
-    return tree, transformer.changed, sorted(transformer.notes)
+    return tree, (transformer.changed or hoisted), sorted(transformer.notes)
 
 
 # Concept buckets for auto-bridging unassigned contract slots (mirrors the

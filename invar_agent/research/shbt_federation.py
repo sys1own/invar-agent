@@ -87,19 +87,24 @@ SHBT_REPOSITORIES: Dict[str, SHBTDomainSpec] = {
         ),
         equations=(
             SHBTEquation(
-                r"\eta_D = \frac{23}{33}, \quad \eta_A = \frac{10}{33}, \quad \eta_D + \eta_A = 1",
-                "eta_D = 23.0 / 33.0; eta_A = 10.0 / 33.0",
-                "Topological Stinespring ledger partitioning",
+                r"\eta_D = \frac{23}{33}",
+                "eta_D = 23.0 / 33.0",
+                "Dark-ledger Stinespring capacity fraction",
             ),
             SHBTEquation(
-                r"M_{\mathrm{seed}} = \alpha_{\mathrm{seed}} \Delta N, \quad \dot{T} = H(t)",
+                r"\eta_A = \frac{10}{33}",
+                "eta_A = 10.0 / 33.0",
+                "Visible Stinespring capacity fraction",
+            ),
+            SHBTEquation(
+                r"M_{\mathrm{seed}} = \alpha_{\mathrm{seed}} \Delta N",
                 "M_seed = alpha_seed * delta_N",
-                "Mass-congestion seed condensation and dynamic bit-loading",
+                "Mass-congestion seed condensation",
             ),
             SHBTEquation(
-                r"\Delta_{\mathrm{fr}} \equiv 0 \iff E_{\mu\nu} \equiv 0",
+                r"\Delta_{\mathrm{fr}} = 0",
                 "delta_fr = 0.0",
-                "Exact framing cancellation and Einstein tensor vanishing",
+                "Exact framing cancellation",
             ),
         ),
         invariants=(
@@ -144,20 +149,40 @@ SHBT_REPOSITORIES: Dict[str, SHBTDomainSpec] = {
             "999,054.0 W net DC @ 400 V (555.03 W/cell, N_min = 1,633 cells for 906 kW debt)."
         ),
         constants=(
-            SHBTConstant("floquet_screening_j", "U_eff", 5.64736e-17, "J", "Floquet-Adler-Wiser screening (352.48 eV)"),
+            SHBTConstant("floquet_screening_ev", "U_eff_eV", 352.48, "eV", "Floquet-Adler-Wiser effective screening potential (352.48 eV)"),
+            SHBTConstant("floquet_screening_j", "U_eff", 5.64735e-17, "J", "Floquet-Adler-Wiser screening (352.48 eV)"),
             SHBTConstant("coherent_lattice_branching", "B_lat", 0.999999994, "dimensionless", "Coherent lattice branching fraction"),
             SHBTConstant("lanr_cell_power_w", "P_cell", 555.03, "W", "Net DC power per LANR cell"),
             SHBTConstant("lanr_module_count", "N_cells", 1800.0, "dimensionless", "1,800-module Ni-H LANR baseload array"),
             SHBTConstant("lanr_array_power_w", "P_array", 999054.0, "W", "Total LANR array net DC power (999.054 kW)"),
+            SHBTConstant("lanr_net_raw_w", "P_net_raw", 93054.0, "W", "Raw net surplus above 906 kW debt (93,054 W)"),
             SHBTConstant("lanr_min_cells", "N_min", 1633.0, "dimensionless", "Minimum cells to cover 906 kW debt"),
-            SHBTConstant("kapitza_delta_t_k", "Delta_T_K", 3.546, "K", "Kapitza thermal resistance drop"),
-            SHBTConstant("quench_headroom_k", "Delta_T_quench", 11.790, "K", "Superconducting quench headroom"),
+            SHBTConstant("kapitza_delta_t_k", "Delta_T_Kapitza", 3.546, "K", "Kapitza interfacial thermal boundary drop"),
+            SHBTConstant("mgb2_critical_temp_k", "T_c_MgB2", 39.0, "K", "MgB2 superconducting critical temperature"),
+            SHBTConstant("quench_headroom_k", "MgB2_quench_headroom", 11.790, "K", "Superconducting quench headroom below MgB2"),
+            SHBTConstant("teg_efficiency", "eta_TEG", 0.33804, "dimensionless", "Dual-stage TEG conversion efficiency"),
+            SHBTConstant("teg_cell_power_w", "P_TEG_cell", 1045.58, "W", "TEG enthalpy recovery per module"),
         ),
         equations=(
             SHBTEquation(
-                r"P_{\mathrm{array}} = N_{\mathrm{cells}} \cdot P_{\mathrm{cell}} = 1800 \times 555.03 = 999{,}054.0\,\mathrm{W}",
-                "P_array = 1800.0 * 555.03",
-                "1,800-module LANR array net DC power output",
+                r"P_{\mathrm{gen}} = N_{\mathrm{cells}} \cdot P_{\mathrm{cell}}",
+                "P_gen = N_cells * P_cell",
+                "1,800-module LANR array net DC power output (999,054.0 W)",
+            ),
+            SHBTEquation(
+                r"P_{\mathrm{net}} = P_{\mathrm{gen}} - P_{\mathrm{debt}}",
+                "P_net = P_gen - P_debt",
+                "Raw net LANR surplus above 906 kW boundary debt",
+            ),
+            SHBTEquation(
+                r"\Delta T_{\mathrm{Kapitza}} = 3.546",
+                "dT_Kapitza = 3.546",
+                "Kapitza interfacial temperature drop",
+            ),
+            SHBTEquation(
+                r"\Delta T_{\mathrm{MgB2}} = T_{c,\mathrm{MgB2}} - T_{\mathrm{op}}",
+                "MgB2_margin = T_c_MgB2 - T_op",
+                "MgB2 superconducting quench margin",
             ),
         ),
         invariants=(
@@ -387,8 +412,10 @@ _SIGNAL_PATTERNS: Dict[str, Tuple[re.Pattern[str], ...]] = {
         re.compile(r"\b312[- ]channel\s+photonic\b|\b52\s+hexamers\b", re.I),
     ),
     "sys1own/shbt-cf": (
-        re.compile(r"\b(?:floquet[- ]screen\w*|floquet[- ]adler[- ]wiser)\b.*\blanr\b|\b1,?800[- ]module\b.*\blanr\b", re.I),
-        re.compile(r"\blanr\b.*\b(?:555\.03|999,?054|1,?633\s+cells|kapitza)\b", re.I),
+        re.compile(r"\b(?:floquet[- ]screen\w*|floquet[- ]adler[- ]wiser|adler[- ]wiser\s+dynamic\s+dielectric)\b", re.I),
+        re.compile(r"\b352\.48\s*ev\b|\b555\.03\s*w\b|\b999,?054(?:\.0+)?\s*w\b", re.I),
+        re.compile(r"\b1,?800[- ](?:module|cell)\b.*\b(?:ni-?h|nickel[- ]hydrogen|lattice[- ]assisted\s+nuclear|lanr)\b", re.I),
+        re.compile(r"\bkapitza\b.*\b3\.546\s*k\b|\bmgb2\b.*\b11\.79\s*k\b", re.I),
     ),
     "sys1own/shbt-power": (
         re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I),
@@ -403,12 +430,14 @@ _SIGNAL_PATTERNS: Dict[str, Tuple[re.Pattern[str], ...]] = {
         re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|23/33|heegaard[- ]floer)\b", re.I),
     ),
     "sys1own/shbt-recon": (
-        re.compile(r"\b2,?112[- ]byte\s+sram\b|\b230[- ]space[- ]group\b|\b45/64\b.*\bvirasoro\b", re.I),
+        re.compile(r"\b2,?112[- ]byte\b|\b640\s*b\b.*\b1,?472\s*b\b|\b230[- ]space[- ]group\b", re.I),
+        re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b.*\b10\s*:\s*23\b", re.I),
     ),
     "sys1own/shbt-warp": (
-        re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw\s+teg|33,?104\s*w|81,?104\s*w)\b", re.I),
-        re.compile(r"\b(?:906(?:\.0+)?\s*kw)\b.*\b(?:lanr|cryogenic|avionics|teg)\b", re.I),
-        re.compile(r"\b(?:dec-x|alcubierre|adm\s+warp)\b.*\b(?:mass[- ]annihilation|ceu|376\.99)\b", re.I),
+        re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw\s+teg|33,?104|81,?104|93,?054)\b", re.I),
+        re.compile(r"\b(?:906(?:\.0+)?\s*kw|906,?000)\b.*\b(?:lanr|lattice[- ]assisted|cryogenic|cryostat|avionics|teg|housekeeping)\b", re.I),
+        re.compile(r"\b(?:housekeeping|teg\s+heat\s+recovery)\b.*\b(?:1,?800[- ](?:cell|module)|lanr|906)\b", re.I),
+        re.compile(r"\b(?:dec-x|alcubierre|adm\s+foliation|mar-312|25\.00\s*ew)\b", re.I),
     ),
     "sys1own/shbt-swarm": (
         re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I),

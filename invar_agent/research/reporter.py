@@ -9,6 +9,7 @@ the report can never invent values.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from ..schemas.research import ResearchBlueprint, SimulationResult
@@ -23,19 +24,60 @@ UNIT_SUFFIX_MAP = [
     ("_w_m2", "W/m²"),
     ("_j_m2", "J/m²"),
     ("_kg_m3", "kg/m³"),
+    ("_j_per_bit", "J/bit"),
+    ("_j_per_k", "J/K"),
     ("_m_s2", "m/s²"),
     ("_m_s", "m/s"),
     ("_ms", "m/s"),
     ("_km_s", "km/s"),
+    ("_dimensionless", "dimensionless"),
+    ("_bytes", "bytes"),
     ("_ge", "g_E"),
     ("_g", "g_E"),
     ("_km", "km"),
     ("_kg", "kg"),
+    ("_kw", "kW"),
+    ("_mw", "MW"),
+    ("_ev", "eV"),
+    ("_pa", "Pa"),
+    ("_hz", "Hz"),
     ("_deg", "deg"),
     ("_rad", "rad"),
     ("_m", "m"),
     ("_s", "s"),
+    ("_w", "W"),
+    ("_k", "K"),
+    ("_j", "J"),
+    ("_v", "V"),
 ]
+
+
+def _deduplicate_observables(observables: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Collapse case-insensitive and unit-suffixed aliases to one canonical row."""
+    if not observables:
+        return {}
+    stem_re = re.compile(r"_(?:w|kw|mw|k|j|s|m|pa|hz|v|ev|dimensionless|bytes)$", re.I)
+    groups: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    for name, obs in observables.items():
+        stem = stem_re.sub("", name.lower())
+        groups.setdefault(stem, []).append((name, obs))
+    out: Dict[str, Dict[str, Any]] = {}
+    for stem, items in groups.items():
+        if len(items) == 1:
+            out[items[0][0]] = items[0][1]
+            continue
+        # Prefer non-zero verified value, then unit-suffixed canonical name.
+        best_name, best_obs = max(
+            items,
+            key=lambda kv: (
+                1 if abs(float(kv[1].get("value") or 0.0)) > 0.0 else 0,
+                1 if _unit_for(kv[0]) != "—" else 0,
+                1 if kv[0] != kv[0].upper() else 0,
+                len(kv[0]),
+            ),
+        )
+        out[best_name] = best_obs
+    return out
 
 
 def _unit_for(name: str) -> str:
@@ -84,6 +126,7 @@ def generate_comprehensive_research_report(
                 observables[key[4:]] = {"value": float(value), "contract_id": "final",
                                         "stage": bp.current_stage or 1,
                                         "status": status or "VERIFIED"}
+    observables = _deduplicate_observables(observables)
 
     lines: List[str] = []
     lines.append(f"# Quantitative Research Report: {bp.title}")
@@ -147,7 +190,7 @@ def generate_comprehensive_research_report(
     for contract in bp.contracts:
         for inv in contract.invariants:
             inv_count += 1
-            lines.append(f"  - `{inv.variable_name}`: {inv.assertion} "
+            lines.append(f"  - `{inv.variable_name}`: `{inv.assertion}` "
                          f"(tolerance {inv.tolerance:g})")
     if inv_count == 0:
         lines.append("  - _No explicit invariants recorded._")

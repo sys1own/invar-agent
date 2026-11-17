@@ -168,6 +168,12 @@ def merge_accretive_module(pinned_code: str, candidate_code: str,
         if name in pinned_consts and _norm(node) != _norm(pinned_consts[name]):
             reverted.append(f"constant {name}")
 
+    intrinsic_prefixes = ("_invar_", "safe_")
+    intrinsic_names = {"div_eps", "smooth_clamp"}
+
+    def _is_intrinsic(fn_name: str) -> bool:
+        return fn_name.startswith(intrinsic_prefixes) or fn_name in intrinsic_names
+
     body: List[ast.stmt] = []
     seen_imports: Set[str] = set()
     for imp in _imports(pinned_tree) + _imports(cand_tree):
@@ -175,10 +181,19 @@ def merge_accretive_module(pinned_code: str, candidate_code: str,
         if key not in seen_imports:
             seen_imports.add(key)
             body.append(imp)
+    seen_intrinsics: Set[str] = set()
+    for k, fn in pinned_fns.items():
+        if k not in overridden_helpers and _is_intrinsic(k) and k not in seen_intrinsics:
+            seen_intrinsics.add(k)
+            body.append(fn)
+    for n in new_fns:
+        if _is_intrinsic(n) and n not in seen_intrinsics:
+            seen_intrinsics.add(n)
+            body.append(cand_fns[n])
     body.extend(pinned_consts.values())
     body.extend(n for k, n in cand_consts.items() if k not in pinned_consts)
-    body.extend(fn for k, fn in pinned_fns.items() if k not in overridden_helpers)
-    body.extend(cand_fns[n] for n in new_fns)
+    body.extend(fn for k, fn in pinned_fns.items() if k not in overridden_helpers and not _is_intrinsic(k))
+    body.extend(cand_fns[n] for n in new_fns if not _is_intrinsic(n))
     body.append(cand_fns[DRIVER])
 
     coupled: List[str] = []

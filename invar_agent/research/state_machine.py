@@ -1971,7 +1971,21 @@ class ResearchStateMachine:
                                                 "steered_by": _json_safe(
                                                     {k: v for k, v in last_telemetry.items()
                                                      if isinstance(v, (int, float))})})
-            state.literature = await self._literature_search(queries, tag)
+            prev_shbt = [
+                h for h in (state.literature or [])
+                if isinstance(h, dict) and h.get("source") == "shbt_federation"
+            ]
+            fresh_lit = await self._literature_search(queries, tag)
+            merged_lit: List[Dict[str, Any]] = []
+            seen_lit: set = set()
+            for h in prev_shbt + list(fresh_lit or []):
+                if not isinstance(h, dict):
+                    continue
+                k = (h.get("source"), h.get("badge"), h.get("title"))
+                if k not in seen_lit:
+                    seen_lit.add(k)
+                    merged_lit.append(h)
+            state.literature = merged_lit
             # Literature constants come ONLY from ingested sources
             # (equations/invariants + numeric constants). Blueprint state
             # variables and contract evaluation metrics are NEVER literature
@@ -2320,7 +2334,11 @@ class ResearchStateMachine:
                     **tag, "query": "shbt_federation", "source": item["source"],
                     "badge": item["badge"], "title": item["title"][:200],
                     "year": item["year"], "url": item["url"], "citation_count": None})
+        from .search import strip_internal_diagnostic_tokens
         for q in queries:
+            q = strip_internal_diagnostic_tokens(q)
+            if not q:
+                continue
             await self._emit("search_log", "query", {**tag, "query": q})
             await self.emit_activity("INGEST", "literature_query",
                                      f"Querying multi-channel literature for '{q}'...")
@@ -2458,7 +2476,14 @@ class ResearchStateMachine:
         ]
         contract_dicts = [
             c.model_dump() if hasattr(c, "model_dump") else c for c in (contracts or [])]
-        det = apply_healing_directives(candidate_code, [], contracts=all_contract_dicts or contract_dicts)
+        seed_directives: List[Dict[str, Any]] = []
+        m_name_err = re.search(
+            r"NameError:\s*name\s*'((?:_invar_|safe_)\w+|div_eps|smooth_clamp)'\s+is\s+not\s+defined",
+            str(failure or ""),
+        )
+        if m_name_err:
+            seed_directives.append({"op": "INLINE_INTRINSIC", "name": m_name_err.group(1)})
+        det = apply_healing_directives(candidate_code, seed_directives, contracts=all_contract_dicts or contract_dicts)
         healed, notes = candidate_code, list(det.notes)
         if det.changed:
             healed = det.code
@@ -2509,6 +2534,27 @@ class ResearchStateMachine:
         llm = self.llm_fast or self.llm_planner
         if llm is None:
             return {"code": candidate_code, "terminated": False}
+        if attempt >= max_attempts and self.llm_planner is not None and "falsified" in str(failure or "").lower():
+            refined = None
+            try:
+                refined = await asyncio.wait_for(
+                    refine_stage_code(
+                        self.llm_planner,
+                        objective=objective,
+                        code=healed,
+                        contracts=contract_dicts,
+                        failure=str(failure),
+                    ),
+                    timeout=90.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                refined = None
+            if refined and refined.strip() and refined.strip() != candidate_code.strip():
+                await self.emit_activity(
+                    "HEALING", "tier2_refine",
+                    "[TIER2_REFINE] Tier-2 planner synthesized full-kernel repair from counterexample.")
+                return {"code": refined, "terminated": False,
+                        "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
         plan = await request_healing_directives(
             llm, objective=objective, code=candidate_code,
             contracts=[c.model_dump() for c in contracts], failure=str(failure))
@@ -2538,7 +2584,7 @@ class ResearchStateMachine:
         patched = apply_healing_directives(candidate_code, directives,
                                            contracts=contract_dicts)
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
-        _is_final_heal = (attempt >= 2 or attempt + 1 >= max_attempts)
+        _is_final_heal = (attempt >= max_attempts)
         _missing_eq_slot = (
             _is_final_heal
             and plan.get("fixable") is not False
@@ -2548,11 +2594,40 @@ class ResearchStateMachine:
                 for m in re.finditer(r"abs\(state\[(\d+)\]\s*-", str(failure or ""))
             )
         )
+        _eq_target_falsified = (
+            _is_final_heal
+            and plan.get("fixable") is not False
+            and self.llm_planner is not None
+            and "falsified" in str(failure or "").lower()
+            and "ENFORCE_CONSERVATION_PROJECTION" not in set(ops)
+        )
         fallback_needed = (
             ("falsified" in str(failure or "").lower() or "diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower())
-            and (not ops or not patched.changed or patched.code == candidate_code or _missing_eq_slot)
+            and (not ops or not patched.changed or patched.code == candidate_code or _missing_eq_slot or _eq_target_falsified)
         )
         if fallback_needed:
+            if (_eq_target_falsified or _missing_eq_slot) and plan.get("fixable") is not False:
+                tier2_llm = self.llm_planner or llm
+                refined = None
+                try:
+                    refined = await asyncio.wait_for(
+                        refine_stage_code(
+                            tier2_llm,
+                            objective=objective,
+                            code=healed,
+                            contracts=contract_dicts,
+                            failure=str(failure),
+                        ),
+                        timeout=90.0,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    refined = None
+                if refined and refined.strip() and refined.strip() != candidate_code.strip():
+                    await self.emit_activity(
+                        "HEALING", "tier2_refine",
+                        "[TIER2_REFINE] Tier-2 planner synthesized full-kernel repair from counterexample.")
+                    return {"code": refined, "terminated": False,
+                            "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
                 candidate_code, contract_dicts)
             if fb_notes:
@@ -2641,7 +2716,12 @@ class ResearchStateMachine:
             "counterexample": (last_result.failure_counterexample if last_result
                                else failure_text),
         }
-        queries = formulate_diagnostic_search_query(blueprint, failure_result)
+        from .search import strip_internal_diagnostic_tokens
+        queries = [
+            strip_internal_diagnostic_tokens(q)
+            for q in formulate_diagnostic_search_query(blueprint, failure_result)
+        ]
+        queries = [q for q in queries if q]
         await self.emit_activity(
             "HEALING_SEARCH", "diagnostic_query",
             f"Triggered targeted re-search for stability/unit closure: "

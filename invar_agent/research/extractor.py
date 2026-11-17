@@ -669,6 +669,15 @@ def _strip_latex_commands(text: str) -> str:
     return s
 
 
+_PARAM_STOPWORDS = {
+    "at", "in", "to", "of", "by", "for", "with", "from", "least", "most",
+    "continuous", "raw", "total", "net", "system_physics", "baseline",
+    "closure", "model", "stage", "part", "step", "and", "or", "the", "a",
+    "an", "is", "are", "was", "were", "as", "on", "per", "below", "above",
+    "under", "over", "down", "up", "into", "onto", "than", "then", "max", "min",
+}
+
+
 def extract_parameters_from_text(text: str, source: str = "",
                                  confidence: float = 0.6,
                                  limit: int = 24) -> List[ExtractedParameter]:
@@ -688,12 +697,9 @@ def extract_parameters_from_text(text: str, source: str = "",
             # A trailing word was captured as a unit; keep only if dimensionless.
             unit = ""
         name = _snake(name_raw)
-        if not name:
+        if not name or re.fullmatch(r"\d+(?:_\d+)*", name):
             return
-        # Boundary conditions like ``M = 0`` / ``n = 5`` in prompts or
-        # equations are not physical constants: never extract single-letter
-        # symbols from user prompts.
-        if source == "user_prompt" and len(name) <= 1:
+        if source == "user_prompt" and (len(name) <= 1 or name in _PARAM_STOPWORDS):
             return
         # Subscripted state tokens (``z_k``, ``q_0``, ``x_n``, ...) extracted
         # from code-like prompt fragments are not physical constants.
@@ -714,8 +720,21 @@ def extract_parameters_from_text(text: str, source: str = "",
         if not is_known_unit(unit):
             continue
         before = text[max(0, m.start() - 48):m.start()]
-        before = re.split(r"[.;,()\n]", before)[-1]
-        _add(before, m.group("num"), unit, m.span())
+        before = re.split(r"[.;,()\n]", before)[-1].strip()
+        # Strip trailing stopwords/prepositions/modifiers; if empty, inspect trailing noun phrase.
+        words = [w for w in re.split(r"\s+", before) if w]
+        while words and words[-1].lower() in _PARAM_STOPWORDS:
+            words.pop()
+        candidate_name = " ".join(words[-4:]) if words else ""
+        if not candidate_name or candidate_name.lower() in _PARAM_STOPWORDS:
+            after = text[m.end():min(len(text), m.end() + 48)]
+            after = re.split(r"[.;,()\n]", after)[0].strip()
+            awords = [w for w in re.split(r"\s+", after) if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", w)]
+            while awords and awords[0].lower() in _PARAM_STOPWORDS:
+                awords.pop(0)
+            candidate_name = " ".join(awords[:4]) if awords else ""
+        if candidate_name:
+            _add(candidate_name, m.group("num"), unit, m.span())
     return params[:limit]
 
 
@@ -953,11 +972,11 @@ _REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
     "relativistic_plasma": ("relativistic plasma", "magnetic sail", "magsail",
                             "plasma sail", "solar wind", "aurora",
                             "lorentz plasma"),
-    "materials_thermophysics": ("tungsten", "pica", "carbide", "titanium",
-                                "ablative", "ablation", "heat shield",
-                                "thermal protection", "heat conduction",
-                                "fourier", "q_in", "phenolic",
-                                "ceramic matrix"),
+    "materials_thermophysics": ("tungsten", "pica", "silicon carbide", "titanium",
+                                "carbon phenolic", "ablative", "ablation",
+                                "re-entry", "reentry", "hypersonic",
+                                "heat shield", "tps", "thermal protection",
+                                "refractory", "ceramic matrix"),
     "nonlinear_dynamics": ("duffing", "van der pol", "lorenz", "lotka",
                            "volterra", "henon", "circle map", "standard map"),
     "chemical_kinetics": ("robertson", "arrhenius", "michaelis",

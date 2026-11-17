@@ -74,7 +74,23 @@ static inline double prng_uniform(double seed, double k) {
     return static_cast<double>(z >> 11) * (1.0 / 9007199254740992.0);
 }
 }  // namespace invar
+
+constexpr inline double _invar_sdiv(double a, double b) noexcept {
+    return (b >= 0.0 && b < 1e-30) ? (a / 1e-30) : ((b < 0.0 && b > -1e-30) ? (a / -1e-30) : (a / b));
+}
+constexpr inline double div_eps(double a, double b) noexcept { return _invar_sdiv(a, b); }
+inline double safe_sqrt(double x) noexcept { return std::sqrt(x > 0.0 ? x : 0.0); }
+inline double safe_log(double x) noexcept { return std::log(x > 1e-300 ? x : 1e-300); }
+inline double safe_exp(double x) noexcept { return std::exp(x > 700.0 ? 700.0 : (x < -700.0 ? -700.0 : x)); }
+inline double safe_pow(double a, double b) noexcept { return std::pow(a > 1e-300 ? a : 1e-300, b); }
+constexpr inline double smooth_clamp(double x, double lo, double hi) noexcept {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
 """
+
+_NATIVE_PRELUDE_INTRINSICS = {
+    "_invar_sdiv", "div_eps", "safe_sqrt", "safe_log", "safe_exp", "safe_pow", "smooth_clamp",
+}
 
 INT, FLOAT, VEC, VEC2, BUF, BOOL = "int", "double", "vec", "vec2", "buf", "bool"
 
@@ -651,11 +667,15 @@ class CppEmitter:
             for f in funcs:
                 self.returns[f["name"]] = self._return_type(f)
         for f in funcs:
+            if f["name"] in _NATIVE_PRELUDE_INTRINSICS:
+                continue
             plist = ", ".join(f"{self.buffer_struct}* buf" if p == "buf" else "double"
                               for p in (f.get("params") or []))
             out.append(f"static {self._cret(self.returns[f['name']])} {f['name']}({plist});")
         out.append("")
         for f in funcs:
+            if f["name"] in _NATIVE_PRELUDE_INTRINSICS:
+                continue
             out.append(self._emit_function(f))
         entries = [f for f in funcs if is_entry_function(f)]
         if not any(f["name"] == "simulation_step" for f in entries):

@@ -517,6 +517,36 @@ def _cache_key(source: str, query: str) -> str:
     return hashlib.blake2b(f"{source}|{query}".encode(), digest_size=16).hexdigest()
 
 
+_INTERNAL_DIAG_RE = re.compile(
+    r"\b(?:cabi|fallback|zero[- ]step|prewrite_guard|python_smoke|clang\+\+|clang|"
+    r"sandbox|tier[- ]?[012]|accretion|overlay|_invar_\w+|buf\.data)\b"
+    r"|state\[\d+\]",
+    re.I,
+)
+_OFF_DOMAIN_CV_RE = re.compile(
+    r"\b(?:ego4d|vision-and-language\s+navigation|object\s+detection|image\s+segmentation|"
+    r"video\s+grounding|embodied\s+navigation|3d\s+pose\s+estimation)\b",
+    re.I,
+)
+_CV_PROMPT_RE = re.compile(
+    r"\b(?:computer\s+vision|object\s+detection|image\s+segmentation|video|robotics|vln|ego4d)\b",
+    re.I,
+)
+
+
+def strip_internal_diagnostic_tokens(text: str) -> str:
+    """Remove internal invar-agent diagnostic/architecture tokens from external search queries."""
+    cleaned = _INTERNAL_DIAG_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _is_off_domain_hit(hit: LiteratureResult, context: str) -> bool:
+    if _CV_PROMPT_RE.search(context or ""):
+        return False
+    blob = f"{hit.title} {hit.summary}"
+    return bool(_OFF_DOMAIN_CV_RE.search(blob))
+
+
 class LiteratureSearchClient:
     """Resilient, cached, offline-capable literature retrieval client."""
 
@@ -550,7 +580,7 @@ class LiteratureSearchClient:
         word canonical concept only. Diagnostics land in
         ``self.last_query_meta`` for ``search_log`` telemetry.
         """
-        raw_query = (query or "").strip()
+        raw_query = strip_internal_diagnostic_tokens((query or "").strip())
         started = time.perf_counter()
         # Pass 1: cleaned, de-pluralized, hyphen-normalized FULL query.
         # Short planner queries (<=5 terms) keep every technical token;
@@ -652,6 +682,7 @@ class LiteratureSearchClient:
         relaxed_query = " | ".join(relaxed_trail) if relaxed_trail else ""
 
         # Stable order: keep connector grouping deterministic for caching/tests.
+        results = [r for r in results if not _is_off_domain_hit(r, prompt_or_query or raw_query)]
         order = {s: i for i, s in enumerate(sources)}
         results.sort(key=lambda r: order.get(r.source, 99))
 

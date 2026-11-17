@@ -232,7 +232,9 @@ def _wrap_table_equation_cells(text: str) -> str:
                 for idx in eq_cols:
                     if idx < len(cells):
                         c = cells[idx]
-                        if c and not c.startswith("$") and not c.startswith("@@INVAR_CODE_") and c not in ("-", "n/a"):
+                        if (c and not c.startswith("$") and not c.startswith("@@INVAR_CODE_")
+                                and c not in ("-", "n/a", "—")
+                                and re.search(r"[=\\^_<>]", c)):
                             cells[idx] = f"${_balance_math_expr(canonicalize_math_content(c))}$"
                 line = "| " + " | ".join(cells) + " |"
         else:
