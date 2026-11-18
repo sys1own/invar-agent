@@ -132,7 +132,11 @@
   .research-card .row { display:flex; gap:8px; margin-top:8px; }
   .research-card.refusal, .action-card.refusal { border-color:#f85149; }
   .action-card.refusal .action-title { color:#f85149; }
-  .telemetry { display:flex; gap:12px; padding:6px 12px; font-size:11px; color:var(--muted); flex-wrap:wrap; flex:none; }
+  .telemetry { display:flex; flex-direction:column; gap:4px; padding:6px 12px; font-size:11px; color:var(--muted); flex:none; }
+  .telemetry-summary { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .telemetry details { width:100%; }
+  .telemetry summary { cursor:pointer; user-select:none; color:var(--accent); font-size:11px; }
+  .telemetry-obs { max-height:140px; overflow-y:auto; margin-top:4px; padding:4px 8px; background:rgba(15,23,42,0.55); border:1px solid var(--border); border-radius:6px; font-family:monospace; font-size:11px; white-space:pre-wrap; word-break:break-word; }
   .badge { background:#12161f; border:1px solid var(--border); border-radius:999px; padding:3px 10px; font-size:11px; color:var(--muted); white-space:nowrap; }
   .badge b { color:var(--green); font-weight:600; }
   .spacer { flex:1; }
@@ -1615,8 +1619,27 @@ function openResearchStream(expectedRunUid) {
     }
     if (msg.event === 'result' && msg.telemetry) {
       const tel = document.getElementById('research-telemetry');
-      tel.textContent = `contract=${msg.contract_id} status=${msg.status} time=${Number(msg.execution_time_ms || 0).toFixed(1)}ms ` +
-        Object.entries(msg.telemetry).map(([k, v]) => `${k}=${Number(v).toPrecision(4)}`).join('  ');
+      const entries = Object.entries(msg.telemetry);
+      const compactEntries = entries.filter(([k]) => !k.startsWith('obs_'));
+      const obsEntries = entries.filter(([k]) => k.startsWith('obs_'));
+      tel.replaceChildren();
+      const summaryRow = document.createElement('div');
+      summaryRow.className = 'telemetry-summary';
+      summaryRow.textContent =
+        `contract=${msg.contract_id} status=${msg.status} time=${Number(msg.execution_time_ms || 0).toFixed(1)}ms` +
+        (compactEntries.length ? '  ' + compactEntries.map(([k, v]) => `${k}=${Number(v).toPrecision(4)}`).join('  ') : '');
+      tel.appendChild(summaryRow);
+      if (obsEntries.length) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.textContent = `Observables (${obsEntries.length})`;
+        const box = document.createElement('div');
+        box.className = 'telemetry-obs';
+        box.textContent = obsEntries.map(([k, v]) => `${k}=${Number(v).toPrecision(4)}`).join('\n');
+        det.appendChild(sum);
+        det.appendChild(box);
+        tel.appendChild(det);
+      }
     }
     if (msg.event === 'stage_start') {
       statusEl.textContent = `research stage ${msg.research_stage}/${msg.total_stages} (${msg.mode}): ${msg.objective || ''}`;

@@ -1249,3 +1249,160 @@ def test_initial_k_folding_introspection_desugaring_heal_fallback_and_norm_latex
     assert r"$|\Delta_{x,\mathrm{CoM}}| \le 10^{-15}$" in norm
     assert r"$|\Delta \sigma_r^2/\sigma_r^2| \le 10^{-6}$" in norm
     assert "$_inf" not in norm
+
+
+def test_helper_inlining_unconditional_slot0_3_enforcement_no_fibonacci_finance_and_ui_telemetry(tmp_path):
+    from pathlib import Path
+    from invar_agent.research.extractor import (
+        QuantitativeInsightExtractor,
+        classify_registry_domains,
+        recommend_execution_strategy,
+    )
+    from invar_agent.research.state_machine import _eval_invariant, _guard_contract_initial_state
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    # 1. Helper step-function inlining (stage_a/stage_b/stage_c) + unconditional state[0..5]
+    # enforcement across 3 contracts / 18 invariants (shbt_pycno_homochiral pattern).
+    pycno_kernel = (
+        "import math\n\n"
+        "def stage_a(buf, dt):\n"
+        "    eta_d = 23.0 / 33.0\n"
+        "    eta_a = 10.0 / 33.0\n"
+        "    r_pyc = 1.0e-120\n"
+        "    buf.data[0] = r_pyc\n"
+        "    buf.data[1] = eta_d\n"
+        "    buf.data[2] = eta_a\n"
+        "    buf.data[3] = 0.0\n"
+        "    buf.data[4] = (eta_a / (eta_d + eta_a)) ** 2\n"
+        "    buf.data[5] = 0.0\n\n"
+        "def stage_b(buf, dt):\n"
+        "    s_instanton = 256.0\n"
+        "    s_pes = 82.0\n"
+        "    mu_debye = 16.5\n"
+        "    m_eff = 2.486\n"
+        "    p_brems = 5.0e-16\n"
+        "    branch_ratio = 1.2e-72\n"
+        "    buf.data[6] = s_instanton\n"
+        "    buf.data[7] = s_pes\n"
+        "    buf.data[8] = mu_debye\n"
+        "    buf.data[9] = m_eff\n"
+        "    buf.data[10] = p_brems\n"
+        "    buf.data[11] = branch_ratio\n\n"
+        "def stage_c(buf, dt):\n"
+        "    eta_d = 23.0 / 33.0\n"
+        "    # Deliberately collide with stage_a's state[0..3] and leave c3 slots 12..17 to be populated/conditioned\n"
+        "    buf.data[0] = 1.001e-120\n"
+        "    buf.data[3] = 0.0053474936\n"
+        "    t_lock_us = 11.40\n"
+        "    q_internal = 0.0\n"
+        "    v_chem = max(1e-12, buf.data[13] * math.exp(-0.5 * dt))\n"
+        "    buf.data[12] = 1.0\n"
+        "    buf.data[13] = v_chem\n"
+        "    buf.data[14] = t_lock_us\n"
+        "    buf.data[15] = q_internal\n"
+        "    buf.data[16] = 0.0\n"
+        "    buf.data[17] = 1.80e-6\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    stage_a(buf, dt)\n"
+        "    stage_b(buf, dt)\n"
+        "    stage_c(buf, dt)\n"
+    )
+    contracts = [
+        VerificationContract.model_validate({
+            "contract_id": "c1_pycno_ledger",
+            "target_backend": "cpp",
+            "initial_state": [1.0e-120, 23.0 / 33.0, 10.0 / 33.0, 0.0, 0.09182736, 0.0] + [0.0] * 18,
+            "dt": 0.01,
+            "steps": 4,
+            "invariants": [
+                {"variable_name": "R_pyc_clamp", "assertion": "state[0] <= 1.0e-120 + 1e-135", "tolerance": 1e-135},
+                {"variable_name": "R_pyc_nonneg", "assertion": "state[0] >= 0.0", "tolerance": 1e-135},
+                {"variable_name": "eta_partition", "assertion": "abs(state[1] + state[2] - 1.0) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "framing_defect", "assertion": "abs(state[3]) <= 1e-15", "tolerance": 1e-15},
+                {"variable_name": "shunt_factor_s", "assertion": "state[4] > 0.0 and state[4] <= 0.25", "tolerance": 1e-12},
+                {"variable_name": "phi_nu_vis_zero", "assertion": "abs(state[5]) <= 1e-15", "tolerance": 1e-15},
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c2_instanton_brems",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 6 + [256.0, 82.0, 16.5, 2.486, 5.0e-16, 1.2e-72] + [0.0] * 12,
+            "dt": 0.01,
+            "steps": 4,
+            "invariants": [
+                {"variable_name": "S_instanton_floor", "assertion": "state[6] >= 250.0", "tolerance": 1e-12},
+                {"variable_name": "S_PES_floor", "assertion": "state[7] >= 81.50", "tolerance": 1e-12},
+                {"variable_name": "mu_Debye_floor", "assertion": "state[8] >= 15.0", "tolerance": 1e-12},
+                {"variable_name": "M_eff_mev", "assertion": "abs(state[9] - 2.486) <= 1e-6", "tolerance": 1e-6},
+                {"variable_name": "P_brems_cap", "assertion": "state[10] >= 0.0 and state[10] <= 1.0e-15", "tolerance": 1e-20},
+                {"variable_name": "branch_ratio_cap", "assertion": "state[11] >= 0.0 and state[11] <= 1.62e-71", "tolerance": 1e-80},
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c3_chiral_lock",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 12 + [1.0, 1.0, 11.40, 0.0, 0.0, 1.80e-6] + [0.0] * 6,
+            "dt": 0.01,
+            "steps": 4,
+            "invariants": [
+                {"variable_name": "ee_homochiral", "assertion": "abs(state[12] - 1.0) <= 1e-6", "tolerance": 1e-6},
+                {"variable_name": "V_chem_nonneg", "assertion": "state[13] >= 0.0 and state[13] <= initial[13]", "tolerance": 1e-12},
+                {"variable_name": "t_lock_us", "assertion": "state[14] > 0.0 and state[14] <= 11.40", "tolerance": 1e-9},
+                {"variable_name": "Q_internal_zero", "assertion": "abs(state[15]) <= 1e-15", "tolerance": 1e-15},
+                {"variable_name": "delta_BL_EM", "assertion": "abs(state[16]) <= 1e-15", "tolerance": 1e-15},
+                {"variable_name": "sigma_phi_urad", "assertion": "state[17] >= 0.0 and state[17] <= 1.83e-6", "tolerance": 1e-12},
+            ],
+        }),
+    ]
+    san = sanitize_intrinsics(pycno_kernel, contracts=contracts, all_contracts=contracts)
+    assert san.changed
+    assert "def stage_a(" not in san.code and "def stage_b(" not in san.code and "def stage_c(" not in san.code
+    assert sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts).changed is False
+
+    bridge = DynamicCABIBridge(tmp_path / "cabi_pycno")
+    cpp = CppEmitter().emit_module(python_source_to_uast(san.code))
+    for vc in contracts:
+        init_v, _ = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
+        res = bridge.run(cpp, list(init_v), dt=0.01, steps=4, entry="execute_step")
+        assert res["finite"] is True
+        for inv in vc.invariants:
+            assert _eval_invariant(inv.assertion, res["state"], {}, {"initial": init_v, "tol": inv.tolerance}), (
+                f"[{vc.contract_id}] {inv.variable_name} failed: state={res['state'][:18]}"
+            )
+
+    # Also verify negative abs(state[3]) <= 1e-15 (signed negative drift) gets clamped to 0.0
+    neg_kernel = "def stage_n(buf, dt):\n    buf.data[3] = -0.0053474936\n\ndef simulation_step(buf, dt):\n    stage_n(buf, dt)\n"
+    vc_neg = VerificationContract.model_validate({
+        "contract_id": "c_neg_abs3",
+        "target_backend": "cpp",
+        "initial_state": [0.0] * 16,
+        "dt": 0.01,
+        "steps": 2,
+        "invariants": [{"variable_name": "framing_defect", "assertion": "abs(state[3]) <= 1e-15", "tolerance": 1e-15}],
+    })
+    san_neg = sanitize_intrinsics(neg_kernel, contracts=[vc_neg])
+    assert sanitize_intrinsics(san_neg.code, contracts=[vc_neg]).changed is False
+    res_neg = bridge.run(CppEmitter().emit_module(python_source_to_uast(san_neg.code)), list(vc_neg.initial_state), dt=0.01, steps=2, entry="execute_step")
+    assert _eval_invariant("abs(state[3]) <= 1e-15", res_neg["state"], {}, {"tol": 1e-15})
+
+    # 2. "Fibonacci braids" / "Fibonacci anyons" must NOT trigger discrete_finance or rust_hin
+    braid_prompt = (
+        "Couple su(2)_26 + su(3)_8 + so(10)_312 affine weight router with coset weight shift "
+        "compensated by 124 Fibonacci braids and Fibonacci anyons so framing defect is zero."
+    )
+    reg_doms = classify_registry_domains(braid_prompt)
+    assert "discrete_finance" not in reg_doms, reg_doms
+    ev_braid = QuantitativeInsightExtractor(use_registry=True).extract(braid_prompt)
+    assert "discrete_finance" not in (ev_braid.domains or []), ev_braid.domains
+    strat = recommend_execution_strategy(braid_prompt)
+    assert strat["target_backend"] != "rust_hin", strat
+
+    # 3. Chat UI telemetry wraps obs_* keys inside collapsed <details> instead of raw flex header dump
+    idx_html = (Path(__file__).resolve().parents[1] / "invar_agent" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "Observables (${obsEntries.length})" in idx_html
+    assert "className = 'telemetry-obs'" in idx_html
+    assert ".telemetry details" in idx_html
+    assert "max-height:140px; overflow-y:auto" in idx_html

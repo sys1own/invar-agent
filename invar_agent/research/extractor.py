@@ -974,7 +974,7 @@ DOMAIN_REFERENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
                        "all concentrations >= 0"],
     },
     "discrete_finance": {
-        "keywords": ("fibonacci", "catalan", "prime", "recurrence", "combinator",
+        "keywords": ("catalan", "prime", "recurrence", "combinator",
                      "integer sequence", "oeis", "binomial", "partition", "permutation",
                      "number theory", "black-scholes", "black scholes", "heston",
                      "option pric", "martingale", "fft", "cooley", "graph"),
@@ -1027,7 +1027,7 @@ _REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
     "chemical_kinetics": ("robertson", "arrhenius", "michaelis",
                           "enzyme kinetics", "stiff chemical",
                           "chemical kinetic"),
-    "discrete_finance": ("black-scholes", "black scholes", "fibonacci",
+    "discrete_finance": ("black-scholes", "black scholes",
                          "catalan", "option pricing", "binomial model",
                          "lattice model", "risk-neutral"),
 }
@@ -1084,7 +1084,7 @@ def registry_evidence(text: str) -> Tuple[List[ExtractedParameter], List[Extract
 # Deterministic backend & stepper recommender
 # ---------------------------------------------------------------------------
 
-_DISCRETE_KW = ("fibonacci", "catalan", "prime", "recurrence", "combinator",
+_DISCRETE_KW = ("catalan", "prime", "recurrence", "combinator",
                 "integer sequence", "oeis", "binomial coefficient", "partition function",
                 "permutation", "number theory", "lattice path", "modular arithmetic",
                 "graph enumeration", "algebraic reduction")
