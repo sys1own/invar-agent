@@ -3656,6 +3656,52 @@ def _match_abs_affine(abs_arg: ast.AST) -> Tuple[Optional[Tuple[int, float]], Op
     return None, None, None
 
 
+def _match_abs_multi_sum(abs_arg: ast.AST) -> Optional[Tuple[List[int], float]]:
+    """Match ``sum_{k=1..N} state[i_k] - C`` / ``C - sum`` with ``N >= 3`` distinct slots."""
+    def _lin(n: ast.AST) -> Optional[Tuple[Dict[int, int], float]]:
+        s = _slot_of_state_ast(n)
+        if s is not None:
+            return {s: 1}, 0.0
+        c = _eval_const_ast(n)
+        if c is not None:
+            return {}, float(c)
+        if isinstance(n, ast.UnaryOp):
+            inner = _lin(n.operand)
+            if inner is None:
+                return None
+            if isinstance(n.op, ast.UAdd):
+                return inner
+            if isinstance(n.op, ast.USub):
+                return {k: -v for k, v in inner[0].items()}, -inner[1]
+            return None
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
+            L = _lin(n.left)
+            R = _lin(n.right)
+            if L is None or R is None:
+                return None
+            sign = 1 if isinstance(n.op, ast.Add) else -1
+            coeffs = dict(L[0])
+            for k, v in R[0].items():
+                coeffs[k] = coeffs.get(k, 0) + sign * v
+                if coeffs[k] == 0:
+                    del coeffs[k]
+            return coeffs, L[1] + sign * R[1]
+        return None
+
+    res = _lin(abs_arg)
+    if res is None:
+        return None
+    coeffs, const_val = res
+    if len(coeffs) < 3 or not abs_arg_has_const(abs_arg):
+        return None
+    vals = set(coeffs.values())
+    if vals == {1}:
+        return list(coeffs.keys()), -const_val
+    if vals == {-1}:
+        return list(coeffs.keys()), const_val
+    return None
+
+
 def abs_arg_has_const(node: ast.AST) -> bool:
     return any(_eval_const_ast(sub) is not None and isinstance(sub, ast.Constant) for sub in ast.walk(node) if sub is not node) or isinstance(node, ast.BinOp)
 
@@ -4426,10 +4472,21 @@ def _split_intra_function_stage_overwrites_tree(
                         best_var = vn
                 if best_var is not None and best_score >= 10:
                     claimed_locals.add(best_var)
-                    bridge_stmts.append(ast.parse(f"buf.data[{m}] = {best_var}\n").body[0])
+                    canonical_slot = next(
+                        (
+                            orig_s for orig_s in sorted(first_write_rhs)
+                            if orig_s != m
+                            and orig_s not in protected
+                            and isinstance(first_write_rhs[orig_s], ast.Name)
+                            and first_write_rhs[orig_s].id == best_var
+                        ),
+                        None,
+                    )
+                    rhs_src = f"buf.data[{canonical_slot}]" if canonical_slot is not None else best_var
+                    bridge_stmts.append(ast.parse(f"buf.data[{m}] = {rhs_src}\n").body[0])
                     assigned_in_fn.add(m)
                     changed = True
-                    notes.append(f"bridged de-collided slot buf.data[{m}] = {best_var} in {fn.name}")
+                    notes.append(f"bridged de-collided slot buf.data[{m}] = {rhs_src} in {fn.name}")
             if bridge_stmts:
                 # Insert before trailing return if present, else extend body
                 if body and isinstance(body[-1], ast.Return):
@@ -4460,6 +4517,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     eq_target_slots: Dict[int, Tuple[float, float, bool]] = {}
     sum_partition_targets: List[Tuple[int, int, float, float, bool]] = []
     seen_sum_partitions: Set[Tuple[int, int, float]] = set()
+    multi_sum_targets: List[Tuple[List[int], float, float, bool]] = []
+    seen_multi_sums: Set[Tuple[Tuple[int, ...], float]] = set()
     diff_eq_targets: List[Tuple[int, int, float, bool]] = []
     seen_diff_eqs: Set[Tuple[int, int]] = set()
     alg_eq_targets: Dict[int, Tuple[str, float, bool, Optional[Tuple[int, int]], bool]] = {}
@@ -4648,15 +4707,29 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                                     diff_eq_targets.append((i_s, j_s, tol_val, is_strict))
                                 matched_ast_bound = True
                             else:
-                                alg = _match_abs_algebraic(abs_inner)
-                                if alg is not None:
-                                    ai, expr_buf, prod_pair = alg
-                                    prev_alg = alg_eq_targets.get(ai)
-                                    if prev_alg is None or tol_val < prev_alg[1]:
-                                        alg_eq_targets[ai] = (
-                                            expr_buf, tol_val, is_strict, prod_pair, (denom_ast is not None or rhs_rel)
-                                        )
+                                multi_s = _match_abs_multi_sum(abs_inner)
+                                if multi_s is not None:
+                                    m_slots, m_tgt = multi_s
+                                    if denom_ast is not None or rhs_rel:
+                                        scale = abs(denom_c) if (denom_c is not None and denom_c != 0.0) else max(abs(m_tgt), 1e-300)
+                                        eff_tol = tol_val * scale
+                                    else:
+                                        eff_tol = tol_val
+                                    m_key = (tuple(sorted(m_slots)), float(m_tgt))
+                                    if m_key not in seen_multi_sums:
+                                        seen_multi_sums.add(m_key)
+                                        multi_sum_targets.append((m_slots, float(m_tgt), float(eff_tol), is_strict))
                                     matched_ast_bound = True
+                                else:
+                                    alg = _match_abs_algebraic(abs_inner)
+                                    if alg is not None:
+                                        ai, expr_buf, prod_pair = alg
+                                        prev_alg = alg_eq_targets.get(ai)
+                                        if prev_alg is None or tol_val < prev_alg[1]:
+                                            alg_eq_targets[ai] = (
+                                                expr_buf, tol_val, is_strict, prod_pair, (denom_ast is not None or rhs_rel)
+                                            )
+                                        matched_ast_bound = True
                             lhs = rhs
                             continue
 
@@ -4837,6 +4910,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             and not other_upper_slots and not relational_le_pairs
             and not relational_strict_gt_pairs
             and not eq_target_slots and not sum_partition_targets
+            and not multi_sum_targets
             and not diff_eq_targets and not alg_eq_targets
             and not coupled_prod_bounds
             and not product_positivity_pairs and not ratio_bounds
@@ -5126,6 +5200,82 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     _ensure_math_import(tree)
                     changed = True
                     notes.append(f"conditioned upper-bound slot state[{s_idx}] {cmp_le} {bound!r} in {fn_tgt.name}")
+
+            # Ensure de-collided bridge copies (`buf.data[dst] = buf.data[src]`) execute AFTER
+            # all scalar lower/upper conditioning on `src` and BEFORE relational comparisons.
+            conditioned_src_slots = (
+                set(nonneg_slots)
+                | set(strict_gt_slots)
+                | set(positive_lower_slots)
+                | quarter_upper_slots
+                | unit_upper_slots
+                | set(small_upper_slots)
+                | set(other_upper_slots)
+            )
+            if conditioned_src_slots and isinstance(fn_tgt.body, list):
+                top_body = fn_tgt.body
+                bridges_to_check: List[Tuple[int, int, int, ast.stmt]] = []
+                for st_i, st_node in enumerate(top_body):
+                    if (
+                        isinstance(st_node, ast.Assign)
+                        and len(st_node.targets) == 1
+                        and isinstance(st_node.value, ast.Subscript)
+                    ):
+                        dst_s = _state_subscript_slot(st_node.targets[0])
+                        src_s = _state_subscript_slot(st_node.value)
+                        if (
+                            dst_s is not None
+                            and src_s is not None
+                            and dst_s != src_s
+                            and dst_s >= 4
+                            and src_s in conditioned_src_slots
+                        ):
+                            bridges_to_check.append((st_i, dst_s, src_s, st_node))
+                if bridges_to_check:
+                    # Process from highest original index down so deletions keep earlier indices stable
+                    moved_any = False
+                    for orig_i, dst_s, src_s, b_stmt in sorted(bridges_to_check, key=lambda x: x[0], reverse=True):
+                        # Only reorder if `dst_s` is not reassigned later in top_body
+                        reassigned_later = any(
+                            dst_s in _collect_assigned_slots(sub_s)
+                            for sub_s in top_body[orig_i + 1 :]
+                        )
+                        if reassigned_later:
+                            continue
+                        last_cond_i = -1
+                        for ci_s in range(orig_i + 1, len(top_body)):
+                            sub_s = top_body[ci_s]
+                            if isinstance(sub_s, ast.If) and src_s in _slots_in_ast(sub_s):
+                                last_cond_i = ci_s
+                        if last_cond_i > orig_i:
+                            read_between = any(
+                                src_s != dst_s and dst_s in _slots_in_ast(sub_s)
+                                for sub_s in top_body[orig_i + 1 : last_cond_i + 1]
+                            )
+                            if not read_between:
+                                popped = top_body.pop(orig_i)
+                                top_body.insert(last_cond_i, popped)
+                                moved_any = True
+                                notes.append(
+                                    f"ordered bridge buf.data[{dst_s}] = buf.data[{src_s}] after source-slot conditioning in {fn_tgt.name}"
+                                )
+                            else:
+                                nxt_i = last_cond_i + 1
+                                already_nxt = (
+                                    nxt_i < len(top_body)
+                                    and ast.dump(top_body[nxt_i], annotate_fields=False, include_attributes=False)
+                                    == ast.dump(b_stmt, annotate_fields=False, include_attributes=False)
+                                )
+                                if not already_nxt:
+                                    top_body.insert(nxt_i, copy.deepcopy(b_stmt))
+                                    moved_any = True
+                                    notes.append(
+                                        f"resynced bridge buf.data[{dst_s}] = buf.data[{src_s}] after source-slot conditioning in {fn_tgt.name}"
+                                    )
+                    if moved_any:
+                        ast.fix_missing_locations(fn_tgt)
+                        changed = True
+
             assigned_in_tgt = _collect_assigned_slots(fn_tgt)
             for i_idx, j_idx, coeff in relational_le_pairs:
                 if coeff == 1.0:
@@ -5212,6 +5362,53 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     _ensure_math_import(tree)
                     changed = True
                     notes.append(f"conditioned sum partition slots state[{i_s}] + state[{j_s}] == {tgt!r} (tol {tol!r}) in {fn_tgt.name}")
+            for ms_idx, (m_slots, m_tgt, m_tol, m_strict) in enumerate(multi_sum_targets):
+                flex = sorted(s for s in m_slots if not (s in dyn_set and s < 4) and s >= 4)
+                if not flex:
+                    flex = sorted(s for s in m_slots if s >= 4)
+                if not flex:
+                    continue
+                fixed = [s for s in m_slots if s not in flex]
+                cmp_op = ">=" if m_strict else ">"
+                rem_var = f"_msum_rem_{ms_idx}"
+                cur_src = ast.unparse(fn_tgt)
+                if f"{rem_var} = " in cur_src:
+                    continue
+                sum_all = " + ".join(f"buf.data[{s}]" for s in m_slots)
+                fin_cond = " or ".join(f"not math.isfinite(buf.data[{s}])" for s in m_slots)
+                rem_expr = repr(float(m_tgt)) if not fixed else f"({float(m_tgt)!r} - (" + " + ".join(f"buf.data[{s}]" for s in fixed) + "))"
+                pivot = flex[-1]
+                others = flex[:-1]
+                ms_lines = [
+                    f"{rem_var} = {float(m_tgt)!r}",
+                    f"if {fin_cond} or abs({sum_all} - {float(m_tgt)!r}) {cmp_op} {m_tol!r}:",
+                    f"    {rem_var} = {rem_expr}",
+                    f"    if not math.isfinite({rem_var}):",
+                    f"        {rem_var} = {float(m_tgt)!r}",
+                ]
+                for s_o in others:
+                    ms_lines.append(f"    if not math.isfinite(buf.data[{s_o}]) or buf.data[{s_o}] < 0.0:")
+                    ms_lines.append(f"        buf.data[{s_o}] = 0.0")
+                if others:
+                    o_sum_expr = " + ".join(f"buf.data[{s_o}]" for s_o in others)
+                    ms_lines.insert(1, f"_msum_o_{ms_idx} = 0.0")
+                    ms_lines.insert(2, f"_msum_sc_{ms_idx} = 1.0")
+                    ms_lines.append(f"    _msum_o_{ms_idx} = {o_sum_expr}")
+                    ms_lines.append(f"    if {rem_var} >= 0.0 and _msum_o_{ms_idx} > {rem_var}:")
+                    ms_lines.append(f"        _msum_sc_{ms_idx} = _invar_sdiv({rem_var}, _msum_o_{ms_idx})")
+                    for s_o in others:
+                        ms_lines.append(f"        buf.data[{s_o}] = buf.data[{s_o}] * _msum_sc_{ms_idx}")
+                    ms_lines.append(f"    if {rem_var} >= 0.0:")
+                    ms_lines.append(f"        buf.data[{pivot}] = max(0.0, {rem_var} - ({o_sum_expr}))")
+                    ms_lines.append(f"    else:")
+                    ms_lines.append(f"        buf.data[{pivot}] = {rem_var} - ({o_sum_expr})")
+                else:
+                    ms_lines.append(f"    buf.data[{pivot}] = {rem_var}")
+                _append_before_return(fn_tgt, ast.parse("\n".join(ms_lines)).body)
+                ast.fix_missing_locations(fn_tgt)
+                _ensure_math_import(tree)
+                changed = True
+                notes.append(f"conditioned multi-slot sum {m_slots} == {m_tgt!r} (tol {m_tol!r}) in {fn_tgt.name}")
             for i_s, j_s, tol, is_strict in diff_eq_targets:
                 cmp_op = ">=" if is_strict else ">"
                 guard_src = (
@@ -6051,6 +6248,482 @@ def _normalize_step_signatures_tree(tree: ast.Module) -> Tuple[ast.Module, bool,
     return tree, changed, notes
 
 
+def _lower_scalar_loops_and_builtins_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Lower tuple-returning helpers, static tuple/list/enumerate loops, and iterable builtins.
+
+    Ensures C++20/Rust emitters see only scalar helper returns, scalar ``min``/``max``/``sum``
+    expressions, and flat/range loops.
+    """
+    changed = False
+    notes: List[str] = []
+    counter = 0
+
+    def _next_id() -> int:
+        nonlocal counter
+        counter += 1
+        return counter
+
+    defined_fns = {
+        n.name for n in tree.body if isinstance(n, ast.FunctionDef)
+    }
+
+    # 1. Split real-valued tuple-returning helper functions (`def fn(...): ... return a, b`)
+    def _uses_complex_ops(fn_def: ast.FunctionDef) -> bool:
+        for n in ast.walk(fn_def):
+            if isinstance(n, ast.Constant) and isinstance(n.value, complex):
+                return True
+            if isinstance(n, ast.Attribute) and n.attr in ("real", "imag", "conjugate"):
+                return True
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "complex":
+                return True
+        return False
+
+    tuple_helpers: Dict[str, Tuple[int, ast.FunctionDef]] = {}
+    for top in tree.body:
+        if not isinstance(top, ast.FunctionDef):
+            continue
+        if top.name == "simulation_step" or top.name.startswith(("layer_", "_invar_")):
+            continue
+        if _uses_complex_ops(top):
+            continue
+        ret_arities: Set[int] = set()
+        valid_returns = True
+
+        def _scan_rets(stmts: Sequence[ast.stmt]) -> None:
+            nonlocal valid_returns
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(st, ast.Return):
+                    if st.value is None or (isinstance(st.value, ast.Constant) and st.value.value is None):
+                        continue
+                    if (isinstance(st.value, (ast.Tuple, ast.List))
+                            and len(st.value.elts) >= 2
+                            and not any(isinstance(e, ast.Starred) for e in st.value.elts)):
+                        ret_arities.add(len(st.value.elts))
+                    else:
+                        valid_returns = False
+                    continue
+                for attr in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, attr, None)
+                    if isinstance(sub, list):
+                        _scan_rets(sub)
+                for h in getattr(st, "handlers", ()) or ():
+                    if isinstance(getattr(h, "body", None), list):
+                        _scan_rets(h.body)
+
+        _scan_rets(top.body)
+        if valid_returns and len(ret_arities) == 1:
+            arity = next(iter(ret_arities))
+            tuple_helpers[top.name] = (arity, top)
+
+    if tuple_helpers:
+        split_needed: Set[str] = set()
+
+        def _is_helper_call(expr: ast.AST) -> Optional[Tuple[str, ast.Call]]:
+            if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+                    and expr.func.id in tuple_helpers
+                    and not expr.keywords
+                    and not any(isinstance(a, ast.Starred) for a in expr.args)):
+                return expr.func.id, expr
+            return None
+
+        # Rewrite subscripted calls `fn(args)[k]` and `a, b = fn(args)` inside statement blocks
+        class _SubCallRewriter(ast.NodeTransformer):
+            def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                self.generic_visit(node)
+                hc = _is_helper_call(node.value)
+                if (hc is not None
+                        and isinstance(node.slice, ast.Constant)
+                        and isinstance(node.slice.value, int)
+                        and not isinstance(node.slice.value, bool)):
+                    fn_name, call_node = hc
+                    arity, _fn_def = tuple_helpers[fn_name]
+                    idx = int(node.slice.value)
+                    if idx < 0:
+                        idx += arity
+                    if 0 <= idx < arity:
+                        split_needed.add(fn_name)
+                        return ast.Call(
+                            func=ast.Name(id=f"{fn_name}__{idx}", ctx=ast.Load()),
+                            args=call_node.args,
+                            keywords=[],
+                        )
+                return node
+
+        def _rewrite_tuple_calls_in_block(stmts: List[ast.stmt]) -> List[ast.stmt]:
+            nonlocal changed
+            out: List[ast.stmt] = []
+            for stmt in stmts:
+                for attr in ("body", "orelse", "finalbody"):
+                    sub = getattr(stmt, attr, None)
+                    if isinstance(sub, list):
+                        setattr(stmt, attr, _rewrite_tuple_calls_in_block(sub))
+                for h in getattr(stmt, "handlers", ()) or ():
+                    if isinstance(getattr(h, "body", None), list):
+                        h.body = _rewrite_tuple_calls_in_block(h.body)
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                    tgt = stmt.targets[0]
+                    hc = _is_helper_call(stmt.value)
+                    if hc is not None and isinstance(tgt, (ast.Tuple, ast.List)):
+                        fn_name, call_node = hc
+                        arity, _ = tuple_helpers[fn_name]
+                        if len(tgt.elts) == arity and not any(isinstance(e, ast.Starred) for e in tgt.elts):
+                            split_needed.add(fn_name)
+                            cid = _next_id()
+                            tmps: List[str] = []
+                            for idx in range(arity):
+                                tname = f"_invar_ret_{cid}_{idx}"
+                                tmps.append(tname)
+                                call_k = ast.Call(
+                                    func=ast.Name(id=f"{fn_name}__{idx}", ctx=ast.Load()),
+                                    args=[copy.deepcopy(a) for a in call_node.args],
+                                    keywords=[],
+                                )
+                                out.append(ast.Assign(targets=[ast.Name(id=tname, ctx=ast.Store())], value=call_k))
+                            for lhs_elt, tname in zip(tgt.elts, tmps):
+                                out.append(ast.Assign(targets=[lhs_elt], value=ast.Name(id=tname, ctx=ast.Load())))
+                            changed = True
+                            continue
+                out.append(stmt)
+            return out
+
+        for fn_node in tree.body:
+            if isinstance(fn_node, ast.FunctionDef):
+                fn_node.body = _rewrite_tuple_calls_in_block(fn_node.body)
+                _SubCallRewriter().visit(fn_node)
+
+        # Also handle single-variable capture `tup = fn(args)` used solely via `tup[0]`, `tup[1]`
+        for fn_node in tree.body:
+            if not isinstance(fn_node, ast.FunctionDef):
+                continue
+            simple_captures: Dict[str, Tuple[str, int]] = {}
+            for st in ast.walk(fn_node):
+                if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Name)):
+                    hc = _is_helper_call(st.value)
+                    if hc is not None:
+                        vname = st.targets[0].id
+                        fn_name, _c = hc
+                        arity, _d = tuple_helpers[fn_name]
+                        # Verify all Load uses of vname are constant int subscripts 0 <= k < arity
+                        valid_uses = True
+                        sub_parents = set()
+                        for sub in ast.walk(fn_node):
+                            if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) and sub.value.id == vname:
+                                if (isinstance(sub.ctx, ast.Load)
+                                        and isinstance(sub.slice, ast.Constant)
+                                        and isinstance(sub.slice.value, int)
+                                        and not isinstance(sub.slice.value, bool)):
+                                    sub_parents.add(id(sub.value))
+                                else:
+                                    valid_uses = False
+                        for sub in ast.walk(fn_node):
+                            if isinstance(sub, ast.Name) and sub.id == vname and isinstance(sub.ctx, ast.Load):
+                                if id(sub) not in sub_parents:
+                                    valid_uses = False
+                        if valid_uses and sub_parents:
+                            simple_captures[vname] = (fn_name, arity)
+            if simple_captures:
+                class _CapSubRewriter(ast.NodeTransformer):
+                    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                        self.generic_visit(node)
+                        if (isinstance(node.value, ast.Name) and node.value.id in simple_captures
+                                and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)):
+                            _fn_n, _ar = simple_captures[node.value.id]
+                            idx = int(node.slice.value)
+                            if idx < 0:
+                                idx += _ar
+                            if 0 <= idx < _ar:
+                                return ast.Name(id=f"{node.value.id}__{idx}", ctx=ast.Load())
+                        return node
+
+                def _rewrite_cap_assigns(stmts: List[ast.stmt]) -> List[ast.stmt]:
+                    nonlocal changed
+                    out_s: List[ast.stmt] = []
+                    for st in stmts:
+                        for attr in ("body", "orelse", "finalbody"):
+                            sub = getattr(st, attr, None)
+                            if isinstance(sub, list):
+                                setattr(st, attr, _rewrite_cap_assigns(sub))
+                        if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                                and isinstance(st.targets[0], ast.Name)
+                                and st.targets[0].id in simple_captures):
+                            hc = _is_helper_call(st.value)
+                            if hc is not None:
+                                fn_name, call_node = hc
+                                arity, _ = tuple_helpers[fn_name]
+                                vname = st.targets[0].id
+                                split_needed.add(fn_name)
+                                for idx in range(arity):
+                                    call_k = ast.Call(
+                                        func=ast.Name(id=f"{fn_name}__{idx}", ctx=ast.Load()),
+                                        args=[copy.deepcopy(a) for a in call_node.args],
+                                        keywords=[],
+                                    )
+                                    out_s.append(ast.Assign(
+                                        targets=[ast.Name(id=f"{vname}__{idx}", ctx=ast.Store())],
+                                        value=call_k,
+                                    ))
+                                changed = True
+                                continue
+                        out_s.append(st)
+                    return out_s
+
+                fn_node.body = _rewrite_cap_assigns(fn_node.body)
+                _CapSubRewriter().visit(fn_node)
+
+        # Emit scalar helper functions fn__0 .. fn__{M-1}
+        if split_needed:
+            new_body: List[ast.stmt] = []
+            for top in tree.body:
+                if isinstance(top, ast.FunctionDef) and top.name in split_needed:
+                    arity, _ = tuple_helpers[top.name]
+                    still_called = any(
+                        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == top.name
+                        for n in ast.walk(tree)
+                    )
+                    if still_called:
+                        new_body.append(top)
+                    for idx in range(arity):
+                        fn_clone = copy.deepcopy(top)
+                        fn_clone.name = f"{top.name}__{idx}"
+
+                        class _RetSlice(ast.NodeTransformer):
+                            def visit_FunctionDef(self, inner: ast.FunctionDef) -> ast.AST:
+                                if inner is fn_clone:
+                                    return self.generic_visit(inner)
+                                return inner
+
+                            def visit_Return(self, rnode: ast.Return) -> ast.AST:
+                                if isinstance(rnode.value, (ast.Tuple, ast.List)) and idx < len(rnode.value.elts):
+                                    rnode.value = rnode.value.elts[idx]
+                                return rnode
+
+                        _RetSlice().visit(fn_clone)
+                        new_body.append(fn_clone)
+                    changed = True
+                    notes.append(f"split tuple-returning helper {top.name} into {arity} scalar functions")
+                else:
+                    new_body.append(top)
+            tree.body = new_body
+
+    # 2. Unroll static tuple / list / enumerate / zip loops (`for v in (a, b, c):`)
+    def _has_direct_loop_jump(stmts: Sequence[ast.stmt]) -> bool:
+        for st in stmts:
+            if isinstance(st, (ast.Break, ast.Continue)):
+                return True
+            if isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef)):
+                continue
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(st, attr, None)
+                if isinstance(sub, list) and _has_direct_loop_jump(sub):
+                    return True
+            for h in getattr(st, "handlers", ()) or ():
+                if isinstance(getattr(h, "body", None), list) and _has_direct_loop_jump(h.body):
+                    return True
+        return False
+
+    def _static_iter_elements(
+        it_expr: ast.AST, local_seqs: Dict[str, List[ast.expr]]
+    ) -> Optional[List[ast.expr]]:
+        if isinstance(it_expr, (ast.Tuple, ast.List)) and not any(isinstance(e, ast.Starred) for e in it_expr.elts):
+            return [copy.deepcopy(e) for e in it_expr.elts]
+        if isinstance(it_expr, ast.Name) and it_expr.id in local_seqs:
+            return [copy.deepcopy(e) for e in local_seqs[it_expr.id]]
+        if (isinstance(it_expr, ast.Call) and isinstance(it_expr.func, ast.Name)
+                and not it_expr.keywords):
+            cname = it_expr.func.id
+            if cname == "enumerate" and 1 <= len(it_expr.args) <= 2:
+                seq = _static_iter_elements(it_expr.args[0], local_seqs)
+                if seq is None:
+                    return None
+                start_i = 0
+                if len(it_expr.args) == 2:
+                    sv = _eval_const_ast(it_expr.args[1])
+                    if sv is None or abs(sv - round(sv)) > 1e-12:
+                        return None
+                    start_i = int(round(sv))
+                return [
+                    ast.Tuple(elts=[ast.Constant(value=start_i + k), elt], ctx=ast.Load())
+                    for k, elt in enumerate(seq)
+                ]
+            if cname == "zip" and it_expr.args:
+                seqs = [_static_iter_elements(a, local_seqs) for a in it_expr.args]
+                if all(s is not None for s in seqs):
+                    min_len = min(len(s) for s in seqs if s is not None)
+                    return [
+                        ast.Tuple(elts=[s[k] for s in seqs if s is not None], ctx=ast.Load())
+                        for k in range(min_len)
+                    ]
+        return None
+
+    def _unroll_block(stmts: List[ast.stmt], outer_seqs: Optional[Dict[str, List[ast.expr]]] = None) -> List[ast.stmt]:
+        nonlocal changed
+        local_seqs: Dict[str, List[ast.expr]] = dict(outer_seqs or {})
+        out: List[ast.stmt] = []
+        for stmt in stmts:
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, attr, None)
+                if isinstance(sub, list):
+                    setattr(stmt, attr, _unroll_block(sub, local_seqs))
+            for h in getattr(stmt, "handlers", ()) or ():
+                if isinstance(getattr(h, "body", None), list):
+                    h.body = _unroll_block(h.body, local_seqs)
+
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                tname = stmt.targets[0].id
+                if (tname not in mutated_names
+                        and isinstance(stmt.value, (ast.Tuple, ast.List))
+                        and not any(isinstance(e, ast.Starred) for e in stmt.value.elts)):
+                    local_seqs[tname] = [copy.deepcopy(e) for e in stmt.value.elts]
+                else:
+                    local_seqs.pop(tname, None)
+
+            if isinstance(stmt, ast.For) and not _has_direct_loop_jump(stmt.body):
+                elts = _static_iter_elements(stmt.iter, local_seqs)
+                if elts is not None:
+                    tgt = stmt.target
+                    for elt in elts:
+                        if isinstance(tgt, ast.Name):
+                            out.append(ast.Assign(
+                                targets=[ast.Name(id=tgt.id, ctx=ast.Store())],
+                                value=copy.deepcopy(elt),
+                            ))
+                        elif isinstance(tgt, (ast.Tuple, ast.List)) and not any(isinstance(x, ast.Starred) for x in tgt.elts):
+                            if isinstance(elt, (ast.Tuple, ast.List)) and len(elt.elts) == len(tgt.elts):
+                                cid = _next_id()
+                                tnames: List[str] = []
+                                for k, ev in enumerate(elt.elts):
+                                    tn = f"_invar_loop_{cid}_{k}"
+                                    tnames.append(tn)
+                                    out.append(ast.Assign(targets=[ast.Name(id=tn, ctx=ast.Store())], value=copy.deepcopy(ev)))
+                                for l_e, tn in zip(tgt.elts, tnames):
+                                    out.append(ast.Assign(targets=[copy.deepcopy(l_e)], value=ast.Name(id=tn, ctx=ast.Load())))
+                            else:
+                                for k, l_e in enumerate(tgt.elts):
+                                    out.append(ast.Assign(
+                                        targets=[copy.deepcopy(l_e)],
+                                        value=ast.Subscript(value=copy.deepcopy(elt), slice=ast.Constant(value=k), ctx=ast.Load()),
+                                    ))
+                        else:
+                            out.append(ast.Assign(targets=[copy.deepcopy(tgt)], value=copy.deepcopy(elt)))
+                        out.extend(copy.deepcopy(b) for b in stmt.body)
+                    if stmt.orelse:
+                        out.extend(copy.deepcopy(o) for o in stmt.orelse)
+                    changed = True
+                    notes.append(f"unrolled static for-loop over {len(elts)} element(s)")
+                    continue
+            out.append(stmt)
+        return out
+
+    # Track mutated sequence names so we only alias immutable locals
+    mutated_names: Set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and isinstance(n.ctx, ast.Store):
+            mutated_names.add(n.value.id)
+        elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and isinstance(n.func.value, ast.Name) and n.func.attr in {"append", "extend", "pop", "insert", "clear"}):
+            mutated_names.add(n.func.value.id)
+
+    for top in tree.body:
+        if isinstance(top, ast.FunctionDef):
+            top.body = _unroll_block(top.body)
+
+    # 3. Lower multi-arg / iterable `min`, `max`, `sum`, `all`, `any`
+    class _SubstituteName(ast.NodeTransformer):
+        def __init__(self, target_id: str, replacement: ast.expr) -> None:
+            self.target_id = target_id
+            self.replacement = replacement
+
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if isinstance(node.ctx, ast.Load) and node.id == self.target_id:
+                return copy.deepcopy(self.replacement)
+            return node
+
+    def _fold_bin_call(fn_id: str, items: Sequence[ast.expr]) -> ast.expr:
+        acc = copy.deepcopy(items[0])
+        for nxt in items[1:]:
+            acc = ast.Call(func=ast.Name(id=fn_id, ctx=ast.Load()), args=[acc, copy.deepcopy(nxt)], keywords=[])
+        return acc
+
+    class _BuiltinScalarLowerer(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            nonlocal changed
+            self.generic_visit(node)
+            if not isinstance(node.func, ast.Name) or node.keywords or node.func.id in defined_fns:
+                return node
+            fname = node.func.id
+            args = node.args
+            if fname in ("min", "max"):
+                if len(args) == 1 and isinstance(args[0], (ast.Tuple, ast.List)) and not any(isinstance(e, ast.Starred) for e in args[0].elts):
+                    elts = args[0].elts
+                    if len(elts) == 1:
+                        changed = True
+                        notes.append(f"lowered single-element {fname}(...)")
+                        return copy.deepcopy(elts[0])
+                    if len(elts) >= 2:
+                        changed = True
+                        notes.append(f"lowered iterable {fname}(...) over {len(elts)} elements")
+                        return _fold_bin_call(fname, elts)
+                elif len(args) >= 3:
+                    changed = True
+                    notes.append(f"lowered {len(args)}-arg {fname}(...) to nested binary {fname}")
+                    return _fold_bin_call(fname, args)
+            elif fname == "sum" and 1 <= len(args) <= 2:
+                seq_arg = args[0]
+                start_expr: Optional[ast.expr] = copy.deepcopy(args[1]) if len(args) == 2 else None
+                terms: Optional[List[ast.expr]] = None
+                if isinstance(seq_arg, (ast.Tuple, ast.List)) and not any(isinstance(e, ast.Starred) for e in seq_arg.elts):
+                    terms = [copy.deepcopy(e) for e in seq_arg.elts]
+                elif (isinstance(seq_arg, (ast.GeneratorExp, ast.ListComp))
+                      and len(seq_arg.generators) == 1
+                      and isinstance(seq_arg.generators[0].target, ast.Name)
+                      and isinstance(seq_arg.generators[0].iter, (ast.Tuple, ast.List))
+                      and not any(isinstance(e, ast.Starred) for e in seq_arg.generators[0].iter.elts)):
+                    gen = seq_arg.generators[0]
+                    t_id = gen.target.id
+                    terms = []
+                    for e_it in gen.iter.elts:
+                        sub_elt = _SubstituteName(t_id, e_it).visit(copy.deepcopy(seq_arg.elt))
+                        if gen.ifs:
+                            cond = gen.ifs[0]
+                            for extra_c in gen.ifs[1:]:
+                                cond = ast.BoolOp(op=ast.And, values=[cond, extra_c])
+                            sub_cond = _SubstituteName(t_id, e_it).visit(copy.deepcopy(cond))
+                            sub_elt = ast.IfExp(test=sub_cond, body=sub_elt, orelse=ast.Constant(value=0.0))
+                        terms.append(sub_elt)
+                if terms is not None:
+                    if not terms:
+                        changed = True
+                        return start_expr if start_expr is not None else ast.Constant(value=0.0)
+                    acc_sum: ast.expr = terms[0] if start_expr is None else ast.BinOp(left=start_expr, op=ast.Add(), right=terms[0])
+                    for t_next in terms[1:]:
+                        acc_sum = ast.BinOp(left=acc_sum, op=ast.Add(), right=t_next)
+                    changed = True
+                    notes.append(f"lowered static sum(...) over {len(terms)} terms")
+                    return acc_sum
+            elif fname in ("all", "any") and len(args) == 1:
+                seq_arg = args[0]
+                if isinstance(seq_arg, (ast.Tuple, ast.List)) and not any(isinstance(e, ast.Starred) for e in seq_arg.elts):
+                    elts = seq_arg.elts
+                    if not elts:
+                        changed = True
+                        return ast.Constant(value=(fname == "all"))
+                    if len(elts) == 1:
+                        changed = True
+                        return copy.deepcopy(elts[0])
+                    changed = True
+                    notes.append(f"lowered iterable {fname}(...) over {len(elts)} elements")
+                    return ast.BoolOp(op=ast.And() if fname == "all" else ast.Or(), values=[copy.deepcopy(e) for e in elts])
+            return node
+
+    tree = _BuiltinScalarLowerer().visit(tree)
+    if changed:
+        ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
 def _desugar_tuple_unpacking_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
     """Desugar tuple/list unpacking assignments ``a, b = (x, y)`` into sequential
     scalar temporary assignments so C++20 lowering never hits tuple-assign errors."""
@@ -6381,6 +7054,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     bridge_contracts = list(all_contracts or contracts or [])
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
     tree, sig_changed, sig_notes = _normalize_step_signatures_tree(tree)
+    tree, loop_changed, loop_notes = _lower_scalar_loops_and_builtins_tree(tree)
     tree, tup_changed, tup_notes = _desugar_tuple_unpacking_tree(tree)
     tree, comp_changed, comp_notes = _lower_comprehensions_tree(tree)
     tree, glob_changed, glob_notes = _strip_global_nonlocal_tree(tree)
@@ -6418,12 +7092,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(sig_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or sig_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):

@@ -1170,11 +1170,14 @@ def render_evidence_table(evidence: StructuredResearchEvidence) -> str:
                 f"| {_md_cell(p.source)} |")
         lines.append("")
     if evidence.equations:
+        from ..latex_normalizer import _balance_math_expr, canonicalize_math_content
         lines += ["| Equation | LaTeX | Python hint (v9) | Source |",
                   "|---|---|---|---|"]
         for e in evidence.equations:
             hint = f"`{e.lhs} = {e.rhs_python_hint}`" if e.rhs_python_hint else "—"
-            lines.append(f"| {_md_cell(e.description or e.lhs)} | `{_md_cell(e.rhs_latex)}` "
+            raw_tex = (e.rhs_latex or "").strip().strip("$").strip("`").strip()
+            tex_cell = f"${_balance_math_expr(canonicalize_math_content(raw_tex))}$" if raw_tex else "—"
+            lines.append(f"| {_md_cell(e.description or e.lhs)} | {_md_cell(tex_cell)} "
                          f"| {_md_cell(hint)} | {_md_cell(e.source)} |")
         lines.append("")
     if evidence.benchmarks:

@@ -217,6 +217,7 @@ class CppEmitter:
         self.types = {p: (BUF if p == "buf" else FLOAT) for p in params}
         self._aliases = {}
         loop_vars: Set[str] = set()
+        float_loop_vars: Set[str] = set()
         assigns: List[tuple] = []
 
         def walk(stmts):
@@ -239,6 +240,8 @@ class CppEmitter:
                     var = _ref_name(s.get("target"))
                     if var:
                         loop_vars.add(var)
+                        if (s.get("iter") or {}).get("type") == "list":
+                            float_loop_vars.add(var)
                     walk(s.get("body"))
                 elif t == "loop_while":
                     walk(s.get("body"))
@@ -248,7 +251,7 @@ class CppEmitter:
 
         walk(fn.get("body"))
         for v in loop_vars:
-            self.types.setdefault(v, INT)
+            self.types.setdefault(v, FLOAT if v in float_loop_vars else INT)
         local_types: Dict[str, str] = {}
         for _ in range(4):
             changed = False
@@ -582,6 +585,13 @@ class CppEmitter:
         if not var:
             raise EmitterError("for-loop target must be a simple name")
         it = node.get("iter") or {}
+        if it.get("type") == "list":
+            elems = it.get("elements") or []
+            if not elems:
+                return ""
+            init_list = ", ".join(self._num(e) for e in elems)
+            body = self._emit_body(node.get("body"), indent + 1)
+            return f"{pad}for (double {var} : {{{init_list}}}) {{\n{body}{pad}}}\n"
         if it.get("type") not in ("call",) or _call_name(it) != "range":
             raise EmitterError("for loops must iterate over range(...)")
         args = _call_args(it)

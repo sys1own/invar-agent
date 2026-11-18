@@ -555,7 +555,27 @@ function renderMarkdown(text) {
     const key = tok.d ? `@@INVAR_MATH_D_${i}@@` : `@@INVAR_MATH_I_${i}@@`;
     html = html.split(key).join(_renderKatexExpr(tok.expr, tok.d));
   }
-  return html;
+  // Ensure LaTeX/Equation table columns wrapped in <code> also render via KaTeX.
+  const wrapDom = document.createElement('div');
+  wrapDom.innerHTML = html;
+  wrapDom.querySelectorAll('table').forEach(tbl => {
+    const ths = Array.from(tbl.querySelectorAll('thead th, tr th'));
+    const eqCols = ths.map((th, idx) => /latex|equation|formula/i.test(th.textContent || '') ? idx : -1).filter(idx => idx >= 0);
+    if (!eqCols.length) return;
+    tbl.querySelectorAll('tbody tr, tr').forEach(tr => {
+      const tds = tr.querySelectorAll('td');
+      eqCols.forEach(idx => {
+        const td = tds[idx];
+        if (!td || td.querySelector('.katex')) return;
+        const codeEl = td.querySelector('code');
+        const raw = (codeEl ? codeEl.textContent : td.textContent || '').trim();
+        if (raw && raw !== '—' && raw !== '-' && /[\\^_=<>]/.test(raw)) {
+          td.innerHTML = _renderKatexExpr(raw.replace(/^\$+|\$+$/g, ''), false);
+        }
+      });
+    });
+  });
+  return wrapDom.innerHTML;
 }
 function addCopilotMsg(markdown) {
   const m = el(`<div class="msg copilot"><div class="md"></div></div>`);

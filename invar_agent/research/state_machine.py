@@ -2779,7 +2779,7 @@ class ResearchStateMachine:
         if stage > 1 and all_contract_dicts:
             prior_slots: Set[int] = set()
             for _cd in all_contract_dicts:
-                if _canon_stage_index(str(_cd.get("contract_id") or "")) < stage:
+                if _contract_stage_index(str(_cd.get("contract_id") or "")) < stage:
                     for _iv in (_cd.get("invariants") or []):
                         for _m_s in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", str(_iv.get("assertion") or "")):
                             prior_slots.add(int(_m_s))

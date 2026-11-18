@@ -919,3 +919,196 @@ def test_ratio_product_or_disjunction_and_witness_cpp_cabi_and_fraction_extracto
             assert _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
                 f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={res['state'][:24]}"
             )
+
+
+def test_tier0_tuple_loop_tuple_return_builtins_bridge_order_and_cpp20_execution(tmp_path):
+    from invar_agent.research.state_machine import _eval_invariant, _guard_contract_initial_state
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    # Mimic nh3_floquet_microkinetics tuple/list for-loops, tuple-returning helper,
+    # multi-arg min/max/sum, and de-collided TOF_classical bridge after state[6] <= 1e-3.
+    kernel = (
+        "import math\n\n"
+        "def rate_classical(t):\n"
+        "    k = math.exp(-3.0 / max(t, 1.0)) * 1e-4\n"
+        "    ea = 1.6e-19 * 0.95\n"
+        "    return k, ea\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    theta_free = 0.70\n"
+        "    theta_n = 0.15\n"
+        "    theta_h = 0.10\n"
+        "    theta_nh3 = 0.05\n"
+        "    eps = 1e-12\n"
+        "    s = 0.0\n"
+        "    for v in (theta_free, theta_n, theta_h, theta_nh3):\n"
+        "        if v > eps:\n"
+        "            s += v * math.log(v)\n"
+        "    k_n2, ea_n2 = rate_classical(300.0)\n"
+        "    min_v = min(theta_free, theta_n, theta_h, theta_nh3)\n"
+        "    tot = sum((theta_free, theta_n, theta_h, theta_nh3))\n"
+        "    tof_cl = 1.0e13\n"  # deliberately violates Stage 1 state[6] <= 1e-3 before clamping
+        "    tof_enh = 5.0 + 0.0 * k_n2 + 0.0 * ea_n2 + 0.0 * min_v + 0.0 * s + 0.0 * tot\n"
+        "    buf.data[4] = theta_free\n"
+        "    buf.data[5] = theta_n\n"
+        "    buf.data[6] = tof_cl\n"
+        "    buf.data[7] = tof_enh\n"
+        "    buf.data[8] = 45.0 / 64.0\n"
+        "    buf.data[9] = 0.95\n"
+    )
+    contracts = [
+        VerificationContract.model_validate({
+            "contract_id": "c1_classical_lhhw",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [
+                {"variable_name": "tof_classical", "assertion": "state[6] <= 1e-3", "tolerance": 1e-12},
+                {"variable_name": "theta_sum", "assertion": "abs(state[4] + state[5] - 0.85) <= 1e-9", "tolerance": 1e-9},
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c2_floquet_virasoro_tof",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [
+                {"variable_name": "delta_h_vis", "assertion": "abs(state[8] - 0.703125) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "tof_enhanced_exceeds_classical", "assertion": "state[7] > state[16] and state[7] >= 1.0", "tolerance": 1e-12},
+                {"variable_name": "eta_selectivity", "assertion": "0.90 <= state[9] <= 1.0", "tolerance": 1e-12},
+            ],
+        }),
+    ]
+    san = sanitize_intrinsics(
+        kernel,
+        contracts=contracts,
+        all_contracts=contracts,
+        variable_map={"tof_classical": 6, "tof_classical_c2": 16, "tof_enhanced": 7},
+    )
+    assert san.changed
+    assert "for v in" not in san.code
+    assert "rate_classical__0" in san.code and "rate_classical__1" in san.code
+    san2 = sanitize_intrinsics(
+        san.code,
+        contracts=contracts,
+        all_contracts=contracts,
+        variable_map={"tof_classical": 6, "tof_classical_c2": 16, "tof_enhanced": 7},
+    )
+    assert san2.changed is False
+
+    # Compile and execute via C++20 C-ABI
+    uast = python_source_to_uast(san.code)
+    cpp = CppEmitter().emit_module(uast)
+    bridge = DynamicCABIBridge(tmp_path / "cabi_tuple_unroll")
+    for vc in contracts:
+        init, _w = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
+        res = bridge.run(
+            cpp_code=cpp,
+            initial_state=list(init) + [0.0] * 4,
+            dt=0.01,
+            steps=3,
+            entry="execute_step",
+        )
+        assert res["finite"] is True
+        assert res["state"][6] <= 1e-3
+        assert res["state"][16] <= 1e-3
+        assert res["state"][7] == pytest.approx(5.0)
+        for inv in vc.invariants:
+            assert _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
+                f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={res['state'][:20]}"
+            )
+
+    # Direct CppEmitter range-for fallback check on an unsanitized scalar tuple loop
+    direct_src = (
+        "def simulation_step(buf, dt):\n"
+        "    s = 0.0\n"
+        "    for v in (buf.data[0], 0.25, 0.5):\n"
+        "        s += v\n"
+        "    buf.data[4] = s\n"
+    )
+    direct_cpp = CppEmitter().emit_module(python_source_to_uast(direct_src))
+    assert "for (double v : {" in direct_cpp
+
+    # Multi-slot linear sum conservation with evolving dynamical slot state[1]
+    simplex_src = (
+        "def simulation_step(buf, dt):\n"
+        "    buf.data[1] = 0.05\n"
+        "    buf.data[24] = 0.1\n"
+        "    buf.data[25] = 0.1\n"
+        "    buf.data[26] = 0.7\n"
+    )
+    vc_simplex = VerificationContract.model_validate({
+        "contract_id": "c3_thermo_selectivity",
+        "target_backend": "cpp",
+        "initial_state": [0.4, 0.1, 0.2, 0.3] + [0.0] * 24,
+        "dt": 0.01,
+        "steps": 3,
+        "invariants": [
+            {"variable_name": "coverage_simplex_stage3", "assertion": "abs(state[24] + state[1] + state[25] + state[26] - 1.0) <= 1e-12", "tolerance": 1e-12},
+        ],
+    })
+    san_sx = sanitize_intrinsics(simplex_src, contracts=[vc_simplex], all_contracts=[vc_simplex])
+    assert san_sx.changed
+    assert sanitize_intrinsics(san_sx.code, contracts=[vc_simplex], all_contracts=[vc_simplex]).changed is False
+    res_sx = DynamicCABIBridge(tmp_path / "cabi_msum").run(
+        cpp_code=CppEmitter().emit_module(python_source_to_uast(san_sx.code)),
+        initial_state=list(vc_simplex.initial_state),
+        dt=0.01,
+        steps=3,
+        entry="execute_step",
+    )
+    assert _eval_invariant(vc_simplex.invariants[0].assertion, res_sx["state"], {}, {"tol": 1e-12})
+
+
+def test_latex_normalizer_no_double_subscripts_no_bare_latex_and_table_wrapping():
+    import re
+    from invar_agent.latex_normalizer import normalize_report_latex
+    from invar_agent.research.extractor import ExtractedEquation, StructuredResearchEvidence, render_evidence_table
+
+    hyp = (
+        "**Hypothesis:** Coupling delta_g_PEGS(t) = G * M_dot_moment(t) / R_fault^3 with "
+        "sigma_eff^2 = sigma_SQL^2 * (exp(-2 * r_squeeze) + S*1e-3), overcoming SNR_SQL < 1 "
+        "so SNR_TMSV >= 10 with r_squeeze = 2.50. Legacy bare "
+        r"\delta_g_{\mathrm{PEGS}}(t)=G \cdot M_dot_{\mathrm{moment}}(t)/R_{\mathrm{fault}}^3 "
+        r"and \mathrm{SNR}_{\mathrm{SQL}}<1 and SNR_{\mathrm{TMSV}} \ge 10."
+    )
+    norm = normalize_report_latex(hyp)
+    assert "S1e-3" not in norm
+    assert r"\cdot 10^{-3}" in norm
+    assert r"\delta_{g,\mathrm{PEGS}}" in norm
+    assert r"M_{\mathrm{dot},\mathrm{moment}}" in norm
+    # Zero double subscripts anywhere in math segments
+    for seg in norm.split("$")[1::2]:
+        assert not re.search(r"_(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|[A-Za-z0-9])\s*_", seg), seg
+    # Zero bare LaTeX commands outside $...$
+    outside = "".join(norm.split("$")[0::2])
+    for forbidden in (r"\mathrm", r"\delta", r"\sigma", r"\ge", r"\le", r"\cdot", "_{", "^{"):
+        assert forbidden not in outside, f"Bare {forbidden} leaked outside $...$: {outside}"
+
+    ev = StructuredResearchEvidence(
+        equations=[
+            ExtractedEquation(
+                lhs="eta_D",
+                rhs_latex=r"\frac{23}{33}",
+                rhs_python_hint="23.0 / 33.0",
+                description="Dark partition",
+                source="SHBT",
+            ),
+            ExtractedEquation(
+                lhs="S",
+                rhs_latex=r"\left(\frac{\eta_A}{\eta_D + \eta_A}\right)^2",
+                rhs_python_hint="(eta_A / (eta_D + eta_A)) ** 2",
+                description="Shunt factor",
+                source="SHBT",
+            ),
+        ]
+    )
+    tbl = render_evidence_table(ev)
+    assert "| $\\frac{23}{33}$ |" in tbl
+    assert "| $\\left(\\frac{\\eta_A}{\\eta_D + \\eta_A}\\right)^2$ |" in tbl
+    tbl_norm = normalize_report_latex(tbl)
+    assert r"$\frac{23}{33}$" in tbl_norm
