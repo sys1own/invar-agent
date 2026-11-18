@@ -20,15 +20,21 @@ SAFE_BUILTINS = {"print", "len", "range", "abs", "min", "max", "sum", "enumerate
 MATH_CONSTANTS = {"pi": 3.141592653589793, "e": 2.718281828459045,
                   "tau": 6.283185307179586, "inf": float("inf")}
 MATH_FUNCS = {
-    "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh",
-    "cosh", "tanh", "exp", "log", "log10", "log2", "log1p", "expm1", "ceil",
-    "floor", "pow", "fabs", "fmod", "hypot", "copysign", "trunc", "isfinite",
-    "isnan", "isinf", "radians", "degrees",
+    "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "exp", "expm1", "log", "log10", "log2", "log1p",
+    "ceil", "floor", "trunc", "pow", "fabs", "fmod", "hypot", "copysign",
+    "erf", "erfc", "gamma", "lgamma",
+    "isfinite", "isnan", "isinf", "radians", "degrees",
 }
 INTRINSIC_ALIASES = {"clamp": "clamp", "clip": "clamp", "sign": "sign",
                      "sgn": "sign", "sq": "sq", "lerp": "lerp",
                      "safe_div": "safe_div"}
-NP_MATH_FUNCS = MATH_FUNCS | {"abs", "clip", "sign", "sgn"}
+_NP_MATH_ALIASES = {
+    "arcsin": "asin", "arccos": "acos", "arctan": "atan", "arctan2": "atan2",
+    "arcsinh": "asinh", "arccosh": "acosh", "arctanh": "atanh",
+}
+NP_MATH_FUNCS = MATH_FUNCS | {"abs", "clip", "sign", "sgn"} | set(_NP_MATH_ALIASES)
 
 
 class UnsupportedError(ValueError):
@@ -233,7 +239,8 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
                 elif attr in {"sq", "lerp", "safe_div"}:
                     func_node = {"type": "reference", "name": attr}
                 elif attr in NP_MATH_FUNCS:
-                    func_node = {"type": "reference", "name": f"math.{attr}"}
+                    mapped_attr = _NP_MATH_ALIASES.get(attr, attr)
+                    func_node = {"type": "reference", "name": f"math.{mapped_attr}"}
         return {"type": call_type, "function": func_node,
                 "argument": args[0] if args else None, "arguments": args}
     if isinstance(expr, ast.IfExp):

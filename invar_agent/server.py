@@ -1349,6 +1349,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         if not manager.approve():
             raise HTTPException(status_code=409, detail="could not start research run")
         return {"status": "running", "started": True, "blueprint_id": bp.blueprint_id,
+                "run_uid": manager.active_run_uid,
                 "source": outcome.get("source"),
                 "feasibility": feasibility.model_dump() if feasibility else None}
 
@@ -1361,7 +1362,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             ok = manager.approve()
             if not ok:
                 raise HTTPException(status_code=409, detail="no pending research plan to approve")
-            return {"status": "running"}
+            return {"status": "running", "run_uid": manager.active_run_uid}
         if req.action == "edit_plan":
             if req.blueprint is None:
                 raise HTTPException(status_code=400, detail="edit_plan requires a blueprint")

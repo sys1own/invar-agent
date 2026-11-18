@@ -633,3 +633,190 @@ def test_intra_function_overwrite_splitter_and_relative_error_product_reconcile(
             assert _eval_invariant(inv.assertion, b.data, {}, {"tol": inv.tolerance}), (
                 f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={b.data[:24]}"
             )
+
+
+def test_cpp20_all_math_functions_and_clamp_transpile_and_execute(tmp_path):
+    import math
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    src = """import math
+
+def simulation_step(buf, dt):
+    x = 0.5
+    buf.data[0] = math.asinh(x)
+    buf.data[1] = math.acosh(2.0)
+    buf.data[2] = math.atanh(0.25)
+    buf.data[3] = math.sinh(x) + math.cosh(x) + math.tanh(x)
+    buf.data[4] = math.erf(x) + math.cbrt(8.0) + math.expm1(x) + math.log1p(x)
+    buf.data[5] = math.gamma(4.0) + math.lgamma(4.0)
+    buf.data[6] = math.degrees(math.radians(45.0))
+    buf.data[7] = clamp(5.0, 2.5, 4.3)
+    buf.data[8] = math.log(8.0, 2.0)
+"""
+    uast = python_source_to_uast(src)
+    cpp = CppEmitter().emit_module(uast)
+    assert "std::asinh(" in cpp
+    assert "std::acosh(std::max(1.0," in cpp
+    assert "std::atanh(std::clamp(" in cpp
+    assert "std::tgamma(" in cpp
+    assert "invar::clamp(" in cpp
+
+    bridge = DynamicCABIBridge(tmp_path / "cabi_math")
+    res = bridge.run(
+        cpp_code=cpp,
+        initial_state=[0.0] * 10,
+        dt=0.01,
+        steps=1,
+        entry="execute_step",
+    )
+    assert res["finite"] is True
+    assert res["state"][0] == pytest.approx(math.asinh(0.5))
+    assert res["state"][1] == pytest.approx(math.acosh(2.0))
+    assert res["state"][2] == pytest.approx(math.atanh(0.25))
+    assert res["state"][4] == pytest.approx(math.erf(0.5) + 2.0 + math.expm1(0.5) + math.log1p(0.5))
+    assert res["state"][5] == pytest.approx(math.gamma(4.0) + math.lgamma(4.0))
+    assert res["state"][6] == pytest.approx(45.0)
+    assert res["state"][7] == pytest.approx(4.3)
+    assert res["state"][8] == pytest.approx(3.0)
+
+    # INLINE_INTRINSIC safety net for math.asinh
+    healed = apply_healing_directives(
+        "def f(x):\n    return math.asinh(x)\n",
+        [{"op": "INLINE_INTRINSIC", "name": "math.asinh"}],
+    )
+    assert "math.log" in healed.code and "math.sqrt" in healed.code
+
+
+def test_chained_bounds_general_upper_bound_and_concept_bridge():
+    from invar_agent.research.state_machine import (
+        _auto_populate_variable_map, _eval_invariant, _guard_contract_initial_state)
+    from invar_agent.schemas.research import VerificationContract
+
+    # Mimics dfn_p2d_sei_fastcharge writing time into slot 20 while computing T_rise locally
+    kernel = (
+        "import math\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    eta_bv = math.asinh(0.4)\n"
+        "    V_cell = 4.65 + 0.01 * eta_bv\n"  # deliberately above 4.3 upper bound
+        "    t = buf.data[20]\n"
+        "    T_rise = 8.4\n"
+        "    buf.data[15] = V_cell\n"
+        "    buf.data[18] = max(0.0, buf.data[18] + 1e-10 * dt)\n"
+        "    buf.data[20] = t + dt\n"
+        "    buf.data[21] = T_rise\n"
+    )
+    vc = VerificationContract.model_validate({
+        "contract_id": "c1_dfn_p2d_sei",
+        "target_backend": "cpp",
+        "initial_state": [0.0] * 24,
+        "dt": 1.0,
+        "steps": 5,
+        "invariants": [
+            {"variable_name": "voltage_bounds", "assertion": "2.5 <= state[15] <= 4.3", "tolerance": 1e-9},
+            {"variable_name": "sei_monotonic", "assertion": "state[18] >= 0.0 and state[18] <= telemetry['final_max']", "tolerance": 1e-12},
+            {"variable_name": "temp_rise", "assertion": "state[20] <= 15.0", "tolerance": 1e-9},
+        ],
+    })
+    bp = ResearchBlueprint(
+        blueprint_id="dfn_test",
+        title="DFN Test",
+        falsifiable_hypothesis="H",
+        search_queries=["dfn"],
+        code_template=kernel,
+        variable_map={},
+        contracts=[vc],
+    )
+    san = sanitize_intrinsics(kernel, contracts=[vc], all_contracts=[vc], variable_map=bp.variable_map)
+    assert san.changed
+    san2 = sanitize_intrinsics(san.code, contracts=[vc], all_contracts=[vc], variable_map=bp.variable_map)
+    assert san2.changed is False
+    _auto_populate_variable_map(bp, san.code)
+    assert bp.variable_map.get("voltage_bounds") == 15
+    assert bp.variable_map.get("temp_rise") == 20
+
+    init, _ = _guard_contract_initial_state(san.code, vc)
+    assert 2.5 <= init[15] <= 4.3
+    assert init[20] <= 15.0
+
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
+            self.size = len(self.data)
+
+    ns = {}
+    exec(compile(san.code, "<dfn_bounds>", "exec"), ns)
+    b = _Buf(init + [0.0] * 8)
+    for _ in range(1800):
+        ns["simulation_step"](b, 1.0)
+    assert 2.5 <= b.data[15] <= 4.3
+    assert b.data[20] == pytest.approx(8.4)
+    assert b.data[20] <= 15.0
+    tel = {"final_max": max(b.data)}
+    for inv in vc.invariants:
+        assert _eval_invariant(inv.assertion, b.data, tel, {"tol": inv.tolerance})
+
+
+def test_zero_cross_run_commit_bleed_and_katex_ui_and_subscripts(tmp_path):
+    from pathlib import Path
+    from invar_agent.research.broadcaster import ResearchEventBroadcaster, ResearchRunManager
+    from invar_agent.schemas.research import VerificationContract
+
+    bc = ResearchEventBroadcaster()
+    mgr = ResearchRunManager(tmp_path, bc)
+
+    def _bp(bid: str):
+        return ResearchBlueprint(
+            blueprint_id=bid,
+            title=bid,
+            falsifiable_hypothesis="f(x) conservation holds",
+            search_queries=["test"],
+            code_template=(
+                "def simulation_step(buf, dt):\n"
+                "    buf.data[4] = 1.0\n"
+            ),
+            contracts=[
+                VerificationContract.model_validate({
+                    "contract_id": "c1_check",
+                    "target_backend": "cpp",
+                    "initial_state": [0.0] * 8,
+                    "dt": 0.01,
+                    "steps": 2,
+                    "invariants": [{"variable_name": "ok", "assertion": "abs(state[4] - 1.0) <= 1e-9", "tolerance": 1e-9}],
+                })
+            ],
+            target_research_stages=1,
+        )
+
+    mgr.request_plan(_bp("run_one"))
+    assert mgr.approve()
+    uid1 = mgr.active_run_uid
+    mgr._thread.join(timeout=30)
+
+    # Simulate stale late publish from uid1 after run 2 has started
+    mgr.request_plan(_bp("run_two"))
+    assert mgr.approve()
+    uid2 = mgr.active_run_uid
+    assert uid1 != uid2
+    bc.publish("accelerator_log", "commit", {"bundle_hash": "deadbeef" * 8}, run_uid=uid1)
+    assert mgr.committed_bundles == [] or all(b != "deadbeef" * 8 for b in mgr.committed_bundles)
+    q = bc.subscribe()
+    mgr._thread.join(timeout=30)
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    assert events
+    assert all(e.get("run_uid") == uid2 for e in events)
+    assert not any(e.get("bundle_hash") == "deadbeef" * 8 for e in events)
+
+    # UI checks: per-run log card + KaTeX output: 'html' + hidden mathml + subscript bracing
+    index_html = (Path(__file__).resolve().parents[1] / "invar_agent" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "output: 'html'" in index_html
+    assert ".katex-mathml { display: none !important; }" in index_html
+    assert "research-log-${uid}" in index_html
+
+    norm = normalize_report_latex("$R_film(t) = \\delta_SEI(t) / \\kappa_SEI$")
+    assert r"R_{\mathrm{film}}" in norm
+    assert r"\delta_{\mathrm{SEI}}" in norm
+    assert r"\kappa_{\mathrm{SEI}}" in norm

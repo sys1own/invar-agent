@@ -1059,6 +1059,7 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                 _iter_atomic_invariant_nodes,
                 _match_abs_affine,
                 _match_abs_algebraic,
+                _slot_of_state_ast,
                 _unwrap_abs_or_rel_err,
             )
             import ast as _ast
@@ -1126,6 +1127,32 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                                                 f"auto-init: algebraic target slot state[{_ai}] ({inv.variable_name}) "
                                                 f"set from {initial[_ai]} to {_alg_val}")
                                             initial[_ai] = _alg_val
+                        else:
+                            # Handle chained and scalar bounds (e.g. `2.5 <= state[15] <= 4.3` or `state[20] <= 15.0`)
+                            _ls = _slot_of_state_ast(_lhs)
+                            _rs = _slot_of_state_ast(_rhs)
+                            if _ls is not None and _ls not in dyn_set and _ls >= 4 and _ls < len(initial):
+                                _bv = _eval_const_ast(_rhs)
+                                if _bv is not None and math.isfinite(_bv):
+                                    if isinstance(_cmp_op, (_ast.GtE, _ast.Gt)) and _bv > 0.0:
+                                        _req = (_bv + 1e-12) if isinstance(_cmp_op, _ast.Gt) else _bv
+                                        if initial[_ls] < _req:
+                                            initial[_ls] = _req
+                                    elif isinstance(_cmp_op, (_ast.LtE, _ast.Lt)) and c_item is contract and _bv > 1.0 + 1e-6:
+                                        _cap = (_bv - 1e-6) if isinstance(_cmp_op, _ast.Lt) else _bv
+                                        if initial[_ls] > _cap:
+                                            initial[_ls] = _cap
+                            elif _rs is not None and _rs not in dyn_set and _rs >= 4 and _rs < len(initial):
+                                _bv = _eval_const_ast(_lhs)
+                                if _bv is not None and math.isfinite(_bv):
+                                    if isinstance(_cmp_op, (_ast.LtE, _ast.Lt)) and _bv > 0.0:
+                                        _req = (_bv + 1e-12) if isinstance(_cmp_op, _ast.Lt) else _bv
+                                        if initial[_rs] < _req:
+                                            initial[_rs] = _req
+                                    elif isinstance(_cmp_op, (_ast.GtE, _ast.Gt)) and c_item is contract and _bv > 1.0 + 1e-6:
+                                        _cap = (_bv - 1e-6) if isinstance(_cmp_op, _ast.Gt) else _bv
+                                        if initial[_rs] > _cap:
+                                            initial[_rs] = _cap
                         _lhs = _rhs
 
             distinct_slots = {
@@ -1271,7 +1298,7 @@ def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
     bp.variable_map = vm
 
 
-def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
+def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> None:
     """Infer missing ``variable_map`` entries from contract constraints and AST
     buffer bindings so report Section 1 and telemetry ``obs_*`` never leave
     contract metrics null."""
@@ -1289,29 +1316,32 @@ def _auto_populate_variable_map(bp: ResearchBlueprint) -> None:
             slot = next(iter(distinct_slots))
             if inv.variable_name:
                 mapping.setdefault(inv.variable_name, slot)
-    # Also scan simulation_step / layer_1_step AST for `<var> = buf.data[idx]` and `buf.data[idx] = <var>`
-    src = getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
+    # Also scan simulation_step / layer_* AST for `<var> = buf.data[idx]` and `buf.data[idx] = <var>`
+    src = code_text or getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
     if src.strip():
         try:
             tree = ast.parse(src)
             for fn in tree.body:
                 if not isinstance(fn, ast.FunctionDef):
                     continue
-                if fn.name not in ("simulation_step", "layer_1_step"):
+                if fn.name != "simulation_step" and not fn.name.startswith("layer_"):
                     continue
                 for stmt in ast.walk(fn):
                     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                         tgt, val = stmt.targets[0], stmt.value
                         if isinstance(tgt, ast.Name) and isinstance(val, ast.Subscript):
                             m_idx = re.search(r"\[(\d+)\]", ast.unparse(val))
-                            if m_idx and not tgt.id.startswith("_invar_"):
+                            if m_idx and not tgt.id.startswith("_"):
                                 mapping.setdefault(tgt.id, int(m_idx.group(1)))
                         elif isinstance(val, ast.Name) and isinstance(tgt, ast.Subscript):
                             m_idx = re.search(r"\[(\d+)\]", ast.unparse(tgt))
-                            if m_idx and not val.id.startswith("_invar_"):
+                            if m_idx and not val.id.startswith("_"):
                                 mapping.setdefault(val.id, int(m_idx.group(1)))
         except SyntaxError:
             pass
+    if len(mapping) > 4 and all(f"state_{i}" in mapping for i in range(4)):
+        for i in range(4):
+            mapping.pop(f"state_{i}", None)
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
@@ -2241,6 +2271,7 @@ class ResearchStateMachine:
                 f"STAGE_{stage}_BUILD", "deterministic_sanitizer",
                 "Tier-0 sanitizer normalized scalar intrinsics/math domains "
                 f"({'; '.join(san.notes[:3])}).")
+        _auto_populate_variable_map(bp, candidate_code)
 
         if stage > 1:
             try:

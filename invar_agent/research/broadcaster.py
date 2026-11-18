@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+import uuid
 from typing import Any, Dict, List, Optional
 
 from ..schemas.research import ResearchBlueprint
@@ -23,6 +24,7 @@ class ResearchEventBroadcaster:
         self._history: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._seq = 0
+        self._active_run_uid: Optional[str] = None
 
     @property
     def seq(self) -> int:
@@ -47,17 +49,26 @@ class ResearchEventBroadcaster:
             if q in self._subscribers:
                 self._subscribers.remove(q)
 
-    def clear_history(self) -> None:
+    def clear_history(self, run_uid: Optional[str] = None) -> None:
         """Clear replayed event history so a new run never leaks prior commit banners."""
         with self._lock:
             self._history.clear()
+            if run_uid is not None:
+                self._active_run_uid = run_uid
 
-    def publish(self, channel: str, event: str, data: Dict[str, Any]) -> None:
-        """Thread-safe fan-out; safe to call from any thread/loop."""
+    def publish(self, channel: str, event: str, data: Dict[str, Any],
+                run_uid: Optional[str] = None) -> None:
+        """Thread-safe fan-out; drops stale events from superseded runs."""
         with self._lock:
+            active_uid = self._active_run_uid
+            if run_uid is not None and active_uid is not None and run_uid != active_uid:
+                return
             self._seq += 1
             seq = self._seq
+            eff_uid = run_uid if run_uid is not None else active_uid
         payload = {"channel": channel, "event": event, "seq": seq, **data}
+        if eff_uid:
+            payload.setdefault("run_uid", eff_uid)
         with self._lock:
             self._history.append(payload)
             if len(self._history) > 500:
@@ -82,12 +93,24 @@ class ResearchRunManager:
         self.search_client = search_client
         self.pending_blueprint: Optional[ResearchBlueprint] = None
         self.active_state: Optional[ResearchRunState] = None
+        self.active_run_uid: Optional[str] = None
+        self.committed_bundles: List[str] = []
+        self.pinned_checkpoints: List[str] = []
         self._thread: Optional[threading.Thread] = None
         self._abort = threading.Event()
 
-    async def _progress(self, channel: str, payload: Dict[str, Any]) -> None:
+    async def _progress(self, channel: str, payload: Dict[str, Any],
+                        run_uid: Optional[str] = None) -> None:
         event = payload.pop("event", "log")
-        self.broadcaster.publish(channel, event, payload)
+        if event == "commit" and payload.get("bundle_hash"):
+            bh = str(payload.get("bundle_hash"))
+            if run_uid is None or run_uid == self.active_run_uid:
+                self.committed_bundles.append(bh)
+        if event == "checkpoint" and payload.get("bundle_hash"):
+            bh = str(payload.get("bundle_hash"))
+            if run_uid is None or run_uid == self.active_run_uid:
+                self.pinned_checkpoints.append(bh)
+        self.broadcaster.publish(channel, event, payload, run_uid=run_uid)
 
     def request_plan(self, blueprint: ResearchBlueprint) -> None:
         """Stage a blueprint awaiting user approval (approve_plan action)."""
@@ -98,20 +121,34 @@ class ResearchRunManager:
         if bp is None:
             return False
         self._abort.clear()
-        self.broadcaster.clear_history()
+        run_uid = uuid.uuid4().hex[:12]
+        self.active_run_uid = run_uid
+        self.committed_bundles = []
+        self.pinned_checkpoints = []
+        self.broadcaster.clear_history(run_uid=run_uid)
+        # Guarantee each fresh run starts with zero leftover layers/history from prior runs.
+        fresh_bp = bp.model_copy(update={
+            "verified_layers": [],
+            "evolution_history": [],
+            "unified_module_code": None,
+        })
+
+        async def _scoped_progress(channel: str, payload: Dict[str, Any]) -> None:
+            await self._progress(channel, payload, run_uid=run_uid)
+
         machine = ResearchStateMachine(
-            self.workspace_root / "research", progress_cb=self._progress,
+            self.workspace_root / "research", progress_cb=_scoped_progress,
             llm_planner=self.llm_planner, llm_fast=self.llm_fast,
             search_client=self.search_client,
             abort_flag=self._abort.is_set,
             workspace_root=self.workspace_root)
-        self.active_state = ResearchRunState(blueprint=bp)
+        self.active_state = ResearchRunState(blueprint=fresh_bp)
         seeded = list(getattr(self, "seeded_upload_ids", None) or [])
 
         def _run() -> None:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._execute(machine, bp, seeded))
+                loop.run_until_complete(self._execute(machine, fresh_bp, seeded, run_uid=run_uid))
             finally:
                 loop.close()
 
@@ -120,10 +157,13 @@ class ResearchRunManager:
         return True
 
     async def _execute(self, machine: ResearchStateMachine, bp: ResearchBlueprint,
-                       seeded: Optional[List[str]] = None) -> None:
+                       seeded: Optional[List[str]] = None,
+                       run_uid: Optional[str] = None) -> None:
         self.broadcaster.publish("accelerator_log", "run_start",
-                                 {"blueprint_id": bp.blueprint_id})
+                                 {"blueprint_id": bp.blueprint_id}, run_uid=run_uid)
         state = await machine.run(bp)
+        if run_uid and run_uid != self.active_run_uid:
+            return
         self.active_state = state
         # Attached user-uploaded research runs flip from UPLOADED_READY once
         # the verified loop has computationally confirmed the baseline.
@@ -136,11 +176,11 @@ class ResearchRunManager:
                 elif state.status == "PARTIAL":
                     vault.mark_status(rid, "PARTIALLY_VERIFIED")
         if state.aborted:
-            self.broadcaster.publish("accelerator_log", "aborted", {})
+            self.broadcaster.publish("accelerator_log", "aborted", {}, run_uid=run_uid)
         else:
             self.broadcaster.publish("accelerator_log", "run_done",
                                      {"stage": state.stage, "status": state.status,
-                                      "snapshot": state.snapshot()})
+                                      "snapshot": state.snapshot()}, run_uid=run_uid)
 
     def edit(self, blueprint: ResearchBlueprint) -> None:
         self.pending_blueprint = blueprint

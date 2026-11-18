@@ -58,6 +58,7 @@
   .process-log-header { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
   .process-log-title { color:#cbd5e1; font-weight:600; }
   .process-log-status { margin-left:auto; }
+  .katex-mathml { display: none !important; }
   .process-log-status.VERIFIED { background:#064e3b; color:#34d399; border:1px solid #059669; }
   .process-log-status.HALTED { background:#3f1d1d; color:#f87171; border:1px solid #f87171; }
   .process-log-status.RUNNING { background:#1e3a2f; color:#a7f3d0; border:1px solid #059669; }
@@ -516,7 +517,7 @@ function addMsg(cls, text) {
 function _renderKatexExpr(expr, isDisplay) {
   if (typeof katex !== 'undefined' && katex && typeof katex.renderToString === 'function') {
     try {
-      return katex.renderToString(expr, { displayMode: isDisplay, throwOnError: false, strict: false });
+      return katex.renderToString(expr, { displayMode: isDisplay, throwOnError: false, strict: false, output: 'html' });
     } catch (e) { /* fall through to escaped text */ }
   }
   return isDisplay ? `$$${escapeHtml(expr)}$$` : `$${escapeHtml(expr)}$`;
@@ -1216,7 +1217,16 @@ async function runResearchDirect(text, feasibility) {
     if (verdict) {
       addMsg('system', `Feasibility gate: ${verdict} — dispatching verified research loop.`);
     }
-    openResearchStream();
+    const runUid = data.run_uid || ('srv-' + Date.now());
+    seenResearchBanners.clear();
+    lastSeenResearchSeq = 0;
+    activeBackendRunUid = runUid;
+    resetResearchStepper();
+    resetLiteratureCount();
+    const tel = document.getElementById('research-telemetry');
+    if (tel) tel.textContent = '';
+    resetRunLogCard('Research Agent Execution Log', runUid);
+    openResearchStream(runUid);
   } catch (e) {
     addMsg('system', 'Research run error: ' + e);
   } finally {
@@ -1303,14 +1313,23 @@ async function researchAction(action, blueprintJson) {
     catch { addMsg('system', 'Invalid blueprint JSON.'); return; }
   }
   try {
-    await api('/api/v1/research/action', {
+    const res = await api('/api/v1/research/action', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
+    if (action === 'approve_plan' && res && res.run_uid) {
+      activeBackendRunUid = res.run_uid;
+      seenResearchBanners.clear();
+      lastSeenResearchSeq = 0;
+      resetResearchStepper();
+      resetLiteratureCount();
+      resetRunLogCard('Research Agent Execution Log', res.run_uid);
+      openResearchStream(res.run_uid);
+    }
   } catch (e) { addMsg('system', 'Research action error: ' + e); }
 }
 function addResearchReportCard(markdown, path, runId) {
-  const card = el(`<div class="report-card">
+  const card = el(`<div class="report-card" data-run-uid="${escapeHtml(activeRunUid || '')}">
     <div class="report-head">
       <span class="title">📄 Quantitative Research Report</span>
       <span class="hint">${runId ? '@research:' + escapeHtml(runId) : (path ? escapeHtml(path) : '')}</span>
@@ -1387,42 +1406,72 @@ function activityTagClass(stage) {
 }
 /* ---- inline agent process log card (inside #chat-messages) ---- */
 let activeRunCard = null;
+let activeRunUid = null;
+let activeBackendRunUid = null;
+function sealActiveRunLogCard() {
+  if (activeRunCard) {
+    activeRunCard.classList.remove('is-processing');
+    activeRunCard = null;
+  }
+  activeRunUid = null;
+}
+let activeRunCardTitle = 'Research Agent Execution Log';
+function createRunLogCard(title, backendRunUid) {
+  sealActiveRunLogCard();
+  if (title) activeRunCardTitle = title;
+  if (backendRunUid !== undefined) activeBackendRunUid = backendRunUid;
+  return ensureRunLogCard();
+}
 function ensureRunLogCard() {
   if (activeRunCard && document.body.contains(activeRunCard)) return activeRunCard;
-  activeRunCard = el(`<div id="active-run-log-card" class="chat-message agent-message chat-process-log-card process-log-card is-processing">
+  const uid = 'run-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  activeRunUid = uid;
+  const bUid = activeBackendRunUid || '';
+  const card = el(`<div id="research-log-${uid}" data-run-uid="${uid}" data-backend-run-uid="${escapeHtml(bUid)}" class="chat-message agent-message chat-process-log-card process-log-card">
     <div class="process-log-header" title="Click to collapse/expand">
-      <span class="process-log-title" id="active-run-title">Research Agent Execution Log</span>
-      <span class="process-log-status badge RUNNING" id="active-run-badge">RUNNING</span>
+      <span class="process-log-title">${escapeHtml(activeRunCardTitle || 'Research Agent Execution Log')}</span>
+      <span class="process-log-status badge RUNNING">RUNNING</span>
     </div>
-    <div class="process-log-entries" id="active-run-entries"></div>
+    <div class="process-log-entries"></div>
   </div>`);
-  chat.appendChild(activeRunCard);
-  activeRunCard.querySelector('.process-log-header').onclick = () => {
-    const entries = activeRunCard.querySelector('#active-run-entries');
-    entries.classList.toggle('collapsed');
-  };
-  return activeRunCard;
-}
-function resetRunLogCard(title) {
-  const card = ensureRunLogCard();
-  if (title) card.querySelector('#active-run-title').textContent = title;
   card.classList.add('is-processing');
-  const badge = card.querySelector('#active-run-badge');
-  badge.textContent = 'RUNNING';
-  badge.className = 'process-log-status badge RUNNING';
-  card.querySelector('#active-run-entries').innerHTML = '';
-  card.querySelector('#active-run-entries').classList.remove('collapsed');
-  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  chat.appendChild(card);
+  activeRunCard = card;
+  card.querySelector('.process-log-header').onclick = () => {
+    const entries = card.querySelector('.process-log-entries');
+    if (entries) entries.classList.toggle('collapsed');
+  };
+  chat.scrollTop = chat.scrollHeight;
+  card.scrollIntoView({ behavior: 'smooth', block: 'end' });
   return card;
+}
+function resetRunLogCard(title, backendRunUid) {
+  // If runResearchDirect/approve_plan already created a fresh card for this exact backendRunUid, reuse it.
+  if (activeRunCard && document.body.contains(activeRunCard) && backendRunUid &&
+      activeRunCard.getAttribute('data-backend-run-uid') === String(backendRunUid)) {
+    const entries = activeRunCard.querySelector('.process-log-entries');
+    if (entries && entries.children.length === 0) {
+      if (title) {
+        const tEl = activeRunCard.querySelector('.process-log-title');
+        if (tEl) tEl.textContent = title;
+      }
+      chat.scrollTop = chat.scrollHeight;
+      activeRunCard.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      return activeRunCard;
+    }
+  }
+  return createRunLogCard(title, backendRunUid);
 }
 function finishRunLogCard(status) {
   const card = ensureRunLogCard();
   card.classList.remove('is-processing');
-  const badge = card.querySelector('#active-run-badge');
-  const s = String(status || '').toUpperCase();
-  const ok = s === 'VERIFIED' || s === 'COMPLETED';
-  badge.textContent = ok ? 'VERIFIED' : 'PARTIAL / HALTED';
-  badge.className = 'process-log-status badge ' + (ok ? 'VERIFIED' : 'HALTED');
+  const badge = card.querySelector('.process-log-status');
+  if (badge) {
+    const s = String(status || '').toUpperCase();
+    const ok = s === 'VERIFIED' || s === 'COMPLETED';
+    badge.textContent = ok ? 'VERIFIED' : 'PARTIAL / HALTED';
+    badge.className = 'process-log-status badge ' + (ok ? 'VERIFIED' : 'HALTED');
+  }
 }
 function scrollChatIfNearBottom() {
   const nearBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
@@ -1430,7 +1479,7 @@ function scrollChatIfNearBottom() {
 }
 function appendActivity(msg) {
   const card = ensureRunLogCard();
-  const entries = card.querySelector('#active-run-entries');
+  const entries = card.querySelector('.process-log-entries');
   if (!entries) return;
   const ts = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
   const line = document.createElement('div');
@@ -1443,10 +1492,16 @@ function appendActivity(msg) {
   // Also mirror into the low-level drawer logs so nothing is lost there.
   logTo('tab-accelerator-log', `[${stage}] ${msg.step || ''} ${msg.message || ''}`);
 }
+function _removeSameRunCards(selector) {
+  if (!activeRunUid) return;
+  chat.querySelectorAll(selector).forEach(n => {
+    if (n.getAttribute('data-run-uid') === activeRunUid) n.remove();
+  });
+}
 function renderResearchCompletion(runId, status) {
-  chat.querySelectorAll('.completion-card').forEach(n => n.remove());
+  _removeSameRunCards('.completion-card');
   const verified = String(status).toUpperCase() === 'VERIFIED';
-  const card = el(`<div class="rcard completion-card">
+  const card = el(`<div class="rcard completion-card" data-run-uid="${escapeHtml(activeRunUid || '')}">
     <div class="rcard-sub" style="font-size:13px">
       ${verified ? '✅ Research Completed & Verified! Archived to Research Vault.' : `🏁 Research run finished (${escapeHtml(status || 'done')}) and archived to the Research Vault.`}
     </div>
@@ -1462,9 +1517,9 @@ function renderResearchCompletion(runId, status) {
   };
 }
 function renderResearchFailure(msg) {
-  chat.querySelectorAll('.failure-card').forEach(n => n.remove());
+  _removeSameRunCards('.failure-card');
   const error = String(msg.error || 'unknown error');
-  const card = el(`<div class="rcard failure-card">
+  const card = el(`<div class="rcard failure-card" data-run-uid="${escapeHtml(activeRunUid || '')}">
     <h4>⚠️ Research Run Halted: ${escapeHtml(error.slice(0, 160))}</h4>
     <div class="rcard-sub">Run <code>${escapeHtml(msg.blueprint_id || '')}</code> stopped.${msg.partial_results_available ? ' Verified partial results were preserved in the Research Vault.' : ''}</div>
     <details><summary class="hint" style="cursor:pointer">Diagnostic details (traceback)</summary><pre>${escapeHtml(msg.traceback || '')}</pre></details>
@@ -1480,8 +1535,11 @@ function renderResearchFailure(msg) {
 }
 let lastSeenResearchSeq = 0;
 const seenResearchBanners = new Set();
-function openResearchStream() {
-  if (researchSource) researchSource.close();
+function openResearchStream(expectedRunUid) {
+  if (expectedRunUid) activeBackendRunUid = expectedRunUid;
+  seenResearchBanners.clear();
+  lastSeenResearchSeq = 0;
+  if (researchSource) { researchSource.close(); researchSource = null; }
   researchSource = new EventSource('/api/v1/research/stream');
   researchSource.onerror = () => {
     // EventSource auto-reconnects; refresh the vault so a dropped connection
@@ -1491,7 +1549,9 @@ function openResearchStream() {
   };
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.run_uid && activeBackendRunUid && msg.run_uid !== activeBackendRunUid) return;
     if (msg.event === 'run_start') {
+      if (msg.run_uid && !activeBackendRunUid) activeBackendRunUid = msg.run_uid;
       seenResearchBanners.clear();
       if (typeof msg.seq === 'number') lastSeenResearchSeq = msg.seq;
     } else if (typeof msg.seq === 'number') {
@@ -1528,13 +1588,9 @@ function openResearchStream() {
       updateLiteratureCount(currentLiteratureCount + 1);
     }
     if (msg.event === 'run_start') {
-      // A new run supersedes any previously rendered report card.
-      chat.querySelectorAll('.report-card').forEach(n => n.remove());
-      chat.querySelectorAll('.failure-card').forEach(n => n.remove());
-      chat.querySelectorAll('.completion-card').forEach(n => n.remove());
       resetResearchStepper();
       resetLiteratureCount();
-      resetRunLogCard();
+      resetRunLogCard('Research Agent Execution Log', msg.run_uid || activeBackendRunUid);
       activateStep('step-feasibility');
     }
     if (msg.event === 'result' && msg.telemetry) {
@@ -1569,12 +1625,13 @@ function openResearchStream() {
       statusEl.textContent = '';
       setDrawerSummary(`Report ready — run ${msg.status || ''}`);
       if (msg.literature_count) updateLiteratureCount(msg.literature_count);
-      chat.querySelectorAll('.report-card').forEach(n => n.remove());  // reconnect replay dedupe
+      _removeSameRunCards('.report-card');  // reconnect replay dedupe within current run only
       activateStep('step-report');
       setStepState('step-report', 'completed');
       finishRunLogCard(msg.status || 'VERIFIED');
       addResearchReportCard(msg.report, msg.report_path || '', msg.run_id || '');
       renderResearchCompletion(msg.run_id || '', msg.status || '');
+      sealActiveRunLogCard();
       loadVault();
       if (researchSource) { researchSource.close(); researchSource = null; }
     }
@@ -1584,6 +1641,7 @@ function openResearchStream() {
       failActiveStep();
       finishRunLogCard('HALTED');
       renderResearchFailure(msg);
+      sealActiveRunLogCard();
       loadVault();  // partial verified results stay visible in the Explorer
       if (researchSource) { researchSource.close(); researchSource = null; }
     }

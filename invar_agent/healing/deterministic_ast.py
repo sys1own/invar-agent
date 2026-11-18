@@ -15,10 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 MATH_FUNCS = {
-    "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh",
-    "cosh", "tanh", "exp", "log", "log10", "log2", "log1p", "expm1", "ceil",
-    "floor", "pow", "fabs", "fmod", "hypot", "copysign", "trunc", "isfinite",
-    "isnan", "isinf", "radians", "degrees",
+    "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "exp", "expm1", "log", "log10", "log2", "log1p",
+    "ceil", "floor", "trunc", "pow", "fabs", "fmod", "hypot", "copysign",
+    "erf", "erfc", "gamma", "lgamma",
+    "isfinite", "isnan", "isinf", "radians", "degrees",
 }
 MATH_CONSTANTS = {"pi", "e", "tau"}
 INTRINSIC_ALIASES = {
@@ -808,6 +810,23 @@ def _prune_helpers_tree(tree: ast.Module,
     return tree, changed, notes
 
 
+def _if_always_assigns(if_stmt: ast.If) -> Set[str]:
+    """Return variable names definitely assigned in BOTH branches of `if_stmt`."""
+    if not if_stmt.body or not if_stmt.orelse:
+        return set()
+
+    def _branch_assigns(stmts: List[ast.stmt]) -> Set[str]:
+        out: Set[str] = set()
+        for sub in stmts:
+            if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
+                out.add(sub.targets[0].id)
+            elif isinstance(sub, ast.If):
+                out |= _if_always_assigns(sub)
+        return out
+
+    return _branch_assigns(if_stmt.body) & _branch_assigns(if_stmt.orelse)
+
+
 def _init_conditional_locals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
     """Zero-initialize locals read before an unconditional top-level assignment."""
     changed = False
@@ -832,9 +851,27 @@ def _init_conditional_locals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, L
                         if n.id in local_targets and n.id not in definitely_assigned:
                             needs_init.add(n.id)
                 definitely_assigned.add(stmt.targets[0].id)
+            elif isinstance(stmt, ast.If) and stmt.body and stmt.orelse:
+                for n in ast.walk(stmt.test):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                        if n.id in local_targets and n.id not in definitely_assigned:
+                            needs_init.add(n.id)
+                for branch in (stmt.body, stmt.orelse):
+                    branch_def = set(definitely_assigned)
+                    for sub in branch:
+                        if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
+                            for n in ast.walk(sub.value):
+                                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                                    if n.id in local_targets and n.id not in branch_def:
+                                        needs_init.add(n.id)
+                            branch_def.add(sub.targets[0].id)
+                        else:
+                            for n in ast.walk(sub):
+                                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                                    if n.id in local_targets and n.id not in branch_def:
+                                        needs_init.add(n.id)
+                definitely_assigned |= _if_always_assigns(stmt)
             else:
-                # Skip pure `for target in iter:` target-only loads? No, Name in target is Store,
-                # so any Load in stmt of a local not yet definitely_assigned is unsafe if branch/loop skips.
                 for n in ast.walk(stmt):
                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
                         if n.id in local_targets and n.id not in definitely_assigned:
@@ -924,7 +961,7 @@ def _ensure_math_import(tree: ast.Module) -> bool:
 def _intrinsic_defs(used: Iterable[str]) -> List[ast.FunctionDef]:
     """AST helper definitions for scalar intrinsics missing from builtins."""
     src = {
-        "clamp": "def clamp(x, lo, hi):\n    return min(max(x, lo), hi)\n",
+        "clamp": "def clamp(x, lo, hi):\n    return max(lo, min(hi, x))\n",
         "clip": "def clip(x, lo, hi):\n    return clamp(x, lo, hi)\n",
         "sign": "def sign(x):\n    return 1.0 if x > 0.0 else (-1.0 if x < 0.0 else 0.0)\n",
         "sgn": "def sgn(x):\n    return sign(x)\n",
@@ -3545,6 +3582,11 @@ def _iter_atomic_invariant_nodes(expr_str: str) -> List[ast.AST]:
         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
             for v in node.values:
                 _walk(v)
+        elif isinstance(node, ast.Compare) and len(node.ops) >= 2:
+            cur_l = node.left
+            for cur_op, cur_r in zip(node.ops, node.comparators):
+                out.append(ast.Compare(left=cur_l, ops=[cur_op], comparators=[cur_r]))
+                cur_l = cur_r
         else:
             out.append(node)
 
@@ -3792,6 +3834,10 @@ def _expand_slot_match_tokens(raw_name: str) -> Set[str]:
         tokens.update({"landauer"})
     if "n_dot" in tokens or "ndot" in tokens or "gamow" in tokens:
         tokens.update({"n_dot", "gamow"})
+    if "t_rise" in tokens or "temp_rise" in tokens or ("temp" in tokens and "rise" in tokens) or "temperature_rise" in tokens or "delta_t_max" in tokens:
+        tokens.update({"t_rise", "temp_rise", "temperature_rise", "rise"})
+    if "v_cell" in tokens or "voltage" in tokens:
+        tokens.update({"v_cell", "voltage"})
     return tokens
 
 
@@ -4061,6 +4107,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     unit_upper_slots: Set[int] = set()
     small_upper_slots: Dict[int, float] = {}
     other_upper_slots: Dict[int, float] = {}
+    other_upper_strict: Set[int] = set()
     eq_target_slots: Dict[int, Tuple[float, float, bool]] = {}
     sum_partition_targets: List[Tuple[int, int, float, float, bool]] = []
     seen_sum_partitions: Set[Tuple[int, int, float]] = set()
@@ -4088,25 +4135,36 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 positive_lower_slots[s_idx] = adj_val
 
     def _record_upper(s_idx: int, op_str: str, val: float, contract: Any) -> None:
+        if not math.isfinite(val) or val < -1e-6:
+            return
         if s_idx in dyn_set and s_idx < 4:
             return
-        if op_str == "<" and val <= 1.0 + 1e-9:
-            target_val = 0.0 if val <= 1e-6 else max(0.0, val - 1e-12)
-            if s_idx not in other_upper_slots or target_val < other_upper_slots[s_idx]:
-                other_upper_slots[s_idx] = target_val
-        elif 0.25 <= val <= 0.250001:
+        if 0.25 <= val <= 0.250001 and op_str == "<=":
             quarter_upper_slots.add(s_idx)
-        elif 1.0 <= val <= 1.000001:
+        elif 1.0 <= val <= 1.000001 and op_str == "<=":
             unit_upper_slots.add(s_idx)
-        elif 0.0 <= val <= 1e-6:
+        elif 0.0 <= val <= 1e-6 and op_str == "<=":
             init_list = _get_contract_initial_list(contract)
             init_v = float(init_list[s_idx]) if s_idx < len(init_list) else 0.0
             if abs(init_v) <= 1e-4:
                 if s_idx not in small_upper_slots or val < small_upper_slots[s_idx]:
                     small_upper_slots[s_idx] = val
-        elif val <= 1.0 + 1e-9:
-            if s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
+            elif s_idx not in other_upper_slots or val < other_upper_slots[s_idx]:
                 other_upper_slots[s_idx] = val
+                other_upper_strict.discard(s_idx)
+        elif op_str == "<" and 0.0 <= val <= 1e-6:
+            other_upper_slots[s_idx] = 0.0
+            other_upper_strict.discard(s_idx)
+        else:
+            prev = other_upper_slots.get(s_idx)
+            if prev is None or val < prev:
+                other_upper_slots[s_idx] = val
+                if op_str == "<":
+                    other_upper_strict.add(s_idx)
+                else:
+                    other_upper_strict.discard(s_idx)
+            elif val == prev and op_str == "<":
+                other_upper_strict.add(s_idx)
 
     def _add_strict_gt(hi_idx: int, lo_idx: int, coeff: float = 1.0, margin: float = 0.0) -> None:
         if hi_idx != lo_idx and (hi_idx not in dyn_set or lo_idx not in dyn_set or hi_idx >= 4 or lo_idx >= 4):
@@ -4318,6 +4376,14 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             and abs(eq_target_slots[i_s][0] + eq_target_slots[j_s][0] - tgt) > tol + 1e-9
         )
     ]
+
+    for s_idx in list(nonneg_slots):
+        lb = nonneg_slots[s_idx]
+        if s_idx in other_upper_slots and other_upper_slots[s_idx] < lb:
+            del other_upper_slots[s_idx]
+            other_upper_strict.discard(s_idx)
+        if s_idx in small_upper_slots and small_upper_slots[s_idx] < lb:
+            del small_upper_slots[s_idx]
 
     for s_idx in list(positive_lower_slots):
         lb = positive_lower_slots[s_idx]
@@ -4603,12 +4669,57 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     notes.append(f"conditioned drift/error slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(other_upper_slots):
                 bound = other_upper_slots[s_idx]
-                guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = {bound!r}\n"
-                if f"if buf.data[{s_idx}] > " not in fn_src:
+                is_strict_u = s_idx in other_upper_strict
+                cmp_gt = ">=" if is_strict_u else ">"
+                cmp_le = "<" if is_strict_u else "<="
+                clamp_val = (bound - max(1e-6, abs(bound) * 1e-9) if bound > 1.0 else max(0.0, bound - 1e-12) if bound > 0.0 else bound - 1e-6) if is_strict_u else bound
+                # Concept bridge: if local var matches slot_var_names[s_idx] (e.g. T_rise for temp_rise)
+                # while buf.data[s_idx] held something else (e.g. elapsed time), bridge it first.
+                bridge_prefix = ""
+                inv_label = slot_var_names.get(s_idx, "")
+                inv_toks = _expand_slot_match_tokens(inv_label) - {"bound", "bounds", "max", "min", "limit", "nonnegative", "positive", "finite"}
+                if inv_toks:
+                    slot_direct_vars = {
+                        stmt.value.id
+                        for stmt in fn_tgt.body
+                        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                        and _state_subscript_slot(stmt.targets[0]) == s_idx
+                        and isinstance(stmt.value, ast.Name)
+                    }
+                    top_locals = [
+                        stmt.targets[0].id
+                        for stmt in fn_tgt.body
+                        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and _state_subscript_slot(stmt.value) is None
+                        and not stmt.targets[0].id.startswith("_")
+                    ]
+                    best_local: Optional[str] = None
+                    best_l_score = 0
+                    for lv in top_locals:
+                        if lv in slot_direct_vars:
+                            continue
+                        ov = (_expand_slot_match_tokens(lv) & inv_toks)
+                        if ov and len(ov) > best_l_score:
+                            best_l_score = len(ov)
+                            best_local = lv
+                    if best_local is not None:
+                        bridge_prefix = (
+                            f"if math.isfinite({best_local}) and {best_local} {cmp_le} {bound!r}:\n"
+                            f"    buf.data[{s_idx}] = {best_local}\n"
+                        )
+                guard_src = (
+                    bridge_prefix
+                    + f"if not math.isfinite(buf.data[{s_idx}]) or buf.data[{s_idx}] {cmp_gt} {bound!r}:\n"
+                    f"    buf.data[{s_idx}] = {clamp_val!r}\n"
+                )
+                marker_upper = f"not math.isfinite(buf.data[{s_idx}]) or buf.data[{s_idx}] {cmp_gt} {bound!r}"
+                if marker_upper not in ast.unparse(fn_tgt):
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
+                    _ensure_math_import(tree)
                     changed = True
-                    notes.append(f"conditioned upper-bound slot state[{s_idx}] <= {bound!r} in {fn_tgt.name}")
+                    notes.append(f"conditioned upper-bound slot state[{s_idx}] {cmp_le} {bound!r} in {fn_tgt.name}")
             assigned_in_tgt = _collect_assigned_slots(fn_tgt)
             for i_idx, j_idx, coeff in relational_le_pairs:
                 if coeff == 1.0:
@@ -6176,6 +6287,20 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
                 patched = _insert_intrinsic_helpers(tree, [name])
                 if patched:
                     notes.append(f"INLINE_INTRINSIC({name})")
+            elif name in ("asinh", "math.asinh"):
+                class _AsinhLowerer(ast.NodeTransformer):
+                    def visit_Call(self, cnode: ast.Call) -> ast.AST:
+                        self.generic_visit(cnode)
+                        cname = _call_name(cnode.func)
+                        if cname in ("asinh", "math.asinh") and len(cnode.args) == 1:
+                            x_src = ast.unparse(cnode.args[0])
+                            return ast.parse(f"math.log(({x_src}) + math.sqrt(({x_src}) * ({x_src}) + 1.0))", mode="eval").body
+                        return cnode
+
+                tree = _AsinhLowerer().visit(tree)
+                _ensure_math_import(tree)
+                ast.fix_missing_locations(tree)
+                notes.append(f"INLINE_INTRINSIC({name})")
         elif op == "GUARD_MATH_DOMAINS":
             eps = float(raw.get("eps", 1e-300) or 1e-300)
             guarded = _DomainGuardTransformer(eps=eps).visit(tree)

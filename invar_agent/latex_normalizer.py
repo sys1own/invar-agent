@@ -147,6 +147,14 @@ def canonicalize_math_content(expr: str) -> str:
     s = _SCI_NOTATION_RE.sub(_format_sci, s)
     for pat, repl in _GREEK_IDENT_RULES:
         s = pat.sub(repl, s)
+    # Convert bare Greek prefixes followed by `_sub` (e.g. delta_SEI -> \delta_SEI, phi_e -> \phi_e)
+    s = re.sub(
+        r"(?<!\\)\b(delta|kappa|alpha|beta|gamma|eta|theta|sigma|phi|psi|rho|omega|epsilon|mu|nu|tau|lambda|Delta|Gamma|Omega|Phi|Psi|Sigma)_",
+        r"\\\1_",
+        s,
+    )
+    # Brace multi-letter unbraced subscripts (e.g. R_film -> R_{\mathrm{film}}, \delta_SEI -> \delta_{\mathrm{SEI}})
+    s = re.sub(r"(?<!\\)_([A-Za-z][A-Za-z0-9]{1,})\b", r"_{\\mathrm{\1}}", s)
     # Collapse excess spaces introduced around operators
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
