@@ -3492,9 +3492,42 @@ def _eval_numeric_const_expr(expr_str: str) -> Optional[float]:
 _INV_STATE_BASES = {"state", "data", "trace_min", "trace_max"}
 
 
-def _eval_const_ast(node: ast.AST) -> Optional[float]:
+def _initial_slot_of_ast(node: ast.AST) -> Optional[int]:
+    if not isinstance(node, ast.Subscript):
+        return None
+    sl = node.slice
+    if not (isinstance(sl, ast.Constant) and isinstance(sl.value, int) and not isinstance(sl.value, bool)):
+        return None
+    if isinstance(node.value, ast.Name) and node.value.id in ("initial", "initial_state"):
+        return int(sl.value)
+    return None
+
+
+def _resolve_initial_in_ast(node: ast.AST, initial_state: Sequence[float]) -> ast.AST:
+    """Substitute ``initial[k]`` / ``initial_state[k]`` subscripts with finite float constants."""
+    class _InitialSub(ast.NodeTransformer):
+        def visit_Subscript(self, sub: ast.Subscript) -> ast.AST:
+            k = _initial_slot_of_ast(sub)
+            if k is not None:
+                val = float(initial_state[k]) if 0 <= k < len(initial_state) else 0.0
+                if not math.isfinite(val):
+                    val = 0.0
+                return ast.Constant(value=val)
+            return self.generic_visit(sub)
+
+    cloned = _InitialSub().visit(copy.deepcopy(node))
+    ast.fix_missing_locations(cloned)
+    return cloned
+
+
+def _eval_const_ast(node: ast.AST, initial_state: Optional[Sequence[float]] = None) -> Optional[float]:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         return float(node.value)
+    if initial_state is not None:
+        init_k = _initial_slot_of_ast(node)
+        if init_k is not None:
+            v = float(initial_state[init_k]) if 0 <= init_k < len(initial_state) else 0.0
+            return v if math.isfinite(v) else 0.0
     if isinstance(node, ast.Name):
         if node.id == "pi":
             return math.pi
@@ -3508,7 +3541,7 @@ def _eval_const_ast(node: ast.AST) -> Optional[float]:
             return math.e
         return None
     if isinstance(node, ast.UnaryOp):
-        v = _eval_const_ast(node.operand)
+        v = _eval_const_ast(node.operand, initial_state=initial_state)
         if v is None:
             return None
         if isinstance(node.op, ast.UAdd):
@@ -3519,12 +3552,12 @@ def _eval_const_ast(node: ast.AST) -> Optional[float]:
     if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
         fn = _call_name(node.func) or ""
         if fn in ("abs", "fabs", "math.fabs"):
-            v = _eval_const_ast(node.args[0])
+            v = _eval_const_ast(node.args[0], initial_state=initial_state)
             return abs(v) if v is not None else None
         return None
     if isinstance(node, ast.BinOp):
-        lv = _eval_const_ast(node.left)
-        rv = _eval_const_ast(node.right)
+        lv = _eval_const_ast(node.left, initial_state=initial_state)
+        rv = _eval_const_ast(node.right, initial_state=initial_state)
         if lv is None or rv is None:
             return None
         if isinstance(node.op, ast.Add):
@@ -4588,6 +4621,23 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 seen_strict_rel_pairs.add(key)
                 relational_strict_gt_pairs.append(key)
 
+    contracts_by_slot: Dict[int, List[Sequence[float]]] = {}
+    for _c_pre in contracts or []:
+        _init_pre = _get_contract_initial_list(_c_pre)
+        for _s_pre in _contract_state_slots(_c_pre):
+            contracts_by_slot.setdefault(_s_pre, []).append(_init_pre)
+
+    def _eval_tight_bound_across_contracts(bound_expr: ast.AST, slot_idx: int, mode: str, fallback_init: Sequence[float]) -> Optional[float]:
+        rel_inits = contracts_by_slot.get(slot_idx) or [fallback_init]
+        vals: List[float] = []
+        for ic in rel_inits:
+            v = _eval_const_ast(bound_expr, initial_state=ic)
+            if v is not None and math.isfinite(v):
+                vals.append(float(v))
+        if not vals:
+            return None
+        return min(vals) if mode == "upper" else max(vals)
+
     for c_idx, contract in enumerate(contracts or []):
         init_c = _get_contract_initial_list(contract)
         c_pure_invs: List[ast.AST] = []
@@ -4641,14 +4691,17 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 if op_d == ">" or rhs_d > 0.0:
                     _add_strict_gt(hi_idx, lo_idx, 1.0, max(0.0, rhs_d))
 
-            # 2. Structured AST parsing (recursively handles `A and B`, chained comparisons, and `abs(...)`)
-            atomic_nodes = _iter_atomic_invariant_nodes(assertion)
+            # 2. Structured AST parsing (recursively handles `A and B`, chained comparisons, `initial[k]`, and `abs(...)`)
+            atomic_nodes = [_resolve_initial_in_ast(n, init_c) for n in _iter_atomic_invariant_nodes(assertion)]
             matched_ast_bound = False
-            for node in atomic_nodes:
+            raw_atomic_nodes = _iter_atomic_invariant_nodes(assertion)
+            for node, raw_node in zip(atomic_nodes, raw_atomic_nodes):
                 if not isinstance(node, ast.Compare):
                     continue
                 lhs = node.left
-                for cmp_op, rhs in zip(node.ops, node.comparators):
+                raw_lhs = raw_node.left if isinstance(raw_node, ast.Compare) else lhs
+                raw_rhs_list = raw_node.comparators if (isinstance(raw_node, ast.Compare) and len(raw_node.comparators) == len(node.comparators)) else node.comparators
+                for cmp_op, rhs, raw_rhs in zip(node.ops, node.comparators, raw_rhs_list):
                     # abs(...) <= tol  or  abs(...) / denom <= tol  or  tol >= abs(...)
                     abs_inner = None
                     denom_ast = None
@@ -4675,6 +4728,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                             _record_upper(s_slot, "<" if is_strict else "<=", eff_tol, contract)
                             matched_ast_bound = True
                             lhs = rhs
+                            raw_lhs = raw_rhs
                             continue
                         elif s_slot is None:
                             single_t, sum_t, diff_p = _match_abs_affine(abs_inner)
@@ -4731,14 +4785,22 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                                             )
                                         matched_ast_bound = True
                             lhs = rhs
+                            raw_lhs = raw_rhs
                             continue
 
-                    # Scalar comparison: state[i] >= C, state[i] <= C, or reversed C <= state[i]
+                    # Scalar comparison: state[i] >= C, state[i] <= C, or reversed C <= state[i] (resolving initial[k])
                     l_slot = _slot_of_state_ast(lhs)
                     r_slot = _slot_of_state_ast(rhs)
                     matched_cmp = False
                     if l_slot is not None:
-                        val = _eval_const_ast(rhs)
+                        val = _eval_tight_bound_across_contracts(
+                            raw_rhs,
+                            l_slot,
+                            "lower" if isinstance(cmp_op, (ast.GtE, ast.Gt)) else "upper",
+                            init_c,
+                        )
+                        if val is None:
+                            val = _eval_const_ast(rhs)
                         if val is not None:
                             if isinstance(cmp_op, (ast.GtE, ast.Gt)):
                                 _record_lower(l_slot, ">=" if isinstance(cmp_op, ast.GtE) else ">", val)
@@ -4749,7 +4811,14 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                                 matched_ast_bound = True
                                 matched_cmp = True
                     elif r_slot is not None:
-                        val = _eval_const_ast(lhs)
+                        val = _eval_tight_bound_across_contracts(
+                            raw_lhs,
+                            r_slot,
+                            "lower" if isinstance(cmp_op, (ast.LtE, ast.Lt)) else "upper",
+                            init_c,
+                        )
+                        if val is None:
+                            val = _eval_const_ast(lhs)
                         if val is not None:
                             if isinstance(cmp_op, (ast.LtE, ast.Lt)):
                                 _record_lower(r_slot, ">=" if isinstance(cmp_op, ast.LtE) else ">", val)
@@ -4780,6 +4849,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                             matched_ast_bound = True
                             matched_cmp = True
                     lhs = rhs
+                    raw_lhs = raw_rhs
 
             if not matched_ast_bound:
                 m_ge = re.search(
@@ -4807,7 +4877,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             if not is_negative_test:
                 has_rel_match = bool(m_rel_le or m_rel_ge or m_diff_gt)
                 try:
-                    full_ast = ast.parse(re.sub(r"\s*\|\|\s*", " or ", re.sub(r"\s*&&\s*", " and ", assertion.strip())), mode="eval").body
+                    raw_full_ast = ast.parse(re.sub(r"\s*\|\|\s*", " or ", re.sub(r"\s*&&\s*", " and ", assertion.strip())), mode="eval").body
+                    full_ast = _resolve_initial_in_ast(raw_full_ast, init_c)
                 except SyntaxError:
                     full_ast = None
                 if full_ast is not None and _has_only_pure_state_names(full_ast) and _slots_in_ast(full_ast):
@@ -6248,6 +6319,277 @@ def _normalize_step_signatures_tree(tree: ast.Module) -> Tuple[ast.Module, bool,
     return tree, changed, notes
 
 
+_STD_BUF_ATTRS = frozenset({"data", "size", "dt", "steps"})
+
+
+def _lower_introspection_and_buf_attrs_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Desugar ``hasattr``, ``getattr``, ``setattr``, ``isinstance``, ``callable``, ``bool``,
+    ``float``, ``int(True/False)``, ``print``, and custom ``buf.<attr>`` scratch attributes
+    into C++20-compatible ``buf.data[...]`` operations before transpilation."""
+    changed = False
+    notes: List[str] = []
+    defined_fns = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    used_slots = _used_state_slots(tree)
+    next_scratch = max(40, max(used_slots, default=39) + 1)
+    custom_buf_attrs: Dict[str, Tuple[int, int]] = {}
+
+    def _alloc_attr(attr_name: str) -> Tuple[int, int]:
+        nonlocal next_scratch
+        if attr_name in custom_buf_attrs:
+            return custom_buf_attrs[attr_name]
+        while next_scratch in used_slots or (next_scratch + 1) in used_slots:
+            next_scratch += 1
+        pair = (next_scratch, next_scratch + 1)
+        used_slots.add(next_scratch)
+        used_slots.add(next_scratch + 1)
+        next_scratch += 2
+        custom_buf_attrs[attr_name] = pair
+        notes.append(f"mapped buf.{attr_name} to scratch slots buf.data[{pair[0]}, {pair[1]}]")
+        return pair
+
+    def _buf_slot(slot_idx: int, ctx: ast.expr_context = ast.Load()) -> ast.Subscript:
+        return ast.Subscript(
+            value=ast.Attribute(value=ast.Name(id="buf", ctx=ast.Load()), attr="data", ctx=ast.Load()),
+            slice=ast.Constant(value=slot_idx),
+            ctx=ctx,
+        )
+
+    def _norm_val_for_slot(expr: ast.expr) -> ast.expr:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, bool):
+            return ast.Constant(value=1.0 if expr.value else 0.0)
+        return expr
+
+    def _const_str(node: ast.AST) -> Optional[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    class _IntrospectionExprTransformer(ast.NodeTransformer):
+        def __init__(self, fn_params: Set[str]) -> None:
+            self.fn_params = fn_params
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            nonlocal changed
+            self.generic_visit(node)
+            if not isinstance(node.func, ast.Name) or node.func.id in defined_fns:
+                return node
+            fn = node.func.id
+            args = node.args
+            if fn == "hasattr" and len(args) == 2 and not node.keywords:
+                obj, attr_arg = args[0], args[1]
+                attr_s = _const_str(attr_arg)
+                if attr_s is not None:
+                    if isinstance(obj, ast.Name) and obj.id == "buf":
+                        changed = True
+                        if attr_s in _STD_BUF_ATTRS:
+                            notes.append(f"lowered hasattr(buf, {attr_s!r}) -> True")
+                            return ast.Constant(value=True)
+                        flag_idx, _val_idx = _alloc_attr(attr_s)
+                        return ast.Compare(
+                            left=_buf_slot(flag_idx),
+                            ops=[ast.NotEq()],
+                            comparators=[ast.Constant(value=0.0)],
+                        )
+                    if isinstance(obj, ast.Name) and obj.id == "math":
+                        changed = True
+                        return ast.Constant(value=bool(hasattr(math, attr_s)))
+                    changed = True
+                    return ast.Constant(value=False)
+            elif fn == "getattr" and 2 <= len(args) <= 3 and not node.keywords:
+                obj, attr_arg = args[0], args[1]
+                default_expr = args[2] if len(args) == 3 else ast.Constant(value=0.0)
+                attr_s = _const_str(attr_arg)
+                if attr_s is not None:
+                    if isinstance(obj, ast.Name) and obj.id == "buf":
+                        changed = True
+                        if attr_s == "dt":
+                            return ast.Name(id="dt", ctx=ast.Load()) if "dt" in self.fn_params else ast.Attribute(
+                                value=ast.Name(id="buf", ctx=ast.Load()), attr="dt", ctx=ast.Load()
+                            )
+                        if attr_s == "size":
+                            return ast.Call(
+                                func=ast.Name(id="len", ctx=ast.Load()),
+                                args=[ast.Attribute(value=ast.Name(id="buf", ctx=ast.Load()), attr="data", ctx=ast.Load())],
+                                keywords=[],
+                            )
+                        if attr_s in ("data", "steps"):
+                            return ast.Attribute(value=ast.Name(id="buf", ctx=ast.Load()), attr=attr_s, ctx=ast.Load())
+                        flag_idx, val_idx = _alloc_attr(attr_s)
+                        if len(args) == 3:
+                            return ast.IfExp(
+                                test=ast.Compare(
+                                    left=_buf_slot(flag_idx),
+                                    ops=[ast.NotEq()],
+                                    comparators=[ast.Constant(value=0.0)],
+                                ),
+                                body=_buf_slot(val_idx),
+                                orelse=default_expr,
+                            )
+                        return _buf_slot(val_idx)
+                    if isinstance(obj, ast.Name) and obj.id == "math":
+                        changed = True
+                        if hasattr(math, attr_s):
+                            return ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()), attr=attr_s, ctx=ast.Load())
+                        return default_expr
+                    changed = True
+                    return default_expr
+            elif fn in ("isinstance", "callable") and not node.keywords:
+                changed = True
+                notes.append(f"lowered {fn}(...) -> True")
+                return ast.Constant(value=True)
+            elif fn == "bool" and len(args) == 1 and not node.keywords:
+                changed = True
+                arg = args[0]
+                if isinstance(arg, (ast.Compare, ast.BoolOp)) or (
+                    isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.Not)
+                ):
+                    return arg
+                return ast.Compare(left=arg, ops=[ast.NotEq()], comparators=[ast.Constant(value=0.0)])
+            elif fn == "float" and len(args) == 1 and not node.keywords:
+                arg = args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    low_s = arg.value.strip().lower()
+                    changed = True
+                    if low_s in ("inf", "+inf", "infinity", "+infinity"):
+                        _ensure_math_import(tree)
+                        return ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()), attr="inf", ctx=ast.Load())
+                    if low_s in ("-inf", "-infinity"):
+                        _ensure_math_import(tree)
+                        return ast.UnaryOp(
+                            op=ast.USub(),
+                            operand=ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()), attr="inf", ctx=ast.Load()),
+                        )
+                    if low_s == "nan":
+                        _ensure_math_import(tree)
+                        return ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()), attr="nan", ctx=ast.Load())
+                    try:
+                        return ast.Constant(value=float(low_s))
+                    except ValueError:
+                        return ast.Constant(value=0.0)
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, bool):
+                    changed = True
+                    return ast.Constant(value=1.0 if arg.value else 0.0)
+                changed = True
+                return arg
+            elif fn == "int" and len(args) == 1 and not node.keywords:
+                if isinstance(args[0], ast.Constant) and isinstance(args[0].value, bool):
+                    changed = True
+                    return ast.Constant(value=1 if args[0].value else 0)
+            elif fn == "print":
+                changed = True
+                return ast.Constant(value=0.0)
+            return node
+
+        def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+            nonlocal changed
+            self.generic_visit(node)
+            if (isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "buf"
+                    and node.attr not in _STD_BUF_ATTRS):
+                _flag_idx, val_idx = _alloc_attr(node.attr)
+                changed = True
+                return _buf_slot(val_idx, ast.Load())
+            return node
+
+    def _rewrite_block(stmts: List[ast.stmt], fn_params: Set[str]) -> List[ast.stmt]:
+        nonlocal changed
+        out: List[ast.stmt] = []
+        expr_xf = _IntrospectionExprTransformer(fn_params)
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append(stmt)
+                continue
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, attr, None)
+                if isinstance(sub, list):
+                    setattr(stmt, attr, _rewrite_block(sub, fn_params))
+            for h in getattr(stmt, "handlers", ()) or ():
+                if isinstance(getattr(h, "body", None), list):
+                    h.body = _rewrite_block(h.body, fn_params)
+
+            # Strip standalone print(...) calls cleanly
+            if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print"
+                    and "print" not in defined_fns):
+                changed = True
+                notes.append("stripped print() call")
+                out.append(ast.Pass())
+                continue
+
+            # Lower setattr(buf, '<attr>', val_expr)
+            if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "setattr"
+                    and "setattr" not in defined_fns
+                    and len(stmt.value.args) == 3 and not stmt.value.keywords):
+                obj, attr_arg, val_arg = stmt.value.args
+                attr_s = _const_str(attr_arg)
+                if attr_s is not None and isinstance(obj, ast.Name) and obj.id == "buf":
+                    val_arg = expr_xf.visit(val_arg)
+                    changed = True
+                    if attr_s in ("dt", "steps"):
+                        out.append(ast.Assign(
+                            targets=[ast.Attribute(value=ast.Name(id="buf", ctx=ast.Load()), attr=attr_s, ctx=ast.Store())],
+                            value=val_arg,
+                        ))
+                    elif attr_s not in _STD_BUF_ATTRS:
+                        flag_idx, val_idx = _alloc_attr(attr_s)
+                        out.append(ast.Assign(targets=[_buf_slot(val_idx, ast.Store())], value=_norm_val_for_slot(val_arg)))
+                        out.append(ast.Assign(targets=[_buf_slot(flag_idx, ast.Store())], value=ast.Constant(value=1.0)))
+                    continue
+
+            # Lower custom `buf.<attr> = val`
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Attribute)
+                    and isinstance(stmt.targets[0].value, ast.Name)
+                    and stmt.targets[0].value.id == "buf"
+                    and stmt.targets[0].attr not in _STD_BUF_ATTRS):
+                flag_idx, val_idx = _alloc_attr(stmt.targets[0].attr)
+                rhs = expr_xf.visit(stmt.value)
+                changed = True
+                out.append(ast.Assign(targets=[_buf_slot(val_idx, ast.Store())], value=_norm_val_for_slot(rhs)))
+                out.append(ast.Assign(targets=[_buf_slot(flag_idx, ast.Store())], value=ast.Constant(value=1.0)))
+                continue
+
+            # Lower custom `buf.<attr> += val`
+            if (isinstance(stmt, ast.AugAssign)
+                    and isinstance(stmt.target, ast.Attribute)
+                    and isinstance(stmt.target.value, ast.Name)
+                    and stmt.target.value.id == "buf"
+                    and stmt.target.attr not in _STD_BUF_ATTRS):
+                flag_idx, val_idx = _alloc_attr(stmt.target.attr)
+                rhs = expr_xf.visit(stmt.value)
+                changed = True
+                out.append(ast.Assign(
+                    targets=[_buf_slot(val_idx, ast.Store())],
+                    value=ast.BinOp(left=_buf_slot(val_idx, ast.Load()), op=stmt.op, right=rhs),
+                ))
+                out.append(ast.Assign(targets=[_buf_slot(flag_idx, ast.Store())], value=ast.Constant(value=1.0)))
+                continue
+
+            # Transform expressions in all remaining statements
+            for field in ("test", "value", "iter"):
+                sub_expr = getattr(stmt, field, None)
+                if isinstance(sub_expr, ast.AST):
+                    setattr(stmt, field, expr_xf.visit(sub_expr))
+            if isinstance(stmt, ast.Assign):
+                stmt.targets = [
+                    expr_xf.visit(t) if isinstance(t, ast.Subscript) else t
+                    for t in stmt.targets
+                ]
+            out.append(stmt)
+        return out
+
+    tree.body = _rewrite_block(tree.body, set())
+    for top in tree.body:
+        if isinstance(top, ast.FunctionDef):
+            pnames = {a.arg for a in top.args.args}
+            top.body = _rewrite_block(top.body, pnames)
+    if changed:
+        ast.fix_missing_locations(tree)
+    return tree, changed, sorted(set(notes))
+
+
 def _lower_scalar_loops_and_builtins_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
     """Lower tuple-returning helpers, static tuple/list/enumerate loops, and iterable builtins.
 
@@ -7054,6 +7396,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     bridge_contracts = list(all_contracts or contracts or [])
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
     tree, sig_changed, sig_notes = _normalize_step_signatures_tree(tree)
+    tree, intro_changed, intro_notes = _lower_introspection_and_buf_attrs_tree(tree)
     tree, loop_changed, loop_notes = _lower_scalar_loops_and_builtins_tree(tree)
     tree, tup_changed, tup_notes = _desugar_tuple_unpacking_tree(tree)
     tree, comp_changed, comp_notes = _lower_comprehensions_tree(tree)
@@ -7092,12 +7435,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(sig_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(sig_notes) | set(intro_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or sig_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or sig_changed or intro_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):

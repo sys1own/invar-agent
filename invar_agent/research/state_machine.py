@@ -931,7 +931,7 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     """
     initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
     max_slot = _max_state_slot(py_code, contract)
-    needed = max(16, max_slot + 1)
+    needed = max(64, max_slot + 1)
     while len(initial) < needed:
         initial.append(0.0)
     warnings: List[str] = []
@@ -2800,10 +2800,24 @@ class ResearchStateMachine:
             variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
         )
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
+        _is_code_level_fail = any(
+            tok in fail_text
+            for tok in (
+                "transpiler:",
+                "prewrite_guard",
+                "syntaxerror",
+                "nameerror",
+                "typeerror",
+                "attributeerror",
+                "compile_error",
+                "compilation failed",
+                "unsupported",
+            )
+        )
         _is_final_heal = (attempt >= max_attempts)
         _missing_eq_slot = (
             _is_final_heal
-            and plan.get("fixable") is not False
+            and (plan.get("fixable") is not False or _is_code_level_fail)
             and any(
                 f"buf.data[{m.group(1)}] =" not in (patched.code or "")
                 and f"buf.data[{m.group(1)}]=" not in (patched.code or "")
@@ -2812,17 +2826,51 @@ class ResearchStateMachine:
         )
         _eq_target_falsified = (
             _is_final_heal
-            and plan.get("fixable") is not False
+            and (plan.get("fixable") is not False or _is_code_level_fail)
             and self.llm_planner is not None
             and "falsified" in str(failure or "").lower()
             and "ENFORCE_CONSERVATION_PROJECTION" not in set(ops)
         )
+        _need_source_repair_on_code_fail = (
+            _is_code_level_fail
+            and (
+                not ops
+                or not patched.changed
+                or patched.code == candidate_code
+                or plan.get("fixable") is False
+            )
+        )
         fallback_needed = (
-            ("falsified" in str(failure or "").lower() or "diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower())
-            and (not ops or not patched.changed or patched.code == candidate_code or _missing_eq_slot or _eq_target_falsified)
+            (
+                "falsified" in fail_text
+                or "diverged" in fail_text
+                or "non-finite" in fail_text
+                or _is_code_level_fail
+            )
+            and (
+                not ops
+                or not patched.changed
+                or patched.code == candidate_code
+                or _missing_eq_slot
+                or _eq_target_falsified
+                or _need_source_repair_on_code_fail
+            )
         )
         if fallback_needed:
-            if (_eq_target_falsified or _missing_eq_slot) and plan.get("fixable") is not False:
+            if (_eq_target_falsified or _missing_eq_slot or _need_source_repair_on_code_fail) and (
+                plan.get("fixable") is not False or _is_code_level_fail
+            ):
+                # Re-run full Tier-0 lowering before invoking full-source LLM repair
+                san_pre = sanitize_intrinsics(
+                    healed,
+                    contracts=all_contract_dicts or contract_dicts,
+                    all_contracts=all_contract_dicts or contract_dicts,
+                    variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                    stabilize_diverged=("diverged" in fail_text or "non-finite" in fail_text),
+                )
+                if san_pre.changed and san_pre.code != candidate_code:
+                    return {"code": san_pre.code, "terminated": False,
+                            "applied_ops": san_pre.notes or ["tier0_scalar_ir_lowering"]}
                 tier2_llm = self.llm_planner or llm
                 refined = None
                 try:
@@ -2839,10 +2887,17 @@ class ResearchStateMachine:
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
                 if refined and refined.strip() and refined.strip() != candidate_code.strip():
+                    san_ref = sanitize_intrinsics(
+                        refined,
+                        contracts=all_contract_dicts or contract_dicts,
+                        all_contracts=all_contract_dicts or contract_dicts,
+                        variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                    )
+                    final_ref = san_ref.code if san_ref.changed else refined
                     await self.emit_activity(
                         "HEALING", "tier2_refine",
                         "[TIER2_REFINE] Tier-2 planner synthesized full-kernel repair from counterexample.")
-                    return {"code": refined, "terminated": False,
+                    return {"code": final_ref, "terminated": False,
                             "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
                 candidate_code, contract_dicts)
@@ -2863,12 +2918,13 @@ class ResearchStateMachine:
                 candidate_code,
                 contracts=all_contract_dicts or contract_dicts,
                 all_contracts=all_contract_dicts or contract_dicts,
-                stabilize_diverged=("diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower()),
+                variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                stabilize_diverged=("diverged" in fail_text or "non-finite" in fail_text),
             )
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,
                         "applied_ops": san_fb.notes or ["zero_diff_slot_conditioner"]}
-            if _is_final_heal and plan.get("fixable") is not False:
+            if _is_final_heal and (plan.get("fixable") is not False or _is_code_level_fail):
                 tier2_llm = self.llm_planner or llm
                 refined = None
                 try:
@@ -2885,12 +2941,19 @@ class ResearchStateMachine:
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
                 if refined and refined.strip() and refined.strip() != candidate_code.strip():
+                    san_ref = sanitize_intrinsics(
+                        refined,
+                        contracts=all_contract_dicts or contract_dicts,
+                        all_contracts=all_contract_dicts or contract_dicts,
+                        variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                    )
+                    final_ref = san_ref.code if san_ref.changed else refined
                     await self.emit_activity(
                         "HEALING", "tier2_refine",
                         "[TIER2_REFINE] Tier-2 planner synthesized full-kernel repair from counterexample.")
-                    return {"code": refined, "terminated": False,
+                    return {"code": final_ref, "terminated": False,
                             "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
-        if plan.get("fixable") is False:
+        if plan.get("fixable") is False and not _is_code_level_fail:
             reason = str(plan.get("unfixable_reason") or "unsatisfiable contract").strip()
             await self.emit_activity(
                 "HEALING", "healing_terminated",

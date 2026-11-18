@@ -124,6 +124,10 @@ _GREEK_IDENT_RULES: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?<!\\)\bbeta\b"), r"\\beta"),
     (re.compile(r"(?<!\\)\bPsi\b"), r"\\Psi"),
     (re.compile(r"(?<!\\)\bPhi\b"), r"\\Phi"),
+    (re.compile(r"(?<!\\)\bTheta\b"), r"\\Theta"),
+    (re.compile(r"(?<!\\)\bGamma\b"), r"\\Gamma"),
+    (re.compile(r"(?<!\\)\bSigma\b"), r"\\Sigma"),
+    (re.compile(r"(?<!\\)\bLambda\b"), r"\\Lambda"),
     (re.compile(r"(?<!\\)\bzeta\b"), r"\\zeta"),
 )
 
@@ -280,6 +284,10 @@ def canonicalize_math_content(expr: str) -> str:
     )
     # Brace multi-letter unbraced subscripts even when another `_...` follows (M_dot_{\mathrm{moment}} -> M_{\mathrm{dot}}_{\mathrm{moment}})
     s = re.sub(r"(?<!\\)_([A-Za-z][A-Za-z0-9]{1,})(?=_|[^A-Za-z0-9]|$)", r"_{\\mathrm{\1}}", s)
+    # Convert infinity subscripts `_inf` / `_{\mathrm{inf}}` -> `_{\infty}`
+    s = re.sub(r"_(?:\{\s*\\mathrm\{inf\}\s*\}|inf\b)", r"_{\\infty}", s)
+    # Convert bare `Delta ` / `Theta ` etc. before math symbols
+    s = re.sub(r"(?<!\\)\b(Delta|Gamma|Omega|Phi|Psi|Sigma|Lambda|Theta)\s+(?=[A-Za-z\\])", r"\\\1 ", s)
     # Guarantee zero double subscripts or double superscripts remain (e.g. \delta_g_{\mathrm{PEGS}} -> \delta_{g,\mathrm{PEGS}})
     s = _merge_consecutive_scripts(s, "_")
     s = _merge_consecutive_scripts(s, "^")
@@ -348,7 +356,8 @@ _MATH_IDENT_START_RE = re.compile(
     r"|(?<![A-Za-z0-9_\\])(?:[A-Za-z][A-Za-z0-9_]*(?:_\{|\^\{|\^[A-Za-z0-9]))"
     r"|(?<![A-Za-z0-9_\\])(?:delta|kappa|alpha|beta|gamma|eta|theta|sigma|phi|psi|rho|omega|epsilon|mu|nu|tau|lambda|zeta|chi|xi|"
     r"Delta|Gamma|Omega|Phi|Psi|Sigma|Lambda|Theta|SNR|TOF|BEP|MHD|LHHW|HER|SEI|PEGS|TMSV|SQL|SHBT|[A-Za-z]{1,2})_[A-Za-z0-9_]+"
-    r"|\|\|[^|\n]+\|\|"
+    r"|\|\|[^|\n]+\|\|(?:_[A-Za-z0-9_{}\\]+)?(?:\^[A-Za-z0-9_{}\\]+)?"
+    r"|(?<![A-Za-z0-9_\\|])\|(?![\s|])[A-Za-z0-9_\\^{}()/*+\-.\s]+(?<!\s)\|(?:_[A-Za-z0-9_{}\\]+)?(?:\^[A-Za-z0-9_{}\\]+)?(?=\s*(?:<=|>=|!=|==|[=<>]|\\le|\\ge|\\ne|\\approx))"
     r"|(?<![A-Za-z0-9_\\])[A-Za-z][A-Za-z0-9_]*\([^)\n]+\)\s*(?:<=|>=|!=|==|[=<>]|\\le|\\ge|\\ne|\\approx)"
     r"|(?<![A-Za-z0-9_\\])[A-Za-z][A-Za-z0-9_]*\s*\*\s*\d+(?:\.\d+)?[eE][+-]?\d+"
     r")"
@@ -408,17 +417,27 @@ def _wrap_table_equation_cells(text: str, tokens: Dict[str, str] | None = None) 
     return "\n".join(out)
 
 
-def _scan_math_run_end(seg: str, start: int) -> int:
+def _scan_math_run_end(seg: str, start: int, *, in_table_row: bool = False) -> int:
     """Scan greedily from ``start`` across a bare mathematical formula in prose."""
     n = len(seg)
     i = start
     p_depth = 0
     b_depth = 0
+    in_pipe = False
     expect_rhs = False
     while i < n:
         ch = seg[i]
-        if ch in "\r\n|;`":
+        if ch in "\r\n;`":
             break
+        if ch == "|":
+            is_norm_pipe = seg.startswith("||", i) or (i > 0 and seg[i - 1] == "|")
+            if in_table_row and not is_norm_pipe:
+                break
+            if not is_norm_pipe:
+                in_pipe = not in_pipe
+            i += 1
+            expect_rhs = False
+            continue
         if seg.startswith("@@INVAR_", i) or seg.startswith("**", i):
             break
         if ch in "{(":
@@ -487,7 +506,7 @@ def _scan_math_run_end(seg: str, start: int) -> int:
                     continue
                 break
             # After a closing brace/paren/number, only continue on operator or math symbol (`f = ...` or `\cdot ...`)
-            if p_depth > 0 or b_depth > 0:
+            if p_depth > 0 or b_depth > 0 or in_pipe:
                 i = j
                 continue
             if re.match(r"^\\(?:le|ge|ne|approx|times|cdot|to|ll|gg)\b", nxt):
@@ -570,13 +589,13 @@ def _wrap_bare_math_in_prose(text: str) -> str:
                 out_chunks.append(seg[pos:m.end()])
                 pos = m.end()
                 continue
-            end = _scan_math_run_end(seg, st)
+            line_start = seg.rfind("\n", 0, st) + 1
+            in_table_row = seg[line_start:st].lstrip().startswith("|")
+            end = _scan_math_run_end(seg, st, in_table_row=in_table_row)
             if end <= st:
                 end = m.end()
             raw = seg[st:end]
             raw_s = raw.strip()
-            line_start = seg.rfind("\n", 0, st) + 1
-            in_table_row = seg[line_start:st].lstrip().startswith("|")
             req_pat = r"[=<>\\^*]" if in_table_row else r"[=<>\\^_*]"
             if (
                 not raw_s

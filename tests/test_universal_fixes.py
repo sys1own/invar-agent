@@ -1112,3 +1112,140 @@ def test_latex_normalizer_no_double_subscripts_no_bare_latex_and_table_wrapping(
     assert "| $\\left(\\frac{\\eta_A}{\\eta_D + \\eta_A}\\right)^2$ |" in tbl
     tbl_norm = normalize_report_latex(tbl)
     assert r"$\frac{23}{33}$" in tbl_norm
+
+
+def test_initial_k_folding_introspection_desugaring_heal_fallback_and_norm_latex(tmp_path):
+    import asyncio
+    from invar_agent.latex_normalizer import normalize_report_latex
+    from invar_agent.research.broadcaster import ResearchEventBroadcaster
+    from invar_agent.research.state_machine import _eval_invariant, _guard_contract_initial_state, ResearchStateMachine
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.schemas.research import ResearchBlueprint, VerificationContract
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    # 1. initial[k] folding on upper/lower/strict/witness bounds (shbt_grmhd_siphon)
+    grmhd_kernel = (
+        "import math\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    buf.data[16] = 1.5\n"     # violates < initial[3] (1.0)
+        "    buf.data[17] = 0.30119\n" # violates <= 1e-16 + 1e-3*initial[3] (0.001)
+        "    buf.data[18] = 1e-5\n"    # violates <= initial[18] + 1e-30 (1e-30)
+    )
+    contracts = [
+        VerificationContract.model_validate({
+            "contract_id": "c1_base",
+            "target_backend": "cpp",
+            "initial_state": [0.0, 0.0, 0.0, 1.0] + [0.0] * 20,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [{"variable_name": "ok", "assertion": "state[4] >= 0.0", "tolerance": 1e-12}],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c2_ccz4_memory",
+            "target_backend": "cpp",
+            "initial_state": [0.0, 0.0, 0.0, 1.0] + [0.0] * 20,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [
+                {"variable_name": "Theta_inf", "assertion": "state[17] <= 1e-16 + 1e-3*initial[3]", "tolerance": 1e-12},
+                {"variable_name": "b16", "assertion": "state[16] < initial[3] and state[16] >= 0.0", "tolerance": 1e-12},
+                {"variable_name": "b18", "assertion": "state[18] <= initial[18] + 1e-30", "tolerance": 1e-12},
+            ],
+        }),
+    ]
+    san = sanitize_intrinsics(grmhd_kernel, contracts=contracts, all_contracts=contracts)
+    assert san.changed
+    assert sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts).changed is False
+
+    bridge = DynamicCABIBridge(tmp_path / "cabi_initk")
+    cpp = CppEmitter().emit_module(python_source_to_uast(san.code))
+    init2, _ = _guard_contract_initial_state(san.code, contracts[1], all_contracts=contracts)
+    res = bridge.run(cpp, list(init2), dt=0.01, steps=3, entry="execute_step")
+    assert res["finite"] is True
+    for inv in contracts[1].invariants:
+        assert _eval_invariant(inv.assertion, res["state"], {}, {"initial": init2, "tol": inv.tolerance}), (
+            f"{inv.variable_name} failed: state={res['state'][16:19]}"
+        )
+
+    # 2. Tier-0 desugaring of hasattr/getattr/setattr/isinstance/print and custom buf.<attr>
+    intro_kernel = (
+        "import math\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    if hasattr(buf, 'dt') and hasattr(math, 'sqrt') and isinstance(dt, float):\n"
+        "        h = getattr(buf, 'dt', 0.01)\n"
+        "    else:\n"
+        "        h = 0.01\n"
+        "    if not hasattr(buf, '_init'):\n"
+        "        buf._init = 1.0\n"
+        "        setattr(buf, '_acc', 2.5)\n"
+        "    else:\n"
+        "        buf._acc += 0.5\n"
+        "    v_acc = getattr(buf, '_acc', 0.0)\n"
+        "    print('debug step')\n"
+        "    buf.data[4] = v_acc + 0.0 * h\n"
+    )
+    vc_intro = VerificationContract.model_validate({
+        "contract_id": "c1_intro",
+        "target_backend": "cpp",
+        "initial_state": [0.0] * 8,
+        "dt": 0.01,
+        "steps": 3,
+        "invariants": [{"variable_name": "acc", "assertion": "state[4] >= 3.0", "tolerance": 1e-12}],
+    })
+    san_in = sanitize_intrinsics(intro_kernel, contracts=[vc_intro])
+    assert san_in.changed
+    for bad_tok in ("hasattr", "getattr", "setattr", "isinstance", "print(", "._init", "._acc"):
+        assert bad_tok not in san_in.code, san_in.code
+    assert sanitize_intrinsics(san_in.code, contracts=[vc_intro]).changed is False
+
+    init_in, _ = _guard_contract_initial_state(san_in.code, vc_intro)
+    assert len(init_in) >= 64
+    res_in = bridge.run(
+        CppEmitter().emit_module(python_source_to_uast(san_in.code)),
+        init_in,
+        dt=0.01,
+        steps=3,
+        entry="execute_step",
+    )
+    assert res_in["finite"] is True
+    # Step 0 sets 2.5, step 1 adds 0.5 -> 3.0, step 2 adds 0.5 -> 3.5
+    assert res_in["state"][4] == pytest.approx(3.5)
+
+    # 3. Healing must never terminate early on transpiler/syntax errors when directives return fixable=False
+    async def _mock_fast(prompt_txt):
+        return '{"fixable": false, "unfixable_reason": "no directive handles transpiler err", "directives": []}'
+
+    async def _mock_planner(prompt_txt):
+        return "```python\ndef simulation_step(buf, dt):\n    buf.data[4] = 3.5\n```"
+
+    sm = ResearchStateMachine(tmp_path / "sm_heal", None, llm_planner=_mock_planner, llm_fast=_mock_fast)
+    sm.blueprint = ResearchBlueprint(
+        blueprint_id="bp_heal",
+        title="Heal Fallback Test",
+        falsifiable_hypothesis="state[4] >= 3.0 holds",
+        search_queries=["q"],
+        code_template="",
+        contracts=[vc_intro],
+    )
+    heal_res = asyncio.run(sm._heal_and_refine(
+        stage=1,
+        round_idx=1,
+        objective="obj",
+        candidate_code="import math\n\ndef simulation_step(buf, dt):\n    x = unknown_builtin(buf.data[0])\n    buf.data[4] = 3.5 + 0.0 * x\n    if buf.data[4] < 3.0:\n        buf.data[4] = 3.0\n",
+        contracts=[vc_intro],
+        failure="transpiler: call to 'unknown_builtin' is not allowed in sandbox kernels",
+        attempt=2,
+        max_attempts=3,
+    ))
+    assert heal_res["terminated"] is False
+    assert "unknown_builtin" not in heal_res["code"]
+
+    # 4. LaTeX normalizer Fix 4: ||h_res||_inf and |Delta_x_CoM| <= 1e-15 / |Delta sigma_r^2/sigma_r^2| <= 1e-6
+    latex_txt = "Checks ||h_res||_inf <= 1.0e-120, ||Theta||_inf <= 1.0e-16, |Delta_x_CoM| <= 1e-15, and |Delta sigma_r^2/sigma_r^2| <= 1e-6."
+    norm = normalize_report_latex(latex_txt)
+    assert r"$\|h_{\mathrm{res}}\|_{\infty} \le 10^{-120}$" in norm
+    assert r"$\|\Theta\|_{\infty} \le 10^{-16}$" in norm
+    assert r"$|\Delta_{x,\mathrm{CoM}}| \le 10^{-15}$" in norm
+    assert r"$|\Delta \sigma_r^2/\sigma_r^2| \le 10^{-6}$" in norm
+    assert "$_inf" not in norm
