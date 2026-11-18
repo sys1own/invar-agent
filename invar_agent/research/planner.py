@@ -1061,12 +1061,15 @@ def canonicalize_contract_dicts(
     slot_lower: Dict[int, float] = {}
     slot_upper: Dict[int, float] = {}
     slot_init_val: Dict[int, float] = {}
+    init_reserved_owner: Dict[int, str] = {}
+    init_reserved_val: Dict[int, float] = {}
     name_order: List[str] = []
     remaps: List[tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
 
     def _extract_eq_target(expr: str) -> Optional[float]:
         m = re.search(
-            r"abs\(\s*(?:state|buf\.data|data)\[\d+\]\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
+            r"abs\(\s*(?:state|buf\.data|data)\[\d+\]\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*"
+            r"(?:/\s*\(?\s*[0-9.eE+\-\s*/()]+?\s*\)?\s*)?<=?",
             expr or "",
         )
         if not m:
@@ -1115,7 +1118,26 @@ def canonicalize_contract_dicts(
     ) -> bool:
         prev_cid = slot_owner_contract.get(slot_idx)
         prev_owner = slot_owner.get(slot_idx)
-        if prev_cid is None or prev_cid == c_id or prev_owner == name:
+        if prev_cid is None:
+            init_cid = init_reserved_owner.get(slot_idx)
+            init_rval = init_reserved_val.get(slot_idx)
+            if init_cid is None or init_cid == c_id or init_rval is None:
+                return False
+            # Earlier contract initialized slot_idx to a non-zero value without
+            # claiming it in an invariant; detect incompatible initial_state or target.
+            diff_init = (
+                init_v is None
+                or abs(float(init_v) - init_rval) > 1e-6 * max(1.0, abs(init_rval), abs(float(init_v)))
+            )
+            eq_target = _extract_eq_target(assertion)
+            lo_new, hi_new = _extract_interval(assertion, slot_idx)
+            target_clash = (
+                (eq_target is not None and abs(eq_target - init_rval) > 1e-3 * max(1.0, abs(init_rval), abs(eq_target)))
+                or (hi_new is not None and hi_new < init_rval - 1e-6)
+                or (lo_new is not None and lo_new > init_rval + 1e-6)
+            )
+            return bool(diff_init or target_clash)
+        if prev_cid == c_id or prev_owner == name:
             return False
         if slot_idx not in (0, 1, 2, 3):
             return True
@@ -1224,6 +1246,17 @@ def canonicalize_contract_dicts(
         for inv in (c.get("invariants") or []):
             if isinstance(inv, dict):
                 assign_for_inv(c, inv, record=not is_prior)
+        c_id_done = str(c.get("contract_id") or "")
+        for s_i, val in enumerate(c.get("initial_state") or []):
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if fval != 0.0:
+                init_reserved_owner.setdefault(s_i, c_id_done)
+                init_reserved_val.setdefault(s_i, fval)
+                slot_init_val.setdefault(s_i, fval)
+                reserved.add(s_i)
 
     for c, inv, old, new in remaps:
         if new in (0, 1, 2, 3):
@@ -1237,6 +1270,43 @@ def canonicalize_contract_dicts(
             if old < len(c_init) and (was_missing or c_init[new] == 0.0) and c_init[old] != 0.0:
                 c_init[new] = c_init[old]
         notes.append(f"canonicalized {inv.get('variable_name')}: state[{old}] -> state[{new}]")
+    # Restore earlier stage's non-zero value at remapped-away `old` slots so Stage k
+    # regression against c1..c_{k-1} still sees Stage 1's initial parameter/state.
+    for c, _inv, old, new in remaps:
+        if new in (0, 1, 2, 3):
+            continue
+        c_init = c.get("initial_state")
+        if isinstance(c_init, list) and old < len(c_init) and old in init_reserved_val:
+            c_init[old] = init_reserved_val[old]
+
+    # Build a unified initial_state layout across c1..cN so every contract carries
+    # valid initial values for both Stage 1's slots and Stage k's de-collided slots.
+    ordered_contracts = [all_contracts[idx] for idx in order if isinstance(all_contracts[idx], dict)]
+    if any(isinstance(c.get("initial_state"), list) for c in ordered_contracts):
+        unified_len = max((len(c.get("initial_state") or []) for c in ordered_contracts), default=0)
+        if unified_len > 0:
+            merged_init: List[float] = [0.0] * unified_len
+            for s_i in range(unified_len):
+                # Earliest contract defining a non-zero initial_state[s_i] sets canonical value.
+                for c_ord in ordered_contracts:
+                    ci = c_ord.get("initial_state")
+                    if isinstance(ci, list) and s_i < len(ci):
+                        try:
+                            fv = float(ci[s_i])
+                        except (TypeError, ValueError):
+                            fv = 0.0
+                        if fv != 0.0:
+                            merged_init[s_i] = fv
+                            break
+            for c_ord in ordered_contracts:
+                ci = c_ord.get("initial_state")
+                if not isinstance(ci, list):
+                    continue
+                while len(ci) < unified_len:
+                    ci.append(0.0)
+                for s_i in range(unified_len):
+                    if ci[s_i] == 0.0 and merged_init[s_i] != 0.0:
+                        ci[s_i] = merged_init[s_i]
 
     # Canonicalize explicit variable_map entries against contract-owned names.
     assigned_names = set(name_slot)

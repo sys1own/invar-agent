@@ -530,8 +530,16 @@ _NAME_FILLER = {
 }
 
 
+_THOUSANDS_COMMA_RE = re.compile(r"(?<=\d),(?=\d{3}\b)")
+_RESERVED_MATH_NAMES = {
+    "ln2", "ln_2", "log2", "log_2", "ln10", "ln_10", "log10", "log_10",
+    "pi", "sin", "cos", "tan", "exp", "sqrt", "log", "ln", "abs",
+    "inf", "nan", "pow",
+}
+
+
 def _parse_number(text: str) -> Optional[float]:
-    t = text.replace("−", "-").replace(",", ".").replace(" ", "")
+    t = _THOUSANDS_COMMA_RE.sub("", text).replace("−", "-").replace(",", ".").replace(" ", "")
     m = re.fullmatch(r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
                      r"(?:(?:×|x|\*|\\times)10\^?\{?([-+]?\d+)\}?)?", t)
     if not m:
@@ -685,7 +693,7 @@ def extract_parameters_from_text(text: str, source: str = "",
                                  confidence: float = 0.6,
                                  limit: int = 24) -> List[ExtractedParameter]:
     """Free-text ``name = number unit`` / ``name number unit`` pairs."""
-    text = _strip_latex_commands(_clean_wikitext(text or ""))
+    text = _THOUSANDS_COMMA_RE.sub("", _strip_latex_commands(_clean_wikitext(text or "")))
     params: List[ExtractedParameter] = []
     seen_spans: List[Tuple[int, int]] = []
 
@@ -708,9 +716,13 @@ def extract_parameters_from_text(text: str, source: str = "",
             return
         if len(name) <= 1 and not unit:
             return
-        if name in _PARAM_STOPWORDS:
+        if name in _PARAM_STOPWORDS or name in _RESERVED_MATH_NAMES:
             return
         if source == "user_prompt" and len(name) <= 1:
+            return
+        # Check if raw identifier is a reserved math function/constant such as `ln(2)`
+        raw_tail = re.split(r"[\s,;]+", cleaned_raw.lower())[-1].strip()
+        if raw_tail in _RESERVED_MATH_NAMES or re.sub(r"[()]", "", raw_tail) in _RESERVED_MATH_NAMES:
             return
         # Subscripted state tokens (``z_k``, ``q_0``, ``x_n``, ...) extracted
         # from code-like prompt fragments are not physical constants.

@@ -1052,40 +1052,80 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                 continue
 
             from ..healing.deterministic_ast import (
+                _eval_ast_on_state,
                 _eval_const_ast,
                 _eval_numeric_const_expr,
+                _extract_abs_tol,
                 _iter_atomic_invariant_nodes,
                 _match_abs_affine,
-                _unwrap_abs_call,
+                _match_abs_algebraic,
+                _unwrap_abs_or_rel_err,
             )
             import ast as _ast
             for _node in _iter_atomic_invariant_nodes(assertion):
                 if isinstance(_node, _ast.Compare):
                     _lhs = _node.left
                     for _cmp_op, _rhs in zip(_node.ops, _node.comparators):
+                        _abs_in, _denom_ast = (None, None)
+                        _tol_v = None
+                        _rhs_rel = False
                         if isinstance(_cmp_op, (_ast.LtE, _ast.Lt)):
-                            _abs_in = _unwrap_abs_call(_lhs)
-                            _tol_v = _eval_const_ast(_rhs) if _abs_in is not None else None
-                            if _abs_in is not None and _tol_v is not None and _tol_v >= 0.0:
-                                _single_t, _sum_t, _diff_p = _match_abs_affine(_abs_in)
-                                if _single_t is not None and c_item is contract:
-                                    _si, _tgt = _single_t
-                                    if _si < len(initial) and abs(initial[_si] - _tgt) > _tol_v:
-                                        warnings.append(
-                                            f"auto-init: target equality slot state[{_si}] ({inv.variable_name}) "
-                                            f"set from {initial[_si]} to {_tgt}")
-                                        initial[_si] = _tgt
-                                elif _sum_t is not None and c_item is contract:
-                                    _i_s, _j_s, _tgt = _sum_t
-                                    if max(_i_s, _j_s) < len(initial) and abs(initial[_i_s] + initial[_j_s] - _tgt) > _tol_v:
-                                        if min(0.0, _tgt) <= initial[_i_s] <= max(0.0, _tgt):
-                                            initial[_j_s] = _tgt - initial[_i_s]
-                                        else:
-                                            initial[_i_s] = 0.5 * _tgt
-                                            initial[_j_s] = 0.5 * _tgt
-                                        warnings.append(
-                                            f"auto-init: sum partition slots state[{_i_s}]+state[{_j_s}] "
-                                            f"initialized to {_tgt}")
+                            _abs_in, _denom_ast = _unwrap_abs_or_rel_err(_lhs)
+                            if _abs_in is not None:
+                                _tol_v, _rhs_rel = _extract_abs_tol(_rhs)
+                        elif isinstance(_cmp_op, (_ast.GtE, _ast.Gt)):
+                            _abs_in, _denom_ast = _unwrap_abs_or_rel_err(_rhs)
+                            if _abs_in is not None:
+                                _tol_v, _rhs_rel = _extract_abs_tol(_lhs)
+                        if _abs_in is not None and _tol_v is not None and _tol_v >= 0.0:
+                            _denom_c = _eval_const_ast(_denom_ast) if _denom_ast is not None else None
+                            _single_t, _sum_t, _diff_p = _match_abs_affine(_abs_in)
+                            if _single_t is not None and c_item is contract:
+                                _si, _tgt = _single_t
+                                _eff_tol = _tol_v
+                                if _denom_ast is not None or _rhs_rel:
+                                    _scale = abs(_denom_c) if (_denom_c is not None and _denom_c != 0.0) else max(abs(_tgt), 1e-300)
+                                    _eff_tol = _tol_v * _scale
+                                if _si < len(initial) and abs(initial[_si] - _tgt) > _eff_tol:
+                                    warnings.append(
+                                        f"auto-init: target equality slot state[{_si}] ({inv.variable_name}) "
+                                        f"set from {initial[_si]} to {_tgt}")
+                                    initial[_si] = _tgt
+                            elif _sum_t is not None and c_item is contract:
+                                _i_s, _j_s, _tgt = _sum_t
+                                _eff_tol = _tol_v
+                                if _denom_ast is not None or _rhs_rel:
+                                    _scale = abs(_denom_c) if (_denom_c is not None and _denom_c != 0.0) else max(abs(_tgt), 1e-300)
+                                    _eff_tol = _tol_v * _scale
+                                if max(_i_s, _j_s) < len(initial) and abs(initial[_i_s] + initial[_j_s] - _tgt) > _eff_tol:
+                                    if min(0.0, _tgt) <= initial[_i_s] <= max(0.0, _tgt):
+                                        initial[_j_s] = _tgt - initial[_i_s]
+                                    else:
+                                        initial[_i_s] = 0.5 * _tgt
+                                        initial[_j_s] = 0.5 * _tgt
+                                    warnings.append(
+                                        f"auto-init: sum partition slots state[{_i_s}]+state[{_j_s}] "
+                                        f"initialized to {_tgt}")
+                            elif _single_t is None and _sum_t is None and _diff_p is None and c_item is contract:
+                                _alg_m = _match_abs_algebraic(_abs_in)
+                                if _alg_m is not None:
+                                    _ai, _expr_buf, _prod_p = _alg_m
+                                    try:
+                                        _expr_node = _ast.parse(_expr_buf, mode="eval").body
+                                        _alg_val = _eval_ast_on_state(_expr_node, initial)
+                                    except SyntaxError:
+                                        _alg_val = None
+                                    if _alg_val is not None and math.isfinite(_alg_val) and _ai < len(initial):
+                                        _denom_v = (
+                                            _eval_ast_on_state(_denom_ast, initial)
+                                            if _denom_ast is not None else (abs(_alg_val) if _rhs_rel else 1.0)
+                                        )
+                                        _eff_tol = _tol_v * abs(_denom_v) if ((_denom_ast is not None or _rhs_rel) and _denom_v) else _tol_v
+                                        if abs(initial[_ai] - _alg_val) > _eff_tol:
+                                            warnings.append(
+                                                f"auto-init: algebraic target slot state[{_ai}] ({inv.variable_name}) "
+                                                f"set from {initial[_ai]} to {_alg_val}")
+                                            initial[_ai] = _alg_val
                         _lhs = _rhs
 
             distinct_slots = {
@@ -2188,8 +2228,12 @@ class ResearchStateMachine:
             for c in (getattr(bp, "contracts", None) or [])
         ]
         cumulative_dicts = [c.model_dump() for c in _contracts_through_stage(bp, stage)]
-        san = sanitize_intrinsics(candidate_code, contracts=contracts,
-                                  all_contracts=all_bp_dicts or cumulative_dicts or contracts)
+        san = sanitize_intrinsics(
+            candidate_code,
+            contracts=contracts,
+            all_contracts=all_bp_dicts or cumulative_dicts or contracts,
+            variable_map=getattr(bp, "variable_map", None),
+        )
         _apply_backup_slots_to_vmap(bp, getattr(san, "backup_slot_map", {}), san.code)
         if san.changed:
             candidate_code = san.code
@@ -2232,6 +2276,7 @@ class ResearchStateMachine:
                 unified,
                 contracts=contracts,
                 all_contracts=all_bp_dicts or cumulative_dicts or contracts,
+                variable_map=getattr(bp, "variable_map", None),
             )
             _apply_backup_slots_to_vmap(bp, getattr(san_u, "backup_slot_map", {}), san_u.code)
             if san_u.changed:
@@ -2597,7 +2642,12 @@ class ResearchStateMachine:
         )
         if m_name_err:
             seed_directives.append({"op": "INLINE_INTRINSIC", "name": m_name_err.group(1)})
-        det = apply_healing_directives(candidate_code, seed_directives, contracts=all_contract_dicts or contract_dicts)
+        bp_vmap = getattr(getattr(self, "blueprint", None), "variable_map", None)
+        det = apply_healing_directives(
+            candidate_code, seed_directives,
+            contracts=all_contract_dicts or contract_dicts,
+            variable_map=bp_vmap,
+        )
         healed, notes = candidate_code, list(det.notes)
         if det.changed:
             healed = det.code
@@ -2713,8 +2763,11 @@ class ResearchStateMachine:
                         continue
                 filtered_dirs.append(_d)
             directives = filtered_dirs
-        patched = apply_healing_directives(candidate_code, directives,
-                                           contracts=all_contract_dicts or contract_dicts)
+        patched = apply_healing_directives(
+            candidate_code, directives,
+            contracts=all_contract_dicts or contract_dicts,
+            variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+        )
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
         _is_final_heal = (attempt >= max_attempts)
         _missing_eq_slot = (

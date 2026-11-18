@@ -3613,6 +3613,439 @@ def abs_arg_has_const(node: ast.AST) -> bool:
     return any(_eval_const_ast(sub) is not None and isinstance(sub, ast.Constant) for sub in ast.walk(node) if sub is not node) or isinstance(node, ast.BinOp)
 
 
+def _unwrap_abs_or_rel_err(node: ast.AST) -> Tuple[Optional[ast.AST], Optional[ast.AST]]:
+    """Return ``(abs_inner, denom_ast)`` for ``abs(inner)`` or ``abs(inner) / denom``."""
+    inner = _unwrap_abs_call(node)
+    if inner is not None:
+        return inner, None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        inner_l = _unwrap_abs_call(node.left)
+        if inner_l is not None:
+            return inner_l, node.right
+    return None, None
+
+
+def _extract_abs_tol(node: ast.AST) -> Tuple[Optional[float], bool]:
+    """Extract scalar tolerance ``(tol, is_rel_rhs)`` from constant or ``c * scale`` RHS."""
+    c_val = _eval_const_ast(node)
+    if c_val is not None:
+        return float(c_val), False
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        lc = _eval_const_ast(node.left)
+        if lc is not None and lc >= 0.0:
+            return float(lc), True
+        rc = _eval_const_ast(node.right)
+        if rc is not None and rc >= 0.0:
+            return float(rc), True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        lt, lr = _extract_abs_tol(node.left)
+        rt, rr = _extract_abs_tol(node.right)
+        if lt is not None and rt is not None:
+            return max(lt, rt), (lr or rr)
+    return None, False
+
+
+def _slots_in_ast(node: ast.AST) -> Set[int]:
+    """Collect all constant integer state/buffer slot indices referenced in ``node``."""
+    out: Set[int] = set()
+    for sub in ast.walk(node):
+        s = _slot_of_state_ast(sub)
+        if s is not None:
+            out.add(s)
+    return out
+
+
+class _StateToBufTransformer(ast.NodeTransformer):
+    """Rewrite ``state[k]``/``buf.data[k]``/``data[k]`` nodes to ``buf.data[k]``."""
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        s = _slot_of_state_ast(node)
+        if s is not None:
+            return ast.Subscript(
+                value=ast.Attribute(
+                    value=ast.Name(id="buf", ctx=ast.Load()),
+                    attr="data",
+                    ctx=ast.Load(),
+                ),
+                slice=ast.Constant(value=s),
+                ctx=ast.Load(),
+            )
+        return self.generic_visit(node)
+
+
+def _match_abs_algebraic(
+    abs_inner: ast.AST,
+) -> Optional[Tuple[int, str, Optional[Tuple[int, int]]]]:
+    """Match ``state[i] - EXPR`` / ``EXPR - state[i]`` where EXPR uses other state slots.
+
+    Returns ``(target_slot, expr_buf_str, product_pair_or_None)``.
+    """
+    if not isinstance(abs_inner, ast.BinOp) or not isinstance(abs_inner.op, (ast.Sub, ast.Add)):
+        return None
+    l_slot = _slot_of_state_ast(abs_inner.left)
+    r_slot = _slot_of_state_ast(abs_inner.right)
+    target_slot: Optional[int] = None
+    target_ast: Optional[ast.AST] = None
+    if isinstance(abs_inner.op, ast.Sub):
+        if l_slot is not None:
+            r_slots = _slots_in_ast(abs_inner.right)
+            if r_slots and l_slot not in r_slots:
+                target_slot = l_slot
+                target_ast = abs_inner.right
+        if target_slot is None and r_slot is not None:
+            l_slots = _slots_in_ast(abs_inner.left)
+            if l_slots and r_slot not in l_slots:
+                target_slot = r_slot
+                target_ast = abs_inner.left
+    else:  # ast.Add: state[i] + EXPR == 0 -> state[i] == -EXPR
+        if l_slot is not None:
+            r_slots = _slots_in_ast(abs_inner.right)
+            if r_slots and l_slot not in r_slots:
+                target_slot = l_slot
+                target_ast = ast.UnaryOp(op=ast.USub(), operand=abs_inner.right)
+        if target_slot is None and r_slot is not None:
+            l_slots = _slots_in_ast(abs_inner.left)
+            if l_slots and r_slot not in l_slots:
+                target_slot = r_slot
+                target_ast = ast.UnaryOp(op=ast.USub(), operand=abs_inner.left)
+    if target_slot is None or target_ast is None:
+        return None
+    prod_pair: Optional[Tuple[int, int]] = None
+    if isinstance(target_ast, ast.BinOp) and isinstance(target_ast.op, ast.Mult):
+        j_s = _slot_of_state_ast(target_ast.left)
+        k_s = _slot_of_state_ast(target_ast.right)
+        if j_s is not None and k_s is not None and j_s != target_slot and k_s != target_slot:
+            prod_pair = (j_s, k_s)
+    buf_ast = _StateToBufTransformer().visit(copy.deepcopy(target_ast))
+    ast.fix_missing_locations(buf_ast)
+    return target_slot, ast.unparse(buf_ast), prod_pair
+
+
+def _eval_ast_on_state(node: ast.AST, state: Sequence[float]) -> Optional[float]:
+    """Evaluate an algebraic AST expression over constants and ``state[k]``."""
+    s_idx = _slot_of_state_ast(node)
+    if s_idx is not None:
+        return float(state[s_idx]) if 0 <= s_idx < len(state) else None
+    c_val = _eval_const_ast(node)
+    if c_val is not None:
+        return float(c_val)
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_ast_on_state(node.operand, state)
+        if v is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return v
+        if isinstance(node.op, ast.USub):
+            return -v
+        return None
+    if isinstance(node, ast.BinOp):
+        lv = _eval_ast_on_state(node.left, state)
+        rv = _eval_ast_on_state(node.right, state)
+        if lv is None or rv is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return lv + rv
+        if isinstance(node.op, ast.Sub):
+            return lv - rv
+        if isinstance(node.op, ast.Mult):
+            return lv * rv
+        if isinstance(node.op, ast.Div):
+            return lv / rv if abs(rv) > 1e-300 else None
+        if isinstance(node.op, ast.Pow) and abs(rv) <= 12:
+            try:
+                return float(lv ** rv)
+            except Exception:
+                return None
+    return None
+
+
+def _expand_slot_match_tokens(raw_name: str) -> Set[str]:
+    """Extract normalized multi-character tokens and physical aliases from an identifier."""
+    low = (raw_name or "").strip().lower()
+    if not low:
+        return set()
+    # Split camelCase then non-alphanumerics
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1_\2", raw_name or "")
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if p]
+    tokens: Set[str] = {low.replace(" ", "_")}
+    for p in parts:
+        if len(p) >= 2:
+            tokens.add(p)
+    for a, b in zip(parts, parts[1:]):
+        tokens.add(f"{a}_{b}")
+    # Expand well-known physics variable-name shorthands (non-intrusive, symmetric)
+    if low == "s" or "s_shunt" in tokens or "shunt" in tokens:
+        tokens.update({"shunt", "s_shunt", "ratio"})
+    if "dt_k" in tokens or "dtk" in tokens or "dt_kap" in tokens or "kapitza" in tokens or "dt_kapitza" in tokens:
+        tokens.update({"kapitza", "dt_k", "dtk"})
+    if "p_vis" in tokens or "pvis" in tokens or "visible" in tokens or "dissipation" in tokens:
+        tokens.update({"p_vis", "visible", "dissipation", "vis"})
+    if "w_cyc" in tokens or "wcyc" in tokens or "cyclic" in tokens or "work" in tokens:
+        tokens.update({"w_cyc", "cyclic", "work", "cyc"})
+    if "p_net" in tokens or "pnet" in tokens or "net" in tokens or "surplus" in tokens:
+        tokens.update({"p_net", "net", "surplus"})
+    if "p_array" in tokens or "parray" in tokens or "array" in tokens:
+        tokens.update({"p_array", "array"})
+    if "eta_a" in tokens or "eta_d" in tokens or "partition" in tokens:
+        tokens.update({"eta", "partition"})
+    if "e_lan" in tokens or "p_lan" in tokens or "landauer" in tokens:
+        tokens.update({"landauer"})
+    if "n_dot" in tokens or "ndot" in tokens or "gamow" in tokens:
+        tokens.update({"n_dot", "gamow"})
+    return tokens
+
+
+def _split_intra_function_stage_overwrites_tree(
+    tree: ast.Module,
+    contracts: Sequence[Any] = (),
+    all_contracts: Sequence[Any] = (),
+    variable_map: Optional[Dict[str, int]] = None,
+) -> Tuple[ast.Module, bool, List[str]]:
+    """Split multi-stage ``buf.data[k]`` overwrites inside one step function and bridge
+    unassigned de-collided Stage 2/3 contract slots from matching local variables.
+    """
+    unique_contracts: List[Any] = []
+    seen_cids: Set[str] = set()
+    for c in list(all_contracts or []) + list(contracts or []):
+        if c is None:
+            continue
+        cid = str(_contract_get(c, "contract_id", "") or "")
+        if cid and cid in seen_cids:
+            continue
+        if cid:
+            seen_cids.add(cid)
+        unique_contracts.append(c)
+    if not unique_contracts:
+        return tree, False, []
+
+    cls = classify_buffer_slots(tree, unique_contracts)
+    protected = {0, 1, 2, 3} | set(cls["dynamical_slots"]) | set(cls["parameter_slots"]) | set(cls["history_slots"])
+
+    stage1_slots: Set[int] = set()
+    slot_tokens: Dict[int, Set[str]] = {}
+    later_slots_ordered: List[int] = []
+    seen_later: Set[int] = set()
+    all_contract_slots: Set[int] = set()
+
+    for c_pos, c in enumerate(unique_contracts):
+        cid = str(_contract_get(c, "contract_id", "") or "")
+        st_idx = _contract_stage_index(cid)
+        is_stage1 = (st_idx == 1) or (st_idx <= 0 and c_pos == 0)
+        for vname, assertion, _tol in _contract_invariant_items(c):
+            s_list = _contract_state_slots_from_text(assertion)
+            for s in s_list:
+                all_contract_slots.add(s)
+                if is_stage1:
+                    stage1_slots.add(s)
+                else:
+                    if s not in seen_later:
+                        seen_later.add(s)
+                        later_slots_ordered.append(s)
+                slot_tokens.setdefault(s, set()).update(_expand_slot_match_tokens(vname))
+
+    if isinstance(variable_map, dict):
+        for vname, s_idx in variable_map.items():
+            try:
+                si = int(s_idx)
+            except (TypeError, ValueError):
+                continue
+            slot_tokens.setdefault(si, set()).update(_expand_slot_match_tokens(str(vname)))
+            all_contract_slots.add(si)
+            if si not in stage1_slots and si not in seen_later and si >= 4:
+                seen_later.add(si)
+                later_slots_ordered.append(si)
+
+    def _score_expr_to_slot(expr_names: Set[str], slot: int) -> int:
+        s_toks = slot_tokens.get(slot)
+        if not s_toks:
+            return 0
+        best = 0
+        for vn in expr_names:
+            v_toks = _expand_slot_match_tokens(vn)
+            # Filter out weak noise tokens so unrelated P_* names don't cross-match
+            overlap = (v_toks & s_toks) - {"bound", "positive", "nonneg", "closes", "locked", "matches", "below", "floor", "passive", "ratio"}
+            if not overlap:
+                continue
+            score = len(overlap) * 10
+            # Exact identifier / specific subscript bonus (e.g. eta_a vs eta_d, p_net, dT_K)
+            vn_low = vn.lower()
+            if vn_low in s_toks:
+                score += 20
+            if score > best:
+                best = score
+        return best
+
+    used_all = _used_state_slots(tree) | all_contract_slots
+    changed = False
+    notes: List[str] = []
+
+    step_fns = [
+        fn for fn in _simulation_functions(tree)
+        if isinstance(fn, ast.FunctionDef) and not fn.name.endswith(("_euler", "_rk4"))
+    ]
+    global_assigned = _collect_assigned_slots(tree)
+
+    for fn in step_fns:
+        body = fn.body
+        if not body:
+            continue
+        deps = _collect_var_deps(body, len(body))
+        first_write_rhs: Dict[int, ast.expr] = {}
+        first_write_dump: Dict[int, str] = {}
+        read_var_by_slot: Dict[int, str] = {}
+        assigned_in_fn: Set[int] = set()
+        local_var_order: List[str] = []
+        seen_locals: Set[str] = set()
+
+        for stmt in body:
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                # Track reads/writes inside nested blocks so we don't treat later blocks blindly
+                continue
+            tgt, val = stmt.targets[0], stmt.value
+            if isinstance(tgt, ast.Name):
+                r_slot = _state_subscript_slot(val)
+                if r_slot is not None:
+                    read_var_by_slot.setdefault(r_slot, tgt.id)
+                elif not tgt.id.startswith("_"):
+                    if tgt.id not in seen_locals:
+                        seen_locals.add(tgt.id)
+                        local_var_order.append(tgt.id)
+                continue
+
+            k = _state_subscript_slot(tgt)
+            if k is None:
+                continue
+            val_dump = ast.dump(val, annotate_fields=False, include_attributes=False)
+            rhs_names = {
+                n.id for n in ast.walk(val)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            }
+            reads_slot_k = any(_state_subscript_slot(sub) == k for sub in ast.walk(val))
+            uses_buf_expr = (
+                any(_state_subscript_slot(sub) is not None for sub in ast.walk(val))
+                or any(
+                    isinstance(sub, ast.Name) and (sub.id.startswith(("_alg_target_", "_invar_")) or sub.id == _SAFE_DIV_HELPER)
+                    for sub in ast.walk(val)
+                )
+            )
+            if uses_buf_expr:
+                assigned_in_fn.add(k)
+                global_assigned.add(k)
+                continue
+
+            # Skip dynamical coordinate updates in 0..3 or Tier-0 reconciled expressions
+            is_coord_upd = (
+                k in {0, 1, 2, 3}
+                and isinstance(val, ast.Name)
+                and val.id.lower() in _STEPPED_COORD_NAMES
+            )
+
+            is_second_write = False
+            is_input_overwrite = False
+            if not is_coord_upd and not reads_slot_k:
+                if k in first_write_rhs:
+                    prev_rhs = first_write_rhs[k]
+                    same_var = (
+                        isinstance(val, ast.Name)
+                        and isinstance(prev_rhs, ast.Name)
+                        and val.id == prev_rhs.id
+                    )
+                    if not same_var and val_dump != first_write_dump.get(k):
+                        is_second_write = True
+                elif k in read_var_by_slot:
+                    rv = read_var_by_slot[k]
+                    trans = set(rhs_names)
+                    for rn in list(rhs_names):
+                        trans.update(deps.get(rn, ()))
+                    if rv not in trans and (k in stage1_slots or not _is_parameter_name(rv)):
+                        is_input_overwrite = True
+
+            if (is_second_write or is_input_overwrite) and rhs_names:
+                best_target: Optional[int] = None
+                best_score = 0
+                candidate_pool = [
+                    m for m in later_slots_ordered
+                    if m != k and m not in stage1_slots and m not in assigned_in_fn and m not in global_assigned
+                ]
+                if not candidate_pool:
+                    candidate_pool = [
+                        m for m in later_slots_ordered
+                        if m != k and m not in stage1_slots and m not in assigned_in_fn
+                    ]
+                for m in candidate_pool:
+                    sc = _score_expr_to_slot(rhs_names, m)
+                    if sc > best_score:
+                        best_score = sc
+                        best_target = m
+                if best_target is not None and best_score > 0:
+                    tgt.slice = ast.Constant(value=best_target)  # type: ignore[attr-defined]
+                    assigned_in_fn.add(best_target)
+                    global_assigned.add(best_target)
+                    used_all.add(best_target)
+                    first_write_rhs.setdefault(best_target, val)
+                    first_write_dump.setdefault(best_target, val_dump)
+                    changed = True
+                    notes.append(
+                        f"redirected intra-function overwrite buf.data[{k}] -> buf.data[{best_target}] in {fn.name}"
+                    )
+                    continue
+                if is_second_write and k in stage1_slots:
+                    sc_slot = _scratch_slot(used_all, {k})
+                    used_all.add(sc_slot)
+                    tgt.slice = ast.Constant(value=sc_slot)  # type: ignore[attr-defined]
+                    assigned_in_fn.add(sc_slot)
+                    changed = True
+                    notes.append(
+                        f"isolated conflicting Stage 1 slot overwrite buf.data[{k}] -> buf.data[{sc_slot}] in {fn.name}"
+                    )
+                    continue
+
+            first_write_rhs.setdefault(k, val)
+            first_write_dump.setdefault(k, val_dump)
+            assigned_in_fn.add(k)
+            global_assigned.add(k)
+
+        # Bridge still-unassigned de-collided Stage 2/3 slots from matching local variables in this function.
+        read_everywhere = _read_state_slots(fn)
+        all_assigned_tree = _collect_assigned_slots(tree)
+        decollided_missing = [
+            m for m in later_slots_ordered
+            if m not in protected
+            and m not in all_assigned_tree
+            and m not in assigned_in_fn
+            and m not in read_everywhere
+            and (m >= 14 or m not in stage1_slots)
+        ]
+        if decollided_missing and local_var_order:
+            claimed_locals: Set[str] = set()
+            bridge_stmts: List[ast.stmt] = []
+            for m in decollided_missing:
+                best_var: Optional[str] = None
+                best_score = 0
+                for vn in local_var_order:
+                    sc = _score_expr_to_slot({vn}, m)
+                    if sc > 0 and vn not in claimed_locals:
+                        sc += 5
+                    if sc > best_score:
+                        best_score = sc
+                        best_var = vn
+                if best_var is not None and best_score >= 10:
+                    claimed_locals.add(best_var)
+                    bridge_stmts.append(ast.parse(f"buf.data[{m}] = {best_var}\n").body[0])
+                    assigned_in_fn.add(m)
+                    changed = True
+                    notes.append(f"bridged de-collided slot buf.data[{m}] = {best_var} in {fn.name}")
+            if bridge_stmts:
+                # Insert before trailing return if present, else extend body
+                if body and isinstance(body[-1], ast.Return):
+                    body[-1:-1] = bridge_stmts
+                else:
+                    body.extend(bridge_stmts)
+                ast.fix_missing_locations(fn)
+
+    return tree, changed, notes
+
+
 def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[Any]
                                         ) -> Tuple[ast.Module, bool, List[str]]:
     """Ensure 3D Bloch coordinates and contract slot bounds/equalities are satisfied."""
@@ -3633,6 +4066,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     seen_sum_partitions: Set[Tuple[int, int, float]] = set()
     diff_eq_targets: List[Tuple[int, int, float, bool]] = []
     seen_diff_eqs: Set[Tuple[int, int]] = set()
+    alg_eq_targets: Dict[int, Tuple[str, float, bool, Optional[Tuple[int, int]], bool]] = {}
+    coupled_prod_bounds: List[Tuple[int, int, int, float, float]] = []
     relational_le_pairs: List[Tuple[int, int, float]] = []
     seen_rel_pairs: Set[Tuple[int, int, float]] = set()
     relational_strict_gt_pairs: List[Tuple[int, int, float, float]] = []
@@ -3734,35 +4169,54 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     continue
                 lhs = node.left
                 for cmp_op, rhs in zip(node.ops, node.comparators):
-                    # abs(...) <= tol  or  tol >= abs(...)
+                    # abs(...) <= tol  or  abs(...) / denom <= tol  or  tol >= abs(...)
                     abs_inner = None
+                    denom_ast = None
                     tol_val = None
+                    rhs_rel = False
                     is_strict = isinstance(cmp_op, (ast.Lt, ast.Gt))
                     if isinstance(cmp_op, (ast.LtE, ast.Lt)):
-                        abs_inner = _unwrap_abs_call(lhs)
-                        tol_val = _eval_const_ast(rhs) if abs_inner is not None else None
+                        abs_inner, denom_ast = _unwrap_abs_or_rel_err(lhs)
+                        if abs_inner is not None:
+                            tol_val, rhs_rel = _extract_abs_tol(rhs)
                     elif isinstance(cmp_op, (ast.GtE, ast.Gt)):
-                        abs_inner = _unwrap_abs_call(rhs)
-                        tol_val = _eval_const_ast(lhs) if abs_inner is not None else None
+                        abs_inner, denom_ast = _unwrap_abs_or_rel_err(rhs)
+                        if abs_inner is not None:
+                            tol_val, rhs_rel = _extract_abs_tol(lhs)
                     if abs_inner is not None and tol_val is not None and tol_val >= 0.0:
+                        denom_c = _eval_const_ast(denom_ast) if denom_ast is not None else None
                         s_slot = _slot_of_state_ast(abs_inner)
-                        if s_slot is not None:
-                            _record_upper(s_slot, "<" if is_strict else "<=", tol_val, contract)
+                        if s_slot is not None and not rhs_rel:
+                            eff_tol = (
+                                tol_val * abs(denom_c)
+                                if (denom_c is not None and denom_c != 0.0)
+                                else tol_val
+                            )
+                            _record_upper(s_slot, "<" if is_strict else "<=", eff_tol, contract)
                             matched_ast_bound = True
                         else:
                             single_t, sum_t, diff_p = _match_abs_affine(abs_inner)
                             if single_t is not None:
                                 si, tgt = single_t
-                                if si not in dyn_set or si >= 4 or True:
-                                    if si not in eq_target_slots or tol_val < eq_target_slots[si][1]:
-                                        eq_target_slots[si] = (tgt, tol_val, is_strict)
-                                    matched_ast_bound = True
+                                if denom_ast is not None or rhs_rel:
+                                    scale = abs(denom_c) if (denom_c is not None and denom_c != 0.0) else max(abs(tgt), 1e-300)
+                                    eff_tol = tol_val * scale
+                                else:
+                                    eff_tol = tol_val
+                                if si not in eq_target_slots or eff_tol < eq_target_slots[si][1]:
+                                    eq_target_slots[si] = (tgt, eff_tol, is_strict)
+                                matched_ast_bound = True
                             elif sum_t is not None:
                                 i_s, j_s, tgt = sum_t
+                                if denom_ast is not None or rhs_rel:
+                                    scale = abs(denom_c) if (denom_c is not None and denom_c != 0.0) else max(abs(tgt), 1e-300)
+                                    eff_tol = tol_val * scale
+                                else:
+                                    eff_tol = tol_val
                                 p_key = (i_s, j_s, tgt)
                                 if p_key not in seen_sum_partitions:
                                     seen_sum_partitions.add(p_key)
-                                    sum_partition_targets.append((i_s, j_s, tgt, tol_val, is_strict))
+                                    sum_partition_targets.append((i_s, j_s, tgt, eff_tol, is_strict))
                                 matched_ast_bound = True
                             elif diff_p is not None:
                                 i_s, j_s = diff_p
@@ -3770,6 +4224,16 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                                     seen_diff_eqs.add((i_s, j_s))
                                     diff_eq_targets.append((i_s, j_s, tol_val, is_strict))
                                 matched_ast_bound = True
+                            else:
+                                alg = _match_abs_algebraic(abs_inner)
+                                if alg is not None:
+                                    ai, expr_buf, prod_pair = alg
+                                    prev_alg = alg_eq_targets.get(ai)
+                                    if prev_alg is None or tol_val < prev_alg[1]:
+                                        alg_eq_targets[ai] = (
+                                            expr_buf, tol_val, is_strict, prod_pair, (denom_ast is not None or rhs_rel)
+                                        )
+                                    matched_ast_bound = True
                         lhs = rhs
                         continue
 
@@ -3866,13 +4330,45 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         elif s_idx in quarter_upper_slots and 0.25 < lb:
             del positive_lower_slots[s_idx]
 
+    # Pair product algebraic equalities `state[i] == state[j] * state[k]` with upper
+    # bounds `state[i] <= U` so upper clamp and factor scaling never fight each other.
+    for i_slot in list(alg_eq_targets):
+        _expr_buf, _tol_v, _is_st, prod_pair, _has_rel = alg_eq_targets[i_slot]
+        if prod_pair is None:
+            continue
+        ub_cands: List[float] = []
+        if i_slot in small_upper_slots:
+            ub_cands.append(small_upper_slots.pop(i_slot))
+        if i_slot in other_upper_slots:
+            ub_cands.append(other_upper_slots.pop(i_slot))
+        if i_slot in unit_upper_slots:
+            unit_upper_slots.discard(i_slot)
+            ub_cands.append(1.0)
+        if i_slot in quarter_upper_slots:
+            quarter_upper_slots.discard(i_slot)
+            ub_cands.append(0.25)
+        if ub_cands:
+            ub_val = min(ub_cands)
+            j_keep, k_adj = prod_pair
+            if k_adj in eq_target_slots and j_keep not in eq_target_slots:
+                j_keep, k_adj = k_adj, j_keep
+            fallback_j = 4.01937e-23
+            for c_fb in contracts or []:
+                init_l = _get_contract_initial_list(c_fb)
+                if j_keep < len(init_l) and float(init_l[j_keep]) > 0.0:
+                    fallback_j = float(init_l[j_keep])
+                    break
+            coupled_prod_bounds.append((i_slot, j_keep, k_adj, float(ub_val), float(fallback_j)))
+            del alg_eq_targets[i_slot]
+
     if (r_max is None and not nonneg_slots and not strict_gt_slots
             and not positive_lower_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
             and not other_upper_slots and not relational_le_pairs
             and not relational_strict_gt_pairs
             and not eq_target_slots and not sum_partition_targets
-            and not diff_eq_targets):
+            and not diff_eq_targets and not alg_eq_targets
+            and not coupled_prod_bounds):
         return tree, False, []
 
     notes: List[str] = []
@@ -4051,7 +4547,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(strict_gt_slots):
                 bound = strict_gt_slots[s_idx]
-                clamp_val = (bound + 1e-3) if bound >= 0.0 else (bound * 0.5)
+                ub_tight = small_upper_slots.get(s_idx, other_upper_slots.get(s_idx))
+                if ub_tight is not None and ub_tight > bound:
+                    clamp_val = 0.5 * (bound + ub_tight)
+                else:
+                    clamp_val = (bound + 1e-3) if bound >= 0.0 else (bound * 0.5)
                 guard_src = f"if buf.data[{s_idx}] <= {bound!r}:\n    buf.data[{s_idx}] = {clamp_val!r}\n"
                 if f"if buf.data[{s_idx}] <= {bound!r}:" not in fn_src:
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
@@ -4093,8 +4593,10 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     notes.append(f"conditioned purity/unit slot state[{s_idx}] <= 1.0 in {fn_tgt.name}")
             for s_idx in sorted(small_upper_slots):
                 bound = small_upper_slots[s_idx]
-                guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = 0.0\n"
-                if f"if buf.data[{s_idx}] > " not in fn_src or f"buf.data[{s_idx}] = 0.0" not in fn_src:
+                lb_strict = strict_gt_slots.get(s_idx)
+                fb_val = (0.5 * (lb_strict + bound)) if (lb_strict is not None and bound > lb_strict) else 0.0
+                guard_src = f"if buf.data[{s_idx}] > {bound!r}:\n    buf.data[{s_idx}] = {fb_val!r}\n"
+                if f"if buf.data[{s_idx}] > " not in fn_src or f"buf.data[{s_idx}] = {fb_val!r}" not in fn_src:
                     _append_before_return(fn_tgt, ast.parse(guard_src).body)
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
@@ -4207,6 +4709,58 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     _ensure_math_import(tree)
                     changed = True
                     notes.append(f"conditioned difference equality slots state[{i_s}] == state[{j_s}] (tol {tol!r}) in {fn_tgt.name}")
+            for i_slot in sorted(alg_eq_targets):
+                expr_buf, tol_v, _is_st, prod_pair, has_rel = alg_eq_targets[i_slot]
+                cur_src = ast.unparse(fn_tgt)
+                if f"_alg_target_{i_slot} = " in cur_src:
+                    continue
+                alg_lines: List[str] = []
+                if has_rel and prod_pair is not None:
+                    for f_idx in prod_pair:
+                        fb_f = 1e-12
+                        for c_fb in contracts or []:
+                            init_l = _get_contract_initial_list(c_fb)
+                            if f_idx < len(init_l) and float(init_l[f_idx]) > 0.0:
+                                fb_f = float(init_l[f_idx])
+                                break
+                        alg_lines.append(
+                            f"if not math.isfinite(buf.data[{f_idx}]) or buf.data[{f_idx}] <= 0.0:\n"
+                            f"    buf.data[{f_idx}] = {fb_f!r}"
+                        )
+                alg_lines.append(
+                    f"_alg_target_{i_slot} = {expr_buf}\n"
+                    f"if math.isfinite(_alg_target_{i_slot}):\n"
+                    f"    buf.data[{i_slot}] = _alg_target_{i_slot}\n"
+                )
+                _append_before_return(fn_tgt, ast.parse("\n".join(alg_lines)).body)
+                ast.fix_missing_locations(fn_tgt)
+                _ensure_math_import(tree)
+                changed = True
+                notes.append(
+                    f"conditioned algebraic target equality state[{i_slot}] == {expr_buf} (tol {tol_v!r}) in {fn_tgt.name}"
+                )
+            for i_slot, j_keep, k_adj, ub_val, fallback_j in coupled_prod_bounds:
+                cur_src = ast.unparse(fn_tgt)
+                marker_reconcile = f"buf.data[{k_adj}] = _invar_sdiv(buf.data[{i_slot}], buf.data[{j_keep}])"
+                if marker_reconcile in cur_src:
+                    continue
+                reconcile_src = (
+                    f"if not math.isfinite(buf.data[{j_keep}]) or buf.data[{j_keep}] <= 0.0:\n"
+                    f"    buf.data[{j_keep}] = {fallback_j!r}\n"
+                    f"if not math.isfinite(buf.data[{k_adj}]) or buf.data[{k_adj}] <= 0.0:\n"
+                    f"    buf.data[{k_adj}] = _invar_sdiv({ub_val!r} * 0.99, buf.data[{j_keep}])\n"
+                    f"buf.data[{i_slot}] = buf.data[{j_keep}] * buf.data[{k_adj}]\n"
+                    f"if buf.data[{i_slot}] > {ub_val!r}:\n"
+                    f"    buf.data[{i_slot}] = {ub_val!r} * 0.999999\n"
+                    f"    buf.data[{k_adj}] = _invar_sdiv(buf.data[{i_slot}], buf.data[{j_keep}])\n"
+                )
+                _append_before_return(fn_tgt, ast.parse(reconcile_src).body)
+                ast.fix_missing_locations(fn_tgt)
+                _ensure_math_import(tree)
+                changed = True
+                notes.append(
+                    f"reconciled coupled product+bound state[{i_slot}] == state[{j_keep}]*state[{k_adj}] <= {ub_val!r} in {fn_tgt.name}"
+                )
     return tree, changed, notes
 
 
@@ -5114,6 +5668,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         eps: float = 1e-300,
                         contracts: Sequence[Any] = (),
                         all_contracts: Sequence[Any] = (),
+                        variable_map: Optional[Dict[str, int]] = None,
                         stabilize_diverged: bool = False) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
@@ -5132,6 +5687,9 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree, init_loc_changed, init_loc_notes = _init_conditional_locals_tree(tree)
     tree, bsize_changed, bsize_notes = _strip_buf_size_branches_tree(tree, bridge_contracts)
     tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
+    tree, split_changed, split_notes = _split_intra_function_stage_overwrites_tree(
+        tree, contracts, bridge_contracts, variable_map=variable_map
+    )
     tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
     tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
     tree, history_changed, history_notes = _repair_history_slots_tree(tree)
@@ -5158,12 +5716,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(alias_notes) | set(sig_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (alias_changed or sig_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):
@@ -5584,12 +6142,13 @@ def _scale_coefficient(tree: ast.Module, var: str, factor: float) -> bool:
 
 
 def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
-                             *, contracts: Sequence[Any] = ()) -> SanitizerResult:
+                             *, contracts: Sequence[Any] = (),
+                             variable_map: Optional[Dict[str, int]] = None) -> SanitizerResult:
     """Apply LLM-emitted structured directives deterministically."""
     notes: List[str] = []
     current = code
     # Always run the intrinsic/domain sanitizer first (Tier-0, zero tokens).
-    san = sanitize_intrinsics(current, contracts=contracts)
+    san = sanitize_intrinsics(current, contracts=contracts, variable_map=variable_map)
     if san.changed:
         current = san.code
         notes.extend(san.notes)

@@ -480,3 +480,156 @@ def test_relevance_filtered_shbt_and_arxiv_generic_tokens():
     assert "floquet_screening_ev" in ev.parameters
     assert "m" not in ev.parameters
     assert "servicing" not in ev.parameters
+
+
+def test_comma_numbers_and_reserved_math_idents():
+    from invar_agent.research.extractor import _parse_number, extract_parameters_from_text
+    assert _parse_number("999,054") == pytest.approx(999054.0)
+    assert _parse_number("93,054") == pytest.approx(93054.0)
+    assert _parse_number("1,800") == pytest.approx(1800.0)
+    assert _parse_number("3,14") == pytest.approx(3.14)
+
+    text = (
+        "1,800-module array with P_array = 999,054 W and P_net = 93,054 W; "
+        "Landauer factor ln(2) gives P_lan = 10.9989 nW and ln2 = 10.9989."
+    )
+    extracted = {p.name: p.si_value for p in extract_parameters_from_text(text, source="user_prompt")}
+    assert extracted.get("p_array") == pytest.approx(999054.0)
+    assert extracted.get("p_net") == pytest.approx(93054.0)
+    assert "ln2" not in extracted
+    assert "ln_2" not in extracted
+
+
+def test_full_initial_state_slot_decollision():
+    c1 = {
+        "contract_id": "c1_baseline_closed_system",
+        "target_backend": "cpp",
+        "initial_state": [0.0, 0.0, 0.0, 0.0, 2.736e8, 2.736e8, 4.01937e-23, 1.0997e-14] + [0.0] * 8,
+        "dt": 0.01,
+        "steps": 5,
+        "invariants": [
+            {
+                "variable_name": "landauer_floor_matches",
+                "assertion": "abs(state[7] - state[6] * state[5]) / (state[6] * state[5]) < 1e-9",
+                "tolerance": 1e-9,
+            },
+        ],
+    }
+    c2 = {
+        "contract_id": "c2_ledger_teg_kapitza",
+        "target_backend": "cpp",
+        "initial_state": [0.0, 0.0, 0.0, 0.0, 999054.0] + [0.0] * 11,
+        "dt": 0.01,
+        "steps": 5,
+        "invariants": [
+            {
+                "variable_name": "P_array_matches",
+                "assertion": "abs(state[4] - 999054.0) < 1e-3",
+                "tolerance": 1e-3,
+            },
+        ],
+    }
+    canon, vm, notes = canonicalize_contract_dicts([c1, c2])
+    c2_assert = canon[1]["invariants"][0]["assertion"]
+    assert "state[4]" not in c2_assert, f"c2 must de-collide state[4] against c1.initial_state[4]: {canon[1]}"
+    assert canon[1]["initial_state"][4] == pytest.approx(2.736e8)
+    new_slot = vm["P_array_matches"]
+    assert new_slot != 4
+    assert canon[1]["initial_state"][new_slot] == pytest.approx(999054.0)
+    assert canon[0]["initial_state"][new_slot] == pytest.approx(999054.0)
+    assert len(canon[0]["initial_state"]) == len(canon[1]["initial_state"])
+
+
+def test_intra_function_overwrite_splitter_and_relative_error_product_reconcile():
+    from invar_agent.research.state_machine import _eval_invariant, _guard_contract_initial_state
+    from invar_agent.schemas.research import VerificationContract
+
+    kernel = (
+        "def simulation_step(buf, dt):\n"
+        "    # Stage 1: closed-system baseline\n"
+        "    N_dot = 2.736e8\n"
+        "    E_lan = 4.01937e-23\n"
+        "    P_lan = N_dot * E_lan\n"
+        "    buf.data[5] = N_dot\n"
+        "    buf.data[6] = E_lan\n"
+        "    buf.data[7] = 1.5e-8\n"  # deliberately exceeds U and disagrees with N_dot*E_lan
+        "    buf.data[12] = 0.0\n"   # deliberately 0 instead of 1.09989e-08\n"
+        "    # Stage 2: coupled LANR + TEG + Kapitza (overwrites 4..7!)\n"
+        "    P_array = 1800.0 * 555.03\n"
+        "    P_net = P_array - 906000.0\n"
+        "    dT_K = 3.546\n"
+        "    buf.data[4] = P_array\n"
+        "    buf.data[5] = P_net\n"
+        "    buf.data[6] = dT_K\n"
+        "    # Stage 3: Stinespring symplectic shunt (overwrites 4..8!)\n"
+        "    eta_A = 10.0 / 33.0\n"
+        "    eta_D = 23.0 / 33.0\n"
+        "    S = (eta_A / (eta_A + eta_D)) ** 2\n"
+        "    P_vis = 1.01e-9\n"
+        "    W_cyc = 0.0\n"
+        "    buf.data[4] = eta_A\n"
+        "    buf.data[5] = eta_D\n"
+        "    buf.data[6] = S\n"
+        "    buf.data[7] = P_vis\n"
+        "    buf.data[8] = W_cyc\n"
+    )
+    contracts = [
+        VerificationContract.model_validate({
+            "contract_id": "c1_baseline_closed_system",
+            "target_backend": "cpp",
+            "initial_state": [0.0, 0.0, 0.0, 0.0, 2.736e8, 2.736e8, 4.01937e-23, 1.0997e-14] + [0.0] * 16,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "landauer_floor_matches", "assertion": "abs(state[7] - state[6] * state[5]) / (state[6] * state[5]) < 1e-9", "tolerance": 1e-9},
+                {"variable_name": "landauer_upper_bound", "assertion": "state[7] <= 1.09989e-08 * 1.01", "tolerance": 1e-12},
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c2_ledger_teg_kapitza",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "P_array_matches", "assertion": "abs(state[14] - 999054.0) < 1e-3", "tolerance": 1e-3},
+                {"variable_name": "P_net_nonneg", "assertion": "state[15] >= 0.0", "tolerance": 1e-9},
+                {"variable_name": "kapitza_drop_positive", "assertion": "state[16] > 0.0", "tolerance": 0.0},
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c3_stinespring_shunt_audit",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 5,
+            "invariants": [
+                {"variable_name": "P_vis_rel_match", "assertion": "abs(state[12] - 1.09989e-08) / 1.09989e-08 < 1e-6", "tolerance": 1e-6},
+                {"variable_name": "partition_closes", "assertion": "abs(state[17] + state[18] - 1.0) <= 1e-12", "tolerance": 1e-12},
+                {"variable_name": "shunt_ratio_locked", "assertion": "abs(state[19] - (100.0 / 1089.0)) <= 1e-9", "tolerance": 1e-9},
+                {"variable_name": "visible_dissipation_below_floor", "assertion": "state[20] <= 1.01e-9", "tolerance": 1e-12},
+                {"variable_name": "cyclic_work_passive", "assertion": "state[21] <= 1e-12", "tolerance": 1e-12},
+            ],
+        }),
+    ]
+    san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
+    assert san.changed
+    san2 = sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts)
+    assert san2.changed is False
+
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
+            self.size = len(self.data)
+
+    ns = {}
+    exec(compile(san.code, "<split_rel>", "exec"), ns)
+    for vc in contracts:
+        init, _w = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
+        b = _Buf(list(init) + [0.0] * 8)
+        for _ in range(5):
+            ns["simulation_step"](b, 0.01)
+        for inv in vc.invariants:
+            assert _eval_invariant(inv.assertion, b.data, {}, {"tol": inv.tolerance}), (
+                f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={b.data[:24]}"
+            )
