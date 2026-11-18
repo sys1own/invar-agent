@@ -73,7 +73,9 @@ class SimulationBuffer(ctypes.Structure):
 
 initial = json.loads(initial_json)
 n = len(initial)
-data = (ctypes.c_double * n)(*initial)
+alloc_n = max(n, 64)
+padded = list(initial) + [0.0] * (alloc_n - n)
+data = (ctypes.c_double * alloc_n)(*padded)
 buf = SimulationBuffer(size=n, dt=dt, steps=0,
                        data=ctypes.cast(data, ctypes.POINTER(ctypes.c_double)))
 lib = ctypes.CDLL(so_path)
@@ -96,7 +98,7 @@ for step in range(steps):
             first_nonfinite = step
     if first_nonfinite >= 0:
         break
-state = list(data)
+state = list(data)[:n]
 finite = all(math.isfinite(v) for v in state)
 print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
                   "execution_time_ms": (time.perf_counter() - t0) * 1000.0,
@@ -139,6 +141,187 @@ def lerp(a, b, t):
 
 def safe_div(a, b):
     return a / (b if abs(b) > 1e-30 else 1e-30)
+
+
+_MASK64 = (1 << 64) - 1
+
+
+def invar_splitmix64_stateless(seed, step, channel):
+    s = int(seed) & _MASK64
+    st = int(step) & _MASK64
+    ch = int(channel) & _MASK64
+    z = (s + ((st * 0x9E3779B97F4A7C15) & _MASK64) + ((ch * 0xBF58476D1CE4E5B9) & _MASK64)) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return (z ^ (z >> 31)) & _MASK64
+
+
+def invar_rand_u01(seed, step, channel):
+    val = invar_splitmix64_stateless(seed, step, channel)
+    u = (val >> 11) * (1.0 / 9007199254740992.0)
+    return 1e-15 if u <= 1e-15 else (1.0 - 1e-15 if u >= 1.0 - 1e-15 else u)
+
+
+def invar_rand_normal(seed, step, channel):
+    ch = int(channel) & _MASK64
+    u1 = invar_rand_u01(seed, step, (ch * 2) & _MASK64)
+    u2 = invar_rand_u01(seed, step, (ch * 2 + 1) & _MASK64)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(6.2831853071795864769 * u2)
+
+
+def invar_rand_poisson(seed, step, lam):
+    if lam <= 0.0:
+        return 0.0
+    if lam < 30.0:
+        L = math.exp(-lam)
+        k = 0
+        p = 1.0
+        while p > L and k < 256:
+            k += 1
+            p *= invar_rand_u01(seed, step, 1000 + k)
+        return float(k - 1)
+    z = invar_rand_normal(seed, step, 999)
+    res = math.floor(lam + math.sqrt(lam) * z + 0.5)
+    return 0.0 if res < 0.0 else res
+
+
+def invar_rand_binomial(seed, step, n, p):
+    if n <= 0.0 or p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return math.floor(n)
+    if n < 64.0:
+        hits = 0
+        ni = int(n)
+        for i in range(ni):
+            if invar_rand_u01(seed, step, 2000 + i) < p:
+                hits += 1
+        return float(hits)
+    mu = n * p
+    sigma = math.sqrt(n * p * (1.0 - p))
+    z = invar_rand_normal(seed, step, 1999)
+    val = math.floor(mu + sigma * z + 0.5)
+    n_floor = math.floor(n)
+    return 0.0 if val < 0.0 else (n_floor if val > n_floor else val)
+
+
+def welford_mean_update(mean, x, k):
+    return mean + (x - mean) / (1.0 if k < 1.0 else k)
+
+
+def welford_m2_update(m2, mean_old, mean_new, x):
+    return m2 + (x - mean_old) * (x - mean_new)
+
+
+def welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y):
+    return c_xy + (x - mean_x_old) * (y - mean_y_new)
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x * 0.70710678118654752440))
+
+
+def norm_ppf(p):
+    pc = 1e-15 if p <= 1e-15 else (1.0 - 1e-15 if p >= 1.0 - 1e-15 else p)
+    a1, a2, a3, a4, a5, a6 = -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00
+    b1, b2, b3, b4, b5 = -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01
+    c1, c2, c3, c4, c5, c6 = -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00
+    d1, d2, d3, d4 = 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+    if pc < p_low:
+        q = math.sqrt(-2.0 * math.log(pc))
+        return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+    elif pc <= p_high:
+        q = pc - 0.5
+        r = q * q
+        return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    else:
+        q = math.sqrt(-2.0 * math.log(1.0 - pc))
+        return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+
+
+def logistic_sigmoid(x):
+    xc = 80.0 if x > 80.0 else (-80.0 if x < -80.0 else x)
+    return 1.0 / (1.0 + math.exp(-xc))
+
+
+def logit(p):
+    pc = 1e-15 if p < 1e-15 else (1.0 - 1e-15 if p > 1.0 - 1e-15 else p)
+    return math.log(pc / (1.0 - pc))
+
+
+def hill_eq(c, ec50, n):
+    if c <= 0.0:
+        return 0.0
+    cn = (c if c > 0.0 else 0.0) ** n
+    kn = (ec50 if ec50 > 1e-15 else 1e-15) ** n
+    return cn / (cn + kn + 1e-30)
+
+
+def michaelis_menten(s, vmax, km):
+    sc = s if s > 0.0 else 0.0
+    return (vmax * sc) / ((km if km > 1e-15 else 1e-15) + sc)
+
+
+def kl_term(p, q):
+    qc = q if q > 1e-30 else 1e-30
+    if p <= 0.0:
+        return qc
+    val = p * math.log(p / qc) - p + qc
+    return val if val > 0.0 else 0.0
+
+
+def shannon_term(p):
+    if p <= 0.0:
+        return 0.0
+    return -p * math.log(p)
+
+
+def gammainc_reg(a, x):
+    ac = a if a > 1e-12 else 1e-12
+    if x <= 0.0:
+        return 0.0
+    ratio = (x / ac) ** (1.0 / 3.0)
+    mu = 1.0 - 1.0 / (9.0 * ac)
+    sigma = math.sqrt(1.0 / (9.0 * ac))
+    return norm_cdf((ratio - mu) / (sigma if sigma > 1e-15 else 1e-15))
+
+
+def betainc_reg(a, b, x):
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ac = a if a > 1e-12 else 1e-12
+    bc = b if b > 1e-12 else 1e-12
+    mean = ac / (ac + bc)
+    var = (ac * bc) / ((ac + bc) * (ac + bc) * (ac + bc + 1.0))
+    sigma = math.sqrt(var)
+    return norm_cdf((x - mean) / (sigma if sigma > 1e-15 else 1e-15))
+
+
+for _fn_name, _fn_obj in [
+    ("invar_splitmix64_stateless", invar_splitmix64_stateless),
+    ("invar_rand_u01", invar_rand_u01),
+    ("invar_rand_normal", invar_rand_normal),
+    ("invar_rand_poisson", invar_rand_poisson),
+    ("invar_rand_binomial", invar_rand_binomial),
+    ("welford_mean_update", welford_mean_update),
+    ("welford_m2_update", welford_m2_update),
+    ("welford_cov_update", welford_cov_update),
+    ("norm_cdf", norm_cdf),
+    ("norm_ppf", norm_ppf),
+    ("logistic_sigmoid", logistic_sigmoid),
+    ("logit", logit),
+    ("hill_eq", hill_eq),
+    ("michaelis_menten", michaelis_menten),
+    ("kl_term", kl_term),
+    ("shannon_term", shannon_term),
+    ("gammainc_reg", gammainc_reg),
+    ("betainc_reg", betainc_reg),
+]:
+    setattr(math, _fn_name, _fn_obj)
 
 
 class _NumpyShim:
@@ -200,14 +383,20 @@ if fn is None:
     raise SystemExit(f"entry function {entry!r} not found in module")
 
 initial = [float(v) for v in json.loads(initial_json)]
+orig_n = len(initial)
+if "[62]" in src and len(initial) < 64:
+    initial = initial + [0.0] * (64 - len(initial))
 buf = SimulationBuffer(initial, dt)
-trace_min = list(initial)
-trace_max = list(initial)
+trace_min = list(initial[:orig_n])
+trace_max = list(initial[:orig_n])
 first_nonfinite = -1
 start = time.perf_counter()
 for step in range(steps):
+    prev_steps = buf.steps
     fn(buf, dt)
-    for i in range(buf.size):
+    if buf.steps == prev_steps:
+        buf.steps += 1
+    for i in range(orig_n):
         v = buf.data[i]
         if v < trace_min[i]:
             trace_min[i] = v
@@ -218,7 +407,7 @@ for step in range(steps):
     if first_nonfinite >= 0:
         break
 run_ms = (time.perf_counter() - start) * 1000.0
-state = [float(v) for v in buf.data]
+state = [float(v) for v in buf.data[:orig_n]]
 finite = all(math.isfinite(v) for v in state)
 print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
                   "trace_min": trace_min, "trace_max": trace_max,
@@ -229,6 +418,16 @@ print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
 
 CUSTOM_DISCRETE_MAP = "custom_discrete_map"
 RK4_ODE = "rk4_ode"
+ARCHETYPE_DYNAMICAL_STEPPER = "archetype_dynamical_stepper"
+ARCHETYPE_MONTE_CARLO_ENSEMBLE = "archetype_monte_carlo_ensemble"
+ARCHETYPE_EQUILIBRIUM_FIXED_POINT = "archetype_equilibrium_fixed_point"
+ARCHETYPE_PARAMETER_BIFURCATION_SWEEP = "archetype_parameter_bifurcation_sweep"
+EXECUTION_ARCHETYPES = (
+    ARCHETYPE_DYNAMICAL_STEPPER,
+    ARCHETYPE_MONTE_CARLO_ENSEMBLE,
+    ARCHETYPE_EQUILIBRIUM_FIXED_POINT,
+    ARCHETYPE_PARAMETER_BIFURCATION_SWEEP,
+)
 
 # Kernel execution modes. ``rk4_ode`` is the classical ODE trajectory mode;
 # ``custom_discrete_map`` executes the researcher's exact discrete update law
@@ -236,7 +435,7 @@ RK4_ODE = "rk4_ode"
 # automata) — the bridge loop calls the exported step function exactly once
 # per step in both modes, so a custom map is a first-class kernel, never
 # wrapped in a hardcoded RK4 stepper.
-KERNEL_MODES = (RK4_ODE, CUSTOM_DISCRETE_MAP)
+KERNEL_MODES = (RK4_ODE, CUSTOM_DISCRETE_MAP) + EXECUTION_ARCHETYPES
 
 
 class DynamicCABIBridge:
@@ -385,13 +584,15 @@ class DynamicCABIBridge:
             fn.argtypes = [ctypes.POINTER(SimulationBuffer)]
             fn.restype = None
             n = len(initial_state)
-            data = (ctypes.c_double * n)(*initial_state)
+            alloc_n = max(n, 64)
+            padded = list(initial_state) + [0.0] * (alloc_n - n)
+            data = (ctypes.c_double * alloc_n)(*padded)
             buf = SimulationBuffer(size=n, dt=dt, steps=0, data=data)
             run_start = time.perf_counter()
             for _ in range(steps):
                 fn(ctypes.byref(buf))
             run_ms = (time.perf_counter() - run_start) * 1000.0
-            state = list(data)
+            state = list(data)[:n]
             finite = all(math.isfinite(v) for v in state)
             return {
                 "state": state,

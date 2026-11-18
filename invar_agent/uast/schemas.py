@@ -53,6 +53,12 @@ class PhysicalQuantity(BaseModel):
     unit: str = Field(default="")
     description: str = Field(default="")
     dimension_unspecified: bool = Field(default=False)
+    semantic_tag: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description="0=Physical, 1=Probability/Fraction, 2=Information/Entropy, 3=Population/Count, 4=StatisticalMetric, 5=EconomicUtility",
+    )
 
     @field_validator("symbol", mode="before")
     @classmethod

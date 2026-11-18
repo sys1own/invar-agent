@@ -46,7 +46,59 @@ from ..transpiler.emitters.base import EmitterError
 from ..transpiler.emitters.cpp_emitter import CppEmitter, entry_symbol
 from ..transpiler.emitters.hin_emitter import HinEmitter  # noqa: F401 - public re-export
 from ..transpiler.frontend import python_source_to_uast, UnsupportedError
-from ..runtime.cabi_bridge import DynamicCABIBridge, KernelExecutionError
+from ..runtime.cabi_bridge import (
+    ARCHETYPE_DYNAMICAL_STEPPER,
+    ARCHETYPE_EQUILIBRIUM_FIXED_POINT,
+    ARCHETYPE_MONTE_CARLO_ENSEMBLE,
+    ARCHETYPE_PARAMETER_BIFURCATION_SWEEP,
+    EXECUTION_ARCHETYPES,
+    DynamicCABIBridge,
+    KernelExecutionError,
+)
+from ..algorithms.prng import (
+    invar_rand_binomial,
+    invar_rand_normal,
+    invar_rand_poisson,
+    invar_rand_u01,
+    invar_splitmix64_stateless,
+)
+from ..uast.totalized_math import (
+    betainc_reg,
+    gammainc_reg,
+    hill_eq,
+    kl_term,
+    logistic_sigmoid,
+    logit,
+    michaelis_menten,
+    norm_cdf,
+    norm_ppf,
+    shannon_term,
+    welford_cov_update,
+    welford_m2_update,
+    welford_mean_update,
+)
+
+for _pan_fn_name, _pan_fn in (
+    ("invar_splitmix64_stateless", invar_splitmix64_stateless),
+    ("invar_rand_u01", invar_rand_u01),
+    ("invar_rand_normal", invar_rand_normal),
+    ("invar_rand_poisson", invar_rand_poisson),
+    ("invar_rand_binomial", invar_rand_binomial),
+    ("welford_mean_update", welford_mean_update),
+    ("welford_m2_update", welford_m2_update),
+    ("welford_cov_update", welford_cov_update),
+    ("norm_cdf", norm_cdf),
+    ("norm_ppf", norm_ppf),
+    ("logistic_sigmoid", logistic_sigmoid),
+    ("logit", logit),
+    ("hill_eq", hill_eq),
+    ("michaelis_menten", michaelis_menten),
+    ("kl_term", kl_term),
+    ("shannon_term", shannon_term),
+    ("gammainc_reg", gammainc_reg),
+    ("betainc_reg", betainc_reg),
+):
+    setattr(math, _pan_fn_name, _pan_fn)
 from .accretion import (AccretionError, code_hash, layer_driver_name,
                         merge_accretive_module, pin_layer_code, candidate_layer_code,
                         strip_driver, unified_from_layers)
@@ -257,6 +309,27 @@ def kernel_mode_for_blueprint(bp: ResearchBlueprint) -> str:
     return "rk4_ode"
 
 
+def execution_archetype_for_blueprint(bp: ResearchBlueprint) -> str:
+    """Classify a research blueprint into one of the 4 Universal Execution Archetypes."""
+    text = f"{getattr(bp, 'title', '') or ''} {getattr(bp, 'falsifiable_hypothesis', '') or ''}".lower()
+    if any(k in text for k in (
+        "monte carlo", "ensemble", "replication", "2sls", "wald", "ols", "estimator",
+        "cramer-rao", "cramér-rao", "sample variance", "bootstrap", "welford",
+    )):
+        return ARCHETYPE_MONTE_CARLO_ENSEMBLE
+    if any(k in text for k in (
+        "fixed point", "fixed-point", "nash equilibrium", "replicator", "bellman",
+        "kkt", "variational inequality", "stationary distribution", "game theory",
+    )):
+        return ARCHETYPE_EQUILIBRIUM_FIXED_POINT
+    if any(k in text for k in (
+        "bifurcation", "dose-response", "dose response", "parameter sweep",
+        "phase diagram", "roc curve", "hill curve", "titration",
+    )):
+        return ARCHETYPE_PARAMETER_BIFURCATION_SWEEP
+    return ARCHETYPE_DYNAMICAL_STEPPER
+
+
 def kernel_log_label(mode: str) -> str:
     """Human-readable kernel archetype for the STAGE_k_BUILD log line."""
     if mode == "custom_discrete_map":
@@ -274,7 +347,25 @@ _INVARIANT_FUNCS = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum,
                     "floor": math.floor, "ceil": math.ceil, "fabs": math.fabs,
                     "hypot": math.hypot, "isfinite": math.isfinite,
                     "isnan": math.isnan, "float": float, "int": int,
-                    "range": range}
+                    "range": range,
+                    "invar_splitmix64_stateless": invar_splitmix64_stateless,
+                    "invar_rand_u01": invar_rand_u01,
+                    "invar_rand_normal": invar_rand_normal,
+                    "invar_rand_poisson": invar_rand_poisson,
+                    "invar_rand_binomial": invar_rand_binomial,
+                    "welford_mean_update": welford_mean_update,
+                    "welford_m2_update": welford_m2_update,
+                    "welford_cov_update": welford_cov_update,
+                    "norm_cdf": norm_cdf,
+                    "norm_ppf": norm_ppf,
+                    "logistic_sigmoid": logistic_sigmoid,
+                    "logit": logit,
+                    "hill_eq": hill_eq,
+                    "michaelis_menten": michaelis_menten,
+                    "kl_term": kl_term,
+                    "shannon_term": shannon_term,
+                    "gammainc_reg": gammainc_reg,
+                    "betainc_reg": betainc_reg}
 
 
 class _BufView:

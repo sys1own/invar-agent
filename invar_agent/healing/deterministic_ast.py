@@ -27,6 +27,24 @@ INTRINSIC_ALIASES = {
     "clamp": "clamp", "clip": "clip",
     "sign": "sign", "sgn": "sgn",
     "sq": "sq", "lerp": "lerp", "safe_div": "safe_div",
+    "invar_splitmix64_stateless": "invar_splitmix64_stateless",
+    "invar_rand_u01": "invar_rand_u01",
+    "invar_rand_normal": "invar_rand_normal",
+    "invar_rand_poisson": "invar_rand_poisson",
+    "invar_rand_binomial": "invar_rand_binomial",
+    "welford_mean_update": "welford_mean_update",
+    "welford_m2_update": "welford_m2_update",
+    "welford_cov_update": "welford_cov_update",
+    "norm_cdf": "norm_cdf",
+    "norm_ppf": "norm_ppf",
+    "logistic_sigmoid": "logistic_sigmoid",
+    "logit": "logit",
+    "hill_eq": "hill_eq",
+    "michaelis_menten": "michaelis_menten",
+    "kl_term": "kl_term",
+    "shannon_term": "shannon_term",
+    "gammainc_reg": "gammainc_reg",
+    "betainc_reg": "betainc_reg",
 }
 NP_MATH_FUNCS = MATH_FUNCS | {"abs", "clip", "sign", "sgn"}
 MONOTONE_NAME_TOKENS = ("entropy_drift", "entropy_monotonicity",
@@ -968,10 +986,182 @@ def _intrinsic_defs(used: Iterable[str]) -> List[ast.FunctionDef]:
         "sq": "def sq(x):\n    return x * x\n",
         "lerp": "def lerp(a, b, t):\n    return a + t * (b - a)\n",
         "safe_div": "def safe_div(a, b):\n    return a / (b if abs(b) > 1e-30 else 1e-30)\n",
+        "invar_splitmix64_stateless": (
+            "def invar_splitmix64_stateless(seed, step, channel):\n"
+            "    m = 18446744073709551615\n"
+            "    s = int(seed) & m\n"
+            "    st = int(step) & m\n"
+            "    ch = int(channel) & m\n"
+            "    z = (s + ((st * 11400714819323198485) & m) + ((ch * 13787848793156543929) & m)) & m\n"
+            "    z = ((z ^ (z >> 30)) * 13787848793156543929) & m\n"
+            "    z = ((z ^ (z >> 27)) * 10723151780598845931) & m\n"
+            "    return (z ^ (z >> 31)) & m\n"
+        ),
+        "invar_rand_u01": (
+            "def invar_rand_u01(seed, step, channel):\n"
+            "    val = invar_splitmix64_stateless(seed, step, channel)\n"
+            "    u = (val >> 11) * (1.0 / 9007199254740992.0)\n"
+            "    return 1e-15 if u <= 1e-15 else (1.0 - 1e-15 if u >= 1.0 - 1e-15 else u)\n"
+        ),
+        "invar_rand_normal": (
+            "def invar_rand_normal(seed, step, channel):\n"
+            "    ch = int(channel) & 18446744073709551615\n"
+            "    u1 = invar_rand_u01(seed, step, ch * 2)\n"
+            "    u2 = invar_rand_u01(seed, step, ch * 2 + 1)\n"
+            "    return math.sqrt(-2.0 * math.log(u1)) * math.cos(6.2831853071795864769 * u2)\n"
+        ),
+        "invar_rand_poisson": (
+            "def invar_rand_poisson(seed, step, lam):\n"
+            "    if lam <= 0.0:\n"
+            "        return 0.0\n"
+            "    if lam < 30.0:\n"
+            "        L = math.exp(-lam)\n"
+            "        k = 0\n"
+            "        p = 1.0\n"
+            "        while p > L and k < 256:\n"
+            "            k = k + 1\n"
+            "            p = p * invar_rand_u01(seed, step, 1000 + k)\n"
+            "        return float(k - 1)\n"
+            "    z = invar_rand_normal(seed, step, 999)\n"
+            "    res = math.floor(lam + math.sqrt(lam) * z + 0.5)\n"
+            "    return 0.0 if res < 0.0 else res\n"
+        ),
+        "invar_rand_binomial": (
+            "def invar_rand_binomial(seed, step, n, p):\n"
+            "    if n <= 0.0 or p <= 0.0:\n"
+            "        return 0.0\n"
+            "    if p >= 1.0:\n"
+            "        return math.floor(n)\n"
+            "    if n < 64.0:\n"
+            "        hits = 0\n"
+            "        for i in range(int(n)):\n"
+            "            if invar_rand_u01(seed, step, 2000 + i) < p:\n"
+            "                hits = hits + 1\n"
+            "        return float(hits)\n"
+            "    mu = n * p\n"
+            "    sigma = math.sqrt(n * p * (1.0 - p))\n"
+            "    z = invar_rand_normal(seed, step, 1999)\n"
+            "    val = math.floor(mu + sigma * z + 0.5)\n"
+            "    nf = math.floor(n)\n"
+            "    return 0.0 if val < 0.0 else (nf if val > nf else val)\n"
+        ),
+        "welford_mean_update": (
+            "def welford_mean_update(mean, x, k):\n"
+            "    return mean + (x - mean) / (1.0 if k < 1.0 else k)\n"
+        ),
+        "welford_m2_update": (
+            "def welford_m2_update(m2, mean_old, mean_new, x):\n"
+            "    return m2 + (x - mean_old) * (x - mean_new)\n"
+        ),
+        "welford_cov_update": (
+            "def welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y):\n"
+            "    return c_xy + (x - mean_x_old) * (y - mean_y_new)\n"
+        ),
+        "norm_cdf": (
+            "def norm_cdf(x):\n"
+            "    return 0.5 * (1.0 + math.erf(x * 0.70710678118654752440))\n"
+        ),
+        "norm_ppf": (
+            "def norm_ppf(p):\n"
+            "    pc = 1e-15 if p <= 1e-15 else (1.0 - 1e-15 if p >= 1.0 - 1e-15 else p)\n"
+            "    if pc < 0.02425:\n"
+            "        q = math.sqrt(-2.0 * math.log(pc))\n"
+            "        return (((((-7.784894002430293e-03 * q - 3.223964580411365e-01) * q - 2.400758277161838e+00) * q - 2.549732539343734e+00) * q + 4.374664141464968e+00) * q + 2.938163982698783e+00) / ((((7.784695709041462e-03 * q + 3.224671290700398e-01) * q + 2.445134137142996e+00) * q + 3.754408661907416e+00) * q + 1.0)\n"
+            "    if pc <= 0.97575:\n"
+            "        q = pc - 0.5\n"
+            "        r = q * q\n"
+            "        return (((((-3.969683028665376e+01 * r + 2.209460984245205e+02) * r - 2.759285104469687e+02) * r + 1.383577518672690e+02) * r - 3.066479806614716e+01) * r + 2.506628277459239e+00) * q / (((((-5.447609879822406e+01 * r + 1.615858368580409e+02) * r - 1.556989798598866e+02) * r + 6.680131188771972e+01) * r - 1.328068155288572e+01) * r + 1.0)\n"
+            "    q = math.sqrt(-2.0 * math.log(1.0 - pc))\n"
+            "    return -(((((-7.784894002430293e-03 * q - 3.223964580411365e-01) * q - 2.400758277161838e+00) * q - 2.549732539343734e+00) * q + 4.374664141464968e+00) * q + 2.938163982698783e+00) / ((((7.784695709041462e-03 * q + 3.224671290700398e-01) * q + 2.445134137142996e+00) * q + 3.754408661907416e+00) * q + 1.0)\n"
+        ),
+        "logistic_sigmoid": (
+            "def logistic_sigmoid(x):\n"
+            "    xc = 80.0 if x > 80.0 else (-80.0 if x < -80.0 else x)\n"
+            "    return 1.0 / (1.0 + math.exp(-xc))\n"
+        ),
+        "logit": (
+            "def logit(p):\n"
+            "    pc = 1e-15 if p < 1e-15 else (1.0 - 1e-15 if p > 1.0 - 1e-15 else p)\n"
+            "    return math.log(pc / (1.0 - pc))\n"
+        ),
+        "hill_eq": (
+            "def hill_eq(c, ec50, n):\n"
+            "    if c <= 0.0:\n"
+            "        return 0.0\n"
+            "    cn = (c if c > 0.0 else 0.0) ** n\n"
+            "    kn = (ec50 if ec50 > 1e-15 else 1e-15) ** n\n"
+            "    return cn / (cn + kn + 1e-30)\n"
+        ),
+        "michaelis_menten": (
+            "def michaelis_menten(s, vmax, km):\n"
+            "    sc = s if s > 0.0 else 0.0\n"
+            "    return (vmax * sc) / ((km if km > 1e-15 else 1e-15) + sc)\n"
+        ),
+        "kl_term": (
+            "def kl_term(p, q):\n"
+            "    qc = q if q > 1e-30 else 1e-30\n"
+            "    if p <= 0.0:\n"
+            "        return qc\n"
+            "    val = p * math.log(p / qc) - p + qc\n"
+            "    return val if val > 0.0 else 0.0\n"
+        ),
+        "shannon_term": (
+            "def shannon_term(p):\n"
+            "    if p <= 0.0:\n"
+            "        return 0.0\n"
+            "    return -p * math.log(p)\n"
+        ),
+        "gammainc_reg": (
+            "def gammainc_reg(a, x):\n"
+            "    ac = a if a > 1e-12 else 1e-12\n"
+            "    if x <= 0.0:\n"
+            "        return 0.0\n"
+            "    ratio = (x / ac) ** (1.0 / 3.0)\n"
+            "    mu = 1.0 - 1.0 / (9.0 * ac)\n"
+            "    sigma = math.sqrt(1.0 / (9.0 * ac))\n"
+            "    return norm_cdf((ratio - mu) / (sigma if sigma > 1e-15 else 1e-15))\n"
+        ),
+        "betainc_reg": (
+            "def betainc_reg(a, b, x):\n"
+            "    if x <= 0.0:\n"
+            "        return 0.0\n"
+            "    if x >= 1.0:\n"
+            "        return 1.0\n"
+            "    ac = a if a > 1e-12 else 1e-12\n"
+            "    bc = b if b > 1e-12 else 1e-12\n"
+            "    mean = ac / (ac + bc)\n"
+            "    var = (ac * bc) / ((ac + bc) * (ac + bc) * (ac + bc + 1.0))\n"
+            "    sigma = math.sqrt(var)\n"
+            "    return norm_cdf((x - mean) / (sigma if sigma > 1e-15 else 1e-15))\n"
+        ),
     }
+    needed = set(used) & set(src)
+    # Transitive dependencies for PRNG and special functions
+    if needed & {"invar_rand_poisson", "invar_rand_binomial"}:
+        needed.add("invar_rand_normal")
+        needed.add("invar_rand_u01")
+    if "invar_rand_normal" in needed:
+        needed.add("invar_rand_u01")
+    if "invar_rand_u01" in needed:
+        needed.add("invar_splitmix64_stateless")
+    if needed & {"gammainc_reg", "betainc_reg"}:
+        needed.add("norm_cdf")
+    if "clip" in needed:
+        needed.add("clamp")
+    if "sgn" in needed:
+        needed.add("sign")
+    order = [
+        "clamp", "clip", "sign", "sgn", "sq", "lerp", "safe_div",
+        "invar_splitmix64_stateless", "invar_rand_u01", "invar_rand_normal",
+        "invar_rand_poisson", "invar_rand_binomial",
+        "welford_mean_update", "welford_m2_update", "welford_cov_update",
+        "norm_cdf", "norm_ppf", "logistic_sigmoid", "logit", "hill_eq",
+        "michaelis_menten", "kl_term", "shannon_term", "gammainc_reg", "betainc_reg",
+    ]
     out: List[ast.FunctionDef] = []
-    for name in sorted(set(used) & set(src)):
-        out.extend(ast.parse(src[name]).body)
+    for name in order:
+        if name in needed:
+            out.extend(ast.parse(src[name]).body)
     return out
 
 
@@ -1035,12 +1225,16 @@ class _IntrinsicTransformer(ast.NodeTransformer):
         if name is None:
             return node
         base, _, attr = name.partition(".")
+        if base == "math" and attr in INTRINSIC_ALIASES and attr not in self.defined:
+            self.used_intrinsics.add(attr)
+            node.func = ast.Name(id=attr, ctx=ast.Load())
+            return node
         if base in {"np", "numpy"} and attr:
             self.used_np.add(attr)
             if attr == "clip":
                 self.used_intrinsics.add("clip")
                 node.func = ast.Name(id="clip", ctx=ast.Load())
-            elif attr in {"sign", "sgn", "sq", "lerp", "safe_div"}:
+            elif attr in INTRINSIC_ALIASES:
                 self.used_intrinsics.add(attr)
                 node.func = ast.Name(id=attr, ctx=ast.Load())
             elif attr == "abs":
@@ -1081,8 +1275,8 @@ class _IntrinsicTransformer(ast.NodeTransformer):
 
 def _hoist_intrinsic_helpers(tree: ast.Module) -> bool:
     """Ensure all _invar_* and safe_* FunctionDefs sit after imports and before all Assign/FunctionDefs."""
-    intrinsic_prefixes = ("_invar_", "safe_")
-    intrinsic_names = {"div_eps", "smooth_clamp"}
+    intrinsic_prefixes = ("_invar_", "safe_", "invar_rand_", "invar_splitmix", "welford_")
+    intrinsic_names = {"div_eps", "smooth_clamp"} | set(INTRINSIC_ALIASES)
     imports: List[ast.stmt] = []
     helpers: List[ast.stmt] = []
     rest: List[ast.stmt] = []
@@ -1621,7 +1815,19 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                 for _, a, _ in _contract_invariant_items(c)
             )
             should_backup = False
-            if name.lower() not in _STEPPED_COORD_NAMES:
+            name_low = name.lower()
+            is_evol_state_var = (
+                name_low in _STEPPED_COORD_NAMES
+                or name_low.endswith("_new")
+                or any(
+                    isinstance(sub_st, ast.Assign)
+                    and len(sub_st.targets) == 1
+                    and isinstance(sub_st.targets[0], ast.Name)
+                    and sub_st.targets[0].id in (f"{name}_new", f"{name}1")
+                    for sub_st in ast.walk(fn)
+                )
+            )
+            if not is_evol_state_var:
                 # 1. Check later writes inside this same function (including nested if/for).
                 same_fn_backup = False
                 later_same_fn: List[Tuple[int, ast.Assign]] = []
@@ -1651,25 +1857,26 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                 # 2. Check overwrites in OTHER layers / simulation_step where that other
                 # function writes buf.data[slot] without evolving `slot` from itself.
                 cross_fn_backup = False
-                for fj, fn2 in enumerate(sim_fns):
-                    if fj == fi or slot in fn_slot_reads.get(fj, set()):
-                        continue
-                    for w_sl, w_stmt in fn_slot_writes.get(fj, []):
-                        if w_sl != slot or not isinstance(w_stmt, ast.Assign):
+                if _is_parameter_name(name):
+                    for fj, fn2 in enumerate(sim_fns):
+                        if fj == fi or slot in fn_slot_reads.get(fj, set()):
                             continue
-                        rhs2 = w_stmt.value
-                        if isinstance(rhs2, ast.Name) and rhs2.id == name:
-                            continue
-                        is_used_here = any(
-                            isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
-                            for s_downstream in body[idx + 1:]
-                            for n in ast.walk(s_downstream)
-                        )
-                        if is_used_here or _is_parameter_name(name):
-                            cross_fn_backup = True
+                        for w_sl, w_stmt in fn_slot_writes.get(fj, []):
+                            if w_sl != slot or not isinstance(w_stmt, ast.Assign):
+                                continue
+                            rhs2 = w_stmt.value
+                            if isinstance(rhs2, ast.Name) and rhs2.id == name:
+                                continue
+                            is_used_here = any(
+                                isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
+                                for s_downstream in body[idx + 1:]
+                                for n in ast.walk(s_downstream)
+                            )
+                            if is_used_here:
+                                cross_fn_backup = True
+                                break
+                        if cross_fn_backup:
                             break
-                    if cross_fn_backup:
-                        break
 
                 if cross_fn_backup:
                     should_backup = True
@@ -2128,6 +2335,11 @@ def _contract_slot_names(contracts: Sequence[Any],
 
 _COORD_VAR_NAMES = {
     "x", "y", "z", "q", "p", "u", "v", "w", "s", "h",
+    "e", "i", "r", "c",
+    "s_t", "e_t", "i_t", "r_t", "v_t",
+    "s_u", "e_u", "i_u", "r_u", "v_u",
+    "m_atm", "m_surf", "m_deep", "m_bio", "c_atm", "c_surf", "c_deep", "c_bio",
+    "p_1", "p_2", "p_3", "p1", "p2", "p3",
     "rx", "ry", "rz", "bx", "by", "bz", "theta", "phi",
     "rho00", "rho11", "rho01r", "rho01i", "rho0r", "rho0i",
     "r00", "r11", "r01r", "r01i",
@@ -2138,6 +2350,9 @@ _STEPPED_COORD_NAMES = _COORD_VAR_NAMES | {
     "xn", "yn", "zn", "xr", "yr", "zr",
     "xf", "yf", "zf", "nx", "ny", "nz",
     "x_new", "y_new", "z_new", "q_new", "p_new", "q1", "p1",
+    "s_new", "e_new", "i_new", "r_new", "v_new", "c_new",
+    "s_t_new", "e_t_new", "i_t_new", "r_t_new", "v_t_new",
+    "s_u_new", "e_u_new", "i_u_new", "r_u_new", "v_u_new",
     "h_new", "v_new", "gamma_new",
     "rho00_new", "rho11_new", "rho0r2", "rho0i2", "rho0r3", "rho0i3",
     "r00n", "r11n", "r01rn", "r01in",
@@ -3860,7 +4075,10 @@ _INV_ALLOWED_FREE_NAMES = frozenset(
 _INV_ALLOWED_MATH_FUNCS = frozenset(
     {"abs", "fabs", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
      "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-     "exp", "log", "log10", "pow", "min", "max", "isfinite", "_invar_sdiv"}
+     "exp", "log", "log10", "pow", "min", "max", "isfinite", "_invar_sdiv",
+     "erf", "erfc", "norm_cdf", "norm_ppf", "logistic_sigmoid", "logit",
+     "hill_eq", "michaelis_menten", "kl_term", "shannon_term",
+     "gammainc_reg", "betainc_reg"}
 )
 
 
@@ -3936,9 +4154,15 @@ class _InvToBufTransformer(ast.NodeTransformer):
             )
         if cname in ("fabs", "sin", "cos", "tan", "asin", "acos", "atan",
                      "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-                     "exp", "log", "log10", "pow", "isfinite"):
+                     "exp", "log", "log10", "pow", "isfinite", "erf", "erfc"):
             return ast.Call(
                 func=ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()), attr=cname, ctx=ast.Load()),
+                args=node.args,
+                keywords=node.keywords,
+            )
+        if cname.startswith("math.") and cname.split(".", 1)[1] in INTRINSIC_ALIASES:
+            return ast.Call(
+                func=ast.Name(id=cname.split(".", 1)[1], ctx=ast.Load()),
                 args=node.args,
                 keywords=node.keywords,
             )
@@ -3997,6 +4221,49 @@ def _match_ratio_cmp(
         if not den_slots or num_slot in den_slots or num_slot in bound_slots:
             continue
         return num_slot, den_node, norm_op, bound_node
+    return None
+
+
+def _match_expr_bound_cmp(
+    lhs: ast.AST, cmp_op: ast.cmpop, rhs: ast.AST
+) -> Optional[Tuple[int, str, ast.AST, bool, Optional[float]]]:
+    """Match ``state[i] (<|<=|>|>=) EXPR``, ``abs(state[i]) (<|<=) EXPR``, or
+    ``abs(state[i] - C) (<|<=) EXPR`` where ``EXPR`` is a pure state expression
+    over other slots (e.g. Cauchy-Schwarz ``abs(state[cov]) <= math.sqrt(state[vx]*state[vy])``,
+    Cramer-Rao ``state[var] >= 1.0 / state[fi]``, or IV vs OLS error ``abs(state[iv] - 2.0) < abs(state[ols] - 2.0)``).
+    Returns ``(target_slot, norm_op, bound_node, is_abs, center_val)``.
+    """
+    op_str = _flip_cmp_op_str(cmp_op)
+    if op_str is None:
+        return None
+    flip_map = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+    candidates = [
+        (lhs, op_str, rhs),
+        (rhs, flip_map[op_str], lhs),
+    ]
+    for target_node, norm_op, bound_node in candidates:
+        t_slot = _slot_of_state_ast(target_node)
+        is_abs = False
+        center_val: Optional[float] = None
+        if t_slot is None:
+            abs_in = _unwrap_abs_call(target_node)
+            if abs_in is not None and norm_op in ("<", "<="):
+                t_slot = _slot_of_state_ast(abs_in)
+                if t_slot is not None:
+                    is_abs = True
+                else:
+                    single_t, _sum_t, _diff_p = _match_abs_affine(abs_in)
+                    if single_t is not None:
+                        t_slot, center_val = single_t
+                        is_abs = True
+        if t_slot is None:
+            continue
+        if not _has_only_pure_state_names(bound_node):
+            continue
+        bound_slots = _slots_in_ast(bound_node)
+        if not bound_slots or t_slot in bound_slots:
+            continue
+        return t_slot, norm_op, bound_node, is_abs, center_val
     return None
 
 
@@ -4892,6 +5159,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_set = set(dyn_slots)
 
     nonneg_slots: Dict[int, float] = {}
+    negative_lower_slots: Dict[int, float] = {}
     strict_gt_slots: Dict[int, float] = {}
     positive_lower_slots: Dict[int, float] = {}
     quarter_upper_slots: Set[int] = set()
@@ -4916,6 +5184,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     seen_product_positivity: Set[Tuple[Tuple[int, ...], float, bool]] = set()
     ratio_bounds: List[Tuple[int, ast.AST, Set[int], str, ast.AST]] = []
     seen_ratio_bounds: Set[Tuple[int, str, str, str]] = set()
+    expr_bounds: List[Tuple[int, str, ast.AST, Set[int], bool, Optional[float]]] = []
+    seen_expr_bounds: Set[Tuple[int, str, str, bool, Optional[float]]] = set()
     uncovered_pure_invs: List[Tuple[int, int, str, Any, ast.AST]] = []
     pure_contract_slots: Dict[int, float] = {}
     contract_pure_invs_by_cid: Dict[int, List[ast.AST]] = {}
@@ -4931,6 +5201,10 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             adj_val = (val + 1e-12) if op_ge == ">" else val
             if s_idx not in positive_lower_slots or adj_val > positive_lower_slots[s_idx]:
                 positive_lower_slots[s_idx] = adj_val
+        elif val < -1e-6 and math.isfinite(val):
+            adj_val = (val + 1e-12) if op_ge == ">" else val
+            if s_idx not in negative_lower_slots or adj_val > negative_lower_slots[s_idx]:
+                negative_lower_slots[s_idx] = adj_val
 
     abs_upper_slots: Set[int] = set()
 
@@ -5200,6 +5474,16 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                                 ratio_bounds.append((num_slot, den_node, _slots_in_ast(den_node), norm_op, bound_node))
                             matched_ast_bound = True
                             matched_cmp = True
+                    if not matched_cmp:
+                        eb_m = _match_expr_bound_cmp(lhs, cmp_op, rhs)
+                        if eb_m is not None:
+                            eb_slot, eb_op, eb_node, eb_abs, eb_center = eb_m
+                            eb_key = (eb_slot, eb_op, ast.unparse(eb_node), eb_abs, eb_center)
+                            if eb_key not in seen_expr_bounds:
+                                seen_expr_bounds.add(eb_key)
+                                expr_bounds.append((eb_slot, eb_op, eb_node, _slots_in_ast(eb_node), eb_abs, eb_center))
+                            matched_ast_bound = True
+                            matched_cmp = True
                     lhs = rhs
                     raw_lhs = raw_rhs
 
@@ -5327,7 +5611,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             coupled_prod_bounds.append((i_slot, j_keep, k_adj, float(ub_val), float(fallback_j)))
             del alg_eq_targets[i_slot]
 
-    if (r_max is None and not nonneg_slots and not strict_gt_slots
+    if (r_max is None and not nonneg_slots and not negative_lower_slots and not strict_gt_slots
             and not positive_lower_slots and not quarter_upper_slots
             and not unit_upper_slots and not small_upper_slots
             and not other_upper_slots and not relational_le_pairs
@@ -5337,6 +5621,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             and not diff_eq_targets and not alg_eq_targets
             and not coupled_prod_bounds
             and not product_positivity_pairs and not ratio_bounds
+            and not expr_bounds
             and not uncovered_pure_invs and not pure_contract_slots):
         return tree, False, []
 
@@ -5514,6 +5799,15 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     ast.fix_missing_locations(fn_tgt)
                     changed = True
                     notes.append(f"conditioned positivity slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
+            for s_idx in sorted(negative_lower_slots):
+                bound = negative_lower_slots[s_idx]
+                guard_src = f"if not math.isfinite(buf.data[{s_idx}]) or buf.data[{s_idx}] < {bound!r}:\n    buf.data[{s_idx}] = {bound!r}\n"
+                if f"buf.data[{s_idx}] < {bound!r}:" not in fn_src:
+                    _append_before_return(fn_tgt, ast.parse(guard_src).body)
+                    ast.fix_missing_locations(fn_tgt)
+                    _ensure_math_import(tree)
+                    changed = True
+                    notes.append(f"conditioned lower-bound slot state[{s_idx}] >= {bound!r} in {fn_tgt.name}")
             for s_idx in sorted(strict_gt_slots):
                 bound = strict_gt_slots[s_idx]
                 ub_tight = small_upper_slots.get(s_idx, other_upper_slots.get(s_idx))
@@ -5774,30 +6068,90 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     _ensure_math_import(tree)
                     changed = True
                     notes.append(f"conditioned target equality slot state[{s_idx}] == {tgt!r} (tol {tol!r}) in {fn_tgt.name}")
+            # Collect local variables bound to buffer slots in fn_tgt so K-simplex projection re-syncs them
+            slot_bound_locals: Dict[int, List[str]] = {}
+            for _st_loc in fn_tgt.body:
+                if isinstance(_st_loc, ast.Assign) and len(_st_loc.targets) == 1:
+                    _t0, _v0 = _st_loc.targets[0], _st_loc.value
+                    if isinstance(_t0, ast.Name) and not _t0.id.startswith("_"):
+                        _sl0 = _state_subscript_slot(_v0)
+                        if _sl0 is not None and _t0.id not in slot_bound_locals.setdefault(_sl0, []):
+                            slot_bound_locals[_sl0].append(_t0.id)
+                    elif isinstance(_v0, ast.Name) and not _v0.id.startswith("_"):
+                        _sl0 = _state_subscript_slot(_t0)
+                        if _sl0 is not None and _v0.id not in slot_bound_locals.setdefault(_sl0, []):
+                            slot_bound_locals[_sl0].append(_v0.id)
+
             for i_s, j_s, tgt, tol, is_strict in sum_partition_targets:
                 cmp_op = ">=" if is_strict else ">"
-                lo_b = min(0.0, tgt)
-                hi_b = max(0.0, tgt)
                 half_t = 0.5 * tgt
-                guard_src = (
-                    f"if not math.isfinite(buf.data[{i_s}]) or not math.isfinite(buf.data[{j_s}]) "
-                    f"or abs(buf.data[{i_s}] + buf.data[{j_s}] - {tgt!r}) {cmp_op} {tol!r}:\n"
-                    f"    if math.isfinite(buf.data[{i_s}]) and {lo_b!r} <= buf.data[{i_s}] <= {hi_b!r}:\n"
-                    f"        buf.data[{j_s}] = {tgt!r} - buf.data[{i_s}]\n"
-                    f"    else:\n"
-                    f"        buf.data[{i_s}] = {half_t!r}\n"
-                    f"        buf.data[{j_s}] = {half_t!r}\n"
+                # Generalized K=2 simplex proportional projection when target > 0 and neither slot is fixed
+                use_k2_simplex = (
+                    tgt > 0.0
+                    and i_s not in eq_target_slots
+                    and j_s not in eq_target_slots
+                    and all(
+                        (s in nonneg_slots or s in strict_gt_slots or s in positive_lower_slots
+                         or pure_contract_slots.get(s, 0.0) >= 0.0)
+                        for s in (i_s, j_s)
+                    )
                 )
-                guard_node = ast.parse(guard_src).body[0]
-                marker = ast.unparse(guard_node.test)  # type: ignore[attr-defined]
-                if marker not in ast.unparse(fn_tgt):
-                    _append_before_return(fn_tgt, [guard_node])
-                    ast.fix_missing_locations(fn_tgt)
-                    _ensure_math_import(tree)
-                    changed = True
-                    notes.append(f"conditioned sum partition slots state[{i_s}] + state[{j_s}] == {tgt!r} (tol {tol!r}) in {fn_tgt.name}")
+                if use_k2_simplex:
+                    lb_i = max(1e-9, strict_gt_slots[i_s] + 1e-9) if (i_s in strict_gt_slots and strict_gt_slots[i_s] >= 0.0) else max(0.0, positive_lower_slots.get(i_s, 0.0))
+                    lb_j = max(1e-9, strict_gt_slots[j_s] + 1e-9) if (j_s in strict_gt_slots and strict_gt_slots[j_s] >= 0.0) else max(0.0, positive_lower_slots.get(j_s, 0.0))
+                    resync_lines = [
+                        f"    {lv} = buf.data[{s_k}]"
+                        for s_k in (i_s, j_s)
+                        for lv in slot_bound_locals.get(s_k, [])
+                    ]
+                    resync_block = ("\n" + "\n".join(resync_lines)) if resync_lines else ""
+                    guard_src = (
+                        f"_ks2_cur_{i_s}_{j_s} = 0.0\n"
+                        f"_ks2_sc_{i_s}_{j_s} = 1.0\n"
+                        f"if not math.isfinite(buf.data[{i_s}]) or not math.isfinite(buf.data[{j_s}]) "
+                        f"or abs(buf.data[{i_s}] + buf.data[{j_s}] - {tgt!r}) {cmp_op} {tol!r}:\n"
+                        f"    buf.data[{i_s}] = buf.data[{i_s}] if (math.isfinite(buf.data[{i_s}]) and buf.data[{i_s}] >= {lb_i!r}) else {lb_i!r}\n"
+                        f"    buf.data[{j_s}] = buf.data[{j_s}] if (math.isfinite(buf.data[{j_s}]) and buf.data[{j_s}] >= {lb_j!r}) else {lb_j!r}\n"
+                        f"    _ks2_cur_{i_s}_{j_s} = buf.data[{i_s}] + buf.data[{j_s}]\n"
+                        f"    if _ks2_cur_{i_s}_{j_s} > 1e-30:\n"
+                        f"        _ks2_sc_{i_s}_{j_s} = _invar_sdiv({tgt!r}, _ks2_cur_{i_s}_{j_s})\n"
+                        f"        buf.data[{i_s}] = buf.data[{i_s}] * _ks2_sc_{i_s}_{j_s}\n"
+                        f"        buf.data[{j_s}] = buf.data[{j_s}] * _ks2_sc_{i_s}_{j_s}\n"
+                        f"    else:\n"
+                        f"        buf.data[{i_s}] = {half_t!r}\n"
+                        f"        buf.data[{j_s}] = {half_t!r}"
+                        + resync_block + "\n"
+                    )
+                    guard_stmts = ast.parse(guard_src).body
+                    marker = f"_ks2_cur_{i_s}_{j_s} = "
+                    if marker not in ast.unparse(fn_tgt):
+                        _append_before_return(fn_tgt, guard_stmts)
+                        ast.fix_missing_locations(fn_tgt)
+                        _ensure_math_import(tree)
+                        changed = True
+                        notes.append(f"projected K=2 simplex slots state[{i_s}] + state[{j_s}] == {tgt!r} (tol {tol!r}) in {fn_tgt.name}")
+                else:
+                    lo_b = min(0.0, tgt)
+                    hi_b = max(0.0, tgt)
+                    guard_src = (
+                        f"if not math.isfinite(buf.data[{i_s}]) or not math.isfinite(buf.data[{j_s}]) "
+                        f"or abs(buf.data[{i_s}] + buf.data[{j_s}] - {tgt!r}) {cmp_op} {tol!r}:\n"
+                        f"    if math.isfinite(buf.data[{i_s}]) and {lo_b!r} <= buf.data[{i_s}] <= {hi_b!r}:\n"
+                        f"        buf.data[{j_s}] = {tgt!r} - buf.data[{i_s}]\n"
+                        f"    else:\n"
+                        f"        buf.data[{i_s}] = {half_t!r}\n"
+                        f"        buf.data[{j_s}] = {half_t!r}\n"
+                    )
+                    guard_node = ast.parse(guard_src).body[0]
+                    marker = ast.unparse(guard_node.test)  # type: ignore[attr-defined]
+                    if marker not in ast.unparse(fn_tgt):
+                        _append_before_return(fn_tgt, [guard_node])
+                        ast.fix_missing_locations(fn_tgt)
+                        _ensure_math_import(tree)
+                        changed = True
+                        notes.append(f"conditioned sum partition slots state[{i_s}] + state[{j_s}] == {tgt!r} (tol {tol!r}) in {fn_tgt.name}")
             for ms_idx, (m_slots, m_tgt, m_tol, m_strict) in enumerate(multi_sum_targets):
-                flex = sorted(m_slots)
+                flex = [s for s in sorted(m_slots) if s not in eq_target_slots] or sorted(m_slots)
                 if not flex:
                     continue
                 fixed = [s for s in m_slots if s not in flex]
@@ -5809,38 +6163,37 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 sum_all = " + ".join(f"buf.data[{s}]" for s in m_slots)
                 fin_cond = " or ".join(f"not math.isfinite(buf.data[{s}])" for s in m_slots)
                 rem_expr = repr(float(m_tgt)) if not fixed else f"({float(m_tgt)!r} - (" + " + ".join(f"buf.data[{s}]" for s in fixed) + "))"
-                pivot = flex[-1]
-                others = flex[:-1]
+                k_flex = len(flex)
+                flex_sum_expr = " + ".join(f"buf.data[{s_f}]" for s_f in flex)
                 ms_lines = [
                     f"{rem_var} = {float(m_tgt)!r}",
+                    f"_msum_cur_{ms_idx} = 0.0",
+                    f"_msum_sc_{ms_idx} = 1.0",
                     f"if {fin_cond} or abs({sum_all} - {float(m_tgt)!r}) {cmp_op} {m_tol!r}:",
                     f"    {rem_var} = {rem_expr}",
                     f"    if not math.isfinite({rem_var}):",
                     f"        {rem_var} = {float(m_tgt)!r}",
                 ]
-                for s_o in others:
-                    ms_lines.append(f"    if not math.isfinite(buf.data[{s_o}]) or buf.data[{s_o}] < 0.0:")
-                    ms_lines.append(f"        buf.data[{s_o}] = 0.0")
-                if others:
-                    o_sum_expr = " + ".join(f"buf.data[{s_o}]" for s_o in others)
-                    ms_lines.insert(1, f"_msum_o_{ms_idx} = 0.0")
-                    ms_lines.insert(2, f"_msum_sc_{ms_idx} = 1.0")
-                    ms_lines.append(f"    _msum_o_{ms_idx} = {o_sum_expr}")
-                    ms_lines.append(f"    if {rem_var} >= 0.0 and _msum_o_{ms_idx} > {rem_var}:")
-                    ms_lines.append(f"        _msum_sc_{ms_idx} = _invar_sdiv({rem_var}, _msum_o_{ms_idx})")
-                    for s_o in others:
-                        ms_lines.append(f"        buf.data[{s_o}] = buf.data[{s_o}] * _msum_sc_{ms_idx}")
-                    ms_lines.append(f"    if {rem_var} >= 0.0:")
-                    ms_lines.append(f"        buf.data[{pivot}] = max(0.0, {rem_var} - ({o_sum_expr}))")
-                    ms_lines.append(f"    else:")
-                    ms_lines.append(f"        buf.data[{pivot}] = {rem_var} - ({o_sum_expr})")
-                else:
-                    ms_lines.append(f"    buf.data[{pivot}] = {rem_var}")
+                for s_f in flex:
+                    lb_f = max(1e-9, strict_gt_slots[s_f] + 1e-9) if (s_f in strict_gt_slots and strict_gt_slots[s_f] >= 0.0) else max(0.0, positive_lower_slots.get(s_f, 0.0))
+                    ms_lines.append(f"    if not math.isfinite(buf.data[{s_f}]) or buf.data[{s_f}] < {lb_f!r}:")
+                    ms_lines.append(f"        buf.data[{s_f}] = {lb_f!r}")
+                ms_lines.append(f"    _msum_cur_{ms_idx} = {flex_sum_expr}")
+                ms_lines.append(f"    if {rem_var} >= 0.0 and _msum_cur_{ms_idx} > 1e-30:")
+                ms_lines.append(f"        _msum_sc_{ms_idx} = _invar_sdiv({rem_var}, _msum_cur_{ms_idx})")
+                for s_f in flex:
+                    ms_lines.append(f"        buf.data[{s_f}] = buf.data[{s_f}] * _msum_sc_{ms_idx}")
+                ms_lines.append(f"    else:")
+                for s_f in flex:
+                    ms_lines.append(f"        buf.data[{s_f}] = {rem_var} * {(1.0 / max(1, k_flex))!r}")
+                for s_f in flex:
+                    for lv in slot_bound_locals.get(s_f, []):
+                        ms_lines.append(f"    {lv} = buf.data[{s_f}]")
                 _append_before_return(fn_tgt, ast.parse("\n".join(ms_lines)).body)
                 ast.fix_missing_locations(fn_tgt)
                 _ensure_math_import(tree)
                 changed = True
-                notes.append(f"conditioned multi-slot sum {m_slots} == {m_tgt!r} (tol {m_tol!r}) in {fn_tgt.name}")
+                notes.append(f"projected K={len(m_slots)} simplex sum {m_slots} == {m_tgt!r} (tol {m_tol!r}) in {fn_tgt.name}")
             for i_s, j_s, tol, is_strict in diff_eq_targets:
                 cmp_op = ">=" if is_strict else ">"
                 guard_src = (
@@ -6011,6 +6364,55 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 _ensure_math_import(tree)
                 changed = True
                 notes.append(f"conditioned ratio bound state[{num_slot}] {norm_op} ({bound_buf}) * ({den_buf}) in {fn_tgt.name}")
+
+            for eb_idx, (eb_slot, eb_op, eb_node, eb_slots, eb_abs, eb_center) in enumerate(expr_bounds):
+                eb_buf = _translate_inv_expr_to_buf(eb_node, protect_denom=True)
+                if eb_buf is None:
+                    continue
+                eb_var = f"_eb_lim_{eb_idx}_{eb_slot}"
+                cur_src = ast.unparse(fn_tgt)
+                if f"{eb_var} = " in cur_src:
+                    continue
+                eb_lines: List[str] = [f"{eb_var} = {eb_buf}"]
+                if eb_abs and eb_op in ("<", "<="):
+                    cap_expr = f"({eb_var} * 0.999999)" if eb_op == "<" else eb_var
+                    if eb_center is not None:
+                        viol_op = ">=" if eb_op == "<" else ">"
+                        eb_lines.append(
+                            f"if math.isfinite({eb_var}) and {eb_var} >= 0.0:\n"
+                            f"    if not math.isfinite(buf.data[{eb_slot}]) or abs(buf.data[{eb_slot}] - {eb_center!r}) {viol_op} {eb_var}:\n"
+                            f"        buf.data[{eb_slot}] = {eb_center!r} + 0.5 * {cap_expr}"
+                        )
+                    else:
+                        viol_op = ">=" if eb_op == "<" else ">"
+                        eb_lines.append(
+                            f"if math.isfinite({eb_var}) and {eb_var} >= 0.0:\n"
+                            f"    if not math.isfinite(buf.data[{eb_slot}]):\n"
+                            f"        buf.data[{eb_slot}] = 0.0\n"
+                            f"    elif abs(buf.data[{eb_slot}]) {viol_op} {eb_var}:\n"
+                            f"        buf.data[{eb_slot}] = {cap_expr} if buf.data[{eb_slot}] >= 0.0 else -({cap_expr})"
+                        )
+                elif not eb_abs and eb_op in ("<", "<="):
+                    viol_op = ">=" if eb_op == "<" else ">"
+                    adj_expr = f"({eb_var} - max(1e-9, abs({eb_var}) * 1e-6))" if eb_op == "<" else eb_var
+                    eb_lines.append(
+                        f"if math.isfinite({eb_var}):\n"
+                        f"    if not math.isfinite(buf.data[{eb_slot}]) or buf.data[{eb_slot}] {viol_op} {eb_var}:\n"
+                        f"        buf.data[{eb_slot}] = {adj_expr}"
+                    )
+                elif not eb_abs and eb_op in (">", ">="):
+                    viol_op = "<=" if eb_op == ">" else "<"
+                    adj_expr = f"({eb_var} + max(1e-9, abs({eb_var}) * 1e-6))" if eb_op == ">" else eb_var
+                    eb_lines.append(
+                        f"if math.isfinite({eb_var}):\n"
+                        f"    if not math.isfinite(buf.data[{eb_slot}]) or buf.data[{eb_slot}] {viol_op} {eb_var}:\n"
+                        f"        buf.data[{eb_slot}] = {adj_expr}"
+                    )
+                _append_before_return(fn_tgt, ast.parse("\n".join(eb_lines)).body)
+                ast.fix_missing_locations(fn_tgt)
+                _ensure_math_import(tree)
+                changed = True
+                notes.append(f"conditioned expression bound state[{eb_slot}] {eb_op} ({eb_buf}) in {fn_tgt.name}")
 
             witness_slots: Dict[int, float] = {}
             for _ci, _ii, inv_label, contract, inv_root in uncovered_pure_invs:
@@ -7737,6 +8139,178 @@ def _repair_call_arity_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[st
     return tree, changed, notes
 
 
+def _lower_random_calls_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    """Strip ``import random`` / ``from random import ...`` and lower ``random.*``
+    and ``np.random.*`` calls into deterministic stateless SplitMix64 PRNG intrinsics
+    with an auto-incrementing step counter in ``buf.data[62]`` and unique channel IDs."""
+    changed = False
+    notes: List[str] = []
+    random_mod_aliases: Set[str] = {"random"}
+    imported_random_fns: Dict[str, str] = {}
+
+    new_body: List[ast.stmt] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            kept_names = []
+            for alias in stmt.names:
+                if alias.name == "random" or alias.name.startswith("random."):
+                    random_mod_aliases.add(alias.asname or "random")
+                    changed = True
+                    notes.append("stripped import random")
+                else:
+                    kept_names.append(alias)
+            if kept_names:
+                stmt.names = kept_names
+                new_body.append(stmt)
+            continue
+        if isinstance(stmt, ast.ImportFrom) and (stmt.module == "random" or (stmt.module or "").startswith("random.")):
+            for alias in stmt.names:
+                imported_random_fns[alias.asname or alias.name] = alias.name
+            changed = True
+            notes.append("stripped from random import")
+            continue
+        new_body.append(stmt)
+    tree.body = new_body
+
+    channel_counter = 0
+    lowered_any_call = False
+
+    def _next_channel() -> int:
+        nonlocal channel_counter
+        channel_counter += 1
+        return channel_counter
+
+    class _RandomCallTransformer(ast.NodeTransformer):
+        def __init__(self, has_buf: bool) -> None:
+            self.has_buf = has_buf
+
+        def _step_expr(self, ch: int) -> str:
+            return "buf.data[62]" if self.has_buf else str(ch)
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            nonlocal changed, lowered_any_call
+            self.generic_visit(node)
+            fn_kind: Optional[str] = None
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                if node.func.value.id in random_mod_aliases:
+                    fn_kind = node.func.attr
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id in ("np", "numpy")
+                and node.func.value.attr == "random"
+            ):
+                fn_kind = node.func.attr
+            elif isinstance(node.func, ast.Name) and node.func.id in imported_random_fns:
+                fn_kind = imported_random_fns[node.func.id]
+
+            if fn_kind is None:
+                return node
+
+            ch = _next_channel()
+            step_s = self._step_expr(ch)
+            args = node.args
+            if fn_kind in ("random", "rand"):
+                changed = True
+                lowered_any_call = True
+                notes.append(f"lowered random.{fn_kind}() -> invar_rand_u01(42, {step_s}, {ch})")
+                return ast.parse(f"invar_rand_u01(42, {step_s}, {ch})", mode="eval").body
+            if fn_kind == "uniform":
+                a_src = ast.unparse(args[0]) if len(args) >= 1 else "0.0"
+                b_src = ast.unparse(args[1]) if len(args) >= 2 else "1.0"
+                changed = True
+                lowered_any_call = True
+                notes.append(f"lowered random.uniform() -> invar_rand_u01(42, {step_s}, {ch})")
+                return ast.parse(
+                    f"(({a_src}) + (({b_src}) - ({a_src})) * invar_rand_u01(42, {step_s}, {ch}))",
+                    mode="eval",
+                ).body
+            if fn_kind in ("gauss", "normalvariate", "normal", "randn", "standard_normal"):
+                mu_src = ast.unparse(args[0]) if len(args) >= 1 else "0.0"
+                sig_src = ast.unparse(args[1]) if len(args) >= 2 else "1.0"
+                changed = True
+                lowered_any_call = True
+                notes.append(f"lowered random.{fn_kind}() -> invar_rand_normal(42, {step_s}, {ch})")
+                if len(args) == 0:
+                    return ast.parse(f"invar_rand_normal(42, {step_s}, {ch})", mode="eval").body
+                return ast.parse(
+                    f"(({mu_src}) + ({sig_src}) * invar_rand_normal(42, {step_s}, {ch}))",
+                    mode="eval",
+                ).body
+            if fn_kind in ("expovariate", "exponential"):
+                lam_src = ast.unparse(args[0]) if len(args) >= 1 else "1.0"
+                changed = True
+                lowered_any_call = True
+                _ensure_math_import(tree)
+                notes.append(f"lowered random.{fn_kind}() -> -math.log(invar_rand_u01)/lam")
+                return ast.parse(
+                    f"(-math.log(invar_rand_u01(42, {step_s}, {ch})) / max({lam_src}, 1e-30))",
+                    mode="eval",
+                ).body
+            if fn_kind in ("randint", "randrange"):
+                a_src = ast.unparse(args[0]) if len(args) >= 1 else "0.0"
+                b_src = ast.unparse(args[1]) if len(args) >= 2 else a_src
+                changed = True
+                lowered_any_call = True
+                _ensure_math_import(tree)
+                notes.append(f"lowered random.{fn_kind}() -> math.floor(...*invar_rand_u01)")
+                return ast.parse(
+                    f"math.floor(({a_src}) + (({b_src}) - ({a_src}) + 1.0) * invar_rand_u01(42, {step_s}, {ch}))",
+                    mode="eval",
+                ).body
+            if fn_kind == "poisson":
+                lam_src = ast.unparse(args[0]) if len(args) >= 1 else "1.0"
+                changed = True
+                lowered_any_call = True
+                notes.append(f"lowered random.poisson() -> invar_rand_poisson(42, {step_s}, {lam_src})")
+                return ast.parse(f"invar_rand_poisson(42, {step_s}, {lam_src})", mode="eval").body
+            if fn_kind == "binomial":
+                n_src = ast.unparse(args[0]) if len(args) >= 1 else "1.0"
+                p_src = ast.unparse(args[1]) if len(args) >= 2 else "0.5"
+                changed = True
+                lowered_any_call = True
+                notes.append(f"lowered random.binomial() -> invar_rand_binomial(42, {step_s}, {n_src}, {p_src})")
+                return ast.parse(f"invar_rand_binomial(42, {step_s}, {n_src}, {p_src})", mode="eval").body
+            if fn_kind == "seed":
+                changed = True
+                notes.append("stripped random.seed()")
+                return ast.Constant(value=0.0)
+            return node
+
+    for top in tree.body:
+        if isinstance(top, ast.FunctionDef):
+            has_buf = any(a.arg == "buf" for a in top.args.args)
+            _RandomCallTransformer(has_buf=has_buf).visit(top)
+        else:
+            _RandomCallTransformer(has_buf=False).visit(top)
+
+    if lowered_any_call:
+        for fn in tree.body:
+            if isinstance(fn, ast.FunctionDef) and fn.name == "simulation_step":
+                fn_src = ast.unparse(fn)
+                if "buf.data[62] = buf.data[62] + 1.0" not in fn_src:
+                    inc_stmt = ast.parse("buf.data[62] = buf.data[62] + 1.0\n").body[0]
+                    insert_at = 1 if (
+                        fn.body
+                        and isinstance(fn.body[0], ast.Expr)
+                        and isinstance(fn.body[0].value, ast.Constant)
+                        and isinstance(fn.body[0].value.value, str)
+                    ) else 0
+                    fn.body.insert(insert_at, inc_stmt)
+                    notes.append("injected buf.data[62] = buf.data[62] + 1.0 step counter in simulation_step")
+                break
+
+    if changed:
+        ast.fix_missing_locations(tree)
+    return tree, changed, notes
+
+
+def _invar_project_k_simplex(code: str, contracts: Sequence[Any] = ()) -> SanitizerResult:
+    """Public entry point for Generalized Arbitrary-K Simplex Projection (K >= 2)."""
+    return sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
+
+
 def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         eps: float = 1e-300,
                         contracts: Sequence[Any] = (),
@@ -7750,6 +8324,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     bridge_contracts = list(all_contracts or contracts or [])
+    tree, rand_changed, rand_notes = _lower_random_calls_tree(tree)
     tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
     tree, sig_changed, sig_notes = _normalize_step_signatures_tree(tree)
     tree, intro_changed, intro_notes = _lower_introspection_and_buf_attrs_tree(tree)
@@ -7792,12 +8367,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
     changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(alias_notes) | set(sig_notes) | set(intro_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(inline_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
+    notes = sorted(set(rand_notes) | set(alias_notes) | set(sig_notes) | set(intro_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(inline_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
                    | set(none_notes) | set(complex_notes) | set(history_notes)
                    | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
                    | set(cons_notes) | set(lyap_notes)
                    | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (alias_changed or sig_changed or intro_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or inline_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
+    if (rand_changed or alias_changed or sig_changed or intro_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or inline_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
             or complex_changed or history_changed or sdiv_changed or unify_changed
             or concept_changed or cons_changed or lyap_changed
             or param_changed or diss_changed):
@@ -9176,7 +9751,8 @@ def _apply_physics_guard_pass(op: str, code: str, contracts: Sequence[Any]) -> S
 
 
 __all__ = [
-    "SanitizerResult", "sanitize_intrinsics", "rewrite_monotone_drift",
+    "SanitizerResult", "sanitize_intrinsics", "_invar_project_k_simplex",
+    "_lower_random_calls_tree", "rewrite_monotone_drift",
     "infer_monotone_drift_directives", "apply_healing_directives",
     "strip_none_literals", "numeric_expr_equivalent",
     "lower_complex_to_real", "prune_unused_helpers",

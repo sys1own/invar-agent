@@ -36,8 +36,28 @@ _MATH_FUNCS = {
     "erf", "erfc", "gamma", "lgamma",
     "isfinite", "isnan", "isinf", "radians", "degrees",
 }
-_INTRINSICS = {"prng_uniform": 2, "clamp": 3, "clip": 3, "sign": 1, "sgn": 1,
-               "sq": 1, "lerp": 3, "safe_div": 2}
+_INTRINSICS = {
+    "prng_uniform": 2, "clamp": 3, "clip": 3, "sign": 1, "sgn": 1,
+    "sq": 1, "lerp": 3, "safe_div": 2,
+    "invar_splitmix64_stateless": 3,
+    "invar_rand_u01": 3,
+    "invar_rand_normal": 3,
+    "invar_rand_poisson": 3,
+    "invar_rand_binomial": 4,
+    "welford_mean_update": 3,
+    "welford_m2_update": 4,
+    "welford_cov_update": 5,
+    "norm_cdf": 1,
+    "norm_ppf": 1,
+    "logistic_sigmoid": 1,
+    "logit": 1,
+    "hill_eq": 3,
+    "michaelis_menten": 3,
+    "kl_term": 2,
+    "shannon_term": 1,
+    "gammainc_reg": 2,
+    "betainc_reg": 3,
+}
 _CMPS = {"==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
          "is": "==", "is_not": "!="}
 
@@ -57,7 +77,157 @@ typedef struct SimulationBuffer {
 } SimulationBuffer;
 }
 
+inline uint64_t invar_splitmix64_stateless(uint64_t seed, uint64_t step, uint64_t channel) noexcept {
+    uint64_t z = seed + step * 0x9e3779b97f4a7c15ULL + channel * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+inline double invar_rand_u01(uint64_t seed, uint64_t step, uint64_t channel) noexcept {
+    uint64_t val = invar_splitmix64_stateless(seed, step, channel);
+    double u = static_cast<double>(val >> 11) * (1.0 / 9007199254740992.0);
+    return u <= 1e-15 ? 1e-15 : (u >= 1.0 - 1e-15 ? 1.0 - 1e-15 : u);
+}
+inline double invar_rand_normal(uint64_t seed, uint64_t step, uint64_t channel) noexcept {
+    double u1 = invar_rand_u01(seed, step, channel * 2ULL);
+    double u2 = invar_rand_u01(seed, step, channel * 2ULL + 1ULL);
+    return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.2831853071795864769 * u2);
+}
+inline double invar_rand_poisson(uint64_t seed, uint64_t step, double lambda) noexcept {
+    if (lambda <= 0.0) return 0.0;
+    if (lambda < 30.0) {
+        double L = std::exp(-lambda);
+        int k = 0;
+        double p = 1.0;
+        do {
+            ++k;
+            p *= invar_rand_u01(seed, step, static_cast<uint64_t>(1000 + k));
+        } while (p > L && k < 256);
+        return static_cast<double>(k - 1);
+    }
+    double z = invar_rand_normal(seed, step, 999ULL);
+    double res = std::floor(lambda + std::sqrt(lambda) * z + 0.5);
+    return res < 0.0 ? 0.0 : res;
+}
+inline double invar_rand_binomial(uint64_t seed, uint64_t step, double n, double p) noexcept {
+    if (n <= 0.0 || p <= 0.0) return 0.0;
+    if (p >= 1.0) return std::floor(n);
+    if (n < 64.0) {
+        int hits = 0;
+        int ni = static_cast<int>(n);
+        for (int i = 0; i < ni; ++i) {
+            if (invar_rand_u01(seed, step, static_cast<uint64_t>(2000 + i)) < p) ++hits;
+        }
+        return static_cast<double>(hits);
+    }
+    double mu = n * p;
+    double sigma = std::sqrt(n * p * (1.0 - p));
+    double z = invar_rand_normal(seed, step, 1999ULL);
+    double val = std::floor(mu + sigma * z + 0.5);
+    double n_floor = std::floor(n);
+    return val < 0.0 ? 0.0 : (val > n_floor ? n_floor : val);
+}
+constexpr inline double welford_mean_update(double mean, double x, double k) noexcept {
+    return mean + (x - mean) / (k < 1.0 ? 1.0 : k);
+}
+constexpr inline double welford_m2_update(double m2, double mean_old, double mean_new, double x) noexcept {
+    return m2 + (x - mean_old) * (x - mean_new);
+}
+constexpr inline double welford_cov_update(double c_xy, double mean_x_old, double x, double mean_y_new, double y) noexcept {
+    return c_xy + (x - mean_x_old) * (y - mean_y_new);
+}
+inline double norm_cdf(double x) noexcept {
+    return 0.5 * (1.0 + std::erf(x * 0.70710678118654752440));
+}
+inline double norm_ppf(double p) noexcept {
+    double pc = p <= 1e-15 ? 1e-15 : (p >= 1.0 - 1e-15 ? 1.0 - 1e-15 : p);
+    constexpr double a1 = -3.969683028665376e+01;
+    constexpr double a2 =  2.209460984245205e+02;
+    constexpr double a3 = -2.759285104469687e+02;
+    constexpr double a4 =  1.383577518672690e+02;
+    constexpr double a5 = -3.066479806614716e+01;
+    constexpr double a6 =  2.506628277459239e+00;
+    constexpr double b1 = -5.447609879822406e+01;
+    constexpr double b2 =  1.615858368580409e+02;
+    constexpr double b3 = -1.556989798598866e+02;
+    constexpr double b4 =  6.680131188771972e+01;
+    constexpr double b5 = -1.328068155288572e+01;
+    constexpr double c1 = -7.784894002430293e-03;
+    constexpr double c2 = -3.223964580411365e-01;
+    constexpr double c3 = -2.400758277161838e+00;
+    constexpr double c4 = -2.549732539343734e+00;
+    constexpr double c5 =  4.374664141464968e+00;
+    constexpr double c6 =  2.938163982698783e+00;
+    constexpr double d1 =  7.784695709041462e-03;
+    constexpr double d2 =  3.224671290700398e-01;
+    constexpr double d3 =  2.445134137142996e+00;
+    constexpr double d4 =  3.754408661907416e+00;
+    constexpr double p_low = 0.02425;
+    constexpr double p_high = 1.0 - p_low;
+    if (pc < p_low) {
+        double q = std::sqrt(-2.0 * std::log(pc));
+        return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+               ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+    } else if (pc <= p_high) {
+        double q = pc - 0.5;
+        double r = q * q;
+        return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+               (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
+    } else {
+        double q = std::sqrt(-2.0 * std::log(1.0 - pc));
+        return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+                ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+    }
+}
+inline double logistic_sigmoid(double x) noexcept {
+    double xc = x > 80.0 ? 80.0 : (x < -80.0 ? -80.0 : x);
+    return 1.0 / (1.0 + std::exp(-xc));
+}
+inline double logit(double p) noexcept {
+    double pc = p < 1e-15 ? 1e-15 : (p > 1.0 - 1e-15 ? 1.0 - 1e-15 : p);
+    return std::log(pc / (1.0 - pc));
+}
+inline double hill_eq(double c, double ec50, double n) noexcept {
+    if (c <= 0.0) return 0.0;
+    double cn = std::pow(c > 0.0 ? c : 0.0, n);
+    double kn = std::pow(ec50 > 1e-15 ? ec50 : 1e-15, n);
+    return cn / (cn + kn + 1e-30);
+}
+inline double michaelis_menten(double s, double vmax, double km) noexcept {
+    double sc = s > 0.0 ? s : 0.0;
+    return (vmax * sc) / ((km > 1e-15 ? km : 1e-15) + sc);
+}
+inline double kl_term(double p, double q) noexcept {
+    double qc = q > 1e-30 ? q : 1e-30;
+    if (p <= 0.0) return qc;
+    double val = p * std::log(p / qc) - p + qc;
+    return val > 0.0 ? val : 0.0;
+}
+inline double shannon_term(double p) noexcept {
+    if (p <= 0.0) return 0.0;
+    return -p * std::log(p);
+}
+inline double gammainc_reg(double a, double x) noexcept {
+    double ac = a > 1e-12 ? a : 1e-12;
+    if (x <= 0.0) return 0.0;
+    double ratio = std::pow(x / ac, 1.0 / 3.0);
+    double mu = 1.0 - 1.0 / (9.0 * ac);
+    double sigma = std::sqrt(1.0 / (9.0 * ac));
+    return norm_cdf((ratio - mu) / (sigma > 1e-15 ? sigma : 1e-15));
+}
+inline double betainc_reg(double a, double b, double x) noexcept {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    double ac = a > 1e-12 ? a : 1e-12;
+    double bc = b > 1e-12 ? b : 1e-12;
+    double mean = ac / (ac + bc);
+    double var = (ac * bc) / ((ac + bc) * (ac + bc) * (ac + bc + 1.0));
+    double sigma = std::sqrt(var);
+    return norm_cdf((x - mean) / (sigma > 1e-15 ? sigma : 1e-15));
+}
+
 namespace invar {
+static inline uint64_t _to_u64(double x) noexcept { return static_cast<uint64_t>(static_cast<int64_t>(x)); }
 static inline long pymod_i(long a, long b) { long r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline long floordiv_i(long a, long b) { long q = a / b; return ((a % b != 0) && ((a < 0) != (b < 0))) ? q - 1 : q; }
 static inline double pymod_f(double a, double b) { double r = std::fmod(a, b); return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r; }
@@ -76,6 +246,34 @@ static inline double prng_uniform(double seed, double k) {
     z = z ^ (z >> 31);
     return static_cast<double>(z >> 11) * (1.0 / 9007199254740992.0);
 }
+static inline double invar_splitmix64_stateless(double seed, double step, double channel) {
+    return static_cast<double>(::invar_splitmix64_stateless(_to_u64(seed), _to_u64(step), _to_u64(channel)));
+}
+static inline double invar_rand_u01(double seed, double step, double channel) {
+    return ::invar_rand_u01(_to_u64(seed), _to_u64(step), _to_u64(channel));
+}
+static inline double invar_rand_normal(double seed, double step, double channel) {
+    return ::invar_rand_normal(_to_u64(seed), _to_u64(step), _to_u64(channel));
+}
+static inline double invar_rand_poisson(double seed, double step, double lambda) {
+    return ::invar_rand_poisson(_to_u64(seed), _to_u64(step), lambda);
+}
+static inline double invar_rand_binomial(double seed, double step, double n, double p) {
+    return ::invar_rand_binomial(_to_u64(seed), _to_u64(step), n, p);
+}
+static inline double welford_mean_update(double mean, double x, double k) { return ::welford_mean_update(mean, x, k); }
+static inline double welford_m2_update(double m2, double mean_old, double mean_new, double x) { return ::welford_m2_update(m2, mean_old, mean_new, x); }
+static inline double welford_cov_update(double c_xy, double mean_x_old, double x, double mean_y_new, double y) { return ::welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y); }
+static inline double norm_cdf(double x) { return ::norm_cdf(x); }
+static inline double norm_ppf(double p) { return ::norm_ppf(p); }
+static inline double logistic_sigmoid(double x) { return ::logistic_sigmoid(x); }
+static inline double logit(double p) { return ::logit(p); }
+static inline double hill_eq(double c, double ec50, double n) { return ::hill_eq(c, ec50, n); }
+static inline double michaelis_menten(double s, double vmax, double km) { return ::michaelis_menten(s, vmax, km); }
+static inline double kl_term(double p, double q) { return ::kl_term(p, q); }
+static inline double shannon_term(double p) { return ::shannon_term(p); }
+static inline double gammainc_reg(double a, double x) { return ::gammainc_reg(a, x); }
+static inline double betainc_reg(double a, double b, double x) { return ::betainc_reg(a, b, x); }
 }  // namespace invar
 
 constexpr inline double _invar_sdiv(double a, double b) noexcept {
@@ -93,6 +291,10 @@ constexpr inline double smooth_clamp(double x, double lo, double hi) noexcept {
 
 _NATIVE_PRELUDE_INTRINSICS = {
     "_invar_sdiv", "div_eps", "safe_sqrt", "safe_log", "safe_exp", "safe_pow", "smooth_clamp",
+    "invar_splitmix64_stateless", "invar_rand_u01", "invar_rand_normal", "invar_rand_poisson",
+    "invar_rand_binomial", "welford_mean_update", "welford_m2_update", "welford_cov_update",
+    "norm_cdf", "norm_ppf", "logistic_sigmoid", "logit", "hill_eq", "michaelis_menten",
+    "kl_term", "shannon_term", "gammainc_reg", "betainc_reg",
 }
 
 INT, FLOAT, VEC, VEC2, BUF, BOOL = "int", "double", "vec", "vec2", "buf", "bool"
@@ -445,6 +647,10 @@ class CppEmitter:
             return f"((double)({x}) * (180.0 / 3.14159265358979323846))"
         if name.startswith("math."):
             fn = name.split(".", 1)[1]
+            if fn in _INTRINSICS:
+                if len(args) != _INTRINSICS[fn]:
+                    raise EmitterError(f"math.{fn}() expects {_INTRINSICS[fn]} arguments")
+                return f"invar::{fn}(" + ", ".join(self._num(a) for a in args) + ")"
             if fn not in _MATH_FUNCS:
                 raise EmitterError(f"unsupported math function math.{fn}")
             if fn == "log":

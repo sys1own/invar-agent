@@ -47,7 +47,16 @@ guard is injected automatically); if/elif/else; ternary `a if c else b`;
 simultaneous assignment `x, v = x + dt * v, v - dt * x`; augmented assignment;
 `import math` and math.sqrt/sin/cos/tan/exp/log/pow/fabs/atan2/hypot/floor/...,
 math.pi/math.e; abs/min/max/int/float/len(buf.data)/len(local_list); intrinsics
-prng_uniform(seed, k) -> [0,1) (deterministic counter PRNG), clamp(x, lo, hi), sign(x).
+prng_uniform(seed, k) -> [0,1) (deterministic counter PRNG),
+invar_rand_u01(seed, step, channel) -> [1e-15, 1-1e-15],
+invar_rand_normal(seed, step, channel) -> N(0,1),
+invar_rand_poisson(seed, step, lam), invar_rand_binomial(seed, step, n, p),
+welford_mean_update(mean, x, k), welford_m2_update(m2, mean_old, mean_new, x),
+welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y),
+norm_cdf(x), norm_ppf(p), logistic_sigmoid(x), logit(p),
+hill_eq(c, ec50, n), michaelis_menten(s, vmax, km),
+kl_term(p, q), shannon_term(p), gammainc_reg(a, x), betainc_reg(a, b, x),
+clamp(x, lo, hi), sign(x).
 STRICT REAL-SCALAR RULE: NEVER use Python complex literals (`1j`), `complex()`, or `cmath`.
 Represent all complex quantities (such as off-diagonal density matrix coherences $\\rho_{01}$)
 strictly as separate real and imaginary `float` variables (`rho01_re`, `rho01_im`).
@@ -719,10 +728,11 @@ def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
     backend = str(contract.get("target_backend") or "cpp").strip().lower()
     contract["target_backend"] = backend if backend in _BACKENDS else "cpp"
     try:
-        contract["timeout_seconds"] = float(contract.get("timeout_seconds", 30.0))
-        contract["dt"] = float(contract.get("dt", 0.01))
-        contract["steps"] = int(contract.get("steps", 1000))
-        contract["max_memory_mb"] = int(contract.get("max_memory_mb", 1024))
+        contract["timeout_seconds"] = max(1.0, min(300.0, float(contract.get("timeout_seconds", 30.0))))
+        raw_dt = float(contract.get("dt", 0.01))
+        contract["dt"] = max(1e-12, min(1e8, raw_dt if raw_dt > 0.0 else 0.01))
+        contract["steps"] = max(1, min(100000, int(contract.get("steps", 1000))))
+        contract["max_memory_mb"] = max(64, min(8192, int(contract.get("max_memory_mb", 1024))))
     except (TypeError, ValueError):
         return None
     initial = _as_float_list(contract.get("initial_state"))
@@ -1082,7 +1092,7 @@ def canonicalize_contract_dicts(
 
     def _extract_sum_target(expr: str) -> Optional[float]:
         m = re.search(
-            r"abs\(\s*\(?\s*(?:state|buf\.data|data)\[\d+\]\s*\+\s*(?:state|buf\.data|data)\[\d+\]\s*\)?\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
+            r"abs\(\s*\(?\s*(?:state|buf\.data|data)\[\d+\](?:\s*\+\s*(?:state|buf\.data|data)\[\d+\])+\s*\)?\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
             expr or "",
         )
         if not m:
@@ -1139,8 +1149,6 @@ def canonicalize_contract_dicts(
             return bool(diff_init or target_clash)
         if prev_cid == c_id or prev_owner == name:
             return False
-        if slot_idx not in (0, 1, 2, 3):
-            return True
         prev_t = slot_eq_target.get(slot_idx)
         prev_sum = slot_sum_target.get(slot_idx)
         prev_iv = slot_init_val.get(slot_idx)
@@ -1149,6 +1157,38 @@ def canonicalize_contract_dicts(
         eq_target = _extract_eq_target(assertion)
         sum_target = _extract_sum_target(assertion)
         lo_new, hi_new = _extract_interval(assertion, slot_idx)
+        if slot_idx not in (0, 1, 2, 3):
+            # If the invariant references asingle slot (and neither is part of a multi-slot sum
+            # conservation law), distinct observable names in different contracts must not share a slot
+            # unless they map to the same explicit variable_map slot or share the same semantic stem.
+            inv_slots = set(_canon_slots_in_text(assertion))
+            is_multi_slot_inv = len(inv_slots) > 1
+            same_vm_slot = (vm.get(name) == slot_idx and vm.get(prev_owner or "") == slot_idx)
+            same_stem = (
+                bool(_canon_semantic_stem(name))
+                and _canon_semantic_stem(name) == _canon_semantic_stem(prev_owner or "")
+            )
+            if not is_multi_slot_inv and prev_sum is None and sum_target is None and not same_vm_slot and not same_stem:
+                return True
+            # Allow multi-contract checks on the SAME slot when initial values,
+            # sum targets, equality targets, and intervals are mutually compatible.
+            init_clash_hi = (init_v is not None and prev_iv is not None and abs(init_v - prev_iv) > 1e-6 * max(1.0, abs(init_v), abs(prev_iv)))
+            target_clash_hi = (
+                (eq_target is not None and prev_t is not None and abs(prev_t - eq_target) > 1e-3 * max(1.0, abs(prev_t), abs(eq_target)))
+                or (eq_target is not None and prev_hi is not None and eq_target > prev_hi + 1e-6)
+                or (eq_target is not None and prev_lo is not None and eq_target < prev_lo - 1e-6)
+                or (prev_t is not None and hi_new is not None and prev_t > hi_new + 1e-6)
+                or (prev_t is not None and lo_new is not None and prev_t < lo_new - 1e-6)
+            )
+            sum_clash_hi = (
+                sum_target is not None and prev_sum is not None and abs(sum_target - prev_sum) > 1e-3 * max(1.0, abs(sum_target), abs(prev_sum))
+            )
+            interval_clash_hi = (
+                (lo_new is not None and prev_hi is not None and lo_new > prev_hi + 1e-9)
+                or (hi_new is not None and prev_lo is not None and hi_new < prev_lo - 1e-9)
+                or (prev_hi is not None and hi_new is not None and (prev_hi <= 1e-6) != (hi_new <= 1e-6))
+            )
+            return bool(init_clash_hi or target_clash_hi or sum_clash_hi or interval_clash_hi)
         init_clash = (init_v is not None and prev_iv is not None and abs(init_v - prev_iv) > 1e-6)
         target_clash = (
             (eq_target is not None and (prev_t is None or abs(prev_t - eq_target) > 1e-3))
@@ -1437,6 +1477,11 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             out.pop("current_stage", None)
     contracts = out.get("contracts")
+    if contracts is None:
+        for alt_k in ("verification_contracts", "stage_contracts"):
+            if alt_k in data and data[alt_k] is not None:
+                contracts = data[alt_k]
+                break
     if isinstance(contracts, dict):
         contracts = [contracts]
     if isinstance(contracts, list):
@@ -1743,7 +1788,32 @@ async def generate_plan_with_feasibility(question: str,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
                     "planner_error": "combined planner returned no blueprint object"}
         raise RuntimeError("research plan synthesis failed: no blueprint object in response")
-    bp = parse_blueprint(bp_raw)
+    try:
+        bp = parse_blueprint(bp_raw)
+    except Exception as exc:
+        if fallback:
+            return {"feasibility": feasibility,
+                    "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
+                    "planner_error": str(exc)[:300]}
+        repair_prompt = (
+            prompt
+            + "\n\nCRITICAL SCHEMA VALIDATION ERROR on your previous JSON output: "
+            f"{str(exc)[:400]}. "
+            "You MUST include a non-empty `contracts` list (with `c1_`, `c2_`, `c3_` contracts, "
+            "each containing `contract_id`, `target_backend`: 'cpp', `initial_state`, `dt`, `steps`, "
+            "and a non-empty `invariants` list), plus `blueprint_id`, `title`, `falsifiable_hypothesis`, "
+            "`search_queries`, `variable_map`, and `code_template`."
+        )
+        raw_retry2 = await llm_complete(repair_prompt)
+        data_retry2 = _extract_json(str(raw_retry2))
+        bp_raw2 = None
+        if isinstance(data_retry2, dict):
+            bp_raw2 = data_retry2.get("blueprint")
+            if not isinstance(bp_raw2, dict) and isinstance(data_retry2.get("contracts"), list) and data_retry2.get("title"):
+                bp_raw2 = data_retry2
+        if not isinstance(bp_raw2, dict):
+            raise
+        bp = parse_blueprint(bp_raw2)
     return {"feasibility": feasibility,
             "blueprint": _attach_evidence(bp.model_dump(), evidence),
             "source": "llm",

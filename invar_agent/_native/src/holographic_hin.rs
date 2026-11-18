@@ -76,6 +76,141 @@ pub fn smooth_clamp(x: f64, a: f64, b: f64) -> f64 {
     lo + (hi - lo) * sig
 }
 
+#[inline]
+pub fn logistic_sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + safe_exp(-x))
+}
+
+#[inline]
+pub fn logit(p: f64) -> f64 {
+    let pc = p.clamp(1e-15, 1.0 - 1e-15);
+    (pc / (1.0 - pc)).ln()
+}
+
+#[inline]
+pub fn hill_eq(c: f64, ec50: f64, n: f64) -> f64 {
+    if c <= 0.0 {
+        return 0.0;
+    }
+    let cn = safe_pow(c.max(0.0), n);
+    let kn = safe_pow(ec50.max(1e-15), n);
+    safe_div(cn, cn + kn)
+}
+
+#[inline]
+pub fn michaelis_menten(s: f64, vmax: f64, km: f64) -> f64 {
+    let sc = s.max(0.0);
+    safe_div(vmax * sc, km.max(1e-15) + sc)
+}
+
+#[inline]
+pub fn kl_term(p: f64, q: f64) -> f64 {
+    let qc = q.max(1e-30);
+    if p <= 0.0 {
+        return qc;
+    }
+    (p * (p / qc).ln() - p + qc).max(0.0)
+}
+
+#[inline]
+pub fn shannon_term(p: f64) -> f64 {
+    if p <= 0.0 {
+        return 0.0;
+    }
+    -p * p.ln()
+}
+
+#[inline]
+pub fn norm_cdf(x: f64) -> f64 {
+    // Abramowitz & Stegun 7.1.26 rational erf approximation
+    let z = x * std::f64::consts::FRAC_1_SQRT_2;
+    let sign = if z < 0.0 { -1.0 } else { 1.0 };
+    let az = z.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * az);
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736
+                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let erf_val = sign * (1.0 - poly * (-az * az).exp());
+    (0.5 * (1.0 + erf_val)).clamp(0.0, 1.0)
+}
+
+#[inline]
+pub fn norm_ppf(p: f64) -> f64 {
+    // Rational Acklam inverse normal CDF on clamp(p, 1e-15, 1.0 - 1e-15)
+    let pc = p.clamp(1e-15, 1.0 - 1e-15);
+    const A1: f64 = -3.969683028665376e+01;
+    const A2: f64 = 2.209460984245205e+02;
+    const A3: f64 = -2.759285104469687e+02;
+    const A4: f64 = 1.383577518672690e+02;
+    const A5: f64 = -3.066479806614716e+01;
+    const A6: f64 = 2.506628277459239e+00;
+
+    const B1: f64 = -5.447609879822406e+01;
+    const B2: f64 = 1.615858368580409e+02;
+    const B3: f64 = -1.556989798598866e+02;
+    const B4: f64 = 6.680131188771972e+01;
+    const B5: f64 = -1.328068155288572e+01;
+
+    const C1: f64 = -7.784894002430293e-03;
+    const C2: f64 = -3.223964580411365e-01;
+    const C3: f64 = -2.400758277161838e+00;
+    const C4: f64 = -2.549732539343734e+00;
+    const C5: f64 = 4.374664141464968e+00;
+    const C6: f64 = 2.938163982698783e+00;
+
+    const D1: f64 = 7.784695709041462e-03;
+    const D2: f64 = 3.224671290700398e-01;
+    const D3: f64 = 2.445134137142996e+00;
+    const D4: f64 = 3.754408661907416e+00;
+
+    const P_LOW: f64 = 0.02425;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+
+    if pc < P_LOW {
+        let q = (-2.0 * pc.ln()).sqrt();
+        (((((C1 * q + C2) * q + C3) * q + C4) * q + C5) * q + C6)
+            / ((((D1 * q + D2) * q + D3) * q + D4) * q + 1.0)
+    } else if pc <= P_HIGH {
+        let q = pc - 0.5;
+        let r = q * q;
+        (((((A1 * r + A2) * r + A3) * r + A4) * r + A5) * r + A6) * q
+            / (((((B1 * r + B2) * r + B3) * r + B4) * r + B5) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - pc).ln()).sqrt();
+        -(((((C1 * q + C2) * q + C3) * q + C4) * q + C5) * q + C6)
+            / ((((D1 * q + D2) * q + D3) * q + D4) * q + 1.0)
+    }
+}
+
+#[inline]
+pub fn gammainc_reg(a: f64, x: f64) -> f64 {
+    let ac = a.max(1e-12);
+    if x <= 0.0 {
+        return 0.0;
+    }
+    // Wilson-Hilferty normal approximation for regularized lower incomplete gamma P(a, x)
+    let ratio = (x / ac).powf(1.0 / 3.0);
+    let mu = 1.0 - 1.0 / (9.0 * ac);
+    let sigma = (1.0 / (9.0 * ac)).sqrt();
+    norm_cdf((ratio - mu) / sigma.max(1e-15))
+}
+
+#[inline]
+pub fn betainc_reg(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ac = a.max(1e-12);
+    let bc = b.max(1e-12);
+    let mean = ac / (ac + bc);
+    let var = (ac * bc) / ((ac + bc).powi(2) * (ac + bc + 1.0));
+    norm_cdf((x - mean) / var.sqrt().max(1e-15))
+}
+
 // ---------------------------------------------------------------------------
 // Holographic Port Types: SIDimensionVector, IntervalBound, MELLType
 // ---------------------------------------------------------------------------
@@ -89,6 +224,8 @@ pub struct SIDimensionVector {
     pub temperature: i8,
     pub amount: i8,
     pub luminosity: i8,
+    #[serde(default)]
+    pub semantic_tag: u8,
 }
 
 impl SIDimensionVector {
@@ -101,12 +238,18 @@ impl SIDimensionVector {
             temperature: 0,
             amount: 0,
             luminosity: 0,
+            semantic_tag: 0,
         }
     }
 
+    pub fn with_semantic_tag(mut self, semantic_tag: u8) -> Self {
+        self.semantic_tag = semantic_tag;
+        self
+    }
+
     pub fn from_vec(v: &[i8]) -> Result<Self, String> {
-        if v.len() != 7 {
-            return Err(format!("Expected 7 SI dimension components, got {}", v.len()));
+        if v.len() != 7 && v.len() != 8 {
+            return Err(format!("Expected 7 or 8 SI dimension components, got {}", v.len()));
         }
         Ok(Self {
             mass: v[0],
@@ -116,7 +259,12 @@ impl SIDimensionVector {
             temperature: v[4],
             amount: v[5],
             luminosity: v[6],
+            semantic_tag: if v.len() == 8 { v[7] as u8 } else { 0 },
         })
+    }
+
+    pub fn from_vec_with_tag(v: &[i8], semantic_tag: u8) -> Result<Self, String> {
+        Ok(Self::from_vec(v)?.with_semantic_tag(semantic_tag))
     }
 
     pub fn to_vec(self) -> Vec<i8> {
@@ -132,10 +280,25 @@ impl SIDimensionVector {
     }
 
     pub fn is_dimensionless(self) -> bool {
-        self == Self::dimensionless()
+        self.mass == 0
+            && self.length == 0
+            && self.time == 0
+            && self.current == 0
+            && self.temperature == 0
+            && self.amount == 0
+            && self.luminosity == 0
     }
 
     pub fn mul_dim(self, other: Self) -> Self {
+        let tag = if self.semantic_tag != 0 && other.semantic_tag == 0 {
+            self.semantic_tag
+        } else if other.semantic_tag != 0 && self.semantic_tag == 0 {
+            other.semantic_tag
+        } else if self.semantic_tag == other.semantic_tag {
+            self.semantic_tag
+        } else {
+            0
+        };
         Self {
             mass: self.mass.saturating_add(other.mass),
             length: self.length.saturating_add(other.length),
@@ -144,10 +307,18 @@ impl SIDimensionVector {
             temperature: self.temperature.saturating_add(other.temperature),
             amount: self.amount.saturating_add(other.amount),
             luminosity: self.luminosity.saturating_add(other.luminosity),
+            semantic_tag: tag,
         }
     }
 
     pub fn div_dim(self, other: Self) -> Self {
+        let tag = if self.semantic_tag == other.semantic_tag {
+            0
+        } else if self.semantic_tag != 0 && other.semantic_tag == 0 {
+            self.semantic_tag
+        } else {
+            0
+        };
         Self {
             mass: self.mass.saturating_sub(other.mass),
             length: self.length.saturating_sub(other.length),
@@ -156,6 +327,7 @@ impl SIDimensionVector {
             temperature: self.temperature.saturating_sub(other.temperature),
             amount: self.amount.saturating_sub(other.amount),
             luminosity: self.luminosity.saturating_sub(other.luminosity),
+            semantic_tag: tag,
         }
     }
 
@@ -168,6 +340,7 @@ impl SIDimensionVector {
             temperature: self.temperature.saturating_mul(exp),
             amount: self.amount.saturating_mul(exp),
             luminosity: self.luminosity.saturating_mul(exp),
+            semantic_tag: if exp == 1 { self.semantic_tag } else { 0 },
         }
     }
 }
@@ -382,6 +555,16 @@ impl CselExpr {
                     "expm1" => a0.clamp(-80.0, 80.0).exp_m1(),
                     "smooth_clamp" => smooth_clamp(a0, a1, a2),
                     "where" => if a0 > 0.0 { a1 } else { a2 },
+                    "norm_cdf" => norm_cdf(a0),
+                    "norm_ppf" => norm_ppf(a0),
+                    "logistic_sigmoid" => logistic_sigmoid(a0),
+                    "logit" => logit(a0),
+                    "hill_eq" => hill_eq(a0, a1, a2),
+                    "michaelis_menten" => michaelis_menten(a0, a1, a2),
+                    "kl_term" => kl_term(a0, a1),
+                    "shannon_term" => shannon_term(a0),
+                    "gammainc_reg" => gammainc_reg(a0, a1),
+                    "betainc_reg" => betainc_reg(a0, a1, a2),
                     _ => 0.0,
                 }
             }
@@ -401,6 +584,8 @@ pub struct QuantitySpec {
     pub is_state_variable: bool,
     #[serde(default)]
     pub dimension_unspecified: bool,
+    #[serde(default)]
+    pub semantic_tag: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +593,8 @@ pub struct EquationReport {
     pub equation_name: String,
     pub valid: bool,
     pub output_dimensions: [i8; 7],
+    #[serde(default)]
+    pub output_semantic_tag: u8,
     pub output_bound: [f64; 2],
     pub promotion_agents: Vec<String>,
     pub dereliction_agents: Vec<String>,
@@ -497,8 +684,8 @@ impl HolographicHinArena {
                 promotion_agents.push(format!("!{} (x{})", sym, count));
                 // Allocate explicit ! promotion box in the arena
                 if let Some(spec) = self.ontology.get(sym) {
-                    let dim = SIDimensionVector::from_vec(&spec.si_dimension)
-                        .unwrap_or_else(|_| SIDimensionVector::dimensionless());
+                    let dim = SIDimensionVector::from_vec_with_tag(&spec.si_dimension, spec.semantic_tag)
+                        .unwrap_or_else(|_| SIDimensionVector::dimensionless().with_semantic_tag(spec.semantic_tag));
                     let port = HolographicPort {
                         mell_type: MELLType::Exponential(PromotionBox {
                             symbol: sym.clone(),
@@ -531,8 +718,8 @@ impl HolographicHinArena {
             .collect();
         for (sym, spec) in unused_specs {
             dereliction_agents.push(format!("?{}", sym));
-            let dim = SIDimensionVector::from_vec(&spec.si_dimension)
-                .unwrap_or_else(|_| SIDimensionVector::dimensionless());
+            let dim = SIDimensionVector::from_vec_with_tag(&spec.si_dimension, spec.semantic_tag)
+                .unwrap_or_else(|_| SIDimensionVector::dimensionless().with_semantic_tag(spec.semantic_tag));
             let port = HolographicPort {
                 mell_type: MELLType::Exponential(PromotionBox {
                     symbol: sym.clone(),
@@ -556,6 +743,7 @@ impl HolographicHinArena {
                 equation_name: equation_name.to_string(),
                 valid: false,
                 output_dimensions: [0; 7],
+                output_semantic_tag: 0,
                 output_bound: [f64::NEG_INFINITY, f64::INFINITY],
                 promotion_agents,
                 dereliction_agents,
@@ -589,6 +777,7 @@ impl HolographicHinArena {
             equation_name: equation_name.to_string(),
             valid: true,
             output_dimensions: dim_arr,
+            output_semantic_tag: out_port.dimensions.semantic_tag,
             output_bound: [out_port.bound.lower, out_port.bound.upper],
             promotion_agents,
             dereliction_agents,
@@ -627,6 +816,7 @@ impl HolographicHinArena {
                             temperature: 0,
                             amount: 0,
                             luminosity: 0,
+                            semantic_tag: 0,
                         },
                         bound: IntervalBound::new(0.0, f64::INFINITY),
                         inferable_dimension: false,
@@ -646,8 +836,8 @@ impl HolographicHinArena {
                     return port;
                 }
                 let spec = self.ontology.get(name).unwrap();
-                let dim = SIDimensionVector::from_vec(&spec.si_dimension)
-                    .unwrap_or_else(|_| SIDimensionVector::dimensionless());
+                let dim = SIDimensionVector::from_vec_with_tag(&spec.si_dimension, spec.semantic_tag)
+                    .unwrap_or_else(|_| SIDimensionVector::dimensionless().with_semantic_tag(spec.semantic_tag));
                 let port = HolographicPort {
                     mell_type: MELLType::Linear,
                     dimensions: dim,
@@ -751,6 +941,7 @@ impl HolographicHinArena {
                             temperature: p0.dimensions.temperature / 2,
                             amount: p0.dimensions.amount / 2,
                             luminosity: p0.dimensions.luminosity / 2,
+                            semantic_tag: 0,
                         };
                         (d, p0.inferable_dimension, p0.bound.safe_sqrt())
                     }
@@ -813,6 +1004,26 @@ impl HolographicHinArena {
                         let (d, inf) = unify_additive_dimensions(&p1, &p2, "where", eq_name, warnings);
                         (d, inf, p1.bound.join(p2.bound))
                     }
+                    "norm_cdf" | "logistic_sigmoid" | "hill_eq" | "gammainc_reg" | "betainc_reg" => (
+                        SIDimensionVector::dimensionless().with_semantic_tag(1),
+                        false,
+                        IntervalBound::new(0.0, 1.0),
+                    ),
+                    "norm_ppf" | "logit" => (
+                        SIDimensionVector::dimensionless().with_semantic_tag(4),
+                        false,
+                        IntervalBound::new(-40.0, 40.0),
+                    ),
+                    "michaelis_menten" => (
+                        p1.dimensions,
+                        p1.inferable_dimension,
+                        IntervalBound::new(0.0, p1.bound.upper.max(0.0)),
+                    ),
+                    "kl_term" | "shannon_term" => (
+                        SIDimensionVector::dimensionless().with_semantic_tag(2),
+                        false,
+                        IntervalBound::new(0.0, f64::INFINITY),
+                    ),
                     _ => (SIDimensionVector::dimensionless(), true, IntervalBound::unbounded()),
                 };
 
@@ -841,6 +1052,15 @@ fn unify_additive_dimensions(
     eq_name: &str,
     warnings: &mut Vec<String>,
 ) -> (SIDimensionVector, bool) {
+    if lp.dimensions.semantic_tag != 0
+        && rp.dimensions.semantic_tag != 0
+        && lp.dimensions.semantic_tag != rp.dimensions.semantic_tag
+    {
+        warnings.push(format!(
+            "Semantic Tag Mismatch at {} ({}): cannot directly combine semantic_tag={} with semantic_tag={}",
+            eq_name, op, lp.dimensions.semantic_tag, rp.dimensions.semantic_tag
+        ));
+    }
     if lp.dimensions == rp.dimensions {
         return (lp.dimensions, lp.inferable_dimension && rp.inferable_dimension);
     }
@@ -849,6 +1069,14 @@ fn unify_additive_dimensions(
     }
     if rp.inferable_dimension {
         return (lp.dimensions, false);
+    }
+    if lp.dimensions.is_dimensionless() && rp.dimensions.is_dimensionless() {
+        let tag = if lp.dimensions.semantic_tag != 0 {
+            lp.dimensions.semantic_tag
+        } else {
+            rp.dimensions.semantic_tag
+        };
+        return (SIDimensionVector::dimensionless().with_semantic_tag(tag), false);
     }
     if lp.dimensions.is_dimensionless() {
         return (rp.dimensions, false);
@@ -956,6 +1184,7 @@ mod tests {
                 interval: [-10.0, 10.0],
                 is_state_variable: true,
                 dimension_unspecified: false,
+                semantic_tag: 0,
             },
             QuantitySpec {
                 symbol: "unused_p".into(),
@@ -963,6 +1192,7 @@ mod tests {
                 interval: [0.0, 100.0],
                 is_state_variable: false,
                 dimension_unspecified: false,
+                semantic_tag: 0,
             },
         ];
         let mut arena = HolographicHinArena::new(q);
@@ -981,5 +1211,44 @@ mod tests {
         assert_eq!(rep.promotion_agents, vec!["!x (x2)"]);
         assert_eq!(rep.dereliction_agents, vec!["?unused_p"]);
         assert_eq!(rep.output_dimensions, [0, 2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_pan_scientific_semantic_tags_and_operators() {
+        assert!((norm_cdf(0.0) - 0.5).abs() < 1e-6);
+        assert!((norm_ppf(0.5) - 0.0).abs() < 1e-6);
+        assert!((logistic_sigmoid(0.0) - 0.5).abs() < 1e-12);
+        assert!((logit(0.5) - 0.0).abs() < 1e-12);
+        assert!((hill_eq(2.0, 2.0, 1.5) - 0.5).abs() < 1e-12);
+        assert!((michaelis_menten(5.0, 10.0, 5.0) - 5.0).abs() < 1e-12);
+        assert!(kl_term(0.5, 0.5).abs() < 1e-12);
+        assert!(shannon_term(0.0).abs() < 1e-12);
+
+        let q = vec![
+            QuantitySpec {
+                symbol: "prob_p".into(),
+                si_dimension: [0; 7],
+                interval: [0.0, 1.0],
+                is_state_variable: true,
+                dimension_unspecified: false,
+                semantic_tag: 1, // Probability
+            },
+            QuantitySpec {
+                symbol: "utility_u".into(),
+                si_dimension: [0; 7],
+                interval: [-100.0, 100.0],
+                is_state_variable: true,
+                dimension_unspecified: false,
+                semantic_tag: 5, // EconomicUtility
+            },
+        ];
+        let mut arena = HolographicHinArena::new(q);
+        let expr = CselExpr::Binary {
+            op: "+".into(),
+            left: Box::new(CselExpr::Symbol { name: "prob_p".into() }),
+            right: Box::new(CselExpr::Symbol { name: "utility_u".into() }),
+        };
+        let rep = arena.verify_equation("invalid_sum", &expr);
+        assert!(rep.dimensional_warnings.iter().any(|w| w.contains("Semantic Tag Mismatch")));
     }
 }

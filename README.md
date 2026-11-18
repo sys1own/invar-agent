@@ -1,8 +1,8 @@
 # invar-agent
 
-Formally Grounded Autonomous Software Engineering Kernel and Computational Research Platform.
+Formally Grounded Autonomous Software Engineering Kernel and Universal Pan-Scientific Hypothesis Verification Engine.
 
-`invar-agent` combines a Rust/PyO3 native verification and algebraic-rewriting core (`invar_agent._native`), a deterministic Python/C++20/Z3 verification substrate (`invar_agent/`), and an interactive FastAPI + SSE web console (`invar_agent/server.py`, `invar_agent/static/index.html`) to synthesize, formally verify, and execute numerical simulation kernels and software modules with zero unverified claims.
+`invar-agent` combines a Rust/PyO3 native verification and algebraic-rewriting core (`invar_agent._native`), a deterministic Python/C++20/Z3 verification substrate (`invar_agent/`), and an interactive FastAPI + SSE web console (`invar_agent/server.py`, `invar_agent/static/index.html`) to synthesize, formally verify, and execute numerical simulation kernels, multi-domain scientific hypotheses across all 8 macro-scientific domains, and software modules with zero unverified claims.
 
 ---
 
@@ -100,6 +100,87 @@ To prevent runtime domain errors (`ZeroDivisionError`, `ValueError`, `OverflowEr
 - **Research-to-Software Bridge (`invar_agent/builder/research_bridge.py`)**: Binds verified Research Vault artifacts across all 7 scientific/engineering archetypes using Three-Tier Research Resolution (explicit `@research:<id>`, keyword match, or implicit recent verified run).
 - **Automated Research-Parity Verification (`tests/test_research_parity.py`)**: Generates and executes `test_research_parity.py` asserting that software constants and invariants match the verified research bundle within tolerance.
 - **Precision Shield**: Enforces `math.isfinite`, bounded residuals, and zero unverified numerical drift during software builds.
+
+---
+
+## Universal Pan-Scientific Hypothesis Verification Engine
+
+`invar-agent` extends its deterministic verification substrate across all **8 Macro-Scientific Domains**, unifying continuous ODE/PDE dynamical steppers, deterministic Monte Carlo ensembles, fixed-point game/equilibrium solvers, and parameter/bifurcation sweeps under a single zero-token unit normalizer, semantic-tagged Holographic Interaction Net (HIN), and C++20 C-ABI verification pipeline.
+
+### 8 Macro-Scientific Domains & Federated Literature Routing
+
+`classify_macro_scientific_domains` and `classify_primary_macro_domain` (`invar_agent/research/extractor.py`) classify every hypothesis across 8 macro-domains and route literature queries to specialized zero-key scientific connectors (`invar_agent/research/search.py`, `invar_agent/research/literature.py`):
+
+| Macro-Domain ID | Representative Sub-Disciplines | Primary Literature & Data Channels |
+|---|---|---|
+| `PHYSICAL_SCIENCES_AND_ENG` | Quantum mechanics, relativity, plasma/fluid dynamics, condensed matter, astrodynamics, thermodynamics, electromagnetism | arXiv, ar5iv, Crossref, OpenAlex, Wikipedia, CODATA `ReferenceRegistry` |
+| `CHEMICAL_AND_MATERIALS` | Reaction kinetics, catalysis, electrochemistry, battery degradation, polymers, thermochemistry, materials thermophysics | PubChem, Crossref, OpenAlex, Semantic Scholar, Wikipedia, `ReferenceRegistry` |
+| `LIFE_SCIENCES_AND_BIOMEDICINE` | Systems biology, enzyme kinetics, genomics, population genetics, pharmacology (PK/PD), oncology, neuroscience, biophysics | Europe PMC REST API, NCBI PubMed E-Utilities, bioRxiv/medRxiv, PubChem, OpenAlex |
+| `EPIDEMIOLOGY_AND_ECOLOGY` | Compartmental infectious disease (`SIR`, `SEIR`, `SEIR-V`, `SEIRHD`), vector-borne transmission, predator-prey, food webs, biodiversity | Europe PMC REST API, NCBI PubMed E-Utilities, bioRxiv/medRxiv, Crossref, OpenAlex |
+| `EARTH_CLIMATE_AND_ENVIRONMENT` | Radiative-convective energy balance, global carbon cycle reservoirs, ocean carbonate chemistry (Revelle factor), hydrology, geophysics | arXiv (`physics.ao-ph`), Crossref, OpenAlex, Wikipedia, `ReferenceRegistry` |
+| `STATISTICS_AND_CAUSAL_INFERENCE` | Frequentist/Bayesian estimation, Structural Causal Models (SCM), `do`-calculus, Instrumental Variables (`2SLS` / Wald), Cramér-Rao bounds | arXiv (`stat.ME`, `stat.ML`, `econ.EM`), Crossref, OpenAlex, Semantic Scholar |
+| `ECONOMICS_AND_GAME_THEORY` | Evolutionary game theory (replicator-mutator dynamics), Nash equilibrium, mechanism design, Bellman dynamic programming, Walrasian equilibria | arXiv (`econ.TH`, `cs.GT`, `q-fin`), Crossref, OpenAlex, Semantic Scholar |
+| `MATHEMATICS_CS_AND_INFO_THEORY` | Information theory (Shannon entropy, KL divergence, channel capacity), Markov chains, spectral graph theory, combinatorics | arXiv (`cs.IT`, `math.*`), OEIS, Crossref, OpenAlex, Wikipedia |
+
+When `LIFE_SCIENCES_AND_BIOMEDICINE` or `EPIDEMIOLOGY_AND_ECOLOGY` is active, `LiteratureSearchOrchestrator` and `FederatedLiteratureEngine` automatically activate resilient zero-key async connectors for **Europe PMC** (`ebi.ac.uk/europepmc/webservices/rest/search`) and **NCBI PubMed E-Utilities** (`esearch.fcgi` + `esummary.fcgi`) with strict 8-second HTTP timeouts and graceful fallback.
+
+### Pan-Scientific Unit Normalizer & Gated ReferenceRegistry
+
+The zero-token unit normalizer (`normalize_to_si` / `normalize_unit` in `invar_agent/research/extractor.py`) converts clinical, pharmacological, biological, epidemiological, climate, and information-theoretic units into canonical base units while preserving case-sensitive disambiguation (such as `cm = 0.01 m` versus `cM = 0.01 Morgan` and `M = 1000 mol/m^3`):
+
+- **Clinical, Pharmacological & Biochemical**: `M` (`1e3 mol/m^3`), `mM` (`1.0 mol/m^3`), `uM` (`1e-3 mol/m^3`), `nM` (`1e-6 mol/m^3`), `pM` (`1e-9 mol/m^3`), `mg/dL` (`1e-2 kg/m^3`), `ug/mL` (`1e-3 kg/m^3`), `ng/mL` (`1e-6 kg/m^3`), `mg/kg` (`1e-6 kg/kg`), `IU/L` (`1e3 IU/m^3`), `Da` (`1.66053906660e-27 kg`), `kDa` (`1.66053906660e-24 kg`), `kcal/mol` (`4184.0 J/mol`).
+- **Biological, Epidemiological & Genomic**: `bp` (`1.0 bp`), `kb` (`1e3 bp`), `Mb` (`1e6 bp`), `cM` (`0.01 Morgan`), `CFU/mL` (`1e6 m^-3`), `PFU/mL` (`1e6 m^-3`), `1/day` (`1 / 86400 1/s`), `1/year` (`1 / 31557600 1/s`).
+- **Climate, Earth-System & Astronomical**: `ppm` (`1e-6 fraction`), `ppb` (`1e-9 fraction`), `GtC` (`1e12 kg`), `PgC` (`1e12 kg`), `GtC/yr` (`1e12 / 31557600 kg/s`), `Sv` (`1e6 m^3/s`), `bar` (`1e5 Pa`), `atm` (`101325.0 Pa`), `au` (`1.495978707e11 m`), `pc` (`3.085677581491367e16 m`).
+- **Statistical, Economic & Information-Theoretic**: `bit` (`1.0 bit`), `nat` (`1 / ln(2) bit ≈ 1.4426950408889634 bit`), `dB` (`1.0 dB`), `%` (`0.01 fraction`), `bps` (`1e-4 fraction`).
+
+The curated `ReferenceRegistry` includes 7 word-boundary-gated pan-scientific domain packs (`epidemiology_population`, `pharmacology_biochemistry`, `genetics_evolution`, `climate_earth_systems`, `statistics_causal_inference`, `economics_game_theory`, `math_info_theory`) supplying canonical equations, benchmark values, and invariant templates only when explicit domain anchors appear in the research prompt.
+
+### Dimensionless Semantic Tags in Holographic Interaction Nets (HIN)
+
+In non-physical sciences, many state variables are dimensionless (`[0, 0, 0, 0, 0, 0, 0]`) yet semantically incompatible under addition or direct comparison (for example, adding a probability `p ∈ [0, 1]` to an economic utility `U` or Shannon entropy `H` in nats). `SIDimensionVector` (`invar_agent/_native/src/holographic_hin.rs`, `invar_agent/uast/schemas.py`) carries an orthogonal `semantic_tag: u8` field (default `0` for 100% backward compatibility):
+
+| `semantic_tag` | Semantic Domain | Domain & Algebraic Constraints |
+|---|---|---|
+| `0` (`SEMANTIC_PHYSICAL`) | Standard physical SI quantity or pure scalar | Checked by the 7-component SI exponent vector `[m, kg, s, A, K, mol, cd]` |
+| `1` (`SEMANTIC_PROBABILITY`) | Probability, allele/compartment fraction, receptor occupancy, prevalence | Bounded to `[0, 1]`; valid input to `logit(p)`, `norm_ppf(p)`, `kl_term(p, q)`, `shannon_term(p)` |
+| `2` (`SEMANTIC_INFORMATION`) | Shannon entropy, KL divergence, mutual information, log-likelihood (`nat` / `bit`) | Non-negative (`≥ 0` for entropy and KL divergence); incompatible with raw probabilities or utilities |
+| `3` (`SEMANTIC_POPULATION`) | Population count, individual/cell/virion count, base-pair length | Non-negative (`≥ 0`); ratios of identical-tag counts normalize to `SEMANTIC_PROBABILITY` (`tag = 1`) |
+| `4` (`SEMANTIC_STAT_METRIC`) | Correlation `r ∈ [-1, 1]`, `R^2 ∈ [0, 1]`, z-score, t-statistic, treatment effect `β` | Checked by statistical domain conditioners (Cauchy-Schwarz, Cramér-Rao, correlation bounds) |
+| `5` (`SEMANTIC_UTILITY`) | Economic payoff, game utility, welfare, log-return, fitness | Compatible with Bellman discounting and Nikaido-Isoda Nash exploitability regret |
+
+In the Rust HIN verifier (`unify_additive_dimensions`), adding two dimensionless wires with distinct non-zero semantic tags (`tag_a != 0 && tag_b != 0 && tag_a != tag_b`) immediately emits a `Semantic Tag Mismatch` diagnostic, while the `egg` equality-saturation e-graph (`csel_egraph.rs`) recognizes pan-scientific operators (`norm_cdf`, `norm_ppf`, `logistic_sigmoid`, `logit`, `hill_eq`, `michaelis_menten`, `kl_term`, `shannon_term`, `gammainc_reg`, `betainc_reg`) and algebraic identities (`kl_term(p, p) -> 0`, `logit(logistic_sigmoid(x)) -> x`, `logistic_sigmoid(logit(p)) -> p`).
+
+### Deterministic Stateless SplitMix64 PRNG, Statistical Intrinsics & 4 Execution Archetypes
+
+To make Monte Carlo simulations, stochastic biostatistics, causal inference, and quantitative biology 100% reproducible across Python smoke checks, Z3 concolic traces, and `-O3 -std=c++20` C-ABI execution without mutable global PRNG state:
+
+1. **Collision-Free Stateless SplitMix64 PRNG (`invar_splitmix64_stateless`)**:
+   Mixes `(seed, step, channel)` using distinct 64-bit Weyl constants (`0x9e3779b97f4a7c15` for `step` and `0xbf58476d1ce4e5b9` for `channel`) so diagonal calls `step == channel` never collide:
+   - `invar_rand_u01(seed, step, channel)`: Uniform variate strictly clamped to `[1e-15, 1.0 - 1e-15]`.
+   - `invar_rand_normal(seed, step, channel)`: Exact Box-Muller standard normal variate `N(0, 1)` guaranteed free of `log(0)` or `NaN`/`Inf`.
+   - `invar_rand_poisson(seed, step, lam)` and `invar_rand_binomial(seed, step, n, p)`: Deterministic Knuth/normal-approximated discrete variates.
+2. **Automatic Tier-0 `random.*` AST Lowering (`_lower_random_calls_tree`)**:
+   Strips `import random` before `PreWrite_Guard`, maintains an automatic monotonic step counter in `buf.data[62]`, and lowers `random.random()`, `random.uniform(a, b)`, `random.gauss(mu, sigma)`, `random.normalvariate(mu, sigma)`, `random.expovariate(lam)`, and `random.randint(a, b)` into stateless PRNG calls with unique per-callsite channel IDs.
+3. **Closed-Form Statistical, Pharmacological & Information-Theoretic Intrinsics**:
+   Exposed identically in Python globals, on the `math` module, and in the C++20 transpiler prelude:
+   - Online Welford accumulators: `welford_mean_update(mean, x, k)`, `welford_m2_update(m2, mean_old, mean_new, x)`, `welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y)`
+   - Gaussian & link functions: `norm_cdf(x)`, `norm_ppf(p)` (Acklam rational approximation on `clamp(p, 1e-15, 1 - 1e-15)`), `logistic_sigmoid(x)`, `logit(p)`
+   - Dose-response & enzyme kinetics: `hill_eq(c, ec50, n) = c^n / (ec50^n + c^n)`, `michaelis_menten(s, vmax, km) = (vmax * s) / (km + s)`
+   - Information theory & special functions: `kl_term(p, q) = p * ln(p / q) - p + q`, `shannon_term(p) = -p * ln(p)`, `gammainc_reg(a, x)`, `betainc_reg(a, b, x)`
+4. **4 Execution Archetypes over `SimulationBuffer`**:
+   - `ARCHETYPE_DYNAMICAL_STEPPER`: Continuous/discrete time-stepping `z[k+1] = Phi_dt(z[k])` for ODEs, PDEs, compartmental epidemiology, and carbon-cycle box models.
+   - `ARCHETYPE_MONTE_CARLO_ENSEMBLE`: Each step `k ∈ {0..N-1}` draws deterministic SplitMix64 variates and updates online Welford moments, 2SLS/OLS estimators, and confidence intervals.
+   - `ARCHETYPE_EQUILIBRIUM_FIXED_POINT`: Iterates contractive/damped best-response, replicator-mutator, or Bellman operators tracking Lyapunov decay (`D_KL(x* || x(t))`) and Nash regret `max_i(u_i - u_bar) -> 0`.
+   - `ARCHETYPE_PARAMETER_BIFURCATION_SWEEP`: Sweeps a control parameter (dose, reproduction number, coupling) across `steps` grid points to verify monotonicity, EC50 thresholds, and bifurcation invariants.
+
+### Generalized Arbitrary-K Simplex Projection & Statistical Domain Conditioners
+
+The Tier-0 deterministic AST normalizer (`invar_agent/healing/deterministic_ast.py`) inspects all blueprint contract invariants and automatically synthesizes domain-specific manifold projectors and statistical conditioners:
+
+- **Generalized Arbitrary-`K` Simplex Projector (`_invar_project_k_simplex`)**:
+  Automatically detects any `K`-slot sum conservation law (`K ≥ 2`), including `K = 2` biallelic frequencies (`p + q = 1`), `K = 3` `SIR` or 3-strategy Rock-Paper-Scissors replicator simplices (`x_1 + x_2 + x_3 = 1`), `K = 4` `SEIR` or 4-reservoir global carbon cycle inventories (`M_atm + M_surf + M_deep + M_bio = 41000 GtC`), `K = 5` `SEIR-V` vaccine models, and `K = 6` `SEIRHD` clinical cohorts. At the end of every step function, it clamps non-negative slots `buf.data[i_m] = max(0.0, buf.data[i_m])`, computes the current sum `_s_cur`, rescales each participating slot by `_invar_sdiv(_target_sum, _s_cur)` (or distributes `_target_sum / K` uniformly on underflow), and re-synchronizes local variable aliases.
+- **Statistical & Causal Inference Domain Conditioners**:
+  Enforces Cauchy-Schwarz covariance bounds (`|Cov(X, Y)| ≤ √(Var(X) * Var(Y))`), Cramér-Rao / Fisher information variance lower bounds (`Var(θ_hat) ≥ 1 / I_F(θ)`), Pearson correlation bounds (`-1.0 ≤ r ≤ 1.0`), probability/AUC/`R^2`/p-value unit-interval bounds (`0.0 ≤ p ≤ 1.0`), and Instrumental Variable (`2SLS` / Wald) versus confounded OLS estimation error ordering.
 
 ---
 

@@ -32,6 +32,16 @@ define_language! {
         "abs" = Abs([Id; 1]),
         "to_f64" = ToF64([Id; 1]),
         "to_i64" = ToI64([Id; 1]),
+        "norm_cdf" = NormCdf([Id; 1]),
+        "norm_ppf" = NormPpf([Id; 1]),
+        "logistic_sigmoid" = LogisticSigmoid([Id; 1]),
+        "logit" = Logit([Id; 1]),
+        "hill_eq" = HillEq([Id; 3]),
+        "michaelis_menten" = MichaelisMenten([Id; 3]),
+        "kl_term" = KlTerm([Id; 2]),
+        "shannon_term" = ShannonTerm([Id; 1]),
+        "gammainc_reg" = GammaincReg([Id; 2]),
+        "betainc_reg" = BetaincReg([Id; 3]),
     }
 }
 
@@ -54,6 +64,14 @@ pub fn make_ast_rewrite_rules() -> Vec<Rewrite> {
         rewrite!("to_i64-to_i64"; "(to_i64 (to_i64 ?x))" => "(to_i64 ?x)"),
         rewrite!("to_f64-to_i64"; "(to_f64 (to_i64 ?x))" => "(to_f64 ?x)"),
         rewrite!("to_i64-to_f64"; "(to_i64 (to_f64 ?x))" => "(to_i64 ?x)"),
+        // Pan-scientific domain rewrites
+        rewrite!("kl-self"; "(kl_term ?p ?p)" => "0"),
+        rewrite!("shannon-zero"; "(shannon_term 0)" => "0"),
+        rewrite!("hill-zero"; "(hill_eq 0 ?ec50 ?n)" => "0"),
+        rewrite!("mm-zero"; "(michaelis_menten 0 ?vmax ?km)" => "0"),
+        rewrite!("logit-sigmoid"; "(logit (logistic_sigmoid ?x))" => "?x"),
+        rewrite!("sigmoid-logit"; "(logistic_sigmoid (logit ?p))" => "?p"),
+        rewrite!("ppf-cdf"; "(norm_ppf (norm_cdf ?x))" => "?x"),
     ]
 }
 
@@ -160,6 +178,13 @@ fn build_enode(
             Err(format!("operator {} needs one argument", name))
         }
     };
+    let three = |kids: &[Id]| -> Result<[Id; 3], String> {
+        if kids.len() == 3 {
+            Ok([kids[0], kids[1], kids[2]])
+        } else {
+            Err(format!("operator {} needs three arguments", name))
+        }
+    };
 
     // Unknown operators are rejected (the caller returns the expression
     // unchanged) rather than being silently reinterpreted.
@@ -177,6 +202,16 @@ fn build_enode(
         "abs" | "fabs" => Ok(expr.add(AeroAstLanguage::Abs(one(kids)?))),
         "to_f64" => Ok(expr.add(AeroAstLanguage::ToF64(one(kids)?))),
         "to_i64" => Ok(expr.add(AeroAstLanguage::ToI64(one(kids)?))),
+        "norm_cdf" => Ok(expr.add(AeroAstLanguage::NormCdf(one(kids)?))),
+        "norm_ppf" => Ok(expr.add(AeroAstLanguage::NormPpf(one(kids)?))),
+        "logistic_sigmoid" => Ok(expr.add(AeroAstLanguage::LogisticSigmoid(one(kids)?))),
+        "logit" => Ok(expr.add(AeroAstLanguage::Logit(one(kids)?))),
+        "hill_eq" => Ok(expr.add(AeroAstLanguage::HillEq(three(kids)?))),
+        "michaelis_menten" => Ok(expr.add(AeroAstLanguage::MichaelisMenten(three(kids)?))),
+        "kl_term" => Ok(expr.add(AeroAstLanguage::KlTerm(two(kids)?))),
+        "shannon_term" => Ok(expr.add(AeroAstLanguage::ShannonTerm(one(kids)?))),
+        "gammainc_reg" => Ok(expr.add(AeroAstLanguage::GammaincReg(two(kids)?))),
+        "betainc_reg" => Ok(expr.add(AeroAstLanguage::BetaincReg(three(kids)?))),
         _ => Err(format!("unsupported call function: {}", name)),
     }
 }
@@ -224,6 +259,16 @@ fn rec_expr_to_value(expr: &RecExpr<AeroAstLanguage>, id: Id) -> Value {
         AeroAstLanguage::Abs([a]) => call_json("abs", &[a], expr),
         AeroAstLanguage::ToF64([a]) => call_json("to_f64", &[a], expr),
         AeroAstLanguage::ToI64([a]) => call_json("to_i64", &[a], expr),
+        AeroAstLanguage::NormCdf([a]) => call_json("norm_cdf", &[a], expr),
+        AeroAstLanguage::NormPpf([a]) => call_json("norm_ppf", &[a], expr),
+        AeroAstLanguage::LogisticSigmoid([a]) => call_json("logistic_sigmoid", &[a], expr),
+        AeroAstLanguage::Logit([a]) => call_json("logit", &[a], expr),
+        AeroAstLanguage::HillEq([a, b, c]) => call_json("hill_eq", &[a, b, c], expr),
+        AeroAstLanguage::MichaelisMenten([a, b, c]) => call_json("michaelis_menten", &[a, b, c], expr),
+        AeroAstLanguage::KlTerm([a, b]) => call_json("kl_term", &[a, b], expr),
+        AeroAstLanguage::ShannonTerm([a]) => call_json("shannon_term", &[a], expr),
+        AeroAstLanguage::GammaincReg([a, b]) => call_json("gammainc_reg", &[a, b], expr),
+        AeroAstLanguage::BetaincReg([a, b, c]) => call_json("betainc_reg", &[a, b, c], expr),
     }
 }
 

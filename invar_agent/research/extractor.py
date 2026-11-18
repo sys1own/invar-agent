@@ -90,9 +90,50 @@ _UNIT_TABLE: Dict[str, Tuple[float, str]] = {
     # thermal conductivity / specific heat / rates
     "W/(m*K)": (1.0, "W/(m*K)"), "W/(m K)": (1.0, "W/(m*K)"),
     "W/m/K": (1.0, "W/(m*K)"), "mW/(m*K)": (1e-3, "W/(m*K)"),
+    "W/(m^2*K)": (1.0, "W/(m^2*K)"), "W/(m^2 K)": (1.0, "W/(m^2*K)"),
     "J/(kg*K)": (1.0, "J/(kg*K)"), "J/(kg K)": (1.0, "J/(kg*K)"),
     "J/kg/K": (1.0, "J/(kg*K)"), "kJ/(kg*K)": (1e3, "J/(kg*K)"),
     "1/s": (1.0, "1/s"), "s^-1": (1.0, "1/s"), "Hz": (1.0, "1/s"),
+    # chemistry & pharmacology: molarity (1 M = 1 mol/L = 1e3 mol/m^3)
+    "M": (1e3, "mol/m^3"), "mol/L": (1e3, "mol/m^3"),
+    "mM": (1.0, "mol/m^3"), "mmol/L": (1.0, "mol/m^3"),
+    "uM": (1e-3, "mol/m^3"), "umol/L": (1e-3, "mol/m^3"),
+    "nM": (1e-6, "mol/m^3"), "nmol/L": (1e-6, "mol/m^3"),
+    "pM": (1e-9, "mol/m^3"), "pmol/L": (1e-9, "mol/m^3"),
+    "mol/m^3": (1.0, "mol/m^3"),
+    # clinical gravimetrics, doses, bio-mass, thermochemistry
+    "mg/dL": (1e-2, "kg/m^3"), "ug/mL": (1e-3, "kg/m^3"),
+    "ng/mL": (1e-6, "kg/m^3"), "mg/L": (1e-3, "kg/m^3"),
+    "mg/kg": (1e-6, "kg/kg"), "ug/kg": (1e-9, "kg/kg"),
+    "IU/L": (1e3, "IU/m^3"), "U/L": (1e3, "U/m^3"),
+    "Da": (1.66053906660e-27, "kg"), "kDa": (1.66053906660e-24, "kg"),
+    "MDa": (1.66053906660e-21, "kg"),
+    "kcal/mol": (4184.0, "J/mol"), "cal/mol": (4.184, "J/mol"),
+    "kJ/mol": (1e3, "J/mol"), "J/mol": (1.0, "J/mol"),
+    # biology, genetics & epidemiology
+    "bp": (1.0, "bp"), "kb": (1e3, "bp"), "Mb": (1e6, "bp"), "Gb": (1e9, "bp"),
+    "cM": (1e-2, "Morgan"), "Morgan": (1.0, "Morgan"),
+    "CFU/mL": (1e6, "m^-3"), "PFU/mL": (1e6, "m^-3"), "copies/mL": (1e6, "m^-3"),
+    "1/day": (1.0 / 86400.0, "1/s"), "day^-1": (1.0 / 86400.0, "1/s"),
+    "d^-1": (1.0 / 86400.0, "1/s"),
+    "1/year": (1.0 / 3.15576e7, "1/s"), "year^-1": (1.0 / 3.15576e7, "1/s"),
+    "yr^-1": (1.0 / 3.15576e7, "1/s"), "1/yr": (1.0 / 3.15576e7, "1/s"),
+    "1/h": (1.0 / 3600.0, "1/s"), "1/hr": (1.0 / 3600.0, "1/s"), "h^-1": (1.0 / 3600.0, "1/s"),
+    # earth, climate & astronomy
+    "ppm": (1e-6, "fraction"), "ppb": (1e-9, "fraction"), "ppt": (1e-12, "fraction"),
+    "GtC": (1e12, "kg"), "PgC": (1e12, "kg"), "GtCO2": (1e12, "kg"),
+    "GtC/yr": (1e12 / 3.15576e7, "kg/s"), "GtC/year": (1e12 / 3.15576e7, "kg/s"),
+    "PgC/yr": (1e12 / 3.15576e7, "kg/s"),
+    "Sv": (1e6, "m^3/s"),
+    "pc": (3.085677581491367e16, "m"), "kpc": (3.085677581491367e19, "m"),
+    "Mpc": (3.085677581491367e22, "m"), "ly": (9.4607304725808e15, "m"),
+    # information, statistics & economics
+    "bit": (1.0, "bit"), "bits": (1.0, "bit"),
+    "byte": (8.0, "bit"), "bytes": (8.0, "bit"),
+    "nat": (1.0 / math.log(2.0), "bit"), "nats": (1.0 / math.log(2.0), "bit"),
+    "dB": (1.0, "dB"),
+    "%": (0.01, "fraction"), "percent": (0.01, "fraction"),
+    "bps": (1e-4, "fraction"),
 }
 
 # Units that are safe to match case-insensitively (no SI-prefix ambiguity).
@@ -100,7 +141,11 @@ _CASE_INSENSITIVE_UNITS = {u.lower(): u for u in (
     "km/s", "km/h", "kg/m^3", "g/cm^3", "g/cc", "kg/L", "g/L", "atm", "bar",
     "kPa", "GPa", "W/m^2", "W/cm^2", "kW/m^2", "J/m^2", "J/cm^2", "eV", "keV",
     "deg", "degree", "degrees", "rad", "Gauss", "AU", "min", "hr", "yr", "day",
-    "days", "tonne", "tonnes", "ton", "tons", "g/mol", "kg/mol")}
+    "days", "tonne", "tonnes", "ton", "tons", "g/mol", "kg/mol",
+    "mg/dL", "ug/mL", "ng/mL", "mg/kg", "IU/L", "kcal/mol", "kJ/mol", "J/mol",
+    "CFU/mL", "PFU/mL", "1/day", "day^-1", "1/year", "year^-1", "yr^-1", "1/yr",
+    "ppm", "ppb", "GtC", "PgC", "GtC/yr", "PgC/yr", "pc", "kpc", "Mpc",
+    "bit", "bits", "nat", "nats", "dB", "bps", "percent", "Da", "kDa", "bp", "kb", "Sv")}
 
 
 def _canonical_unit(unit_str: str) -> str:
@@ -1001,6 +1046,188 @@ DOMAIN_REFERENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "invariants": ["integer sequence terms are exact (zero tolerance)",
                        "discounted asset price is a martingale: E[exp(-r T) S_T] == S_0"],
     },
+    "epidemiology_population": {
+        "keywords": ("kermack", "mckendrick", "seir", "seir-v", "seirhd", "sir model",
+                     "reproduction number", "herd immunity", "compartmental disease",
+                     "epidemic", "infectious disease", "predator-prey"),
+        "parameters": [
+            _p("baseline_transmission_rate", "beta_0", 0.60, "1/day", "Kermack-McKendrick SEIR benchmark"),
+            _p("incubation_rate", "sigma", 0.20, "1/day", "Kermack-McKendrick SEIR benchmark"),
+            _p("recovery_rate", "gamma", 0.10, "1/day", "Kermack-McKendrick SEIR benchmark"),
+            _p("basic_reproduction_number", "R_0", 6.0, "", "R_0 = beta_0 / gamma"),
+            _p("herd_immunity_threshold", "p_c", 1.0 - 1.0 / 6.0, "", "p_c = 1 - 1 / R_0"),
+        ],
+        "equations": [
+            ("R_0 = \\frac{\\beta}{\\gamma}", "Basic reproduction number"),
+            ("p_c = 1 - \\frac{1}{R_0}", "Herd immunity critical threshold"),
+            ("\\frac{dS}{dt} = -\\frac{\\beta S I}{N}", "Susceptible compartment decay"),
+            ("\\frac{dE}{dt} = \\frac{\\beta S I}{N} - \\sigma E", "Exposed compartment dynamics"),
+            ("\\frac{dI}{dt} = \\sigma E - \\gamma I", "Infectious compartment dynamics"),
+            ("R_{eff} = \\frac{\\beta_{eff}}{\\gamma} \\frac{S}{N}", "Effective reproduction number"),
+        ],
+        "benchmarks": [
+            {"name": "Epidemic suppression threshold", "input_regime": "SEIR / SEIR-V compartmental model",
+             "expected_value": 1.0, "unit": "R_eff", "tolerance": 1e-6,
+             "source": "Kermack & McKendrick (1927)"},
+        ],
+        "invariants": [
+            "sum_{i=1..K} C_i == N_pop (exact population conservation across compartments)",
+            "min(S, E, I, R, V) >= 0.0 (non-negativity of all compartments)",
+            "0.0 < R_eff < 1.0 in suppressed epidemic regime",
+        ],
+    },
+    "pharmacology_biochemistry": {
+        "keywords": ("pharmacokinetic", "pharmacodynamic", "pk/pd", "pk-pd", "hill-langmuir",
+                     "hill equation", "hill coefficient", "ec50", "ic50", "receptor occupancy",
+                     "hodgkin-huxley", "volume of distribution", "clearance"),
+        "parameters": [
+            _p("half_maximal_effective_concentration", "EC50", 0.50, "uM", "Hill-Langmuir PD benchmark"),
+            _p("hill_coefficient", "n_H", 2.0, "", "Hill-Langmuir cooperativity benchmark"),
+            _p("max_antiviral_efficacy", "E_max", 0.85, "", "Antiviral Hill inhibition benchmark"),
+        ],
+        "equations": [
+            ("\\theta_{Hill} = \\frac{C_p^n}{EC_{50}^n + C_p^n}", "Hill-Langmuir receptor occupancy"),
+            ("V_d = \\frac{Dose}{C_p}", "Volume of distribution"),
+            ("CL = k_{el} V_d", "Pharmacokinetic systemic clearance"),
+            ("v = \\frac{V_{max} S}{K_m (1 + I / K_i) + S}", "Michaelis-Menten competitive inhibition"),
+        ],
+        "benchmarks": [
+            {"name": "Hill occupancy at C_p = EC50", "input_regime": "C_p = EC50, any n_H > 0",
+             "expected_value": 0.5, "unit": "fraction", "tolerance": 1e-6,
+             "source": "Hill (1910)"},
+        ],
+        "invariants": [
+            "0.0 <= theta_Hill <= 1.0 (Hill receptor occupancy bounded to unit interval)",
+            "C_p >= 0.0 (non-negative plasma drug concentration)",
+        ],
+    },
+    "genetics_evolution": {
+        "keywords": ("hardy-weinberg", "wright-fisher", "price equation", "allele frequency",
+                     "genotype frequency", "population genetics", "directional selection",
+                     "linkage disequilibrium", "coalescent"),
+        "parameters": [
+            _p("selection_coefficient", "s_sel", 0.05, "", "Wright-Fisher directional selection"),
+            _p("mutation_rate_per_base", "mu_gen", 1.0e-8, "1/bp", "Population genetics typical rate"),
+        ],
+        "equations": [
+            ("p + q = 1", "Biallelic frequency conservation"),
+            ("f_{AA} = p^2", "Hardy-Weinberg homozygous dominant genotype frequency"),
+            ("f_{Aa} = 2 p q", "Hardy-Weinberg heterozygous genotype frequency"),
+            ("\\frac{dp}{dt} = \\frac{s p (1 - p)}{\\bar{w}}", "Wright-Fisher directional selection ODE"),
+        ],
+        "benchmarks": [
+            {"name": "Maximum heterozygosity 2pq", "input_regime": "Hardy-Weinberg equilibrium p = q = 0.5",
+             "expected_value": 0.5, "unit": "fraction", "tolerance": 1e-6,
+             "source": "Hardy (1908) & Weinberg (1908)"},
+        ],
+        "invariants": [
+            "abs(p + q - 1.0) <= 1e-12 (allele frequency simplex conservation)",
+            "abs(p**2 + 2*p*q + q**2 - 1.0) <= 1e-12 (Hardy-Weinberg genotype simplex)",
+            "0.0 <= p <= 1.0 and 0.0 <= q <= 1.0",
+        ],
+    },
+    "climate_earth_systems": {
+        "keywords": ("carbon cycle", "carbon-cycle", "revelle", "radiative forcing",
+                     "planck feedback", "terrestrial biosphere", "deep ocean", "surface ocean",
+                     "pre-industrial", "gtc", "pgc", "thermohaline"),
+        "parameters": [
+            _p("preindustrial_atmospheric_carbon", "M_atm_0", 590.0, "GtC", "IPCC AR6 Carbon Cycle"),
+            _p("total_carbon_inventory", "M_total", 41000.0, "GtC", "4-reservoir global carbon inventory"),
+            _p("co2_radiative_forcing_coeff", "alpha_CO2", 5.35, "W/m^2", "Myhre et al. (1998) Arrhenius forcing"),
+            _p("planck_feedback_parameter", "lambda_Planck", 1.25, "W/(m^2*K)", "CMIP6 radiative feedback"),
+            _p("revelle_buffer_factor_nominal", "gamma_Revelle", 10.0, "", "Revelle & Suess (1957)"),
+        ],
+        "equations": [
+            ("\\Delta F = 5.35 \\ln\\left(\\frac{M_{atm}}{M_{atm,0}}\\right)", "Arrhenius logarithmic CO2 radiative forcing [W/m^2]"),
+            ("C_{eff} \\frac{dT_{surf}}{dt} = \\Delta F - \\lambda_{Planck} T_{surf}", "Global surface temperature anomaly energy balance"),
+            ("M_{total} = M_{atm} + M_{bio} + M_{surf} + M_{deep}", "4-reservoir global carbon mass conservation"),
+        ],
+        "benchmarks": [
+            {"name": "Doubled-CO2 radiative forcing (2x M_atm_0)", "input_regime": "M_atm / M_atm_0 = 2.0",
+             "expected_value": 3.7083, "unit": "W/m^2", "tolerance": 0.05,
+             "source": "Myhre et al. (1998)"},
+        ],
+        "invariants": [
+            "abs((M_atm + M_bio + M_surf + M_deep) - M_total) <= 1e-6 (total carbon mass conservation)",
+            "min(M_atm, M_bio, M_surf, M_deep) > 0.0 (strictly positive reservoir inventories)",
+            "8.0 <= gamma_Revelle <= 15.0 (physical Revelle carbonate buffer bounds)",
+            "dV_climate <= 0.0 (monotonic free-energy Lyapunov relaxation in unforced regime)",
+        ],
+    },
+    "statistics_causal_inference": {
+        "keywords": ("structural causal model", "instrumental variable", "2sls", "two-stage least squares",
+                     "wald estimator", "cramer-rao", "cramér-rao", "fisher information",
+                     "unmeasured confounder", "confounding bias", "do-calculus", "average treatment effect",
+                     "welford"),
+        "parameters": [
+            _p("true_causal_effect_benchmark", "beta_true", 2.0, "", "SCM Instrumental Variable benchmark"),
+            _p("first_stage_instrument_strength", "pi_Z", 0.8, "", "SCM first-stage Z -> X coefficient"),
+        ],
+        "equations": [
+            ("\\beta_{OLS} = \\frac{Cov(X, Y)}{Var(X)}", "Ordinary Least Squares (OLS) slope estimator"),
+            ("\\beta_{IV} = \\frac{Cov(Z, Y)}{Cov(Z, X)}", "Instrumental Variable (IV) Wald / 2SLS estimator"),
+            ("Var(\\hat{\\theta}) = \\frac{1}{I_F(\\theta)}", "Cramer-Rao Fisher Information variance lower bound"),
+            ("r_{XZ} = \\frac{Cov(X, Z)}{\\sqrt{Var(X) Var(Z)}}", "Pearson sample correlation coefficient"),
+        ],
+        "benchmarks": [
+            {"name": "Asymptotic IV consistency under unmeasured confounding", "input_regime": "Z _||_ U, Cov(Z, X) != 0",
+             "expected_value": 2.0, "unit": "beta_IV", "tolerance": 0.05,
+             "source": "Wald (1940) & Pearl (2000)"},
+        ],
+        "invariants": [
+            "abs(Cov_XZ) <= sqrt(Var_X * Var_Z) (Cauchy-Schwarz covariance inequality)",
+            "-1.0 <= r_XZ <= 1.0 (correlation bound)",
+            "Var_beta_IV >= CRLB_floor and CRLB_floor > 0.0 (Cramer-Rao variance lower bound)",
+            "abs(beta_IV - beta_true) <= 0.05 (deconfounded IV consistency)",
+        ],
+    },
+    "economics_game_theory": {
+        "keywords": ("replicator", "replicator-mutator", "nash equilibrium", "exploitability",
+                     "nikaido-isoda", "rock-paper-scissors", "evolutionary game", "payoff matrix",
+                     "bellman", "walrasian", "vcg mechanism", "regret"),
+        "parameters": [
+            _p("interior_nash_3simplex", "p_star", 1.0 / 3.0, "", "Symmetric 3-strategy Nash equilibrium"),
+            _p("mutation_damping_rate", "mu_mut", 0.05, "", "Replicator-mutator interior convergence rate"),
+        ],
+        "equations": [
+            ("\\frac{dp_i}{dt} = p_i (f_i - \\bar{f}) + \\mu (p_i^* - p_i)", "Damped replicator-mutator dynamics on K-simplex"),
+            ("D_{KL}(p^* || p) = p_1^* \\ln\\left(\\frac{p_1^*}{p_1}\\right)", "Kullback-Leibler relative-entropy Lyapunov divergence"),
+            ("\\Psi_{regret} = \\max(0, f_i - \\bar{f})", "Nikaido-Isoda Nash exploitability regret"),
+        ],
+        "benchmarks": [
+            {"name": "Symmetric 3-strategy Nash fixed point", "input_regime": "Cyclic RPS with positive mutation/damping",
+             "expected_value": [0.333333333333, 0.333333333333, 0.333333333333], "unit": "probability",
+             "tolerance": 1e-3, "source": " Maynard Smith (1982) & Hofbauer-Sigmund (1998)"},
+        ],
+        "invariants": [
+            "abs((p_1 + p_2 + p_3) - 1.0) <= 1e-12 (unit 3-simplex probability conservation)",
+            "min(p_1, p_2, p_3) >= 0.0 (non-negative strategy frequencies)",
+            "D_KL >= 0.0 and d_D_KL <= 0.0 (monotonic KL Lyapunov contraction)",
+            "0.0 <= Psi_regret <= 1e-4 (Nash exploitability convergence)",
+        ],
+    },
+    "math_info_theory": {
+        "keywords": ("shannon-hartley", "channel capacity", "shannon entropy", "source coding",
+                     "kullback-leibler", "mutual information", "rate-distortion", "hamming bound",
+                     "ergodic markov", "spectral gap"),
+        "parameters": [
+            _p("binary_entropy_max", "H_2_max", 1.0, "bit", "Shannon (1948) binary source entropy limit"),
+            _p("nat_to_bit_factor", "log2_e", 1.0 / math.log(2.0), "bit", "1 / ln(2)"),
+        ],
+        "equations": [
+            ("C = B \\log_2\\left(1 + \\frac{S}{N}\\right)", "Shannon-Hartley AWGN channel capacity [bit/s]"),
+            ("H = -p \\ln(p) - (1 - p) \\ln(1 - p)", "Binary Shannon entropy [nat]"),
+        ],
+        "benchmarks": [
+            {"name": "Shannon capacity at SNR = 1 (0 dB)", "input_regime": "S/N = 1.0, B = 1.0 Hz",
+             "expected_value": 1.0, "unit": "bit/s", "tolerance": 1e-6,
+             "source": "Shannon (1948)"},
+        ],
+        "invariants": [
+            "H_shannon >= 0.0 and D_KL >= 0.0 (non-negativity of Shannon entropy and KL divergence)",
+            "R_transmission <= C_shannon (Shannon channel coding capacity bound)",
+        ],
+    },
 }
 
 
@@ -1030,7 +1257,125 @@ _REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
     "discrete_finance": ("black-scholes", "black scholes",
                          "catalan", "option pricing", "binomial model",
                          "lattice model", "risk-neutral"),
+    "epidemiology_population": ("kermack", "mckendrick", "seir", "seir-v", "seirhd",
+                                "sir model", "reproduction number", "herd immunity",
+                                "infectious disease", "epidemic"),
+    "pharmacology_biochemistry": ("pharmacokinetic", "pharmacodynamic", "pk/pd", "pk-pd",
+                                  "hill-langmuir", "hill coefficient", "ec50", "ic50",
+                                  "receptor occupancy", "hodgkin-huxley", "antiviral"),
+    "genetics_evolution": ("hardy-weinberg", "wright-fisher", "price equation",
+                           "allele frequency", "genotype frequency", "population genetics"),
+    "climate_earth_systems": ("carbon cycle", "carbon-cycle", "revelle", "radiative forcing",
+                              "planck feedback", "terrestrial biosphere", "deep ocean",
+                              "surface ocean", "gtc", "pgc"),
+    "statistics_causal_inference": ("structural causal model", "instrumental variable",
+                                    "2sls", "two-stage least squares", "wald estimator",
+                                    "cramer-rao", "cramér-rao", "fisher information",
+                                    "unmeasured confounder", "confounding bias", "do-calculus",
+                                    "welford"),
+    "economics_game_theory": ("replicator", "replicator-mutator", "nash equilibrium",
+                              "exploitability", "nikaido-isoda", "rock-paper-scissors",
+                              "evolutionary game", "bellman", "walrasian", "vcg mechanism"),
+    "math_info_theory": ("shannon-hartley", "channel capacity", "shannon entropy",
+                         "source coding", "kullback-leibler", "mutual information",
+                         "rate-distortion"),
 }
+
+
+ReferenceRegistry = DOMAIN_REFERENCE_REGISTRY
+
+MACRO_SCIENTIFIC_DOMAINS: Tuple[str, ...] = (
+    "PHYSICAL_SCIENCES_AND_ENG",
+    "CHEMICAL_AND_MATERIALS",
+    "LIFE_SCIENCES_AND_BIOMEDICINE",
+    "EPIDEMIOLOGY_AND_ECOLOGY",
+    "EARTH_CLIMATE_AND_ENVIRONMENT",
+    "STATISTICS_AND_CAUSAL_INFERENCE",
+    "ECONOMICS_AND_GAME_THEORY",
+    "MATHEMATICS_CS_AND_INFO_THEORY",
+)
+
+_MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "PHYSICAL_SCIENCES_AND_ENG": (
+        "quantum", "relativit", "lorentz", "plasma", "fluid dynamics", "navier-stokes",
+        "condensed matter", "astrodynamics", "orbital", "thermodynamic", "electromagnet",
+        "maxwell", "hamiltonian", "lindblad", "bloch", "soliton", "korteweg", "kdv",
+        "aeroshell", "sutton-graves", "hypersonic", "schrodinger", "magnetism",
+    ),
+    "CHEMICAL_AND_MATERIALS": (
+        "reaction kinetic", "chemical kinetic", "catalys", "electrochem", "battery",
+        "degradation", "sei growth", "polymer", "thermochem", "arrhenius", "robertson",
+        "oregonator", "stoichiometr", "tungsten", "silicon carbide", "material science",
+        "molarity", "redox", "butler-volmer",
+    ),
+    "LIFE_SCIENCES_AND_BIOMEDICINE": (
+        "systems biology", "michaelis-menten", "enzyme", "genomic", "gene regulatory",
+        "population genetics", "hardy-weinberg", "wright-fisher", "pharmacolog",
+        "pharmacokinetic", "pharmacodynamic", "pk/pd", "pk-pd", "hill-langmuir",
+        "hill coefficient", "ec50", "ic50", "receptor occupancy", "oncolog", "tumor",
+        "neuroscience", "hodgkin-huxley", "membrane potential", "biophysic", "antiviral",
+        "clearance", "volume of distribution", "allele", "clinical",
+    ),
+    "EPIDEMIOLOGY_AND_ECOLOGY": (
+        "epidemiolog", "infectious disease", "seir", "seir-v", "seirhd", "sir model",
+        "compartmental", "kermack", "mckendrick", "reproduction number", "herd immunity",
+        "vector-borne", "metapopulation", "lotka-volterra", "predator-prey", "food web",
+        "biodiversity", "island biogeography", "outbreak", "transmission rate",
+        "vaccination", "epidemic", "ecolog",
+    ),
+    "EARTH_CLIMATE_AND_ENVIRONMENT": (
+        "radiative-convective", "radiative forcing", "carbon cycle", "carbon-cycle",
+        "reservoir", "revelle", "ocean carbonate", "thermohaline", "hydrolog",
+        "geophysic", "terrestrial biosphere", "deep ocean", "surface ocean",
+        "planck feedback", "climate feedback", "gtc", "pgc", "sverdrup", "albedo",
+        "greenhouse", "temperature anomaly",
+    ),
+    "STATISTICS_AND_CAUSAL_INFERENCE": (
+        "bayesian inference", "neyman-pearson", "hypothesis test", "cramer-rao",
+        "cramér-rao", "fisher information", "structural causal model", "do-calculus",
+        "potential outcome", "average treatment effect", "instrumental variable",
+        "2sls", "two-stage least squares", "wald estimator", "difference-in-differences",
+        "unmeasured confound", "confounding bias", "ordinary least squares", "welford",
+        "biostatistic", "covariance", "p-value", "estimator variance",
+    ),
+    "ECONOMICS_AND_GAME_THEORY": (
+        "game theory", "evolutionary game", "nash equilibrium", "replicator",
+        "replicator-mutator", "exploitability", "nikaido-isoda", "rock-paper-scissors",
+        "prisoner's dilemma", "mechanism design", "vcg", "bellman", "dynamic programming",
+        "walrasian", "dsge", "macroeconomic", "quantitative finance", "black-scholes",
+        "martingale", "utility", "payoff matrix", "regret",
+    ),
+    "MATHEMATICS_CS_AND_INFO_THEORY": (
+        "information theory", "channel coding", "shannon-hartley", "shannon entropy",
+        "kullback-leibler", "source coding", "spectral graph", "markov chain",
+        "algorithmic complexity", "combinator", "number theory", "catalan", "fibonacci",
+        "rate-distortion", "mutual information", "ergodic",
+    ),
+}
+
+
+def classify_macro_scientific_domains(text: str) -> List[str]:
+    """Zero-shot NLP classification mapping a prompt/query into the 8 Macro-Scientific Domains.
+
+    Returns matched domains sorted by match score (descending); defaults to
+    ``["PHYSICAL_SCIENCES_AND_ENG"]`` when no domain keyword matches.
+    """
+    t = (text or "").lower()
+    scores: List[Tuple[int, int, str]] = []
+    for idx, domain in enumerate(MACRO_SCIENTIFIC_DOMAINS):
+        kws = _MACRO_DOMAIN_KEYWORDS.get(domain, ())
+        hits = sum(1 for kw in kws if kw in t)
+        if hits > 0:
+            scores.append((hits, -idx, domain))
+    if not scores:
+        return ["PHYSICAL_SCIENCES_AND_ENG"]
+    scores.sort(reverse=True)
+    return [d for _, _, d in scores]
+
+
+def classify_primary_macro_domain(text: str) -> str:
+    """Return the highest-scoring macro-scientific domain for ``text``."""
+    return classify_macro_scientific_domains(text)[0]
 
 
 def classify_registry_domains(text: str) -> List[str]:
@@ -1392,3 +1737,13 @@ def evidence_si_constants(evidence: Optional[StructuredResearchEvidence]) -> Dic
     if evidence is None:
         return {}
     return {name: float(p.si_value) for name, p in evidence.parameters.items()}
+
+
+normalize_unit = normalize_to_si
+
+
+def lookup_reference_registry(text: str) -> List[ExtractedParameter]:
+    """Convenience wrapper returning matched reference parameters for ``text``."""
+    params, _eqs, _bench, _inv, _doms = registry_evidence(text)
+    return params
+

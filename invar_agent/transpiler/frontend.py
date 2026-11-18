@@ -27,9 +27,29 @@ MATH_FUNCS = {
     "erf", "erfc", "gamma", "lgamma",
     "isfinite", "isnan", "isinf", "radians", "degrees",
 }
-INTRINSIC_ALIASES = {"clamp": "clamp", "clip": "clamp", "sign": "sign",
-                     "sgn": "sign", "sq": "sq", "lerp": "lerp",
-                     "safe_div": "safe_div"}
+INTRINSIC_ALIASES = {
+    "clamp": "clamp", "clip": "clamp", "sign": "sign",
+    "sgn": "sign", "sq": "sq", "lerp": "lerp",
+    "safe_div": "safe_div",
+    "invar_splitmix64_stateless": "invar_splitmix64_stateless",
+    "invar_rand_u01": "invar_rand_u01",
+    "invar_rand_normal": "invar_rand_normal",
+    "invar_rand_poisson": "invar_rand_poisson",
+    "invar_rand_binomial": "invar_rand_binomial",
+    "welford_mean_update": "welford_mean_update",
+    "welford_m2_update": "welford_m2_update",
+    "welford_cov_update": "welford_cov_update",
+    "norm_cdf": "norm_cdf",
+    "norm_ppf": "norm_ppf",
+    "logistic_sigmoid": "logistic_sigmoid",
+    "logit": "logit",
+    "hill_eq": "hill_eq",
+    "michaelis_menten": "michaelis_menten",
+    "kl_term": "kl_term",
+    "shannon_term": "shannon_term",
+    "gammainc_reg": "gammainc_reg",
+    "betainc_reg": "betainc_reg",
+}
 _NP_MATH_ALIASES = {
     "arcsin": "asin", "arccos": "acos", "arctan": "atan", "arctan2": "atan2",
     "arcsinh": "asinh", "arccosh": "acosh", "arctanh": "atanh",
@@ -231,13 +251,16 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
                     and func.id not in local:
                 func_node = {"type": "reference",
                              "name": INTRINSIC_ALIASES[func.id]}
+            elif fname.startswith("math.") and fname.split(".", 1)[1] in INTRINSIC_ALIASES:
+                attr = fname.split(".", 1)[1]
+                func_node = {"type": "reference", "name": INTRINSIC_ALIASES[attr]}
             elif fname.startswith(("np.", "numpy.")):
                 attr = fname.split(".", 1)[1]
                 if attr in {"clip", "sign", "sgn"}:
                     func_node = {"type": "reference",
                                  "name": {"clip": "clamp", "sgn": "sign"}.get(attr, attr)}
-                elif attr in {"sq", "lerp", "safe_div"}:
-                    func_node = {"type": "reference", "name": attr}
+                elif attr in INTRINSIC_ALIASES:
+                    func_node = {"type": "reference", "name": INTRINSIC_ALIASES[attr]}
                 elif attr in NP_MATH_FUNCS:
                     mapped_attr = _NP_MATH_ALIASES.get(attr, attr)
                     func_node = {"type": "reference", "name": f"math.{mapped_attr}"}

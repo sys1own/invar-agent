@@ -34,6 +34,9 @@ WIKIDATA_SEARCH = "https://www.wikidata.org/w/api.php"
 WIKIDATA_ENTITIES = "https://www.wikidata.org/w/api.php"
 OEIS_SEARCH = "https://oeis.org/search"
 PUBCHEM_PROPERTIES = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+EUROPE_PMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+NCBI_ESEARCH_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+NCBI_ESUMMARY_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
 USER_AGENT = ("InvarAgent/1.0 (https://github.com/sys1own/invar-agent; "
               "mailto:research@invar-agent.local")
@@ -449,6 +452,7 @@ _CHANNEL_BY_DOMAIN = {
     "constants": ("wikipedia", "wikidata", "openalex"),
     "discrete_oeis": ("oeis", "arxiv"),
     "chemical_pubchem": ("pubchem", "semantic_scholar"),
+    "biomed_epmc_pubmed": ("europe_pmc", "pubmed"),
 }
 
 
@@ -456,9 +460,10 @@ def classify_research_domain(prompt_or_query: str) -> set:
     """Route a prompt to research channels.
 
     Returns a subset of ``{"equations", "peer_reviewed", "constants",
-    "discrete_oeis", "chemical_pubchem"}``. Every prompt gets
-    ``peer_reviewed`` + ``equations`` + ``constants`` unless it is clearly
-    discrete or chemical, in which case the dedicated channels are added.
+    "discrete_oeis", "chemical_pubchem", "biomed_epmc_pubmed"}``. Every prompt
+    gets ``peer_reviewed`` + ``equations`` + ``constants`` unless it is clearly
+    discrete, chemical, or biomedical/epidemiological, in which case the
+    dedicated channels are added.
     """
     t = (prompt_or_query or "").lower()
     channels = {"equations", "peer_reviewed", "constants"}
@@ -470,15 +475,22 @@ def classify_research_domain(prompt_or_query: str) -> set:
             if re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", padded):
                 channels.add(domain)
                 break
-    # Pure discrete/chemical prompts keep the core channels too (equations
-    # still apply), but skip nothing: OEIS/PubChem are additive.
+    try:
+        from .extractor import classify_macro_scientific_domains
+        macro_domains = set(classify_macro_scientific_domains(prompt_or_query or ""))
+        if macro_domains & {"LIFE_SCIENCES_AND_BIOMEDICINE", "EPIDEMIOLOGY_AND_ECOLOGY"}:
+            channels.add("biomed_epmc_pubmed")
+    except Exception:  # noqa: BLE001
+        pass
+    # Pure discrete/chemical/biomedical prompts keep the core channels too
+    # (equations still apply), but skip nothing: OEIS/PubChem/EuropePMC/PubMed are additive.
     return channels
 
 
 def _channels_for_prompt(prompt_or_query: str) -> List[str]:
     channels = classify_research_domain(prompt_or_query)
     sources: List[str] = []
-    for channel in ("peer_reviewed", "equations", "constants",
+    for channel in ("biomed_epmc_pubmed", "peer_reviewed", "equations", "constants",
                     "discrete_oeis", "chemical_pubchem"):
         if channel in channels:
             for src in _CHANNEL_BY_DOMAIN[channel]:
@@ -788,6 +800,12 @@ class LiteratureSearchClient:
                 raw_count = len(results)
             elif source == "pubchem":
                 results = self._search_pubchem(query, limit)
+                raw_count = len(results)
+            elif source in ("europe_pmc", "europepmc"):
+                results = self._search_europe_pmc(query, limit)
+                raw_count = len(results)
+            elif source in ("pubmed", "ncbi_pubmed"):
+                results = self._search_pubmed(query, limit)
                 raw_count = len(results)
             else:
                 return cached or []
@@ -1132,6 +1150,137 @@ class LiteratureSearchClient:
             "pubchem", f"PubChem: {title}", "; ".join(snippets)[:1200],
             f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}", badge="PubChem",
             constants=constants)]
+
+    def _search_europe_pmc(self, query: str, limit: int = 10,
+                           cursor_mark: str = "*") -> List[LiteratureResult]:
+        """Zero-API-key Europe PMC REST connector with strict 8s timeout and cursorMark support."""
+        page_size = min(max(int(limit or 10), 1), 10)
+        url = (
+            f"{EUROPE_PMC_API}?query={urllib.parse.quote(query)}"
+            f"&format=json&resultType=core&pageSize={page_size}"
+            f"&cursorMark={urllib.parse.quote(cursor_mark)}"
+        )
+        timeout = min(float(self.timeout or 8.0), 8.0)
+        try:
+            payload = self._fetch(url, timeout)
+            data = json.loads(payload)
+        except Exception:  # noqa: BLE001
+            return []
+        items = ((data.get("resultList") or {}).get("result")) or []
+        out: List[LiteratureResult] = []
+        for item in items[:page_size]:
+            if not isinstance(item, dict):
+                continue
+            title = _strip_markup(str(item.get("title") or "")).strip()
+            if not title:
+                continue
+            abstract = _strip_markup(str(item.get("abstractText") or "")).strip()
+            pmid = str(item.get("pmid") or "").strip()
+            pmcid = str(item.get("pmcid") or "").strip()
+            doi = str(item.get("doi") or "").strip()
+            pub_year = item.get("pubYear")
+            year = int(str(pub_year)[:4]) if pub_year and str(pub_year)[:4].isdigit() else None
+            cited = item.get("citedByCount")
+            citation_count = int(cited) if isinstance(cited, (int, float)) else None
+            if pmcid:
+                article_url = f"https://europepmc.org/article/PMC/{pmcid}"
+            elif pmid:
+                article_url = f"https://europepmc.org/article/MED/{pmid}"
+            elif doi:
+                article_url = f"https://doi.org/{doi}"
+            else:
+                article_url = ""
+            constants: Dict[str, Any] = {}
+            if abstract:
+                try:
+                    from .extractor import extract_parameters_from_text
+                    for p in extract_parameters_from_text(abstract, source="EuropePMC")[:10]:
+                        constants[p.name] = {
+                            "value": p.si_value,
+                            "unit": p.si_unit,
+                            "raw_value": p.raw_value,
+                            "raw_unit": p.raw_unit,
+                        }
+                except Exception:  # noqa: BLE001
+                    pass
+            out.append(
+                LiteratureResult(
+                    source="europe_pmc",
+                    title=title,
+                    summary=abstract[:1200],
+                    url=article_url,
+                    year=year,
+                    badge="EuropePMC",
+                    citation_count=citation_count,
+                    constants=constants,
+                )
+            )
+        return out
+
+    def _search_pubmed(self, query: str, limit: int = 10) -> List[LiteratureResult]:
+        """Zero-API-key NCBI PubMed E-utilities connector (esearch.fcgi + esummary.fcgi, retmode=json)."""
+        retmax = min(max(int(limit or 10), 1), 10)
+        esearch_url = (
+            f"{NCBI_ESEARCH_API}?db=pubmed&term={urllib.parse.quote(query)}"
+            f"&usehistory=y&retmode=json&retmax={retmax}"
+        )
+        timeout = min(float(self.timeout or 8.0), 8.0)
+        try:
+            esearch_payload = self._fetch(esearch_url, timeout)
+            esearch_data = json.loads(esearch_payload)
+        except Exception:  # noqa: BLE001
+            return []
+        es_res = esearch_data.get("esearchresult") or {}
+        idlist = [str(x).strip() for x in (es_res.get("idlist") or []) if str(x).strip()]
+        webenv = str(es_res.get("webenv") or "").strip()
+        querykey = str(es_res.get("querykey") or "").strip()
+        if not idlist and not (webenv and querykey):
+            return []
+        if idlist:
+            esummary_url = (
+                f"{NCBI_ESUMMARY_API}?db=pubmed&id={urllib.parse.quote(','.join(idlist[:retmax]))}"
+                f"&retmode=json"
+            )
+        else:
+            esummary_url = (
+                f"{NCBI_ESUMMARY_API}?db=pubmed&query_key={urllib.parse.quote(querykey)}"
+                f"&WebEnv={urllib.parse.quote(webenv)}&retmax={retmax}&retmode=json"
+            )
+        try:
+            esummary_payload = self._fetch(esummary_url, timeout)
+            esummary_data = json.loads(esummary_payload)
+        except Exception:  # noqa: BLE001
+            return []
+        res_map = esummary_data.get("result") or {}
+        uids = res_map.get("uids") or idlist
+        out: List[LiteratureResult] = []
+        for uid in uids[:retmax]:
+            doc = res_map.get(str(uid))
+            if not isinstance(doc, dict):
+                continue
+            title = _strip_markup(str(doc.get("title") or "")).strip()
+            if not title:
+                continue
+            source_j = str(doc.get("fulljournalname") or doc.get("source") or "").strip()
+            pubdate = str(doc.get("pubdate") or "")
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", pubdate)
+            year = int(m_yr.group(1)) if m_yr else None
+            authors = ", ".join(
+                str(a.get("name") or "") for a in (doc.get("authors") or [])[:4] if isinstance(a, dict)
+            )
+            summary_parts = [p for p in (source_j, pubdate, authors) if p]
+            summary = " — ".join(summary_parts)
+            out.append(
+                LiteratureResult(
+                    source="pubmed",
+                    title=title,
+                    summary=summary[:1200],
+                    url=f"https://pubmed.ncbi.nlm.nih.gov/{uid}/",
+                    year=year,
+                    badge="PubMed",
+                )
+            )
+        return out
 
     # -- deterministic disk cache -----------------------------------------
     def clear_cache(self) -> int:

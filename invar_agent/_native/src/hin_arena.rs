@@ -17,6 +17,8 @@ use serde::Serialize;
 use serde_json::Value;
 use smallvec::SmallVec;
 
+pub use crate::holographic_hin::SIDimensionVector;
+
 /// MELL structural type used for port annotations.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind")]

@@ -43,6 +43,16 @@ define_language! {
         "smooth_clamp" = SmoothClamp([Id; 3]),
         "where" = Where([Id; 3]),
         "imex_split" = ImexSplit([Id; 2]),
+        "norm_cdf" = NormCdf([Id; 1]),
+        "norm_ppf" = NormPpf([Id; 1]),
+        "logistic_sigmoid" = LogisticSigmoid([Id; 1]),
+        "logit" = Logit([Id; 1]),
+        "hill_eq" = HillEq([Id; 3]),
+        "michaelis_menten" = MichaelisMenten([Id; 3]),
+        "kl_term" = KlTerm([Id; 2]),
+        "shannon_term" = ShannonTerm([Id; 1]),
+        "gammainc_reg" = GammaincReg([Id; 2]),
+        "betainc_reg" = BetaincReg([Id; 3]),
     }
 }
 
@@ -97,6 +107,14 @@ pub fn make_csel_rewrite_rules() -> Vec<CselRewrite> {
         rewrite!("div-factor-r"; "(safe_div (* ?b ?a) ?a)" => "?b" if is_not_zero("?a")),
         // 5. Separation of Stiff Linear Decay
         rewrite!("stiff-sep"; "(+ (* ?k ?x) ?nonlinear)" => "(imex_split (* ?k ?x) ?nonlinear)" if is_stiff_operator("?k")),
+        // 6. Pan-Scientific Domain Identities
+        rewrite!("kl-self"; "(kl_term ?p ?p)" => "0"),
+        rewrite!("shannon-zero"; "(shannon_term 0)" => "0"),
+        rewrite!("hill-zero"; "(hill_eq 0 ?ec50 ?n)" => "0"),
+        rewrite!("mm-zero"; "(michaelis_menten 0 ?vmax ?km)" => "0"),
+        rewrite!("logit-sigmoid"; "(logit (logistic_sigmoid ?x))" => "?x"),
+        rewrite!("sigmoid-logit"; "(logistic_sigmoid (logit ?p))" => "?p"),
+        rewrite!("ppf-cdf"; "(norm_ppf (norm_cdf ?x))" => "?x"),
     ]
 }
 
@@ -152,6 +170,16 @@ fn csel_to_recexpr(expr: &CselExpr, rec: &mut RecExpr<CselLanguage>) -> Id {
                 "smooth_clamp" => rec.add(CselLanguage::SmoothClamp([g0, g1, g2])),
                 "where" => rec.add(CselLanguage::Where([g0, g1, g2])),
                 "imex_split" => rec.add(CselLanguage::ImexSplit([g0, g1])),
+                "norm_cdf" => rec.add(CselLanguage::NormCdf([g0])),
+                "norm_ppf" => rec.add(CselLanguage::NormPpf([g0])),
+                "logistic_sigmoid" => rec.add(CselLanguage::LogisticSigmoid([g0])),
+                "logit" => rec.add(CselLanguage::Logit([g0])),
+                "hill_eq" => rec.add(CselLanguage::HillEq([g0, g1, g2])),
+                "michaelis_menten" => rec.add(CselLanguage::MichaelisMenten([g0, g1, g2])),
+                "kl_term" => rec.add(CselLanguage::KlTerm([g0, g1])),
+                "shannon_term" => rec.add(CselLanguage::ShannonTerm([g0])),
+                "gammainc_reg" => rec.add(CselLanguage::GammaincReg([g0, g1])),
+                "betainc_reg" => rec.add(CselLanguage::BetaincReg([g0, g1, g2])),
                 _ => g0,
             }
         }
@@ -205,6 +233,16 @@ fn recexpr_to_csel(rec: &RecExpr<CselLanguage>, id: Id) -> CselExpr {
         CselLanguage::Expm1([a]) => CselExpr::Call { func: "expm1".into(), args: vec![recexpr_to_csel(rec, *a)] },
         CselLanguage::SmoothClamp([a, b, c]) => CselExpr::Call { func: "smooth_clamp".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b), recexpr_to_csel(rec, *c)] },
         CselLanguage::Where([a, b, c]) => CselExpr::Call { func: "where".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b), recexpr_to_csel(rec, *c)] },
+        CselLanguage::NormCdf([a]) => CselExpr::Call { func: "norm_cdf".into(), args: vec![recexpr_to_csel(rec, *a)] },
+        CselLanguage::NormPpf([a]) => CselExpr::Call { func: "norm_ppf".into(), args: vec![recexpr_to_csel(rec, *a)] },
+        CselLanguage::LogisticSigmoid([a]) => CselExpr::Call { func: "logistic_sigmoid".into(), args: vec![recexpr_to_csel(rec, *a)] },
+        CselLanguage::Logit([a]) => CselExpr::Call { func: "logit".into(), args: vec![recexpr_to_csel(rec, *a)] },
+        CselLanguage::HillEq([a, b, c]) => CselExpr::Call { func: "hill_eq".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b), recexpr_to_csel(rec, *c)] },
+        CselLanguage::MichaelisMenten([a, b, c]) => CselExpr::Call { func: "michaelis_menten".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b), recexpr_to_csel(rec, *c)] },
+        CselLanguage::KlTerm([a, b]) => CselExpr::Call { func: "kl_term".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b)] },
+        CselLanguage::ShannonTerm([a]) => CselExpr::Call { func: "shannon_term".into(), args: vec![recexpr_to_csel(rec, *a)] },
+        CselLanguage::GammaincReg([a, b]) => CselExpr::Call { func: "gammainc_reg".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b)] },
+        CselLanguage::BetaincReg([a, b, c]) => CselExpr::Call { func: "betainc_reg".into(), args: vec![recexpr_to_csel(rec, *a), recexpr_to_csel(rec, *b), recexpr_to_csel(rec, *c)] },
         CselLanguage::ImexSplit([a, b]) => {
             // In runtime evaluation, imex_split(linear_stiff, nonlinear) is still linear_stiff + nonlinear
             CselExpr::Binary {

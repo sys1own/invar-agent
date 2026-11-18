@@ -29,7 +29,10 @@ native Rust/C++ kernels, Z3 SMT and concolic execution in an air-gapped sandbox
 (no network, no disk I/O, no imports beyond math helpers).
 
 Classify the research request into EXACTLY ONE verdict:
-- OPTIMAL_DIRECT: quantitative, mathematical, physical, dynamical or algorithmic
+- OPTIMAL_DIRECT: quantitative, mathematical, physical, chemical, biological,
+  epidemiological (SIR/SEIR), pharmacological (PK/PD/Hill), statistical/causal
+  inference (Monte Carlo/OLS/2SLS/IV/Cramer-Rao), game-theoretic/evolutionary
+  (replicator-mutator/Nash), climate/biogeochemical, dynamical or algorithmic
   research that can be falsified by simulation.
 - REFORMULATED_SURROGATE: too large for full-scale local execution (e.g. 3D DNS
   turbulence, ab-initio, macro-scale) but admits a rigorous reduced-order /
@@ -88,7 +91,7 @@ _UNSUITABLE_PATTERNS = [
     (r"\bmoral\s+(?:superiority|philosophy|debate|dilemma)\b", "moral philosophy"),
     (r"causal effect on|effect on .*legislation|influence on .*policy", "non-quantifiable causal claim"),
     (r"\bbeaut(y|iful)\b|\bmeaning of life\b|\bmorality\b|\bethics\b", "subjective value judgement"),
-    (r"\bclinical\b(?!.*(trial|endpoint|biomarker|dose))", "clinical/wet-lab task without a model"),
+    (r"\bclinical\b(?!.*(trial|endpoint|biomarker|dose|pk|pd|pharmac|seir|sir|model|simulat|hill|ec50))", "clinical/wet-lab task without a model"),
     (r"\bprove\b.*\b(poetry|art|music|culture|society)\b", "unfalsifiable cultural claim"),
 ]
 
@@ -251,7 +254,10 @@ _COMPUTATIONAL_BENCHMARK_HINTS = re.compile(
     r"drift[- ]wave|lindblad|kinetics|patankar|oregonator|cayley|"
     r"midpoint|crank[- ]nicolson|symplectic|poisson[- ]bracket|"
     r"casimir|enstrophy|hamiltonian|lyapunov|conservation|stiff\w*|"
-    r"dynamical\s+system\w*|reaction\s+network|quantum|plasma)\b",
+    r"dynamical\s+system\w*|reaction\s+network|quantum|plasma|"
+    r"seir\w*|epidemiolog\w*|pharmacokinetic\w*|hill\s+inhibition|"
+    r"monte\s+carlo|2sls|instrumental\s+variable|cramer[- ]rao|cramér[- ]rao|"
+    r"replicator|nash\s+regret|carbon\s+cycle|revelle|arrhenius)\b",
     re.I,
 )
 
