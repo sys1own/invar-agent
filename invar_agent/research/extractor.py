@@ -505,7 +505,7 @@ _AR5IV_MATH = re.compile(r"<math\b([^>]*)>", re.I)
 _ALTTEXT = re.compile(r'alttext="([^"]+)"')
 _INLINE_TEX = re.compile(r"\$\$?([^$]{3,400}?)\$\$?")
 
-_NUMBER = (r"[-+−]?\d+(?:[.,]\d+)?(?:[eE][-+−]?\d+)?"
+_NUMBER = (r"[-+−]?\d+(?:[.,]\d+)?(?:[eE][-+−]?\d+|\s*/\s*\d+(?:[.,]\d+)?)?"
            r"(?:\s*(?:×|x|\*|\\times)\s*10\s*\^?\s*\{?\s*[-+−]?\d+\s*\}?)?")
 _UNIT_TOKEN = (r"(?:[A-Za-zμµ°]+(?:\^?-?[0-9²³])?"
                r"(?:\s*/\s*\(\s*[A-Za-z]+\s*[*·.\s]\s*[A-Za-z]+\s*\)"
@@ -540,6 +540,10 @@ _RESERVED_MATH_NAMES = {
 
 def _parse_number(text: str) -> Optional[float]:
     t = _THOUSANDS_COMMA_RE.sub("", text).replace("−", "-").replace(",", ".").replace(" ", "")
+    m_frac = re.fullmatch(r"([-+]?\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)", t)
+    if m_frac:
+        den = float(m_frac.group(2))
+        return None if den == 0.0 else float(m_frac.group(1)) / den
     m = re.fullmatch(r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
                      r"(?:(?:×|x|\*|\\times)10\^?\{?([-+]?\d+)\}?)?", t)
     if not m:

@@ -820,3 +820,102 @@ def test_zero_cross_run_commit_bleed_and_katex_ui_and_subscripts(tmp_path):
     assert r"R_{\mathrm{film}}" in norm
     assert r"\delta_{\mathrm{SEI}}" in norm
     assert r"\kappa_{\mathrm{SEI}}" in norm
+
+
+def test_ratio_product_or_disjunction_and_witness_cpp_cabi_and_fraction_extractor(tmp_path):
+    from invar_agent.research.extractor import _parse_number, extract_parameters_from_text
+    from invar_agent.research.state_machine import _eval_invariant, _guard_contract_initial_state
+    from invar_agent.runtime.cabi_bridge import DynamicCABIBridge
+    from invar_agent.schemas.research import VerificationContract
+    from invar_agent.transpiler.emitters.cpp_emitter import CppEmitter
+    from invar_agent.transpiler.frontend import python_source_to_uast
+
+    # 1. Fraction literals parsed cleanly without truncating at '/'
+    assert _parse_number("100/1089") == pytest.approx(100.0 / 1089.0, rel=1e-12)
+    extracted = extract_parameters_from_text(
+        "S_shunt = 100/1089, eta_A = 10/33, Delta_h_vis = 45/64 Hz.",
+        source="user_prompt",
+    )
+    by_name = {p.name: p.si_value for p in extracted}
+    assert by_name.get("s_shunt") == pytest.approx(100.0 / 1089.0, rel=1e-12)
+    assert by_name.get("eta") == pytest.approx(10.0 / 33.0, rel=1e-12)
+    assert by_name.get("delta_h_vis") == pytest.approx(45.0 / 64.0, rel=1e-12)
+
+    # 2. Ratio inequality, product positivity, `or` disjunction, and uncovered witness + unassigned slots
+    kernel = (
+        "import math\n\n"
+        "def simulation_step(buf, dt):\n"
+        "    # Stage 2 violates SNR < 1: sigma_sql = 1.7147e-22, snr_sql = 4.9448e20\n"
+        "    buf.data[8] = 1.7147e-22\n"
+        "    buf.data[9] = 4.9448e+20\n"
+        "    # Stage 3 violates >= 10 disjunction when squeezed noise dominates\n"
+        "    buf.data[18] = 1.0\n"
+        "    buf.data[20] = 25.0\n"
+        "    buf.data[21] = 100.0\n"
+        "    # Deliberately omit assigning buf.data[19] and buf.data[22]\n"
+    )
+    contracts = [
+        VerificationContract.model_validate({
+            "contract_id": "c2_sql_classical_snr",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [
+                {
+                    "variable_name": "classical_SNR_below_unity",
+                    "assertion": "state[8] * state[9] > 0.0 and state[9] / math.sqrt(state[8]) < 1.0",
+                    "tolerance": 1e-12,
+                },
+            ],
+        }),
+        VerificationContract.model_validate({
+            "contract_id": "c3_tmsv_snr_recovery",
+            "target_backend": "cpp",
+            "initial_state": [0.0] * 24,
+            "dt": 0.01,
+            "steps": 3,
+            "invariants": [
+                {
+                    "variable_name": "quantum_SNR_recovered",
+                    "assertion": "state[18] / math.sqrt(state[20] + state[21]) >= 10.0 or state[18] / math.sqrt(state[20]) >= 10.0",
+                    "tolerance": 1e-12,
+                },
+                {
+                    "variable_name": "witness_nonlinear_margin",
+                    "assertion": "state[19] * state[19] + state[22] >= 2.0",
+                    "tolerance": 1e-12,
+                },
+            ],
+        }),
+    ]
+    san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
+    assert san.changed
+    san2 = sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts)
+    assert san2.changed is False
+
+    # Verify zero CONTRACT_SLOT_GUARD warnings on slots 19 / 22
+    for vc in contracts:
+        _init, warnings = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
+        assert not any("CONTRACT_SLOT_GUARD" in w for w in warnings), warnings
+
+    # Compile and execute via real C++20 C-ABI bridge
+    uast = python_source_to_uast(san.code)
+    cpp = CppEmitter().emit_module(uast)
+    bridge = DynamicCABIBridge(tmp_path / "cabi_ratio_witness")
+    for vc in contracts:
+        init, _w = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
+        res = bridge.run(
+            cpp_code=cpp,
+            initial_state=list(init) + [0.0] * 4,
+            dt=0.01,
+            steps=3,
+            entry="execute_step",
+        )
+        assert res["finite"] is True
+        # Physical sigma_sql (1.7147e-22) preserved when positive
+        assert res["state"][8] == pytest.approx(1.7147e-22, rel=1e-9)
+        for inv in vc.invariants:
+            assert _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
+                f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={res['state'][:24]}"
+            )
