@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict, ResearchBlueprint
 from .feasibility import truncate_at_sentence
@@ -156,7 +156,33 @@ approximations).
   `target_research_stages: 3` (or `>= 2` matching the contract stage prefixes)
   with one `stage_objectives` entry per stage, and name each contract's stage
   clearly (prefix contract_ids with `c1_` / `c2_` / `c3_` or `stage1_` /
-  `stage2_` / `stage3_`) so every stage builds on the pinned verified layer."""
+  `stage2_` / `stage3_`) so every stage builds on the pinned verified layer.
+- PHYSICAL TIME-HORIZON CLOSURE (CRITICAL): `dt * steps` MUST match the
+  requested simulation duration in the EXACT same time unit as the kernel's
+  rate constants. If rate constants are in SI `1/s` (e.g. divided by `86400.0`
+  or `3.15576e7`) and the prompt specifies 180 days, then `dt` MUST be in seconds
+  so `dt * steps = 180 * 86400 = 15552000.0 s` (e.g. `dt = 1728.0, steps = 9000`,
+  NEVER `dt = 0.02, steps = 9000`).
+- TIME-UNIT & CFL STABILITY RULE (CRITICAL): EVERY rate constant (transfer,
+  clearance, mortality, reaction, relaxation) in `code_template` MUST be
+  expressed in the SAME time unit as `dt` (convert `1/day` rates by `/ 86400.0`,
+  `1/min` by `/ 60.0` whenever `dt` is in seconds!) and satisfy `dt * k < 0.5`.
+  For any stiff/fast linear compartment (`dt * k > 0.25`), ALWAYS use an
+  unconditionally positive semi-implicit / Patankar update
+  `C_new = (C + dt * inflow) / (1.0 + dt * outflow_rate)` instead of explicit
+  Euler `C + dt * (-outflow_rate * C + inflow)` which explodes on large `dt`.
+- DISJOINT PARAMETER & OBSERVABLE SLOTS: static parameters (e.g. `V_max`,
+  `K_m`, `EC_50`, `E_max`, `beta_0`) and derived outputs (e.g. `occ`, `E_eff`,
+  `R_eff`) MUST occupy separate indices in `buf.data[...]` and `variable_map`;
+  NEVER write a derived output back into a static parameter slot.
+- MONTE CARLO ENSEMBLE STEPPING (CRITICAL): NEVER multiply an outer contract
+  step count (`steps >= 50`) by an inner Monte Carlo replication loop (`M >= 50`)
+  inside `simulation_step` (O(steps * M * N) causes >120s sandbox timeouts). If
+  `simulation_step` already runs `M` replications internally, set `steps = 1`
+  (single-shot ensemble contract); otherwise accumulate 1 replication per step
+  with `steps = M`. Also keep `O(N)` sample-accumulation loops directly inside
+  the step/accumulation function rather than returning a 4+ tuple from an
+  `O(N)` helper (tuple scalarization multiplies runtime by tuple arity)."""
 
 PLANNER_PROMPT = """You are the Research Agent planner of a mathematically verified computational
 research engine. Produce ONE falsifiable research blueprint for the request.
@@ -1562,6 +1588,80 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_HORIZON_FACTORS = {
+    "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
+    "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
+    "d": 86400.0, "day": 86400.0, "days": 86400.0,
+    "wk": 604800.0, "week": 604800.0, "weeks": 604800.0,
+    "yr": 3.15576e7, "yrs": 3.15576e7, "year": 3.15576e7, "years": 3.15576e7,
+}
+_HORIZON_RE = re.compile(
+    r"(?:over|for|across|during|until|horizon(?:\s+of)?|duration(?:\s+of)?|simulate)\s+"
+    r"(?:a\s+|the\s+)?(\d+(?:\.\d+)?)\s*"
+    r"(minutes?|mins?|hours?|hrs?|days?|weeks?|years?|yrs?)\b",
+    re.I,
+)
+_UNIT_DIVISOR_HINTS = {
+    60.0: ("60.0", "/ 60", "/60"),
+    3600.0: ("3600",),
+    86400.0: ("86400",),
+    604800.0: ("604800",),
+    3.15576e7: ("3.15576e7", "31557600", "31536000", "3.1536e7", "86400"),
+}
+
+
+def _reconcile_time_horizon(
+    bp_dict: Dict[str, Any],
+    question: str,
+    evidence: Any = None,
+) -> Dict[str, Any]:
+    """Ensure ``dt * steps`` uses the same time unit as the kernel's rate constants."""
+    if not isinstance(bp_dict, dict) or not question:
+        return bp_dict
+    matches = _HORIZON_RE.findall(question)
+    if not matches:
+        return bp_dict
+    horizons: List[Tuple[float, float]] = []
+    for val_s, unit_s in matches:
+        try:
+            raw_v = float(val_s)
+        except ValueError:
+            continue
+        fac = _HORIZON_FACTORS.get(unit_s.lower())
+        if fac and raw_v > 0.0:
+            horizons.append((raw_v, fac))
+    if not horizons:
+        return bp_dict
+    # Use the longest physical horizon specified in the prompt.
+    raw_val, unit_factor = max(horizons, key=lambda pair: pair[0] * pair[1])
+    code = str(bp_dict.get("code_template") or "")
+    has_si_rate_conv = any(tok in code for tok in _UNIT_DIVISOR_HINTS.get(unit_factor, ()))
+    if not has_si_rate_conv and evidence is not None:
+        for p in (getattr(evidence, "parameters", None) or {}).values():
+            if getattr(p, "si_unit", "") in ("1/s", "mol/(m^3*s)", "kg/s") and getattr(p, "raw_unit", "") != getattr(p, "si_unit", ""):
+                has_si_rate_conv = True
+                break
+    if not has_si_rate_conv:
+        return bp_dict
+    out = copy.deepcopy(bp_dict)
+    for c in out.get("contracts") or []:
+        if not isinstance(c, dict):
+            continue
+        try:
+            dt = float(c.get("dt", 0.0))
+            steps = int(c.get("steps", 0))
+        except (TypeError, ValueError):
+            continue
+        if dt <= 0.0 or steps <= 0:
+            continue
+        sim_t = dt * steps
+        # Only rescale when dt * steps matches the raw (unconverted) prompt horizon
+        # while the kernel itself uses SI 1/s rates (off by ~unit_factor).
+        if 0.5 * raw_val <= sim_t <= 2.0 * raw_val and unit_factor >= 60.0:
+            c["dt"] = min(1e8, dt * unit_factor)
+    return out
+
+
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
     return ResearchBlueprint.model_validate(normalize_blueprint_payload(payload))
 
@@ -1630,7 +1730,8 @@ async def generate_research_plan(question: str,
             data = _extract_json(str(raw))
             if isinstance(data, dict):
                 bp = parse_blueprint(data)
-                return {"blueprint": _attach_evidence(bp.model_dump(), evidence),
+                bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
+                return {"blueprint": _attach_evidence(bp_dict, evidence),
                         "source": "llm", "structured_evidence": evidence.model_dump() if evidence else None}
             error = "planner returned no JSON object"
         except Exception as exc:  # noqa: BLE001 - fall through to fallback
@@ -1814,8 +1915,9 @@ async def generate_plan_with_feasibility(question: str,
         if not isinstance(bp_raw2, dict):
             raise
         bp = parse_blueprint(bp_raw2)
+    bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
     return {"feasibility": feasibility,
-            "blueprint": _attach_evidence(bp.model_dump(), evidence),
+            "blueprint": _attach_evidence(bp_dict, evidence),
             "source": "llm",
             "structured_evidence": evidence.model_dump() if evidence else None}
 

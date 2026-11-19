@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import ast
 import copy
+import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 MATH_FUNCS = {
     "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
@@ -29,6 +32,7 @@ INTRINSIC_ALIASES = {
     "sq": "sq", "lerp": "lerp", "safe_div": "safe_div",
     "invar_splitmix64_stateless": "invar_splitmix64_stateless",
     "invar_rand_u01": "invar_rand_u01",
+    "prng_uniform": "prng_uniform",
     "invar_rand_normal": "invar_rand_normal",
     "invar_rand_poisson": "invar_rand_poisson",
     "invar_rand_binomial": "invar_rand_binomial",
@@ -724,12 +728,140 @@ def _name_read_before_overwrite(stmts: List[ast.stmt], name: str) -> bool:
             return False
         if isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and s.target.id == name:
             return True
-        if any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name for n in ast.walk(s)):
+        if any(
+            (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name)
+            or (isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == name)
+            for n in ast.walk(s)
+        ):
             return True
     return False
 
 
-def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple[List[ast.stmt], bool]:
+def _ensure_nonempty_stmt_list(stmts: List[ast.stmt], *, allow_empty: bool = False) -> List[ast.stmt]:
+    """Recursively ensure no compound statement in ``stmts`` has an empty body."""
+    out: List[ast.stmt] = []
+    for stmt in stmts:
+        if isinstance(stmt, ast.If):
+            stmt.body = _ensure_nonempty_stmt_list(stmt.body, allow_empty=True)
+            stmt.orelse = _ensure_nonempty_stmt_list(stmt.orelse, allow_empty=True)
+            if not stmt.body:
+                if not stmt.orelse and _is_pure_expr(stmt.test):
+                    continue
+                stmt.body = [ast.Pass()]
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            stmt.body = _ensure_nonempty_stmt_list(stmt.body, allow_empty=False)
+            stmt.orelse = _ensure_nonempty_stmt_list(stmt.orelse, allow_empty=True)
+        elif isinstance(stmt, (ast.With, ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stmt.body = _ensure_nonempty_stmt_list(stmt.body, allow_empty=False)
+        elif isinstance(stmt, ast.Try):
+            stmt.body = _ensure_nonempty_stmt_list(stmt.body, allow_empty=False)
+            stmt.orelse = _ensure_nonempty_stmt_list(stmt.orelse, allow_empty=True)
+            stmt.finalbody = _ensure_nonempty_stmt_list(stmt.finalbody, allow_empty=True)
+            for handler in stmt.handlers:
+                handler.body = _ensure_nonempty_stmt_list(handler.body, allow_empty=False)
+        elif hasattr(ast, "TryStar") and isinstance(stmt, ast.TryStar):  # type: ignore[attr-defined]
+            stmt.body = _ensure_nonempty_stmt_list(stmt.body, allow_empty=False)
+            stmt.orelse = _ensure_nonempty_stmt_list(stmt.orelse, allow_empty=True)
+            stmt.finalbody = _ensure_nonempty_stmt_list(stmt.finalbody, allow_empty=True)
+            for handler in stmt.handlers:
+                handler.body = _ensure_nonempty_stmt_list(handler.body, allow_empty=False)
+        out.append(stmt)
+    if not out and not allow_empty:
+        out.append(ast.Pass())
+    return out
+
+
+def _ensure_nonempty_blocks(tree: ast.AST) -> ast.AST:
+    """Final AST integrity pass guaranteeing every compound body is non-empty."""
+    if isinstance(tree, ast.Module):
+        tree.body = _ensure_nonempty_stmt_list(tree.body, allow_empty=True)
+    elif isinstance(tree, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        tree.body = _ensure_nonempty_stmt_list(tree.body, allow_empty=False)
+    elif hasattr(tree, "body") and isinstance(getattr(tree, "body"), list):
+        setattr(tree, "body", _ensure_nonempty_stmt_list(getattr(tree, "body"), allow_empty=False))
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+def _safe_unparse(tree: ast.AST) -> str:
+    """Repair any empty compound blocks and unparse ``tree``."""
+    _ensure_nonempty_blocks(tree)
+    return ast.unparse(tree)
+
+
+def _snapshot_pinned_functions(
+    tree: ast.Module,
+    pinned_functions: Optional[Collection[str]] = None,
+) -> Dict[str, ast.FunctionDef]:
+    """Capture deep copies of pinned verified functions so Tier-0 passes cannot mutate them."""
+    if not pinned_functions:
+        return {}
+    pinned_set = {str(name) for name in pinned_functions if name and not str(name).startswith("_invar_")}
+    if not pinned_set:
+        return {}
+    return {
+        node.name: copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in pinned_set
+    }
+
+
+def _restore_pinned_functions(
+    tree: ast.Module,
+    snapshots: Dict[str, ast.FunctionDef],
+) -> None:
+    """Restore pinned verified functions verbatim after a Tier-0 pass."""
+    if not snapshots:
+        return
+    seen: Set[str] = set()
+    new_body: List[ast.stmt] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in snapshots:
+            if node.name not in seen:
+                new_body.append(copy.deepcopy(snapshots[node.name]))
+                seen.add(node.name)
+            continue
+        new_body.append(node)
+    for name, fn_node in snapshots.items():
+        if name not in seen:
+            new_body.insert(0, copy.deepcopy(fn_node))
+    tree.body = new_body
+    ast.fix_missing_locations(tree)
+
+
+def _run_tier0_tree_pass(
+    tree: ast.Module,
+    op_name: str,
+    pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]],
+    *args: Any,
+    pinned_snapshots: Optional[Dict[str, ast.FunctionDef]] = None,
+    **kwargs: Any,
+) -> Tuple[ast.Module, bool, List[str]]:
+    """Transactional syntax + pinned-layer guard around a single Tier-0 AST pass."""
+    prev_tree = copy.deepcopy(tree)
+    prev_dump = ast.dump(prev_tree, annotate_fields=False, include_attributes=False)
+    try:
+        new_tree, changed, pass_notes = pass_fn(tree, *args, **kwargs)
+        if pinned_snapshots:
+            _restore_pinned_functions(new_tree, pinned_snapshots)
+        if not changed:
+            return new_tree, False, list(pass_notes or [])
+        _ensure_nonempty_blocks(new_tree)
+        after_dump = ast.dump(new_tree, annotate_fields=False, include_attributes=False)
+        if after_dump == prev_dump:
+            return prev_tree, False, []
+        candidate = ast.unparse(new_tree) + "\n"
+        ast.parse(candidate)
+        return new_tree, True, list(pass_notes or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Tier-0 op %s produced invalid syntax or failed (%s: %s); rolling back.",
+            op_name, type(exc).__name__, exc,
+        )
+        return prev_tree, False, []
+
+
+def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str], *, allow_empty: bool = False) -> Tuple[List[ast.stmt], bool]:
     changed = False
     out: List[ast.stmt] = []
     for idx, stmt in enumerate(stmts):
@@ -743,14 +875,33 @@ def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple
                     for n in ast.walk(stmt):
                         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
                             rem_loaded.add(n.id)
+                        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                            rem_loaded.add(n.target.id)
                 for later in stmts[idx + 1:]:
                     for n in ast.walk(later):
                         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
                             rem_loaded.add(n.id)
-                new_sub, sub_changed = _prune_dead_in_block(sub, rem_loaded)
+                        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                            rem_loaded.add(n.target.id)
+                new_sub, sub_changed = _prune_dead_in_block(
+                    sub,
+                    rem_loaded,
+                    allow_empty=(fld == "orelse") or (isinstance(stmt, ast.If) and fld == "body"),
+                )
                 if sub_changed:
                     setattr(stmt, fld, new_sub)
                     changed = True
+        if isinstance(stmt, ast.If):
+            if not stmt.body:
+                if not stmt.orelse and _is_pure_expr(stmt.test):
+                    changed = True
+                    continue
+                stmt.body = [ast.Pass()]
+                changed = True
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+            if not stmt.body:
+                stmt.body = [ast.Pass()]
+                changed = True
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
             tgt = stmt.targets[0]
             # Prune trivial self-assignments `x = x` or `buf.data[k] = buf.data[k]`
@@ -766,7 +917,7 @@ def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple
                     changed = True
                     continue
         out.append(stmt)
-    if not out:
+    if not out and not allow_empty:
         out.append(ast.Pass())
     return out, changed
 
@@ -774,18 +925,28 @@ def _prune_dead_in_block(stmts: List[ast.stmt], outer_loaded: set[str]) -> Tuple
 def _dead_assignments_in_function(fn: ast.FunctionDef) -> Tuple[ast.FunctionDef, bool]:
     total_changed = False
     for _ in range(8):
-        new_body, changed = _prune_dead_in_block(fn.body, set())
+        new_body, changed = _prune_dead_in_block(fn.body, set(), allow_empty=False)
         if not changed:
             break
         fn.body = new_body
         total_changed = True
+    if not fn.body:
+        fn.body = [ast.Pass()]
     return fn, total_changed
 
 
 def _prune_helpers_tree(tree: ast.Module,
-                        entrypoints: Sequence[str] = ("simulation_step",)
+                        entrypoints: Sequence[str] = ("simulation_step",),
+                        pinned_functions: Optional[Collection[str]] = None,
                         ) -> Tuple[ast.Module, bool, List[str]]:
     notes: List[str] = []
+    pinned_set: Set[str] = {
+        str(n) for n in (pinned_functions or ()) if n and not str(n).startswith("_invar_")
+    }
+    has_driver = any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "simulation_step"
+        for n in tree.body
+    )
     funcs = [n for n in tree.body
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     changed = False
@@ -795,6 +956,7 @@ def _prune_helpers_tree(tree: ast.Module,
         roots = [
             f.name for f in funcs
             if f.name in entrypoints
+            or f.name in pinned_set
             or f.name.startswith("simulation_step_")
             or f.name.startswith("layer_")
             or f.name.startswith("_invar_")
@@ -817,14 +979,31 @@ def _prune_helpers_tree(tree: ast.Module,
                     continue
                 kept.append(node)
             tree.body = kept
+    layer_nums = [
+        int(m_ly.group(1))
+        for f in funcs
+        for m_ly in [re.match(r"^layer_(\d+)_step$", f.name)]
+        if m_ly is not None
+    ]
+    max_layer_num = max(layer_nums, default=0)
     for node in list(tree.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Treat pinned verified layers (and earlier layer_<k>_step when higher layers exist) as read-only.
+            m_ly = re.match(r"^layer_(\d+)_step$", node.name)
+            is_earlier_layer = bool(
+                pinned_functions is None
+                and has_driver
+                and m_ly is not None
+                and int(m_ly.group(1)) < max_layer_num
+            )
+            if node.name in pinned_set or is_earlier_layer:
+                continue
             new_node, node_changed = _dead_assignments_in_function(node)
             if node_changed:
                 changed = True
                 notes.append(f"PRUNE_UNUSED_HELPERS(dead assignments in {node.name})")
             tree.body[tree.body.index(node)] = new_node
-    ast.fix_missing_locations(tree)
+    _ensure_nonempty_blocks(tree)
     return tree, changed, notes
 
 
@@ -914,10 +1093,14 @@ def _init_conditional_locals_tree(tree: ast.Module) -> Tuple[ast.Module, bool, L
     return tree, changed, notes
 
 
-def _lower_complex_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+def _lower_complex_tree(
+    tree: ast.Module,
+    pinned_functions: Optional[Collection[str]] = None,
+) -> Tuple[ast.Module, bool, List[str]]:
     notes: List[str] = []
     changed = False
-    tree, p_changed, p_notes = _prune_helpers_tree(tree)
+    snaps = _snapshot_pinned_functions(tree, pinned_functions)
+    tree, p_changed, p_notes = _prune_helpers_tree(tree, pinned_functions=pinned_functions)
     changed |= p_changed
     notes.extend(p_notes)
     funcs = {n.name: n for n in tree.body
@@ -932,36 +1115,56 @@ def _lower_complex_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
         if _ensure_math_import(tree):
             notes.append("injected import math")
             changed = True
-    tree, q_changed, q_notes = _prune_helpers_tree(tree)
+    tree, q_changed, q_notes = _prune_helpers_tree(tree, pinned_functions=pinned_functions)
     changed |= q_changed
     notes.extend(q_notes)
+    if snaps:
+        _restore_pinned_functions(tree, snaps)
+    _ensure_nonempty_blocks(tree)
     return tree, changed, sorted(set(notes))
 
 
-def lower_complex_to_real(code: str) -> SanitizerResult:
+def lower_complex_to_real(
+    code: str,
+    pinned_functions: Optional[Collection[str]] = None,
+) -> SanitizerResult:
     """Public Tier-0 entry point for ``LOWER_COMPLEX_TO_REAL`` directives."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
-    tree, changed, notes = _lower_complex_tree(tree)
+    tree, changed, notes = _run_tier0_tree_pass(
+        tree,
+        "LOWER_COMPLEX_TO_REAL",
+        _lower_complex_tree,
+        pinned_functions=pinned_functions,
+        pinned_snapshots=_snapshot_pinned_functions(tree, pinned_functions),
+    )
     if not changed:
         return SanitizerResult(code, [], False)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def prune_unused_helpers(code: str,
-                         entrypoints: Sequence[str] = ("simulation_step",)
+                         entrypoints: Sequence[str] = ("simulation_step",),
+                         pinned_functions: Optional[Collection[str]] = None,
                          ) -> SanitizerResult:
     """Public Tier-0 entry point for ``PRUNE_UNUSED_HELPERS`` directives."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
-    tree, changed, notes = _prune_helpers_tree(tree, entrypoints)
+    tree, changed, notes = _run_tier0_tree_pass(
+        tree,
+        "PRUNE_UNUSED_HELPERS",
+        _prune_helpers_tree,
+        entrypoints,
+        pinned_functions=pinned_functions,
+        pinned_snapshots=_snapshot_pinned_functions(tree, pinned_functions),
+    )
     if not changed:
         return SanitizerResult(code, [], False)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def _ensure_math_import(tree: ast.Module) -> bool:
@@ -1002,6 +1205,16 @@ def _intrinsic_defs(used: Iterable[str]) -> List[ast.FunctionDef]:
             "    val = invar_splitmix64_stateless(seed, step, channel)\n"
             "    u = (val >> 11) * (1.0 / 9007199254740992.0)\n"
             "    return 1e-15 if u <= 1e-15 else (1.0 - 1e-15 if u >= 1.0 - 1e-15 else u)\n"
+        ),
+        "prng_uniform": (
+            "def prng_uniform(seed, k):\n"
+            "    m = 18446744073709551615\n"
+            "    z = (((int(seed) & m) * 11400714819323198485) & m) + (int(k) & m) + 11400714819323198485\n"
+            "    z = z & m\n"
+            "    z = ((z ^ (z >> 30)) * 13787848793156543929) & m\n"
+            "    z = ((z ^ (z >> 27)) * 10723151780598845931) & m\n"
+            "    z = z ^ (z >> 31)\n"
+            "    return (z >> 11) * (1.0 / 9007199254740992.0)\n"
         ),
         "invar_rand_normal": (
             "def invar_rand_normal(seed, step, channel):\n"
@@ -1152,7 +1365,7 @@ def _intrinsic_defs(used: Iterable[str]) -> List[ast.FunctionDef]:
         needed.add("sign")
     order = [
         "clamp", "clip", "sign", "sgn", "sq", "lerp", "safe_div",
-        "invar_splitmix64_stateless", "invar_rand_u01", "invar_rand_normal",
+        "invar_splitmix64_stateless", "invar_rand_u01", "prng_uniform", "invar_rand_normal",
         "invar_rand_poisson", "invar_rand_binomial",
         "welford_mean_update", "welford_m2_update", "welford_cov_update",
         "norm_cdf", "norm_ppf", "logistic_sigmoid", "logit", "hill_eq",
@@ -1597,7 +1810,12 @@ def _used_state_slots(tree: ast.Module) -> set[int]:
     return used
 
 
-def _scratch_slot(used: set[int], avoid: set[int]) -> int:
+def _scratch_slot(used: set[int], avoid: set[int], min_slot: Optional[int] = None) -> int:
+    if min_slot is not None:
+        cand = max(0, int(min_slot))
+        while cand in used or cand in avoid:
+            cand += 1
+        return cand
     for cand in list(range(28, 48)) + list(range(16, 28)):
         if cand not in used and cand not in avoid:
             return cand
@@ -1676,8 +1894,13 @@ def _strip_buf_size_branches_tree(
     tree: ast.Module,
     contracts: Sequence[Any] = (),
 ) -> Tuple[ast.Module, bool, List[str]]:
-    """Remove `if buf.size > ...` / `if len(buf.data) > ...` overwrites of Stage 1 or prior-assigned slots."""
+    """Remove `if buf.size > ...` / `if len(buf.data) > ...` overwrites of Stage 1 or prior-assigned slots,
+    and raise hardcoded `< N` size guards so high contract slots (e.g. state[44]) stay in bounds."""
     s1_slots = _stage1_slot_set(contracts)
+    all_slots = _used_state_slots(tree)
+    for c in contracts or []:
+        all_slots.update(_contract_state_slots(c))
+    required_size = (max(all_slots) + 1) if all_slots else 0
     changed = False
     notes: List[str] = []
 
@@ -1688,19 +1911,49 @@ def _strip_buf_size_branches_tree(
             nonlocal changed
             out: List[ast.stmt] = []
             for stmt in stmts:
+                if (
+                    isinstance(stmt, ast.If)
+                    and _is_buf_size_compare(stmt.test)
+                    and isinstance(stmt.test, ast.Compare)
+                    and len(stmt.test.ops) == 1
+                    and len(stmt.test.comparators) == 1
+                    and isinstance(stmt.test.ops[0], (ast.Lt, ast.LtE))
+                    and isinstance(stmt.test.comparators[0], ast.Constant)
+                    and isinstance(stmt.test.comparators[0].value, int)
+                    and not isinstance(stmt.test.comparators[0].value, bool)
+                    and required_size > 0
+                ):
+                    cur_lim = int(stmt.test.comparators[0].value)
+                    needed_lim = required_size if isinstance(stmt.test.ops[0], ast.Lt) else (required_size - 1)
+                    if cur_lim < needed_lim:
+                        stmt.test.comparators[0] = ast.Constant(value=needed_lim)
+                        changed = True
+                        notes.append(f"raised buf.size guard to {needed_lim} in {fn.name}")
                 if isinstance(stmt, ast.If) and _is_buf_size_compare(stmt.test):
                     stmt.body = _filter_block(stmt.body, inside_buf_size=True)
                     stmt.orelse = _filter_block(stmt.orelse, inside_buf_size=True)
-                    if not stmt.body and not stmt.orelse:
+                    if not stmt.body:
+                        if not stmt.orelse:
+                            changed = True
+                            notes.append(f"stripped colliding buf.size branch in {fn.name}")
+                            continue
+                        stmt.body = [ast.Pass()]
                         changed = True
-                        notes.append(f"stripped colliding buf.size branch in {fn.name}")
-                        continue
                     out.append(stmt)
                     continue
                 for attr in ("body", "orelse", "finalbody"):
                     sub = getattr(stmt, attr, None)
-                    if isinstance(sub, list):
+                    if isinstance(sub, list) and sub:
                         setattr(stmt, attr, _filter_block(sub, inside_buf_size=inside_buf_size))
+                if isinstance(stmt, ast.If) and not stmt.body:
+                    if not stmt.orelse and _is_pure_expr(stmt.test):
+                        changed = True
+                        continue
+                    stmt.body = [ast.Pass()]
+                    changed = True
+                elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)) and not stmt.body:
+                    stmt.body = [ast.Pass()]
+                    changed = True
                 tgt_slot = _stmt_slot_target(stmt) if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)) else None
                 if inside_buf_size and tgt_slot is not None and (tgt_slot in s1_slots or tgt_slot in early_assigned):
                     changed = True
@@ -1712,6 +1965,8 @@ def _strip_buf_size_branches_tree(
             return out
 
         fn.body = _filter_block(fn.body, inside_buf_size=False)
+        if not fn.body:
+            fn.body = [ast.Pass()]
         ast.fix_missing_locations(fn)
     return tree, changed, notes
 
@@ -1721,10 +1976,18 @@ def _collect_var_deps(body: List[ast.stmt], stop_idx: int) -> Dict[str, Set[str]
     direct: Dict[str, Set[str]] = {}
     for stmt in body[:stop_idx]:
         for sub in ast.walk(stmt):
-            if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
-                lhs = sub.targets[0].id
+            if isinstance(sub, ast.Assign):
                 refs = {n.id for n in ast.walk(sub.value) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-                direct.setdefault(lhs, set()).update(refs)
+                for tgt in sub.targets:
+                    for item in _iter_assign_targets(tgt):
+                        if isinstance(item, ast.Name):
+                            direct.setdefault(item.id, set()).update(refs)
+            elif isinstance(sub, ast.AugAssign) and isinstance(sub.target, ast.Name):
+                refs = {n.id for n in ast.walk(sub.value) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                direct.setdefault(sub.target.id, set()).update(refs)
+            elif isinstance(sub, ast.For) and isinstance(sub.target, ast.Name):
+                refs = {n.id for n in ast.walk(sub.iter) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                direct.setdefault(sub.target.id, set()).update(refs)
     deps: Dict[str, Set[str]] = {k: set(v) for k, v in direct.items()}
     for k in list(deps):
         frontier = list(deps[k])
@@ -1735,6 +1998,90 @@ def _collect_var_deps(body: List[ast.stmt], stop_idx: int) -> Dict[str, Set[str]
                     deps[k].add(nxt)
                     frontier.append(nxt)
     return deps
+
+
+_TIER0_SYNTH_PREFIXES = (
+    "_invar_", "_msum_", "_ks2_", "_eb_lim_", "_ratio_",
+    "_alg_target_", "_prod_pos_", "_bloch_",
+)
+
+
+def _is_tier0_conditioning_stmt(stmt: ast.stmt) -> bool:
+    """True when ``stmt`` was injected by Tier-0 conditioning/projection passes."""
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Name) and node.id.startswith(_TIER0_SYNTH_PREFIXES):
+            return True
+    if isinstance(stmt, ast.If) and not stmt.orelse and len(stmt.body) == 1:
+        b0 = stmt.body[0]
+        if (
+            isinstance(b0, ast.Assign)
+            and len(b0.targets) == 1
+            and _state_subscript_slot(b0.targets[0]) is not None
+        ):
+            for node in ast.walk(stmt.test):
+                if (
+                    isinstance(node, ast.Call)
+                    and _call_name(node.func) == "math.isfinite"
+                ):
+                    return True
+            if (
+                isinstance(stmt.test, ast.Compare)
+                and _state_subscript_slot(stmt.test.left) is not None
+                and isinstance(b0.value, (ast.Constant, ast.Subscript))
+            ):
+                return True
+    return False
+
+
+def _expr_depends_on_slot_or_var(
+    expr: ast.expr,
+    slot: int,
+    var_name: str,
+    deps: Dict[str, Set[str]],
+    slot_aliases: Set[str],
+) -> bool:
+    """True if ``expr`` directly or transitively reads ``var_name`` or ``buf.data[slot]``."""
+    for sub in ast.walk(expr):
+        if _state_subscript_slot(sub) == slot:
+            return True
+    refs = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    trans = set(refs)
+    for rr in list(refs):
+        trans.update(deps.get(rr, ()))
+    return var_name in trans or bool(trans & slot_aliases)
+
+
+def _slot_is_dynamically_evolved_in_fn(
+    fn: ast.FunctionDef,
+    slot: int,
+    var_name: str,
+    dyn_slots: Set[int],
+) -> bool:
+    """Dataflow check: True when ``buf.data[slot]`` is an evolving state variable in ``fn``."""
+    if slot in dyn_slots:
+        return True
+    body = fn.body
+    slot_aliases: Set[str] = {var_name}
+    for st in body:
+        if (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and _state_subscript_slot(st.value) == slot
+        ):
+            slot_aliases.add(st.targets[0].id)
+
+    for j, st in enumerate(body):
+        if _is_tier0_conditioning_stmt(st):
+            continue
+        for sub in ast.walk(st):
+            if isinstance(sub, ast.AugAssign) and _stmt_slot_target(sub) == slot:
+                return True
+            if isinstance(sub, ast.Assign) and _stmt_slot_target(sub) == slot:
+                deps = _collect_var_deps(body, j + 1)
+                if _expr_depends_on_slot_or_var(sub.value, slot, var_name, deps, slot_aliases):
+                    return True
+    return False
 
 
 def _collect_parameter_backup_map(tree: ast.Module) -> Dict[str, int]:
@@ -1760,8 +2107,21 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
     changed = False
     notes: List[str] = []
     used = _used_state_slots(tree)
+    all_contract_slots: Set[int] = set()
+    max_init_len = 0
     for c in contracts or []:
-        used.update(_contract_state_slots(c))
+        c_slots = _contract_state_slots(c)
+        used.update(c_slots)
+        all_contract_slots.update(c_slots)
+        max_init_len = max(max_init_len, len(_get_contract_initial_list(c)))
+    latch_floor = max(max(all_contract_slots, default=-1), max_init_len) + 3
+    cls_slots = classify_buffer_slots(tree, contracts)
+    dyn_slots: Set[int] = set(cls_slots.get("dynamical_slots") or ())
+    sum_parts, multi_sums = _detect_declared_simplices(contracts)
+    for i_s, j_s, _tgt, _tol, _st in sum_parts:
+        dyn_slots.update((i_s, j_s))
+    for m_slots, _m_tgt, _m_tol, _m_st in multi_sums:
+        dyn_slots.update(m_slots)
     allow_kappa = _contracts_allow_kappa_default(contracts)
     sim_fns = _simulation_functions(tree)
 
@@ -1805,10 +2165,8 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                 continue
 
             # Detect input-parameter reads whose slot is overwritten by an unrelated expression.
-            # Note: if a named parameter is only overwritten inside this same function and
-            # `slot` is NOT referenced in any contract, let the existing `later_writes`
-            # branch below redirect the unrelated write to a scratch slot so the parameter
-            # stays cleanly in `buf.data[slot]` (and keeps its zero-guard).
+            # Dynamic evolving state variables (any slot written via AugAssign or updated
+            # from itself / `name`) MUST NEVER be latched into write-once `_invar_psz_*` slots.
             has_contract_slot = any(
                 slot in _contract_state_slots_from_text(a)
                 for c in (contracts or [])
@@ -1826,12 +2184,15 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                     and sub_st.targets[0].id in (f"{name}_new", f"{name}1")
                     for sub_st in ast.walk(fn)
                 )
+                or _slot_is_dynamically_evolved_in_fn(fn, slot, name, dyn_slots)
             )
             if not is_evol_state_var:
-                # 1. Check later writes inside this same function (including nested if/for).
+                # 1. Check later non-Tier-0 writes inside this same function.
                 same_fn_backup = False
                 later_same_fn: List[Tuple[int, ast.Assign]] = []
                 for j in range(idx + 1, len(body)):
+                    if _is_tier0_conditioning_stmt(body[j]):
+                        continue
                     for sub in ast.walk(body[j]):
                         if isinstance(sub, ast.Assign) and _stmt_slot_target(sub) == slot:
                             later_same_fn.append((j, sub))
@@ -1840,11 +2201,7 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                     if isinstance(rhs_val, ast.Name) and rhs_val.id == name:
                         continue
                     deps = _collect_var_deps(body, j_ow + 1)
-                    rhs_refs = {n.id for n in ast.walk(rhs_val) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-                    trans_refs = set(rhs_refs)
-                    for rr in list(rhs_refs):
-                        trans_refs.update(deps.get(rr, ()))
-                    if name not in trans_refs:
+                    if not _expr_depends_on_slot_or_var(rhs_val, slot, name, deps, {name}):
                         is_used = any(
                             isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
                             for s_downstream in body[idx + 1:]
@@ -1884,8 +2241,8 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
                     should_backup = True
 
             if should_backup:
-                bak = _scratch_slot(used, {slot})
-                flag = _scratch_slot(used | {bak}, {slot})
+                bak = _scratch_slot(used, {slot}, min_slot=latch_floor)
+                flag = _scratch_slot(used | {bak}, {slot}, min_slot=latch_floor)
                 used.update({bak, flag})
                 backed_up_slots.add(slot)
                 fb_val = 0.0
@@ -5150,7 +5507,93 @@ def _split_intra_function_stage_overwrites_tree(
     return tree, changed, notes
 
 
-def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[Any]
+def _detect_declared_simplices(
+    contracts: Sequence[Any],
+) -> Tuple[List[Tuple[int, int, float, float, bool]], List[Tuple[List[int], float, float, bool]]]:
+    """Detect explicit K=2 and K>=3 conservation sum laws from blueprint contracts."""
+    sum_parts: List[Tuple[int, int, float, float, bool]] = []
+    seen_2: Set[Tuple[int, int, float]] = set()
+    multi_sums: List[Tuple[List[int], float, float, bool]] = []
+    seen_m: Set[Tuple[Tuple[int, ...], float]] = set()
+    for contract in contracts or []:
+        init_c = _get_contract_initial_list(contract)
+        for _name, assertion, _tol in _contract_invariant_items(contract):
+            if "impossible" in (_name or "").lower():
+                continue
+            for node in [_resolve_initial_in_ast(n, init_c) for n in _iter_atomic_invariant_nodes(assertion)]:
+                if not isinstance(node, ast.Compare):
+                    continue
+                lhs = node.left
+                for cmp_op, rhs in zip(node.ops, node.comparators):
+                    abs_inner = None
+                    denom_ast = None
+                    tol_val = None
+                    rhs_rel = False
+                    is_strict = isinstance(cmp_op, (ast.Lt, ast.Gt))
+                    if isinstance(cmp_op, (ast.LtE, ast.Lt)):
+                        abs_inner, denom_ast = _unwrap_abs_or_rel_err(lhs)
+                        if abs_inner is not None:
+                            tol_val, rhs_rel = _extract_abs_tol(rhs)
+                    elif isinstance(cmp_op, (ast.GtE, ast.Gt)):
+                        abs_inner, denom_ast = _unwrap_abs_or_rel_err(rhs)
+                        if abs_inner is not None:
+                            tol_val, rhs_rel = _extract_abs_tol(lhs)
+                    if abs_inner is not None and tol_val is not None and tol_val >= 0.0:
+                        denom_c = _eval_const_ast(denom_ast) if denom_ast is not None else None
+                        _single_t, sum_t, _diff_p = _match_abs_affine(abs_inner)
+                        if sum_t is not None:
+                            i_s, j_s, tgt = sum_t
+                            scale = abs(denom_c) if (denom_c is not None and denom_c != 0.0) else max(abs(tgt), 1e-300)
+                            eff_tol = tol_val * scale if (denom_ast is not None or rhs_rel) else tol_val
+                            k2 = (i_s, j_s, tgt)
+                            if k2 not in seen_2:
+                                seen_2.add(k2)
+                                sum_parts.append((i_s, j_s, tgt, eff_tol, is_strict))
+                        else:
+                            multi_s = _match_abs_multi_sum(abs_inner)
+                            if multi_s is not None:
+                                m_slots, m_tgt = multi_s
+                                scale = abs(denom_c) if (denom_c is not None and denom_c != 0.0) else max(abs(m_tgt), 1e-300)
+                                eff_tol = tol_val * scale if (denom_ast is not None or rhs_rel) else tol_val
+                                km = (tuple(sorted(m_slots)), float(m_tgt))
+                                if km not in seen_m:
+                                    seen_m.add(km)
+                                    multi_sums.append((m_slots, float(m_tgt), float(eff_tol), is_strict))
+                    lhs = rhs
+    return sum_parts, multi_sums
+
+
+_IV_TOKEN_RE = re.compile(r"(?:2sls|wald|\biv\b|_iv\b|iv_|tsls)", re.I)
+_OLS_TOKEN_RE = re.compile(r"(?:\bols\b|_ols\b|ols_)", re.I)
+
+
+def _is_estimator_comparison_invariant(
+    inv_name: str,
+    assertion: str,
+    slot_var_names: Optional[Dict[int, str]] = None,
+) -> bool:
+    """True when an invariant asserts an empirical estimator ordering (e.g. 2SLS/IV vs OLS).
+
+    In weak-instrument regimes (F < 10), MSE(2SLS) > MSE(OLS) is scientifically real;
+    Tier-0 MUST NEVER rewrite or clamp estimator comparison bounds.
+    """
+    slot_labels = []
+    if slot_var_names:
+        for s_txt in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", assertion or ""):
+            lbl = slot_var_names.get(int(s_txt))
+            if lbl:
+                slot_labels.append(lbl)
+    blob = " ".join([inv_name or "", assertion or "", *slot_labels])
+    if _IV_TOKEN_RE.search(blob) and _OLS_TOKEN_RE.search(blob):
+        return True
+    low = (inv_name or "").lower()
+    if any(tok in low for tok in ("weak_instrument", "mse_crossover", "iv_vs_ols", "2sls_vs_ols", "estimator_crossover")):
+        return True
+    return False
+
+
+def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[Any],
+                                        variable_map: Optional[Dict[str, int]] = None,
                                         ) -> Tuple[ast.Module, bool, List[str]]:
     """Ensure 3D Bloch coordinates and contract slot bounds/equalities are satisfied."""
     r_max = _detect_bloch_radius(tree, contracts)
@@ -5190,6 +5633,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     pure_contract_slots: Dict[int, float] = {}
     contract_pure_invs_by_cid: Dict[int, List[ast.AST]] = {}
     slot_var_names: Dict[int, str] = {}
+    for _vm_name, _vm_slot in (variable_map or {}).items():
+        try:
+            slot_var_names.setdefault(int(_vm_slot), str(_vm_name))
+        except (TypeError, ValueError):
+            pass
 
     def _record_lower(s_idx: int, op_ge: str, val: float) -> None:
         if op_ge == ">=" and -1e-6 <= val <= 0.0:
@@ -5276,6 +5724,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     if _s_decl not in pure_contract_slots:
                         iv = float(init_c[_s_decl]) if _s_decl < len(init_c) else 0.0
                         pure_contract_slots[_s_decl] = iv if math.isfinite(iv) else 0.0
+                if _is_estimator_comparison_invariant(str(_name or ""), assertion, slot_var_names):
+                    continue
             # 1. Relational regex checks (weak <= / >= vs strict < / > separated cleanly)
             m_rel_le = re.search(
                 r"(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?\s*(<=|<)\s*(?:([0-9.eE+-]+)\s*\*\s*)?(?:abs\(\s*)?(?:state|buf\.data|data)\[(\d+)\](?:\s*\))?",
@@ -6643,6 +7093,11 @@ def _is_mass_kinetics_system(tree: ast.Module, contracts: Sequence[Any]) -> bool
     """Detect chemical kinetics / production-destruction systems with mass conservation."""
     if _is_density_matrix_system(tree, contracts):
         return False
+    # Never trigger the hardcoded 4-slot mass-simplex rescaler when contracts declare
+    # explicit conservation laws (e.g. K=6 SEIRHD, K=2 alleles, K=4 carbon 41000 GtC, K=3 RPS).
+    sum_parts, multi_sums = _detect_declared_simplices(contracts)
+    if sum_parts or multi_sums:
+        return False
     tokens = ("mass_error", "mass_drift", "mass_residual", "mass_consistency",
               "mass_conserv", "positivity_mass", "min_concentration",
               "max_concentration", "patankar", "stoich", "oregonator",
@@ -6711,6 +7166,7 @@ def _ensure_stabilize_helpers(
     is_mass_kinetics: bool = False,
     is_triad: bool = False,
     is_sphere_s2: bool = False,
+    unit_bounded: bool = False,
     layout: Tuple[int, int, int, int],
 ) -> None:
     existing = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
@@ -6723,78 +7179,86 @@ def _ensure_stabilize_helpers(
     if _SAFE_DIV_HELPER not in existing:
         sdiv_src = (
             "def _invar_sdiv(a, b):\n"
+            "    if not math.isfinite(a):\n"
+            "        a = math.copysign(1e100, a) if math.isinf(a) else 0.0\n"
+            "    if not math.isfinite(b):\n"
+            "        return 0.0\n"
             "    mag = abs(b) if abs(b) >= 1e-12 else 1e-12\n"
             "    denom = -mag if b < 0.0 else mag\n"
             "    return a / denom\n"
         )
         to_insert.extend(ast.parse(sdiv_src).body)
     if "_invar_stabilize_state" not in existing:
+        if unit_bounded:
+            stab_slots = "\n".join(
+                f"    if _sz > {idx}:\n"
+                f"        v{idx} = buf.data[{idx}]\n"
+                f"        if not math.isfinite(v{idx}):\n"
+                f"            buf.data[{idx}] = p{idx}\n"
+                f"        else:\n"
+                f"            d{idx} = v{idx} - p{idx}\n"
+                f"            if abs(d{idx}) > 0.5:\n"
+                f"                buf.data[{idx}] = p{idx} + _invar_sdiv(d{idx}, 1.0 + abs(d{idx}))"
+                for idx in range(4)
+            )
+        else:
+            stab_slots = "\n".join(
+                f"    if _sz > {idx}:\n"
+                f"        v{idx} = buf.data[{idx}]\n"
+                f"        if not math.isfinite(v{idx}):\n"
+                f"            buf.data[{idx}] = p{idx}\n"
+                f"        else:\n"
+                f"            d{idx} = v{idx} - p{idx}\n"
+                f"            _lim{idx} = max(1e3, 10.0 * max(1.0, abs(p{idx})))\n"
+                f"            if abs(d{idx}) > _lim{idx}:\n"
+                f"                buf.data[{idx}] = p{idx} + _invar_sdiv(d{idx}, 1.0 + abs(d{idx}) / _lim{idx})"
+                for idx in range(4)
+            )
         stab_src = (
             "def _invar_stabilize_state(buf, p0, p1, p2, p3):\n"
             "    _sz = len(buf.data)\n"
-            "    if _sz > 0:\n"
-            "        v0 = buf.data[0]\n"
-            "        if not math.isfinite(v0):\n"
-            "            buf.data[0] = p0\n"
-            "        else:\n"
-            "            d0 = v0 - p0\n"
-            "            if abs(d0) > 0.5:\n"
-            "                buf.data[0] = p0 + _invar_sdiv(d0, 1.0 + abs(d0))\n"
-            "    if _sz > 1:\n"
-            "        v1 = buf.data[1]\n"
-            "        if not math.isfinite(v1):\n"
-            "            buf.data[1] = p1\n"
-            "        else:\n"
-            "            d1 = v1 - p1\n"
-            "            if abs(d1) > 0.5:\n"
-            "                buf.data[1] = p1 + _invar_sdiv(d1, 1.0 + abs(d1))\n"
-            "    if _sz > 2:\n"
-            "        v2 = buf.data[2]\n"
-            "        if not math.isfinite(v2):\n"
-            "            buf.data[2] = p2\n"
-            "        else:\n"
-            "            d2 = v2 - p2\n"
-            "            if abs(d2) > 0.5:\n"
-            "                buf.data[2] = p2 + _invar_sdiv(d2, 1.0 + abs(d2))\n"
-            "    if _sz > 3:\n"
-            "        v3 = buf.data[3]\n"
-            "        if not math.isfinite(v3):\n"
-            "            buf.data[3] = p3\n"
-            "        else:\n"
-            "            d3 = v3 - p3\n"
-            "            if abs(d3) > 0.5:\n"
-            "                buf.data[3] = p3 + _invar_sdiv(d3, 1.0 + abs(d3))\n"
+            f"{stab_slots}\n"
             "    for _k in range(_sz):\n"
             "        _vk = buf.data[_k]\n"
             "        if not math.isfinite(_vk):\n"
             "            buf.data[_k] = 0.0\n"
-            "        elif _vk > 1e12:\n"
-            "            buf.data[_k] = 1e12\n"
-            "        elif _vk < -1e12:\n"
-            "            buf.data[_k] = -1e12\n"
+            "        elif _vk > 1e100:\n"
+            "            buf.data[_k] = 1e100\n"
+            "        elif _vk < -1e100:\n"
+            "            buf.data[_k] = -1e100\n"
         )
         to_insert.extend(ast.parse(stab_src).body)
     if is_triad and "_invar_stabilize_state_6" not in existing:
+        if unit_bounded:
+            stab6_slots = "\n".join(
+                f"    if _sz > {idx}:\n"
+                f"        v{idx} = buf.data[{idx}]\n"
+                f"        if not math.isfinite(v{idx}):\n"
+                f"            buf.data[{idx}] = p{idx}\n"
+                f"        else:\n"
+                f"            d{idx} = v{idx} - p{idx}\n"
+                f"            if abs(d{idx}) > 0.5:\n"
+                f"                buf.data[{idx}] = p{idx} + _invar_sdiv(d{idx}, 1.0 + abs(d{idx}))"
+                for idx in (4, 5)
+            )
+        else:
+            stab6_slots = "\n".join(
+                f"    if _sz > {idx}:\n"
+                f"        v{idx} = buf.data[{idx}]\n"
+                f"        if not math.isfinite(v{idx}):\n"
+                f"            buf.data[{idx}] = p{idx}\n"
+                f"        else:\n"
+                f"            d{idx} = v{idx} - p{idx}\n"
+                f"            _lim{idx} = max(1e3, 10.0 * max(1.0, abs(p{idx})))\n"
+                f"            if abs(d{idx}) > _lim{idx}:\n"
+                f"                buf.data[{idx}] = p{idx} + _invar_sdiv(d{idx}, 1.0 + abs(d{idx}) / _lim{idx})"
+                for idx in (4, 5)
+            )
         stab6_src = (
             "def _invar_stabilize_state_6(buf, p0, p1, p2, p3, p4, p5):\n"
             "    _invar_stabilize_state(buf, p0, p1, p2, p3)\n"
             "    _sz = len(buf.data)\n"
-            "    if _sz > 4:\n"
-            "        v4 = buf.data[4]\n"
-            "        if not math.isfinite(v4):\n"
-            "            buf.data[4] = p4\n"
-            "        else:\n"
-            "            d4 = v4 - p4\n"
-            "            if abs(d4) > 0.5:\n"
-            "                buf.data[4] = p4 + _invar_sdiv(d4, 1.0 + abs(d4))\n"
-            "    if _sz > 5:\n"
-            "        v5 = buf.data[5]\n"
-            "        if not math.isfinite(v5):\n"
-            "            buf.data[5] = p5\n"
-            "        else:\n"
-            "            d5 = v5 - p5\n"
-            "            if abs(d5) > 0.5:\n"
-            "                buf.data[5] = p5 + _invar_sdiv(d5, 1.0 + abs(d5))\n"
+            f"{stab6_slots}\n"
         )
         to_insert.extend(ast.parse(stab6_src).body)
     if is_density and "_invar_project_density" not in existing:
@@ -6989,28 +7453,36 @@ def _stabilize_dynamical_state_tree(
                 last_dyn_idx = idx
 
         fn.body[0:0] = snap_stmts
+        inserted_inline = False
         if last_dyn_idx >= 0 and last_dyn_idx + len(snap_stmts) < len(fn.body) - 1:
             ins_at = last_dyn_idx + len(snap_stmts) + 1
-            # Re-sync local variables written into buf.data[0..max_dyn_slot] so downstream
-            # diagnostics (e.g. M = n1 + n2 + n3 + n4, F = ...) use stabilized/projected values.
-            resync_vars: Dict[int, str] = {}
-            for pre_stmt in fn.body[:ins_at]:
-                if (isinstance(pre_stmt, ast.Assign) and len(pre_stmt.targets) == 1
-                        and isinstance(pre_stmt.value, ast.Name)
-                        and not pre_stmt.value.id.startswith("_invar_")):
-                    tgt_slot = _state_subscript_slot(pre_stmt.targets[0])
-                    if tgt_slot is not None and 0 <= tgt_slot <= max_dyn_slot:
-                        resync_vars[tgt_slot] = pre_stmt.value.id
-            resync_stmts: List[ast.stmt] = []
-            if resync_vars:
-                resync_src = "\n".join(
-                    f"{vname} = buf.data[{slot}]"
-                    for slot, vname in sorted(resync_vars.items())
-                )
-                resync_stmts = ast.parse(resync_src).body
-            fn.body[ins_at:ins_at] = [copy.deepcopy(s) for s in call_stmts] + resync_stmts
-        # Always also append at the end of fn.body (unless fn.body ends with Return)
-        if not isinstance(fn.body[-1], ast.Return):
+            tail_calls_step = any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id.endswith("_step")
+                for st_tail in fn.body[ins_at:]
+                for n in ast.walk(st_tail)
+            )
+            if not tail_calls_step:
+                # Re-sync local variables written into buf.data[0..max_dyn_slot] so downstream
+                # diagnostics (e.g. M = n1 + n2 + n3 + n4, F = ...) use stabilized/projected values.
+                resync_vars: Dict[int, str] = {}
+                for pre_stmt in fn.body[:ins_at]:
+                    if (isinstance(pre_stmt, ast.Assign) and len(pre_stmt.targets) == 1
+                            and isinstance(pre_stmt.value, ast.Name)
+                            and not pre_stmt.value.id.startswith("_invar_")):
+                        tgt_slot = _state_subscript_slot(pre_stmt.targets[0])
+                        if tgt_slot is not None and 0 <= tgt_slot <= max_dyn_slot:
+                            resync_vars[tgt_slot] = pre_stmt.value.id
+                resync_stmts: List[ast.stmt] = []
+                if resync_vars:
+                    resync_src = "\n".join(
+                        f"{vname} = buf.data[{slot}]"
+                        for slot, vname in sorted(resync_vars.items())
+                    )
+                    resync_stmts = ast.parse(resync_src).body
+                fn.body[ins_at:ins_at] = [copy.deepcopy(s) for s in call_stmts] + resync_stmts
+                inserted_inline = True
+        # Idempotent single projection: append at function exit only if not already inserted inline.
+        if not inserted_inline and not isinstance(fn.body[-1], ast.Return):
             fn.body.extend([copy.deepcopy(s) for s in call_stmts])
 
         ast.fix_missing_locations(fn)
@@ -7030,6 +7502,7 @@ def _stabilize_dynamical_state_tree(
             is_mass_kinetics=is_mass_kinetics,
             is_triad=is_triad,
             is_sphere_s2=is_sphere_s2,
+            unit_bounded=bool(is_density or is_sphere_s2),
             layout=layout,
         )
         ast.fix_missing_locations(tree)
@@ -8316,7 +8789,8 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         contracts: Sequence[Any] = (),
                         all_contracts: Sequence[Any] = (),
                         variable_map: Optional[Dict[str, int]] = None,
-                        stabilize_diverged: bool = False) -> SanitizerResult:
+                        stabilize_diverged: bool = False,
+                        pinned_functions: Optional[Collection[str]] = None) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
         tree = ast.parse(code)
@@ -8324,76 +8798,87 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
         return SanitizerResult(code, [], False)
     original = ast.dump(tree, annotate_fields=False, include_attributes=False)
     bridge_contracts = list(all_contracts or contracts or [])
-    tree, rand_changed, rand_notes = _lower_random_calls_tree(tree)
-    tree, alias_changed, alias_notes = _normalize_buffer_aliases_tree(tree)
-    tree, sig_changed, sig_notes = _normalize_step_signatures_tree(tree)
-    tree, intro_changed, intro_notes = _lower_introspection_and_buf_attrs_tree(tree)
-    tree, loop_changed, loop_notes = _lower_scalar_loops_and_builtins_tree(tree)
-    tree, tup_changed, tup_notes = _desugar_tuple_unpacking_tree(tree)
-    tree, comp_changed, comp_notes = _lower_comprehensions_tree(tree)
-    tree, glob_changed, glob_notes = _strip_global_nonlocal_tree(tree)
-    tree, modconst_changed, modconst_notes = _inline_non_scalar_module_constants_tree(tree)
-    tree, arity_changed, arity_notes = _repair_call_arity_tree(tree)
-    tree, inline_changed, inline_notes = _inline_buffer_mutating_helpers_tree(tree)
-    tree, init_loc_changed, init_loc_notes = _init_conditional_locals_tree(tree)
-    tree, bsize_changed, bsize_notes = _strip_buf_size_branches_tree(tree, bridge_contracts)
-    tree, coll_changed, coll_notes = _resolve_slot_collisions_tree(tree, contracts, bridge_contracts)
-    tree, split_changed, split_notes = _split_intra_function_stage_overwrites_tree(
-        tree, contracts, bridge_contracts, variable_map=variable_map
-    )
-    tree, rev_changed, rev_notes = _repair_reversibility_branch_tree(tree, bridge_contracts)
-    tree, bridge_changed, bridge_notes = _bridge_contract_slots_tree(tree, bridge_contracts)
-    tree, history_changed, history_notes = _repair_history_slots_tree(tree)
-    tree, stab_changed, stab_notes = _stabilize_dynamical_state_tree(
-        tree, list(contracts or bridge_contracts), stabilize_diverged=stabilize_diverged
-    )
-    tree, monotone_changed, monotone_notes = _repair_monotone_observables_tree(
-        tree, bridge_contracts)
-    tree, bloch_changed, bloch_notes = _enforce_bloch_ball_projection_tree(tree, bridge_contracts)
-    tree, none_changed, none_notes = _strip_none_literals_tree(tree)
-    tree, complex_changed, complex_notes = _lower_complex_tree(tree)
-    tree, sdiv_changed, sdiv_notes = _lower_safe_division_tree(tree)
-    tree, unify_changed, unify_notes = _unify_concept_slots_tree(tree, bridge_contracts)
-    tree, concept_changed, concept_notes = _bridge_unassigned_concept_slots_tree(
-        tree, bridge_contracts)
-    tree, cons_changed, cons_notes = _enforce_conservation_projection_tree(
-        tree, bridge_contracts)
-    tree, lyap_changed, lyap_notes = _enforce_lyapunov_sign_tree(tree, bridge_contracts)
-    tree, param_changed, param_notes = _protect_parameter_slots_tree(tree, bridge_contracts)
-    tree, diss_changed, diss_notes = _seed_dissipation_parameters_tree(tree, contracts)
-    transformer = _IntrinsicTransformer()
-    transformer.defined = _defined_names(tree)
-    transformer.guard_eps = float(eps)
-    tree = transformer.visit(tree)
-    ast.fix_missing_locations(tree)
-    changed = ast.dump(tree, annotate_fields=False, include_attributes=False) != original
-    notes = sorted(set(rand_notes) | set(alias_notes) | set(sig_notes) | set(intro_notes) | set(loop_notes) | set(tup_notes) | set(comp_notes) | set(glob_notes) | set(modconst_notes) | set(arity_notes) | set(inline_notes) | set(init_loc_notes) | set(bsize_notes) | set(coll_notes) | set(split_notes) | set(rev_notes) | set(stab_notes) | set(bloch_notes) | set(bridge_notes) | set(monotone_notes)
-                   | set(none_notes) | set(complex_notes) | set(history_notes)
-                   | set(sdiv_notes) | set(unify_notes) | set(concept_notes)
-                   | set(cons_notes) | set(lyap_notes)
-                   | set(param_notes) | set(diss_notes) | set(transformer.notes))
-    if (rand_changed or alias_changed or sig_changed or intro_changed or loop_changed or tup_changed or comp_changed or glob_changed or modconst_changed or arity_changed or inline_changed or init_loc_changed or bsize_changed or coll_changed or split_changed or rev_changed or bloch_changed or bridge_changed or monotone_changed or none_changed
-            or complex_changed or history_changed or sdiv_changed or unify_changed
-            or concept_changed or cons_changed or lyap_changed
-            or param_changed or diss_changed):
-        changed = True
-    if transformer.used_math or transformer.used_np or transformer.used_intrinsics:
-        if _ensure_math_import(tree):
-            notes.append("injected import math")
-            changed = True
-    if _insert_intrinsic_helpers(tree, transformer.used_intrinsics):
-        notes.append("injected scalar intrinsics: " + ", ".join(sorted(transformer.used_intrinsics)))
-        changed = True
+    pinned_snaps = _snapshot_pinned_functions(tree, pinned_functions)
+    all_notes: Set[str] = set()
+    any_changed = False
+
+    def _run_op(op_name: str, pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]], *args: Any, **kwargs: Any) -> None:
+        nonlocal tree, any_changed
+        tree, op_changed, op_notes = _run_tier0_tree_pass(
+            tree, op_name, pass_fn, *args, pinned_snapshots=pinned_snaps, **kwargs
+        )
+        if op_changed:
+            any_changed = True
+        all_notes.update(op_notes)
+
+    _run_op("LOWER_RANDOM_CALLS", _lower_random_calls_tree)
+    _run_op("NORMALIZE_BUFFER_ALIASES", _normalize_buffer_aliases_tree)
+    _run_op("NORMALIZE_STEP_SIGNATURES", _normalize_step_signatures_tree)
+    _run_op("LOWER_INTROSPECTION_AND_BUF_ATTRS", _lower_introspection_and_buf_attrs_tree)
+    _run_op("LOWER_SCALAR_LOOPS_AND_BUILTINS", _lower_scalar_loops_and_builtins_tree)
+    _run_op("DESUGAR_TUPLE_UNPACKING", _desugar_tuple_unpacking_tree)
+    _run_op("LOWER_COMPREHENSIONS", _lower_comprehensions_tree)
+    _run_op("STRIP_GLOBAL_NONLOCAL", _strip_global_nonlocal_tree)
+    _run_op("INLINE_NON_SCALAR_MODULE_CONSTANTS", _inline_non_scalar_module_constants_tree)
+    _run_op("REPAIR_CALL_ARITY", _repair_call_arity_tree)
+    _run_op("INLINE_BUFFER_MUTATING_HELPERS", _inline_buffer_mutating_helpers_tree)
+    _run_op("INIT_CONDITIONAL_LOCALS", _init_conditional_locals_tree)
+    _run_op("STRIP_BUF_SIZE_BRANCHES", _strip_buf_size_branches_tree, bridge_contracts)
+    _run_op("RESOLVE_SLOT_COLLISIONS", _resolve_slot_collisions_tree, contracts, bridge_contracts)
+    _run_op("SPLIT_INTRA_FUNCTION_STAGE_OVERWRITES", _split_intra_function_stage_overwrites_tree, contracts, bridge_contracts, variable_map=variable_map)
+    _run_op("REPAIR_REVERSIBILITY_BRANCH", _repair_reversibility_branch_tree, bridge_contracts)
+    _run_op("BRIDGE_CONTRACT_SLOTS", _bridge_contract_slots_tree, bridge_contracts)
+    _run_op("REPAIR_HISTORY_SLOTS", _repair_history_slots_tree)
+    _run_op("STABILIZE_DYNAMICAL_STATE", _stabilize_dynamical_state_tree, list(contracts or bridge_contracts), stabilize_diverged=stabilize_diverged)
+    _run_op("REPAIR_MONOTONE_OBSERVABLES", _repair_monotone_observables_tree, bridge_contracts)
+    _run_op("ENFORCE_BLOCH_BALL_PROJECTION", _enforce_bloch_ball_projection_tree, bridge_contracts, variable_map=variable_map)
+    _run_op("STRIP_NONE_LITERALS", _strip_none_literals_tree)
+    _run_op("LOWER_COMPLEX_TO_REAL", _lower_complex_tree, pinned_functions=pinned_functions)
+    _run_op("LOWER_SAFE_DIVISION", _lower_safe_division_tree)
+    _run_op("UNIFY_CONCEPT_SLOTS", _unify_concept_slots_tree, bridge_contracts)
+    _run_op("BRIDGE_UNASSIGNED_CONCEPT_SLOTS", _bridge_unassigned_concept_slots_tree, bridge_contracts)
+    _run_op("ENFORCE_CONSERVATION_PROJECTION", _enforce_conservation_projection_tree, bridge_contracts)
+    _run_op("ENFORCE_LYAPUNOV_SIGN", _enforce_lyapunov_sign_tree, bridge_contracts)
+    _run_op("PROTECT_PARAMETER_SLOTS", _protect_parameter_slots_tree, bridge_contracts)
+    _run_op("SEED_DISSIPATION_PARAMETERS", _seed_dissipation_parameters_tree, contracts)
+    # Refresh buf.size < N guards after latch/slot allocation so latches and high contract slots stay in-bounds.
+    _run_op("RAISE_BUF_SIZE_GUARDS", _strip_buf_size_branches_tree, bridge_contracts)
+
+    def _intrinsic_pass(t: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+        tr = _IntrinsicTransformer()
+        tr.defined = _defined_names(t)
+        tr.guard_eps = float(eps)
+        before_i = ast.dump(t, annotate_fields=False, include_attributes=False)
+        t = tr.visit(t)
+        ast.fix_missing_locations(t)
+        i_notes = set(tr.notes)
+        if tr.used_math or tr.used_np or tr.used_intrinsics:
+            if _ensure_math_import(t):
+                i_notes.add("injected import math")
+        if _insert_intrinsic_helpers(t, tr.used_intrinsics):
+            i_notes.add("injected scalar intrinsics: " + ", ".join(sorted(tr.used_intrinsics)))
+        after_i = ast.dump(t, annotate_fields=False, include_attributes=False)
+        return t, (after_i != before_i or bool(i_notes)), sorted(i_notes)
+
+    _run_op("INTRINSIC_TRANSFORMER", _intrinsic_pass)
+
     if guard_domains:
-        # Second pass guards math.log/sqrt/asin/acos introduced above.
-        before = ast.dump(tree, annotate_fields=False, include_attributes=False)
-        tree = _DomainGuardTransformer(eps=float(eps)).visit(tree)
-        ast.fix_missing_locations(tree)
-        if ast.dump(tree, annotate_fields=False, include_attributes=False) != before:
-            notes.append("guarded math domains (log/sqrt/asin/acos)")
-            changed = True
-    out = ast.unparse(tree) + ("\n" if code.endswith("\n") or not code.endswith("\n") else "")
-    return SanitizerResult(out, notes, changed, backup_slot_map=_collect_parameter_backup_map(tree))
+        def _domain_pass(t: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+            before_d = ast.dump(t, annotate_fields=False, include_attributes=False)
+            t = _DomainGuardTransformer(eps=float(eps)).visit(t)
+            ast.fix_missing_locations(t)
+            if ast.dump(t, annotate_fields=False, include_attributes=False) != before_d:
+                return t, True, ["guarded math domains (log/sqrt/asin/acos)"]
+            return t, False, []
+
+        _run_op("DOMAIN_GUARD", _domain_pass)
+
+    if pinned_snaps:
+        _restore_pinned_functions(tree, pinned_snaps)
+    _ensure_nonempty_blocks(tree)
+    changed = bool(any_changed or ast.dump(tree, annotate_fields=False, include_attributes=False) != original)
+    out = _safe_unparse(tree) + "\n"
+    return SanitizerResult(out, sorted(all_notes), changed, backup_slot_map=_collect_parameter_backup_map(tree))
 
 
 class _DomainGuardTransformer(ast.NodeTransformer):
@@ -8459,11 +8944,10 @@ def strip_none_literals(code: str) -> SanitizerResult:
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
-    original = ast.dump(tree, annotate_fields=False, include_attributes=False)
-    tree, changed, notes = _strip_none_literals_tree(tree)
+    tree, changed, notes = _run_tier0_tree_pass(tree, "STRIP_NONE_LITERALS", _strip_none_literals_tree)
     if not changed:
         return SanitizerResult(code, [], False)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def _is_state_target(node: ast.AST, slot: int) -> bool:
@@ -8587,7 +9071,7 @@ def rewrite_monotone_drift(code: str, *, slot: int, direction: str = "non_increa
                or ast.dump(tree, annotate_fields=False, include_attributes=False) != original)
     notes = history_notes + r_notes + ([f"rewrote monotone drift state[{slot}] ({direction})"]
                                        if transformer.changed else [])
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, changed)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, changed)
 
 
 def infer_monotone_drift_directives(contracts: Sequence[Any], code: str) -> List[Dict[str, Any]]:
@@ -8719,7 +9203,7 @@ def repair_drift_self_comparison(code: str, *, slot: int, prev_slot: int,
         break
     if not changed:
         return SanitizerResult(code, [], False)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def infer_drift_self_comparison_directives(contracts: Sequence[Any],
@@ -8794,12 +9278,18 @@ def _scale_coefficient(tree: ast.Module, var: str, factor: float) -> bool:
 
 def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
                              *, contracts: Sequence[Any] = (),
-                             variable_map: Optional[Dict[str, int]] = None) -> SanitizerResult:
+                             variable_map: Optional[Dict[str, int]] = None,
+                             pinned_functions: Optional[Collection[str]] = None) -> SanitizerResult:
     """Apply LLM-emitted structured directives deterministically."""
     notes: List[str] = []
     current = code
     # Always run the intrinsic/domain sanitizer first (Tier-0, zero tokens).
-    san = sanitize_intrinsics(current, contracts=contracts, variable_map=variable_map)
+    san = sanitize_intrinsics(
+        current,
+        contracts=contracts,
+        variable_map=variable_map,
+        pinned_functions=pinned_functions,
+    )
     if san.changed:
         current = san.code
         notes.extend(san.notes)
@@ -8807,132 +9297,156 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
         tree = ast.parse(current)
     except SyntaxError:
         return SanitizerResult(current, notes, bool(notes))
+    pinned_snaps = _snapshot_pinned_functions(tree, pinned_functions)
     before_dump = ast.dump(tree, annotate_fields=False, include_attributes=False)
     for raw in directives or []:
         if not isinstance(raw, dict):
             continue
         op = str(raw.get("op") or "")
-        if op == "INLINE_INTRINSIC":
-            name = str(raw.get("name") or "")
-            if name == _SAFE_DIV_HELPER:
-                has_fn = any(
-                    isinstance(n, ast.FunctionDef) and n.name == _SAFE_DIV_HELPER
-                    for n in tree.body
-                )
-                if not has_fn:
-                    tree.body.insert(0, ast.parse(_SAFE_DIV_SRC).body[0])
-                _hoist_intrinsic_helpers(tree)
-                notes.append(f"INLINE_INTRINSIC({name})")
-            elif name in INTRINSIC_ALIASES:
-                patched = _insert_intrinsic_helpers(tree, [name])
-                if patched:
+        snap_op_tree = copy.deepcopy(tree)
+        try:
+            if op == "INLINE_INTRINSIC":
+                name = str(raw.get("name") or "")
+                if name == _SAFE_DIV_HELPER:
+                    has_fn = any(
+                        isinstance(n, ast.FunctionDef) and n.name == _SAFE_DIV_HELPER
+                        for n in tree.body
+                    )
+                    if not has_fn:
+                        tree.body.insert(0, ast.parse(_SAFE_DIV_SRC).body[0])
+                        _ensure_math_import(tree)
+                    _hoist_intrinsic_helpers(tree)
                     notes.append(f"INLINE_INTRINSIC({name})")
-            elif name in ("asinh", "math.asinh"):
-                class _AsinhLowerer(ast.NodeTransformer):
-                    def visit_Call(self, cnode: ast.Call) -> ast.AST:
-                        self.generic_visit(cnode)
-                        cname = _call_name(cnode.func)
-                        if cname in ("asinh", "math.asinh") and len(cnode.args) == 1:
-                            x_src = ast.unparse(cnode.args[0])
-                            return ast.parse(f"math.log(({x_src}) + math.sqrt(({x_src}) * ({x_src}) + 1.0))", mode="eval").body
-                        return cnode
+                elif name in INTRINSIC_ALIASES:
+                    patched = _insert_intrinsic_helpers(tree, [name])
+                    if patched:
+                        notes.append(f"INLINE_INTRINSIC({name})")
+                elif name in ("asinh", "math.asinh"):
+                    class _AsinhLowerer(ast.NodeTransformer):
+                        def visit_Call(self, cnode: ast.Call) -> ast.AST:
+                            self.generic_visit(cnode)
+                            cname = _call_name(cnode.func)
+                            if cname in ("asinh", "math.asinh") and len(cnode.args) == 1:
+                                x_src = ast.unparse(cnode.args[0])
+                                return ast.parse(f"math.log(({x_src}) + math.sqrt(({x_src}) * ({x_src}) + 1.0))", mode="eval").body
+                            return cnode
 
-                tree = _AsinhLowerer().visit(tree)
-                _ensure_math_import(tree)
-                ast.fix_missing_locations(tree)
-                notes.append(f"INLINE_INTRINSIC({name})")
-        elif op == "GUARD_MATH_DOMAINS":
-            eps = float(raw.get("eps", 1e-300) or 1e-300)
-            guarded = _DomainGuardTransformer(eps=eps).visit(tree)
-            if guarded is not tree:
-                notes.append("GUARD_MATH_DOMAINS")
-            tree = guarded
-        elif op == "REWRITE_MONOTONE_DRIFT":
-            _raw_slot = raw.get("slot", -1)
-            try:
-                slot = int(_raw_slot)
-            except (TypeError, ValueError):
-                _m_slot = re.search(r"(\d+)", str(_raw_slot or ""))
-                slot = int(_m_slot.group(1)) if _m_slot else -1
-            if slot >= 0:
-                # Re-render through the dedicated rewriter for precise notes.
-                rw = rewrite_monotone_drift(ast.unparse(tree) + "\n", slot=slot,
-                                            direction=str(raw.get("direction") or "non_increasing"),
-                                            before_var=raw.get("before_var"),
-                                            after_var=raw.get("after_var"))
+                    tree = _AsinhLowerer().visit(tree)
+                    _ensure_math_import(tree)
+                    ast.fix_missing_locations(tree)
+                    notes.append(f"INLINE_INTRINSIC({name})")
+            elif op == "GUARD_MATH_DOMAINS":
+                eps = float(raw.get("eps", 1e-300) or 1e-300)
+                guarded = _DomainGuardTransformer(eps=eps).visit(tree)
+                if guarded is not tree:
+                    notes.append("GUARD_MATH_DOMAINS")
+                tree = guarded
+            elif op == "REWRITE_MONOTONE_DRIFT":
+                _raw_slot = raw.get("slot", -1)
+                try:
+                    slot = int(_raw_slot)
+                except (TypeError, ValueError):
+                    _m_slot = re.search(r"(\d+)", str(_raw_slot or ""))
+                    slot = int(_m_slot.group(1)) if _m_slot else -1
+                if slot >= 0:
+                    # Re-render through the dedicated rewriter for precise notes.
+                    rw = rewrite_monotone_drift(_safe_unparse(tree) + "\n", slot=slot,
+                                                direction=str(raw.get("direction") or "non_increasing"),
+                                                before_var=raw.get("before_var"),
+                                                after_var=raw.get("after_var"))
+                    if rw.changed:
+                        tree = ast.parse(rw.code)
+                        notes.extend(rw.notes)
+            elif op in {"ENFORCE_CONSERVATION_PROJECTION", "ENFORCE_LYAPUNOV_SIGN",
+                        "REWRITE_MONOTONE_DRIFT_CONCEPT", "LOWER_SAFE_DIVISION",
+                        "UNIFY_CONCEPT_SLOTS", "BRIDGE_UNASSIGNED_SLOTS"}:
+                text = _safe_unparse(tree) + "\n"
+                rw = _apply_physics_guard_pass(op, text, contracts)
                 if rw.changed:
                     tree = ast.parse(rw.code)
-                    notes.extend(rw.notes)
-        elif op in {"ENFORCE_CONSERVATION_PROJECTION", "ENFORCE_LYAPUNOV_SIGN",
-                    "REWRITE_MONOTONE_DRIFT_CONCEPT", "LOWER_SAFE_DIVISION",
-                    "UNIFY_CONCEPT_SLOTS", "BRIDGE_UNASSIGNED_SLOTS"}:
-            text = ast.unparse(tree) + "\n"
-            rw = _apply_physics_guard_pass(op, text, contracts)
-            if rw.changed:
-                tree = ast.parse(rw.code)
-                notes.extend(rw.notes or [op])
-        elif op == "WRAP_SUBSTEP":
-            if _wrap_substep(tree, int(raw.get("substeps", 1) or 1)):
-                notes.append(f"WRAP_SUBSTEP({int(raw.get('substeps', 1) or 1)})")
-        elif op == "SCALE_COEFFICIENT":
-            var = str(raw.get("var") or "")
-            if var and _scale_coefficient(tree, var, float(raw.get("factor", 1.0) or 1.0)):
-                notes.append(f"SCALE_COEFFICIENT({var},{float(raw.get('factor', 1.0) or 1.0)})")
-        elif op == "REPAIR_DRIFT_SELF_COMPARISON":
-            try:
-                slot = int(raw.get("slot", -1))
-            except (TypeError, ValueError):
-                slot = -1
-            try:
-                prev = int(raw.get("prev_slot", -1))
-            except (TypeError, ValueError):
-                prev = -1
-            if slot >= 0 and prev >= 0:
-                rw = repair_drift_self_comparison(ast.unparse(tree) + "\n", slot=slot,
-                                                 prev_slot=prev, contracts=contracts)
-                if rw.changed:
-                    tree = ast.parse(rw.code)
-                    notes.extend(rw.notes)
-        elif op == "LOWER_COMPLEX_TO_REAL":
-            lowered = lower_complex_to_real(ast.unparse(tree) + "\n")
-            if lowered.changed:
-                tree = ast.parse(lowered.code)
-                notes.append("LOWER_COMPLEX_TO_REAL")
-        elif op == "PRUNE_UNUSED_HELPERS":
-            pruned = prune_unused_helpers(ast.unparse(tree) + "\n")
-            if pruned.changed:
-                tree = ast.parse(pruned.code)
-                notes.append("PRUNE_UNUSED_HELPERS")
-        elif op == "STRIP_NONE_LITERALS":
-            stripped = strip_none_literals(ast.unparse(tree) + "\n")
-            if stripped.changed:
-                tree = ast.parse(stripped.code)
-                notes.append("STRIP_NONE_LITERALS")
-        elif op == "CLAMP_STATE_NORM":
-            notes.append("CLAMP_STATE_NORM recorded (no scalar AST rewrite)")
-        elif op == "BIND_SLOT_TO_VAR":
-            notes.append(f"BIND_SLOT_TO_VAR({raw.get('slot')},{raw.get('var')})")
-        else:
-            notes.append(f"ignored unknown directive {op or '<missing>'}")
+                    notes.extend(rw.notes or [op])
+            elif op == "WRAP_SUBSTEP":
+                if _wrap_substep(tree, int(raw.get("substeps", 1) or 1)):
+                    notes.append(f"WRAP_SUBSTEP({int(raw.get('substeps', 1) or 1)})")
+            elif op == "SCALE_COEFFICIENT":
+                var = str(raw.get("var") or "")
+                if var and _scale_coefficient(tree, var, float(raw.get("factor", 1.0) or 1.0)):
+                    notes.append(f"SCALE_COEFFICIENT({var},{float(raw.get('factor', 1.0) or 1.0)})")
+            elif op == "REPAIR_DRIFT_SELF_COMPARISON":
+                try:
+                    slot = int(raw.get("slot", -1))
+                except (TypeError, ValueError):
+                    slot = -1
+                try:
+                    prev = int(raw.get("prev_slot", -1))
+                except (TypeError, ValueError):
+                    prev = -1
+                if slot >= 0 and prev >= 0:
+                    rw = repair_drift_self_comparison(_safe_unparse(tree) + "\n", slot=slot,
+                                                     prev_slot=prev, contracts=contracts)
+                    if rw.changed:
+                        tree = ast.parse(rw.code)
+                        notes.extend(rw.notes)
+            elif op == "LOWER_COMPLEX_TO_REAL":
+                lowered = lower_complex_to_real(_safe_unparse(tree) + "\n", pinned_functions=pinned_functions)
+                if lowered.changed:
+                    tree = ast.parse(lowered.code)
+                    notes.append("LOWER_COMPLEX_TO_REAL")
+            elif op == "PRUNE_UNUSED_HELPERS":
+                pruned = prune_unused_helpers(_safe_unparse(tree) + "\n", pinned_functions=pinned_functions)
+                if pruned.changed:
+                    tree = ast.parse(pruned.code)
+                    notes.append("PRUNE_UNUSED_HELPERS")
+            elif op == "STRIP_NONE_LITERALS":
+                stripped = strip_none_literals(_safe_unparse(tree) + "\n")
+                if stripped.changed:
+                    tree = ast.parse(stripped.code)
+                    notes.append("STRIP_NONE_LITERALS")
+            elif op == "CLAMP_STATE_NORM":
+                notes.append("CLAMP_STATE_NORM recorded (no scalar AST rewrite)")
+            elif op == "BIND_SLOT_TO_VAR":
+                notes.append(f"BIND_SLOT_TO_VAR({raw.get('slot')},{raw.get('var')})")
+            else:
+                notes.append(f"ignored unknown directive {op or '<missing>'}")
+            if pinned_snaps:
+                _restore_pinned_functions(tree, pinned_snaps)
+            _ensure_nonempty_blocks(tree)
+            ast.parse(_safe_unparse(tree) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Healing directive %s produced invalid syntax (%s: %s); rolling back.", op, type(exc).__name__, exc)
+            tree = snap_op_tree
     # Contract-inferred deterministic drift repairs run without an LLM.
-    current_code = ast.unparse(tree) + "\n"
+    current_code = _safe_unparse(tree) + "\n"
     inferred = infer_monotone_drift_directives(contracts, current_code)
     inferred += infer_drift_self_comparison_directives(contracts, current_code)
     for d in inferred:
-        if d.get("op") == "REPAIR_DRIFT_SELF_COMPARISON":
-            rw = repair_drift_self_comparison(ast.unparse(tree) + "\n", slot=int(d["slot"]),
-                                             prev_slot=int(d["prev_slot"]), contracts=contracts)
-        else:
-            rw = rewrite_monotone_drift(ast.unparse(tree) + "\n", slot=int(d["slot"]),
-                                        direction=str(d.get("direction") or "non_increasing"))
-        if rw.changed:
-            tree = ast.parse(rw.code)
-            notes.extend(rw.notes)
+        snap_inf = copy.deepcopy(tree)
+        try:
+            if d.get("op") == "REPAIR_DRIFT_SELF_COMPARISON":
+                rw = repair_drift_self_comparison(_safe_unparse(tree) + "\n", slot=int(d["slot"]),
+                                                 prev_slot=int(d["prev_slot"]), contracts=contracts)
+            else:
+                rw = rewrite_monotone_drift(_safe_unparse(tree) + "\n", slot=int(d["slot"]),
+                                            direction=str(d.get("direction") or "non_increasing"))
+            if rw.changed:
+                cand_t = ast.parse(rw.code)
+                if pinned_snaps:
+                    _restore_pinned_functions(cand_t, pinned_snaps)
+                _ensure_nonempty_blocks(cand_t)
+                ast.parse(_safe_unparse(cand_t) + "\n")
+                tree = cand_t
+                notes.extend(rw.notes)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Inferred directive %s failed syntax check (%s); rolling back.", d.get("op"), exc)
+            tree = snap_inf
+    if pinned_snaps:
+        _restore_pinned_functions(tree, pinned_snaps)
+    _ensure_nonempty_blocks(tree)
     ast.fix_missing_locations(tree)
     after_dump = ast.dump(tree, annotate_fields=False, include_attributes=False)
     ast_changed = after_dump != before_dump
     changed = bool(san.changed or ast_changed)
-    out = ast.unparse(tree) + "\n"
+    out = _safe_unparse(tree) + "\n"
     return SanitizerResult(out if changed else code, sorted(set(notes)), changed)
 
 
@@ -8946,6 +9460,10 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
 _SAFE_DIV_HELPER = "_invar_sdiv"
 _SAFE_DIV_SRC = (
     "def _invar_sdiv(a, b):\n"
+    "    if not math.isfinite(a):\n"
+    "        a = math.copysign(1e100, a) if math.isinf(a) else 0.0\n"
+    "    if not math.isfinite(b):\n"
+    "        return 0.0\n"
     "    if b >= 0.0 and b < 1e-30:\n"
     "        return a / 1e-30\n"
     "    if b < 0.0 and b > -1e-30:\n"
@@ -9689,11 +10207,11 @@ def _tree_pass_wrapper(code: str, pass_fn, *, contracts: Sequence[Any] = ()) -> 
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
-    tree, changed, notes = pass_fn(tree, contracts)
+    tree, changed, notes = _run_tier0_tree_pass(tree, getattr(pass_fn, "__name__", "TREE_PASS"), pass_fn, contracts)
     if not changed:
         return SanitizerResult(code, [], False)
     ast.fix_missing_locations(tree)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def enforce_conservation_projection(code: str, *,
@@ -9716,10 +10234,10 @@ def lower_safe_division(code: str) -> SanitizerResult:
         tree = ast.parse(code)
     except SyntaxError:
         return SanitizerResult(code, [], False)
-    tree, changed, notes = _lower_safe_division_tree(tree)
+    tree, changed, notes = _run_tier0_tree_pass(tree, "LOWER_SAFE_DIVISION", _lower_safe_division_tree)
     if not changed:
         return SanitizerResult(code, [], False)
-    return SanitizerResult(ast.unparse(tree) + "\n", notes, True)
+    return SanitizerResult(_safe_unparse(tree) + "\n", notes, True)
 
 
 def unify_concept_slots(code: str, *, contracts: Sequence[Any] = ()) -> SanitizerResult:

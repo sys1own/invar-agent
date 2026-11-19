@@ -10,20 +10,23 @@ the report can never invent values.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..schemas.research import ResearchBlueprint, SimulationResult
 from .report import _fmt_value, extract_observables
 
-# Map common unit suffixes embedded in observable names to display units.
-# LONGEST compound suffixes are checked first so `impact_velocity_m_s` maps
-# to `m/s` (never `s`) and `peak_g_gE` maps to `g_E` (never `—`).
+# Multi-character suffixes are checked first (longest match), case-insensitively.
+# Single-letter SI suffixes are strictly case-sensitive so biological/state
+# symbols like `sim_epi_S` (Susceptible) or `M_atm` never map to seconds/meters.
 UNIT_SUFFIX_MAP = [
     ("_mw_m2", "MW/m²"),
     ("_mj_m2", "MJ/m²"),
     ("_w_m2", "W/m²"),
     ("_j_m2", "J/m²"),
     ("_kg_m3", "kg/m³"),
+    ("_mol_m3_s", "mol/(m³·s)"),
+    ("_mol_m3", "mol/m³"),
+    ("_gtc_yr", "GtC/yr"),
     ("_j_per_bit", "J/bit"),
     ("_j_per_k", "J/K"),
     ("_m_s2", "m/s²"),
@@ -32,8 +35,13 @@ UNIT_SUFFIX_MAP = [
     ("_km_s", "km/s"),
     ("_dimensionless", "dimensionless"),
     ("_bytes", "bytes"),
+    ("_bits", "bits"),
+    ("_nats", "nats"),
+    ("_morgan", "Morgan"),
+    ("_gtc", "GtC"),
+    ("_pgc", "PgC"),
+    ("_ppm", "ppm"),
     ("_ge", "g_E"),
-    ("_g", "g_E"),
     ("_km", "km"),
     ("_kg", "kg"),
     ("_kw", "kW"),
@@ -43,23 +51,28 @@ UNIT_SUFFIX_MAP = [
     ("_hz", "Hz"),
     ("_deg", "deg"),
     ("_rad", "rad"),
+]
+
+_SINGLE_LETTER_UNIT_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     ("_m", "m"),
     ("_s", "s"),
-    ("_w", "W"),
-    ("_k", "K"),
-    ("_j", "J"),
-    ("_v", "V"),
-]
+    ("_W", "W"),
+    ("_K", "K"),
+    ("_J", "J"),
+    ("_V", "V"),
+    ("_g", "g_E"),
+)
 
 
 def _deduplicate_observables(observables: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Collapse case-insensitive and unit-suffixed aliases to one canonical row."""
     if not observables:
         return {}
-    stem_re = re.compile(r"_(?:w|kw|mw|k|j|s|m|pa|hz|v|ev|dimensionless|bytes)$", re.I)
+    multi_stem_re = re.compile(r"_(?:kw|mw|pa|hz|ev|dimensionless|bytes|km|kg|deg|rad)$", re.I)
+    single_stem_re = re.compile(r"_(?:W|K|J|V|s|m)$")
     groups: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
     for name, obs in observables.items():
-        stem = stem_re.sub("", name.lower())
+        stem = single_stem_re.sub("", multi_stem_re.sub("", name)).lower()
         groups.setdefault(stem, []).append((name, obs))
     out: Dict[str, Dict[str, Any]] = {}
     for stem, items in groups.items():
@@ -80,10 +93,26 @@ def _deduplicate_observables(observables: Dict[str, Dict[str, Any]]) -> Dict[str
     return out
 
 
-def _unit_for(name: str) -> str:
+def _unit_for(name: str, blueprint: Optional[ResearchBlueprint] = None) -> str:
+    stem_no_sym = re.sub(r"_[a-zA-Z]$", "", name.lower())
+    if blueprint is not None:
+        ev = getattr(blueprint, "structured_evidence", None)
+        ev_params = ev.get("parameters") if isinstance(ev, dict) else getattr(ev, "parameters", None)
+        if isinstance(ev_params, dict):
+            key_low = name.lower()
+            p = ev_params.get(name) or ev_params.get(key_low) or ev_params.get(stem_no_sym)
+            if p is not None:
+                u = (p.get("si_unit") or p.get("raw_unit")) if isinstance(p, dict) else (getattr(p, "si_unit", "") or getattr(p, "raw_unit", ""))
+                return str(u) if u else "—"
     lowered = name.lower()
     for suffix, unit in UNIT_SUFFIX_MAP:
         if lowered.endswith(suffix):
+            return unit
+    _NON_TIME_S_WORDS = ("coefficient", "factor", "ratio", "index", "entropy", "susceptible", "selection", "score", "fraction", "state")
+    for suffix, unit in _SINGLE_LETTER_UNIT_SUFFIXES:
+        if name.endswith(suffix):
+            if suffix == "_s" and any(w in lowered for w in _NON_TIME_S_WORDS):
+                return "—"
             return unit
     return "—"
 
@@ -146,7 +175,7 @@ def generate_comprehensive_research_report(
             st = "VERIFIED" if status == "VERIFIED" else (obs.get("status") or status or "VERIFIED")
             lines.append(
                 f"| {_nice_metric(name)} | `{_symbol_for(name)}` | "
-                f"**{_fmt_value(obs['value'])}** | {_unit_for(name)} | {st} |")
+                f"**{_fmt_value(obs['value'])}** | {_unit_for(name, blueprint=bp)} | {st} |")
         lines.append("")
     else:
         lines.append("_No named observables were mapped in this blueprint "

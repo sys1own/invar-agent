@@ -368,6 +368,8 @@ class CppEmitter:
                 return VEC
             if op == "/" or op == "**":
                 return FLOAT
+            if op in ("&", "|", "^", "<<", ">>"):
+                return INT
             if lt in (INT, BOOL) and rt in (INT, BOOL):
                 return INT
             return FLOAT
@@ -454,11 +456,12 @@ class CppEmitter:
         walk(fn.get("body"))
         for v in loop_vars:
             self.types.setdefault(v, FLOAT if v in float_loop_vars else INT)
+        assigned_names = {n for n, _ in assigns}
         local_types: Dict[str, str] = {}
         for _ in range(4):
             changed = False
             for name, value in assigns:
-                if name in params or name in loop_vars:
+                if name in params or (name in loop_vars and name not in assigned_names):
                     continue
                 vt = self._type_of(value)
                 if vt == BOOL:
@@ -572,6 +575,25 @@ class CppEmitter:
                     f"std::vector<double>(static_cast<size_t>({cols}), {fill}))")
         raise EmitterError(f"unsupported expression type {t!r}")
 
+    def _emit_u64(self, node: Optional[Dict[str, Any]]) -> str:
+        """Emit an integer/numeric IR expression in exact 64-bit unsigned arithmetic."""
+        if node is None:
+            return "0ULL"
+        t = node.get("type")
+        if t == "literal":
+            v = node.get("value")
+            if isinstance(v, (int, bool)):
+                iv = int(v)
+                return f"{iv}ULL" if iv >= 0 else f"static_cast<uint64_t>({iv}LL)"
+        if t == "binop":
+            op = node.get("op")
+            if op in ("+", "-", "*", "&", "|", "^", "<<", ">>"):
+                return f"({self._emit_u64(node.get('left'))} {op} {self._emit_u64(node.get('right'))})"
+        rendered = self.emit_expr(node)
+        if self._type_of(node) in (INT, BOOL):
+            return f"static_cast<uint64_t>(static_cast<int64_t>({rendered}))"
+        return f"invar::_to_u64({rendered})"
+
     def _emit_binop(self, node: Dict[str, Any]) -> str:
         op = node.get("op")
         left, right = node.get("left"), node.get("right")
@@ -597,8 +619,8 @@ class CppEmitter:
             return f"invar::pymod_f({self._num(left)}, {self._num(right)})"
         if op in ("+", "-", "*"):
             return f"({self.emit_expr(left)} {op} {self.emit_expr(right)})"
-        if op in ("&", "|", "^", "<<", ">>") and both_int:
-            return f"({self.emit_expr(left)} {op} {self.emit_expr(right)})"
+        if op in ("&", "|", "^", "<<", ">>"):
+            return f"static_cast<int64_t>({self._emit_u64(left)} {op} {self._emit_u64(right)})"
         raise EmitterError(f"unsupported binop {op!r}")
 
     def _emit_call(self, node: Dict[str, Any]) -> str:
@@ -808,8 +830,9 @@ class CppEmitter:
         stop = as_long(args[1] if len(args) >= 2 else args[0])
         step_node = args[2] if len(args) == 3 else None
         body = self._emit_body(node.get("body"), indent + 1)
+        decl = "" if var in getattr(self, "_declared_locals", set()) else "long "
         if step_node is None:
-            return (f"{pad}for (long {var} = {start}; {var} < {stop}; ++{var}) {{\n"
+            return (f"{pad}for ({decl}{var} = {start}; {var} < {stop}; ++{var}) {{\n"
                     f"{body}{pad}}}\n")
         step = as_long(step_node)
         neg = step_node.get("type") == "unaryop" and step_node.get("op") == "-"
@@ -822,7 +845,7 @@ class CppEmitter:
             cond = f"{var} < {stop}"
         else:
             cond = f"(({step}) > 0 ? {var} < {stop} : {var} > {stop})"
-        return (f"{pad}for (long {var} = {start}; {cond}; {var} += {step}) {{\n"
+        return (f"{pad}for ({decl}{var} = {start}; {cond}; {var} += {step}) {{\n"
                 f"{body}{pad}}}\n")
 
     def _cret(self, ret: str) -> str:
@@ -864,6 +887,7 @@ class CppEmitter:
         self._current_fn = name
         params = fn.get("params") or []
         local_types = self._collect_locals(fn)
+        self._declared_locals = set(local_types) | set(params)
         ret = self.returns.get(name, "void")
         cret = self._cret(ret)
         plist = ", ".join(f"{self.buffer_struct}* buf" if p == "buf" else f"double {p}"

@@ -107,7 +107,9 @@ from .planner import (canonicalize_contract_dicts, guided_queries,
                         refine_stage_code, request_healing_directives,
                         synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
-    _detect_bloch_radius, apply_healing_directives, classify_buffer_slots,
+    _detect_bloch_radius, _ensure_nonempty_blocks,
+    _restore_pinned_functions, _snapshot_pinned_functions,
+    apply_healing_directives, classify_buffer_slots,
     enforce_conservation_projection, enforce_lyapunov_sign,
     numeric_expr_equivalent, resolve_slot_collisions, rewrite_monotone_drift,
     sanitize_intrinsics)
@@ -1022,6 +1024,8 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     """
     initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
     max_slot = _max_state_slot(py_code, contract)
+    for oc in (all_contracts or ()):
+        max_slot = max(max_slot, _max_state_slot(py_code, oc))
     needed = max(64, max_slot + 1)
     while len(initial) < needed:
         initial.append(0.0)
@@ -1571,6 +1575,19 @@ LLMFn = Callable[[str], Awaitable[Optional[str]]]
 StageSynthFn = Callable[..., Awaitable[Dict[str, Any]]]
 
 
+def _pinned_function_names(pinned_code: str = "", pinned_layers: Sequence[ModuleLayer] = ()) -> List[str]:
+    names: Set[str] = {layer_driver_name(layer.stage) for layer in (pinned_layers or ())}
+    if pinned_code and pinned_code.strip():
+        try:
+            pt = ast.parse(pinned_code)
+            for node in pt.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_invar_"):
+                    names.add(node.name)
+        except SyntaxError:
+            pass
+    return sorted(names)
+
+
 class ResearchStateMachine:
     """Drives a blueprint through the cyclic 9-stage loop with accretive stages."""
 
@@ -1794,6 +1811,7 @@ class ResearchStateMachine:
             best_score: Optional[Tuple[int, float]] = None
             healing_stall = 0
             healing_terminated = False
+            had_divergence = False
             while attempt < max_attempts:
                 if self._aborted(state):
                     break
@@ -1805,7 +1823,8 @@ class ResearchStateMachine:
                     objective=objective, pinned_code=pinned_code,
                     pinned_layers=pinned_layers, candidate_code=candidate_code,
                     contracts=contracts, failures=failures,
-                    last_telemetry=last_telemetry)
+                    last_telemetry=last_telemetry,
+                    stabilize_diverged=had_divergence)
                 candidate_code = outcome.get("candidate_code", candidate_code)
                 contracts = outcome.get("contracts", contracts)
                 if outcome["status"] == "commit":
@@ -1851,10 +1870,13 @@ class ResearchStateMachine:
                         f"Attempt {attempt}: Invariant {cid} falsified "
                         f"({str(failure)[:120]}). Feeding counterexample back to model...")
                 elif failed_status == "DIVERGED":
+                    had_divergence = True
                     await self.emit_activity(
                         f"STAGE_{stage}_EXEC", "sandbox_diverged",
                         f"Attempt {attempt}: sandbox trajectory diverged. "
                         "Feeding counterexample back to model...")
+                if "diverged" in fail_text or "non-finite" in fail_text:
+                    had_divergence = True
                 # ALWAYS surface the exact attempt error (compiler diagnostic /
                 # schema violation / falsified invariant) BEFORE any healing
                 # dispatch, so the stream never jumps straight from a silent
@@ -1930,7 +1952,8 @@ class ResearchStateMachine:
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=base_heal_code,
                     contracts=contracts, failure=base_heal_failure,
-                    attempt=attempt, max_attempts=max_attempts)
+                    attempt=attempt, max_attempts=max_attempts,
+                    pinned_functions=_pinned_function_names(pinned_code, pinned_layers))
                 if isinstance(raw_heal, dict):
                     heal_outcome = raw_heal
                 elif isinstance(raw_heal, str):
@@ -2202,7 +2225,8 @@ class ResearchStateMachine:
                          round_idx: int, objective: str, pinned_code: str,
                          pinned_layers: List[ModuleLayer], candidate_code: Optional[str],
                          contracts: List[VerificationContract], failures: List[str],
-                         last_telemetry: Dict[str, Any]) -> Dict[str, Any]:
+                         last_telemetry: Dict[str, Any],
+                         stabilize_diverged: bool = False) -> Dict[str, Any]:
         bp = state.blueprint
         emit = self._emit
         tag = {"round": round_idx, "research_stage": stage, "attempt": attempt}
@@ -2281,11 +2305,17 @@ class ResearchStateMachine:
             contract_vars = sorted(
                 {str(k) for k in (getattr(bp, "variable_map", {}) or {})}
                 | {str(i.variable_name) for c in contracts for i in c.invariants})
+            source_breakdown: Dict[str, int] = {}
+            for h in state.literature:
+                src_name = str((h or {}).get("source") or "unknown")
+                source_breakdown[src_name] = source_breakdown.get(src_name, 0) + 1
             await self.emit_activity(
                 "INGEST", "literature_hit",
                 f"Ingested {len(state.literature)} sources "
-                f"({eq_count} equations/invariants, {const_count} numeric "
-                f"constants); contract variables: {contract_vars}")
+                f"(by_source={source_breakdown}; "
+                f"{eq_count} equations/invariants, {const_count} numeric "
+                f"constants); contract variables: {contract_vars}",
+                telemetry={"source_breakdown": source_breakdown, "equations": eq_count, "constants": const_count})
 
         # 2. GoI_Plan: accretive synthesis for stage k > 1.
         state.stage = "GoI_Plan"
@@ -2344,6 +2374,7 @@ class ResearchStateMachine:
         except SyntaxError:
             pass
 
+        pinned_fn_names = _pinned_function_names(pinned_code, pinned_layers) if stage > 1 else []
         all_bp_dicts = [
             c.model_dump() if hasattr(c, "model_dump") else c
             for c in (getattr(bp, "contracts", None) or [])
@@ -2354,6 +2385,8 @@ class ResearchStateMachine:
             contracts=contracts,
             all_contracts=all_bp_dicts or cumulative_dicts or contracts,
             variable_map=getattr(bp, "variable_map", None),
+            stabilize_diverged=stabilize_diverged,
+            pinned_functions=pinned_fn_names or None,
         )
         _apply_backup_slots_to_vmap(bp, getattr(san, "backup_slot_map", {}), san.code)
         if san.changed:
@@ -2394,11 +2427,14 @@ class ResearchStateMachine:
             unified = candidate_code
 
         if stage > 1:
+            unified_pinned = sorted(set(pinned_fn_names) | set(merge.pinned_functions))
             san_u = sanitize_intrinsics(
                 unified,
                 contracts=contracts,
                 all_contracts=all_bp_dicts or cumulative_dicts or contracts,
                 variable_map=getattr(bp, "variable_map", None),
+                stabilize_diverged=stabilize_diverged,
+                pinned_functions=unified_pinned or None,
             )
             _apply_backup_slots_to_vmap(bp, getattr(san_u, "backup_slot_map", {}), san_u.code)
             if san_u.changed:
@@ -2448,12 +2484,13 @@ class ResearchStateMachine:
                 )
                 _smoke_buf = _BufView([0.5] * min(4096, _max_idx + 1))
                 _smoke_steps = 0
+                _smoke_t0 = time.perf_counter()
 
                 def _smoke_trace(frame, event, arg):
                     nonlocal _smoke_steps
                     _smoke_steps += 1
-                    if _smoke_steps > 500_000:
-                        raise TimeoutError("python_smoke exceeded 500k steps (possible infinite loop)")
+                    if _smoke_steps > 25_000_000 or ((_smoke_steps & 4095) == 0 and (time.perf_counter() - _smoke_t0) > 6.0):
+                        raise TimeoutError("python_smoke exceeded safety step/time budget (possible infinite loop)")
                     return _smoke_trace
 
                 _old_trace = sys.gettrace()
@@ -2624,8 +2661,9 @@ class ResearchStateMachine:
             await self.emit_activity("INGEST", "literature_query",
                                      f"Querying multi-channel literature for '{q}'...")
             try:
+                ctx_query = f"{bp_text} {q}".strip() if bp_text else q
                 hits = await asyncio.to_thread(
-                    self.search_client.search, q, 3, None, q)
+                    self.search_client.search, q, 3, None, ctx_query)
             except TypeError:
                 # Legacy/custom clients without prompt_or_query routing.
                 try:
@@ -2746,7 +2784,8 @@ class ResearchStateMachine:
                                contracts: List[VerificationContract],
                                failure: str,
                                attempt: int = 1,
-                               max_attempts: int = 3) -> Dict[str, Any]:
+                               max_attempts: int = 3,
+                               pinned_functions: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
         # Normalize to plain dicts so deterministic healing passes read
@@ -2769,6 +2808,7 @@ class ResearchStateMachine:
             candidate_code, seed_directives,
             contracts=all_contract_dicts or contract_dicts,
             variable_map=bp_vmap,
+            pinned_functions=pinned_functions,
         )
         healed, notes = candidate_code, list(det.notes)
         if det.changed:
@@ -2776,7 +2816,7 @@ class ResearchStateMachine:
         lowered_failure = str(failure or "").lower()
         allow_egg = not ("transpiler:" in lowered_failure or "compile_error" in lowered_failure
                          or "compilation failed" in lowered_failure or "syntaxerror" in lowered_failure)
-        fixed, fix_notes = tier0_heal(healed, allow_egg=allow_egg)
+        fixed, fix_notes = tier0_heal(healed, allow_egg=allow_egg, pinned_functions=pinned_functions)
         if fix_notes:
             healed, notes = fixed, notes + fix_notes
         # Deterministic monotone/drift fallback for tightly bounded state slots
@@ -2820,7 +2860,8 @@ class ResearchStateMachine:
         llm = self.llm_fast or self.llm_planner
         if llm is None:
             return {"code": candidate_code, "terminated": False}
-        if attempt >= max_attempts and self.llm_planner is not None and "falsified" in str(failure or "").lower():
+        if (attempt >= max_attempts and self.llm_planner is not None
+                and ("falsified" in fail_text or "diverged" in fail_text or "non-finite" in fail_text)):
             refined = None
             try:
                 refined = await asyncio.wait_for(
@@ -2855,6 +2896,7 @@ class ResearchStateMachine:
                 contracts=all_contract_dicts or contract_dicts,
                 all_contracts=all_contract_dicts or contract_dicts,
                 stabilize_diverged=("diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower()),
+                pinned_functions=pinned_functions,
             )
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,
@@ -2889,6 +2931,7 @@ class ResearchStateMachine:
             candidate_code, directives,
             contracts=all_contract_dicts or contract_dicts,
             variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+            pinned_functions=pinned_functions,
         )
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
         _is_code_level_fail = any(
@@ -2922,6 +2965,7 @@ class ResearchStateMachine:
             and "falsified" in str(failure or "").lower()
             and "ENFORCE_CONSERVATION_PROJECTION" not in set(ops)
         )
+        _diverged_fail = ("diverged" in fail_text or "non-finite" in fail_text)
         _need_source_repair_on_code_fail = (
             _is_code_level_fail
             and (
@@ -2934,8 +2978,7 @@ class ResearchStateMachine:
         fallback_needed = (
             (
                 "falsified" in fail_text
-                or "diverged" in fail_text
-                or "non-finite" in fail_text
+                or _diverged_fail
                 or _is_code_level_fail
             )
             and (
@@ -2944,12 +2987,13 @@ class ResearchStateMachine:
                 or patched.code == candidate_code
                 or _missing_eq_slot
                 or _eq_target_falsified
+                or _diverged_fail
                 or _need_source_repair_on_code_fail
             )
         )
         if fallback_needed:
-            if (_eq_target_falsified or _missing_eq_slot or _need_source_repair_on_code_fail) and (
-                plan.get("fixable") is not False or _is_code_level_fail
+            if (_eq_target_falsified or _missing_eq_slot or _diverged_fail or _need_source_repair_on_code_fail) and (
+                plan.get("fixable") is not False or _is_code_level_fail or _diverged_fail
             ):
                 # Re-run full Tier-0 lowering before invoking full-source LLM repair
                 san_pre = sanitize_intrinsics(
@@ -2957,7 +3001,8 @@ class ResearchStateMachine:
                     contracts=all_contract_dicts or contract_dicts,
                     all_contracts=all_contract_dicts or contract_dicts,
                     variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
-                    stabilize_diverged=("diverged" in fail_text or "non-finite" in fail_text),
+                    stabilize_diverged=_diverged_fail,
+                    pinned_functions=pinned_functions,
                 )
                 if san_pre.changed and san_pre.code != candidate_code:
                     return {"code": san_pre.code, "terminated": False,
@@ -2983,6 +3028,7 @@ class ResearchStateMachine:
                         contracts=all_contract_dicts or contract_dicts,
                         all_contracts=all_contract_dicts or contract_dicts,
                         variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                        pinned_functions=pinned_functions,
                     )
                     final_ref = san_ref.code if san_ref.changed else refined
                     await self.emit_activity(
@@ -3011,6 +3057,7 @@ class ResearchStateMachine:
                 all_contracts=all_contract_dicts or contract_dicts,
                 variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
                 stabilize_diverged=("diverged" in fail_text or "non-finite" in fail_text),
+                pinned_functions=pinned_functions,
             )
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,
@@ -3037,6 +3084,7 @@ class ResearchStateMachine:
                         contracts=all_contract_dicts or contract_dicts,
                         all_contracts=all_contract_dicts or contract_dicts,
                         variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                        pinned_functions=pinned_functions,
                     )
                     final_ref = san_ref.code if san_ref.changed else refined
                     await self.emit_activity(
@@ -3481,7 +3529,8 @@ def _deterministic_physics_guard_fallback(code: str, contracts: List[Any]
     return code, notes
 
 
-def tier0_heal(code: str, *, allow_egg: bool = True) -> Tuple[str, List[str]]:
+def tier0_heal(code: str, *, allow_egg: bool = True,
+               pinned_functions: Optional[Sequence[str]] = None) -> Tuple[str, List[str]]:
     """Deterministic, semantics-preserving source repairs + egg simplification.
 
     Returns ``(code, notes)``; ``notes`` is empty when nothing applied.
@@ -3491,6 +3540,9 @@ def tier0_heal(code: str, *, allow_egg: bool = True) -> Tuple[str, List[str]]:
         tree = ast.parse(code)
     except SyntaxError:
         return code, notes
+
+    pinned_snaps = _snapshot_pinned_functions(tree, pinned_functions)
+    pinned_set = set(pinned_snaps)
 
     class _Fix(ast.NodeTransformer):
         def visit_Import(self, node):
@@ -3517,16 +3569,33 @@ def tier0_heal(code: str, *, allow_egg: bool = True) -> Tuple[str, List[str]]:
             return self.generic_visit(node)
 
         def visit_FunctionDef(self, node):
+            if node.name in pinned_set:
+                return node
             self.generic_visit(node)
             if not node.body:
                 node.body = [ast.Pass()]
             return node
 
     tree = _Fix().visit(tree)
+    if pinned_snaps:
+        _restore_pinned_functions(tree, pinned_snaps)
+    _ensure_nonempty_blocks(tree)
     ast.fix_missing_locations(tree)
     healed = ast.unparse(tree) + "\n"
+    try:
+        ast.parse(healed)
+    except SyntaxError:
+        return code, []
     if allow_egg:
         healed2, egg_notes = _egg_simplify(healed)
+        if pinned_snaps and egg_notes:
+            try:
+                t2 = ast.parse(healed2)
+                _restore_pinned_functions(t2, pinned_snaps)
+                _ensure_nonempty_blocks(t2)
+                healed2 = ast.unparse(t2) + "\n"
+            except SyntaxError:
+                healed2, egg_notes = healed, []
     else:
         healed2, egg_notes = healed, []
     return healed2, notes + egg_notes

@@ -52,7 +52,8 @@ _UNIT_TABLE: Dict[str, Tuple[float, str]] = {
     "d": (86400.0, "s"), "day": (86400.0, "s"), "days": (86400.0, "s"),
     "yr": (3.15576e7, "s"), "year": (3.15576e7, "s"), "years": (3.15576e7, "s"),
     # velocity
-    "m/s": (1.0, "m/s"), "km/s": (1e3, "m/s"), "km/h": (1.0 / 3.6, "m/s"),
+    "m/s": (1.0, "m/s"), "m/min": (1.0 / 60.0, "m/s"), "m/h": (1.0 / 3600.0, "m/s"),
+    "km/s": (1e3, "m/s"), "km/h": (1.0 / 3.6, "m/s"),
     "cm/s": (1e-2, "m/s"), "c": (299792458.0, "m/s"),
     # acceleration
     "m/s^2": (1.0, "m/s^2"), "g_E": (9.80665, "m/s^2"), "gE": (9.80665, "m/s^2"),
@@ -101,6 +102,18 @@ _UNIT_TABLE: Dict[str, Tuple[float, str]] = {
     "nM": (1e-6, "mol/m^3"), "nmol/L": (1e-6, "mol/m^3"),
     "pM": (1e-9, "mol/m^3"), "pmol/L": (1e-9, "mol/m^3"),
     "mol/m^3": (1.0, "mol/m^3"),
+    # concentration rates (1 M/s = 1000 mol/(m^3*s), 1 M/min = 1000/60 mol/(m^3*s))
+    "M/s": (1e3, "mol/(m^3*s)"), "M/min": (1000.0 / 60.0, "mol/(m^3*s)"),
+    "M/h": (1000.0 / 3600.0, "mol/(m^3*s)"), "M/hr": (1000.0 / 3600.0, "mol/(m^3*s)"),
+    "mM/s": (1.0, "mol/(m^3*s)"), "mM/min": (1.0 / 60.0, "mol/(m^3*s)"),
+    "mM/h": (1.0 / 3600.0, "mol/(m^3*s)"), "mM/hr": (1.0 / 3600.0, "mol/(m^3*s)"),
+    "uM/s": (1e-3, "mol/(m^3*s)"), "uM/min": (1e-3 / 60.0, "mol/(m^3*s)"),
+    "uM/h": (1e-3 / 3600.0, "mol/(m^3*s)"),
+    "nM/s": (1e-6, "mol/(m^3*s)"), "nM/min": (1e-6 / 60.0, "mol/(m^3*s)"),
+    "mol/(m^3*s)": (1.0, "mol/(m^3*s)"),
+    "mol/(L*s)": (1e3, "mol/(m^3*s)"), "mol/(L*min)": (1000.0 / 60.0, "mol/(m^3*s)"),
+    "mol/L/s": (1e3, "mol/(m^3*s)"), "mol/L/min": (1000.0 / 60.0, "mol/(m^3*s)"),
+    "1/min": (1.0 / 60.0, "1/s"), "min^-1": (1.0 / 60.0, "1/s"),
     # clinical gravimetrics, doses, bio-mass, thermochemistry
     "mg/dL": (1e-2, "kg/m^3"), "ug/mL": (1e-3, "kg/m^3"),
     "ng/mL": (1e-6, "kg/m^3"), "mg/L": (1e-3, "kg/m^3"),
@@ -553,19 +566,22 @@ _INLINE_TEX = re.compile(r"\$\$?([^$]{3,400}?)\$\$?")
 _NUMBER = (r"[-+−]?\d+(?:[.,]\d+)?(?:[eE][-+−]?\d+|\s*/\s*\d+(?:[.,]\d+)?)?"
            r"(?:\s*(?:×|x|\*|\\times)\s*10\s*\^?\s*\{?\s*[-+−]?\d+\s*\}?)?")
 _UNIT_TOKEN = (r"(?:[A-Za-zμµ°]+(?:\^?-?[0-9²³])?"
-               r"(?:\s*/\s*\(\s*[A-Za-z]+\s*[*·.\s]\s*[A-Za-z]+\s*\)"
-               r"|\s*/\s*[A-Za-zμµ]+(?:\^?-?[0-9²³])?)?|°)")
+               r"(?:\s*/\s*\(\s*[A-Za-z]+(?:\^?-?[0-9²³])?\s*[*·.\s]\s*[A-Za-z]+(?:\^?-?[0-9²³])?\s*\)"
+               r"|\s*/\s*[A-Za-zμµ]+(?:\^?-?[0-9²³])?(?:\s*/\s*[A-Za-zμµ]+)?)?|°)")
 _PARAM_ASSIGN = re.compile(
-    r"(?P<name>[A-Za-z][A-Za-z0-9_\- ]{0,48}?)\s*(?:=|≈|~|:|\bof\b|\bis\b)\s*"
-    r"(?P<num>" + _NUMBER + r")\s*(?P<unit>" + _UNIT_TOKEN + r")?")
+    r"(?P<name>[A-Za-z][A-Za-z0-9_\- ]{0,48}?)[ \t]*(?P<op>=|≈|~|:|\bof\b|\bis\b)[ \t]*"
+    r"(?P<num>" + _NUMBER + r")(?!\s*\.[ \t]+[A-Za-z])(?:[ \t]*(?P<unit>" + _UNIT_TOKEN + r"))?")
 _PARAM_WITH_UNIT = re.compile(
-    r"(?P<num>" + _NUMBER + r")\s*(?P<unit>" + _UNIT_TOKEN + r")")
+    r"(?P<num>" + _NUMBER + r")[ \t]*(?P<unit>" + _UNIT_TOKEN + r")")
 # Single-letter subscript state tokens (``z_k``, ``q_0``, ``x_n``, ``i_2``,
 # ``j_m``, ...) are code identifiers, never physical constants.
 _SUBSCRIPT_STATE_RE = re.compile(r"^[a-zA-Z]_[knij012m]$")
 _NAME_FILLER = {
-    "the", "a", "an", "of", "is", "and", "or", "with", "at", "to", "for",
-    "in", "on", "by", "about", "approximately", "roughly", "around",
+    "the", "a", "an", "of", "is", "and", "or", "with", "without", "at", "to", "for",
+    "in", "on", "by", "about", "approximately", "roughly", "around", "across",
+    "between", "through", "during", "after", "before", "since", "until", "upon",
+    "above", "below", "against", "toward", "towards", "among", "amongst",
+    "throughout", "regarding", "within", "via", "per", "vs", "versus",
     "value", "equal", "equals", "be", "was", "were", "are", "its",
     "case", "literature", "violate", "violates", "diverge", "diverges",
     "positivity", "when", "where", "if", "then", "else", "such", "that",
@@ -727,14 +743,26 @@ def _strip_latex_commands(text: str) -> str:
 
 
 _PARAM_STOPWORDS = {
-    "at", "in", "to", "of", "by", "for", "with", "from", "least", "most",
+    "at", "in", "to", "of", "by", "for", "with", "without", "from", "least", "most",
     "continuous", "raw", "total", "net", "system_physics", "baseline",
-    "closure", "model", "stage", "part", "step", "and", "or", "the", "a",
+    "closure", "model", "stage", "part", "step", "steps", "and", "or", "the", "a",
     "an", "is", "are", "was", "were", "as", "on", "per", "below", "above",
     "under", "over", "down", "up", "into", "onto", "than", "then", "max", "min",
+    "across", "between", "within", "about", "around", "through", "during",
+    "after", "before", "since", "until", "upon", "against", "toward", "towards",
+    "among", "amongst", "throughout", "regarding", "vs", "versus",
     "service", "servicing", "covering", "drop", "cell", "accuracy",
     "calculating", "computing", "modeling", "verifying", "coupling",
     "overcoming", "connecting", "incorporating", "shunting", "via",
+}
+
+_BARE_PROSE_NOUNS = {
+    "resistance", "mortality", "fixation", "treatment", "coverage",
+    "concentration", "infusion", "fraction", "threshold", "duration",
+    "horizon", "layer", "stage", "section", "objective", "regime", "regimes",
+    "sample", "samples", "sensitivity", "collapse", "transition", "boundary",
+    "crossover", "advantage", "equilibrium", "stability", "value", "values",
+    "rate", "factor", "coefficient", "parameter", "variable", "result", "error",
 }
 
 
@@ -746,7 +774,7 @@ def extract_parameters_from_text(text: str, source: str = "",
     params: List[ExtractedParameter] = []
     seen_spans: List[Tuple[int, int]] = []
 
-    def _add(name_raw: str, num_raw: str, unit_raw: str, span: Tuple[int, int]) -> None:
+    def _add(name_raw: str, num_raw: str, unit_raw: str, span: Tuple[int, int], *, assign_op: str = "=") -> None:
         if any(a <= span[0] < b for a, b in seen_spans):
             return
         # Ignore ratio expressions like `10:23` matched as `name 10 : 23`.
@@ -766,6 +794,10 @@ def extract_parameters_from_text(text: str, source: str = "",
         if len(name) <= 1 and not unit:
             return
         if name in _PARAM_STOPWORDS or name in _RESERVED_MATH_NAMES:
+            return
+        if not unit and name in _BARE_PROSE_NOUNS:
+            return
+        if assign_op in (":", "of", "is") and not unit and "_" not in name and len(name) > 3 and name.islower():
             return
         if source == "user_prompt" and len(name) <= 1:
             return
@@ -788,13 +820,13 @@ def extract_parameters_from_text(text: str, source: str = "",
         seen_spans.append(span)
 
     for m in _PARAM_ASSIGN.finditer(text):
-        _add(m.group("name"), m.group("num"), m.group("unit") or "", m.span())
+        _add(m.group("name"), m.group("num"), m.group("unit") or "", m.span(), assign_op=m.group("op"))
     for m in _PARAM_WITH_UNIT.finditer(text):
         unit = m.group("unit")
         if not is_known_unit(unit):
             continue
         before = text[max(0, m.start() - 48):m.start()]
-        before = re.split(r"[.;,()\n=]|>=|<=", before)[-1].strip()
+        before = re.split(r"[.;,()\n=\[\]]|>=|<=", before)[-1].strip()
         # Strip trailing stopwords/prepositions/operators; if empty, inspect trailing noun phrase.
         words = [
             w for w in re.split(r"\s+", before)
@@ -994,13 +1026,14 @@ DOMAIN_REFERENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
                        "abs(telemetry['energy_drift']) < 1e-3 for conservative systems"],
     },
     "chemical_kinetics": {
-        "keywords": ("kinetic", "kinetics", "reaction", "arrhenius", "robertson",
-                     "stiff", "michaelis", "menten", "enzyme", "combustion",
-                     "methane", "catalys", "chemical", "rate constant", "autocatal"),
+        "keywords": ("robertson", "arrhenius", "oregonator", "brusselator",
+                     "combustion", "chemical kinetic", "chemical kinetics",
+                     "reaction network", "inorganic reaction", "stiff chemical",
+                     "autocatal"),
         "parameters": [
-            _p("robertson_k1", "k_1", 0.04, "", "Robertson (1966)"),
-            _p("robertson_k2", "k_2", 1.0e4, "", "Robertson (1966)"),
-            _p("robertson_k3", "k_3", 3.0e7, "", "Robertson (1966)"),
+            _p("robertson_k1", "k_1", 0.04, "", "Robertson (1966)", 1.0, ("robertson",)),
+            _p("robertson_k2", "k_2", 1.0e4, "", "Robertson (1966)", 1.0, ("robertson",)),
+            _p("robertson_k3", "k_3", 3.0e7, "", "Robertson (1966)", 1.0, ("robertson",)),
             _p("molar_gas_constant", "R", 8.314462618, "J/(mol K)", "CODATA 2018"),
         ],
         "equations": [
@@ -1251,9 +1284,10 @@ _REGISTRY_ANCHORS: Dict[str, Tuple[str, ...]] = {
                                 "refractory", "ceramic matrix"),
     "nonlinear_dynamics": ("duffing", "van der pol", "lorenz", "lotka",
                            "volterra", "henon", "circle map", "standard map"),
-    "chemical_kinetics": ("robertson", "arrhenius", "michaelis",
-                          "enzyme kinetics", "stiff chemical",
-                          "chemical kinetic"),
+    "chemical_kinetics": ("robertson", "arrhenius", "oregonator", "brusselator",
+                          "combustion", "chemical kinetic", "chemical kinetics",
+                          "chemical reaction network", "inorganic reaction",
+                          "stiff chemical", "autocatal"),
     "discrete_finance": ("black-scholes", "black scholes",
                          "catalan", "option pricing", "binomial model",
                          "lattice model", "risk-neutral"),
@@ -1314,14 +1348,16 @@ _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "pharmacokinetic", "pharmacodynamic", "pk/pd", "pk-pd", "hill-langmuir",
         "hill coefficient", "ec50", "ic50", "receptor occupancy", "oncolog", "tumor",
         "neuroscience", "hodgkin-huxley", "membrane potential", "biophysic", "antiviral",
-        "clearance", "volume of distribution", "allele", "clinical",
+        "antimicrobial", "bactericidal", "antibiotic", "pathogen", "dosing",
+        "infusion", "hospital", "mortality", "haldane", "recombination", "epista",
+        "linkage", "clearance", "volume of distribution", "allele", "clinical",
     ),
     "EPIDEMIOLOGY_AND_ECOLOGY": (
         "epidemiolog", "infectious disease", "seir", "seir-v", "seirhd", "sir model",
         "compartmental", "kermack", "mckendrick", "reproduction number", "herd immunity",
         "vector-borne", "metapopulation", "lotka-volterra", "predator-prey", "food web",
         "biodiversity", "island biogeography", "outbreak", "transmission rate",
-        "vaccination", "epidemic", "ecolog",
+        "vaccination", "epidemic", "ecolog", "droplet transmission",
     ),
     "EARTH_CLIMATE_AND_ENVIRONMENT": (
         "radiative-convective", "radiative forcing", "carbon cycle", "carbon-cycle",
@@ -1416,10 +1452,14 @@ def registry_evidence(text: str) -> Tuple[List[ExtractedParameter], List[Extract
                 raw_unit=p["unit"], si_value=si_value, si_unit=si_unit,
                 source=f"ReferenceRegistry: {p['source']}", confidence=p["confidence"]))
         for latex, desc in spec["equations"]:
+            if "robertson" in desc.lower() and "robertson" not in t:
+                continue
             eq = parse_equation(latex, source="ReferenceRegistry", description=desc)
             if eq is not None:
                 equations.append(eq)
         for b in spec["benchmarks"]:
+            if "robertson" in str(b.get("name", "")).lower() and "robertson" not in t:
+                continue
             benchmarks.append(BenchmarkAnchor(**b))
         invariants.extend(spec["invariants"])
     return params, equations, benchmarks, invariants, domains

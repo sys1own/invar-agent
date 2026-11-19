@@ -14,13 +14,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 AR5IV_HTML = "https://ar5iv.labs.arxiv.org/html/"
@@ -65,6 +66,34 @@ _QUERY_FILLER_TOKENS = {
     "generic",
 }
 
+_UNIT_NOISE_TOKENS = {
+    "m2", "m3", "cm2", "cm3", "mm2", "mm3", "km2", "km3",
+    "cm", "mm", "um", "nm", "pm", "km", "kg", "mg", "ug", "ng",
+    "mol", "mmol", "umol", "nmol", "pmol", "kcal", "cal", "kj", "mj", "gj",
+    "kw", "mw", "gw", "hz", "khz", "mhz", "ghz", "kpa", "mpa", "gpa", "pa",
+    "atm", "bar", "sec", "msec", "usec", "nsec", "min", "mins", "hr", "hrs",
+    "yr", "yrs", "gtc", "pgc", "ppm", "ppb", "ppt", "ev", "kev", "mev", "gev",
+    "bits", "nats", "deg", "rad", "bps", "dt", "dx", "dy", "dz",
+    "s-1", "m-3", "cm-3",
+}
+
+_COMPOUND_UNIT_STR_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"(?:mol|mmol|umol|nmol|pmol|kg|mg|ug|ng|g|k?[wW]|M?[jJ]|GtC|PgC|gtco2|m|km|cm|mm|um|M|mM|uM|nM|1)"
+    r"\s*/\s*(?:\([^)]+\)|[A-Za-zμµ]+(?:\^?-?[0-9²³]+)?(?:\s*/\s*[A-Za-z]+)?)"
+    r"|[A-Za-z]+\^-[123]"
+    r")(?![A-Za-z0-9_])",
+    re.I,
+)
+_SCI_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_])[+-]?\d+(?:\.\d+)?[eE][+-]?\d+(?![A-Za-z0-9_])")
+
+
+def _strip_unit_and_numeric_noise(text: str) -> str:
+    """Strip compound unit expressions (``mol/m3``, ``W/m^2``, ``M/min``) and sci-notation literals."""
+    s = _COMPOUND_UNIT_STR_RE.sub(" ", text or "")
+    s = _SCI_LITERAL_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 
 def _token_score(tok: str) -> int:
     score = 1
@@ -87,7 +116,7 @@ def _kept_tokens(q: str) -> List[str]:
     keywords (``metriplectic``, ``gradient``) that the compact Pass-1 query
     drops.
     """
-    original = (q or "").strip()
+    original = _strip_unit_and_numeric_noise((q or "").strip())
     if not original:
         return []
     text = re.sub(r"\([^)]*\)", " ", original)
@@ -100,7 +129,7 @@ def _kept_tokens(q: str) -> List[str]:
         if not tok:
             continue
         low = tok.lower()
-        if low in _QUERY_FILLER_TOKENS:
+        if low in _QUERY_FILLER_TOKENS or low in _UNIT_NOISE_TOKENS:
             continue
         if len(tok) == 1 and tok.isalpha():
             continue
@@ -327,7 +356,33 @@ def anchor_or_queries(query: str, max_queries: int = 2) -> List[str]:
     return out[:max_queries]
 
 
-def _arxiv_query_string(query: str) -> str:
+_ARXIV_DOMAIN_CATS: Dict[str, Tuple[str, ...]] = {
+    "LIFE_SCIENCES_AND_BIOMEDICINE": ("q-bio.PE", "q-bio.QM", "q-bio.BM", "q-bio.CB", "q-bio.GN", "q-bio.MN"),
+    "EPIDEMIOLOGY_AND_ECOLOGY": ("q-bio.PE", "q-bio.QM", "physics.soc-ph"),
+    "EARTH_CLIMATE_AND_ENVIRONMENT": ("physics.ao-ph", "physics.geo-ph", "physics.flu-dyn"),
+    "STATISTICS_AND_CAUSAL_INFERENCE": ("stat.ME", "stat.TH", "stat.AP", "stat.ML", "econ.EM", "math.ST"),
+    "ECONOMICS_AND_GAME_THEORY": ("econ.TH", "cs.GT", "q-fin.EC", "physics.soc-ph"),
+    "MATHEMATICS_CS_AND_INFO_THEORY": ("cs.IT", "math.IT", "cs.GT", "math.DS", "math.PR", "nlin.CD"),
+    "CHEMICAL_AND_MATERIALS": ("physics.chem-ph", "cond-mat.mtrl-sci", "q-bio.BM"),
+}
+
+
+def _arxiv_categories_for_prompt(prompt_or_query: str) -> Tuple[str, ...]:
+    """Derive macro-domain arXiv category filters from ``classify_macro_scientific_domains``."""
+    try:
+        from .extractor import classify_macro_scientific_domains
+        domains = classify_macro_scientific_domains(prompt_or_query or "")
+    except Exception:  # noqa: BLE001
+        return ()
+    cats: List[str] = []
+    for dom in domains[:2]:
+        for c in _ARXIV_DOMAIN_CATS.get(dom, ()):
+            if c not in cats:
+                cats.append(c)
+    return tuple(cats)
+
+
+def _arxiv_query_string(query: str, *, categories: Optional[Sequence[str]] = None) -> str:
     """Build an arXiv ``search_query`` value that the API parser accepts.
 
     Hyphens are replaced with spaces (unquoted hyphens inside ``all:`` break
@@ -340,15 +395,22 @@ def _arxiv_query_string(query: str) -> str:
     if not raw:
         return "all:"
     if " OR " in raw or raw.startswith(("all:", "ti:", "abs:")):
-        return raw
-    terms = [t for t in raw.replace("-", " ").split() if t]
-    if not terms:
-        return "all:"
-    if len(terms) <= 2:
-        return " AND ".join(f"all:{t}" for t in terms)
-    bigrams = [f"(all:{terms[i]} AND all:{terms[i + 1]})"
-               for i in range(len(terms) - 1)]
-    return " OR ".join(bigrams[:3])
+        base = raw
+    else:
+        terms = [t for t in raw.replace("-", " ").split() if t]
+        if not terms:
+            return "all:"
+        if len(terms) <= 2:
+            base = " AND ".join(f"all:{t}" for t in terms)
+        else:
+            bigrams = [f"(all:{terms[i]} AND all:{terms[i + 1]})"
+                       for i in range(len(terms) - 1)]
+            base = " OR ".join(bigrams[:3])
+    cats = [c.strip() for c in (categories or ()) if c and c.strip()]
+    if cats:
+        cat_clause = " OR ".join(f"cat:{c}" for c in cats)
+        return f"({base}) AND ({cat_clause})"
+    return base
 
 
 def _count_json_list(payload: str, key: str) -> int:
@@ -519,9 +581,18 @@ class LiteratureResult:
 FetchFn = Callable[[str, float], str]
 
 
+def _default_ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return ssl.create_default_context()
+
+
 def _default_fetch(url: str, timeout: float) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed https/http API hosts
+    ctx = _default_ssl_context() if url.lower().startswith("https://") else None
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310 - fixed https/http API hosts
         return resp.read().decode("utf-8", errors="replace")
 
 
@@ -547,9 +618,11 @@ _CV_PROMPT_RE = re.compile(
 
 
 def strip_internal_diagnostic_tokens(text: str) -> str:
-    """Remove internal invar-agent diagnostic/architecture tokens from external search queries."""
+    """Remove internal invar-agent diagnostic tokens and raw unit/sci-notation noise from search queries."""
     cleaned = _INTERNAL_DIAG_RE.sub(" ", text or "")
-    return re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _strip_unit_and_numeric_noise(cleaned)
+    toks = [t for t in cleaned.split() if t.lower() not in _UNIT_NOISE_TOKENS]
+    return " ".join(toks).strip()
 
 
 def _is_off_domain_hit(hit: LiteratureResult, context: str) -> bool:
@@ -605,19 +678,21 @@ class LiteratureSearchClient:
         limit = max_results or self.max_results
         if sources is None:
             sources = tuple(_channels_for_prompt(prompt_or_query or raw_query))
+        arxiv_cats = _arxiv_categories_for_prompt(prompt_or_query or raw_query)
         channel_counts: Dict[str, int] = {}
         raw_counts: Dict[str, int] = {}
         channel_errors: Dict[str, str] = {}
         relaxed_trail: List[str] = []
         error_note = ""
 
-        def _run(pass_sources: tuple, pass_query: str) -> List[LiteratureResult]:
+        def _run(pass_sources: tuple, pass_query: str, *, use_arxiv_cats: bool = True) -> List[LiteratureResult]:
             nonlocal error_note
             pass_results: List[LiteratureResult] = []
+            cats_arg = arxiv_cats if use_arxiv_cats else ()
             if self.offline or len(pass_sources) <= 1:
                 for source in pass_sources:
                     try:
-                        got = self._search_source(source, pass_query, limit)
+                        got = self._search_source(source, pass_query, limit, arxiv_categories=cats_arg)
                         channel_counts[source] = channel_counts.get(source, 0) + len(got)
                         raw_counts[source] = raw_counts.get(source, 0) + \
                             getattr(self, "_last_raw_count", 0)
@@ -629,7 +704,7 @@ class LiteratureSearchClient:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=min(4, len(pass_sources))) as pool:
                     futures = {pool.submit(self._search_source_safe, source,
-                                           pass_query, limit): source
+                                           pass_query, limit, cats_arg): source
                                for source in pass_sources}
                     for fut in as_completed(futures):
                         src = futures[fut]
@@ -652,7 +727,7 @@ class LiteratureSearchClient:
         # Pass 1: primary academic APIs with the normalized full query.
         self._channel_raw = {}
         self._channel_errors = {}
-        results = _run(sources, query)
+        results = _run(sources, query, use_arxiv_cats=True)
         _merge_diag()
 
         # Pass 2: 2-word bigram decomposition — runs whenever Pass 1 accepted
@@ -664,7 +739,7 @@ class LiteratureSearchClient:
                 or ("arxiv", "openalex")
             for relaxed in bigram_relaxations(raw_query):
                 relaxed_trail.append(relaxed)
-                relaxed_results = _run(pass2_sources, relaxed)
+                relaxed_results = _run(pass2_sources, relaxed, use_arxiv_cats=True)
                 _merge_diag()
                 if relaxed_results:
                     results = relaxed_results
@@ -672,9 +747,11 @@ class LiteratureSearchClient:
 
         # Pass 3: broad single-anchor / explicit OR query on arXiv & OpenAlex.
         if not results:
+            pass2_sources = tuple(s for s in ("arxiv", "openalex") if s in sources) \
+                or ("arxiv", "openalex")
             for anchor_q in anchor_or_queries(raw_query):
                 relaxed_trail.append(anchor_q)
-                relaxed_results = _run(pass2_sources, anchor_q)
+                relaxed_results = _run(pass2_sources, anchor_q, use_arxiv_cats=False)
                 _merge_diag()
                 if relaxed_results:
                     results = relaxed_results
@@ -688,7 +765,7 @@ class LiteratureSearchClient:
                                   if s in ("wikidata", "oeis", "pubchem"))
             if concept and pass3_sources:
                 relaxed_trail.append(concept)
-                results = _run(pass3_sources, concept)
+                results = _run(pass3_sources, concept, use_arxiv_cats=False)
                 _merge_diag()
 
         relaxed_query = " | ".join(relaxed_trail) if relaxed_trail else ""
@@ -721,12 +798,13 @@ class LiteratureSearchClient:
             ]
             channel_counts["shbt_federation"] = len(shbt_items)
             results = shbt_items + results
-        results = results[: max(limit * 2, limit)]
+        results = results[: max(limit * len(sources), limit * 3, 12)]
         # Diagnostic telemetry for search_log query_done events.
         self.last_query_meta = {
             "query": query,
             "raw_query": raw_query,
             "status": "ok" if results else "empty",
+            "arxiv_categories": list(arxiv_cats),
             "channel_counts": channel_counts,
             "raw_counts": raw_counts,
             "channel_errors": channel_errors,
@@ -742,9 +820,10 @@ class LiteratureSearchClient:
         return results
 
     def _search_source_safe(self, source: str, query: str,
-                            limit: int) -> List[LiteratureResult]:
+                            limit: int,
+                            arxiv_categories: Sequence[str] = ()) -> List[LiteratureResult]:
         try:
-            return self._search_source(source, query, limit)
+            return self._search_source(source, query, limit, arxiv_categories=arxiv_categories)
         except Exception as exc:  # noqa: BLE001
             errs = getattr(self, "_channel_errors", None)
             if errs is not None:
@@ -765,8 +844,10 @@ class LiteratureSearchClient:
         return out
 
     # -- source implementations -------------------------------------------
-    def _search_source(self, source: str, query: str, limit: int) -> List[LiteratureResult]:
-        cached = self._read_cache(source, query)
+    def _search_source(self, source: str, query: str, limit: int,
+                       arxiv_categories: Sequence[str] = ()) -> List[LiteratureResult]:
+        cache_q = f"{query}|cat={','.join(arxiv_categories)}" if (source == "arxiv" and arxiv_categories) else query
+        cached = self._read_cache(source, cache_q)
         raw = getattr(self, "_channel_raw", None)
         if self.offline:
             if raw is not None:
@@ -775,7 +856,7 @@ class LiteratureSearchClient:
         raw_count = 0
         try:
             if source == "arxiv":
-                payload = self._fetch_with_backoff(self._arxiv_url(query, limit))
+                payload = self._fetch_with_backoff(self._arxiv_url(query, limit, categories=arxiv_categories))
                 raw_count = payload.count("<entry>")
                 results = self._parse_arxiv(payload)
             elif source == "openalex":
@@ -820,7 +901,7 @@ class LiteratureSearchClient:
         # or missing abstracts — extractor.py handles symbolic content.
         results = [r for r in results if r.title]
         if results:
-            self._write_cache(source, query, [r.__dict__ for r in results])
+            self._write_cache(source, cache_q, [r.__dict__ for r in results])
             return results
         # NEVER cache a 0-result response: an empty answer must be retried
         # live on the next call instead of poisoning the disk cache.
@@ -838,8 +919,8 @@ class LiteratureSearchClient:
         raise last_exc if last_exc else RuntimeError("fetch failed")
 
     @staticmethod
-    def _arxiv_url(query: str, limit: int) -> str:
-        q = urllib.parse.quote(_arxiv_query_string(query))
+    def _arxiv_url(query: str, limit: int, *, categories: Sequence[str] = ()) -> str:
+        q = urllib.parse.quote(_arxiv_query_string(query, categories=categories))
         return f"{ARXIV_API}?search_query={q}&start=0&max_results={limit}"
 
     @staticmethod
@@ -1164,7 +1245,10 @@ class LiteratureSearchClient:
         try:
             payload = self._fetch(url, timeout)
             data = json.loads(payload)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errs = getattr(self, "_channel_errors", None)
+            if errs is not None:
+                errs["europe_pmc"] = f"{type(exc).__name__}: {str(exc)[:140]}"
             return []
         items = ((data.get("resultList") or {}).get("result")) or []
         out: List[LiteratureResult] = []
@@ -1228,7 +1312,10 @@ class LiteratureSearchClient:
         try:
             esearch_payload = self._fetch(esearch_url, timeout)
             esearch_data = json.loads(esearch_payload)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errs = getattr(self, "_channel_errors", None)
+            if errs is not None:
+                errs["pubmed"] = f"{type(exc).__name__}: {str(exc)[:140]}"
             return []
         es_res = esearch_data.get("esearchresult") or {}
         idlist = [str(x).strip() for x in (es_res.get("idlist") or []) if str(x).strip()]
@@ -1249,7 +1336,10 @@ class LiteratureSearchClient:
         try:
             esummary_payload = self._fetch(esummary_url, timeout)
             esummary_data = json.loads(esummary_payload)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errs = getattr(self, "_channel_errors", None)
+            if errs is not None:
+                errs["pubmed"] = f"{type(exc).__name__}: {str(exc)[:140]}"
             return []
         res_map = esummary_data.get("result") or {}
         uids = res_map.get("uids") or idlist
