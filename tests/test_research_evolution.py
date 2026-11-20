@@ -1,5 +1,6 @@
 """Cumulative blueprint evolution, literature search, epistemic gate tests."""
 
+import ast
 import json
 import math
 from pathlib import Path
@@ -79,7 +80,101 @@ def _blueprint(code=STAGE1, stages=1, contracts=None, **kw):
     return ResearchBlueprint(**base)
 
 
+@pytest.mark.asyncio
+async def test_ode_reference_failure_refines_law_instead_of_projection(tmp_path, monkeypatch):
+    import invar_agent.research.state_machine as module
+    seen = []
+    async def refine(client, **kwargs):
+        seen.append(kwargs)
+        return STAGE1
+    def project(*args, **kwargs):
+        raise AssertionError('Scientific mismatch must not dispatch a projection repair')
+    monkeypatch.setattr(module, 'refine_stage_code', refine)
+    monkeypatch.setattr(module, 'apply_healing_directives', project)
+    machine = ResearchStateMachine(tmp_path, llm_planner=object())
+    machine.blueprint = _blueprint(falsifiable_hypothesis='dx/dt = v; dv/dt = -x',variable_map={'x':0,'v':1})
+    result = await machine._heal_and_refine(stage=1,round_idx=1,objective='conservation',
+        candidate_code=STAGE2_COUPLED,contracts=machine.blueprint.contracts,
+        failure='VAULT_REFERENCE_MISMATCH: x diverges at step 1',attempt=1,max_attempts=3)
+    assert result['code'] == STAGE1 and result['applied_ops'] == ['ODE_REFERENCE_REFINE']
+    assert 'dx/dt = v' in seen[0]['objective'] and 'derivative/RHS' in seen[0]['objective']
+    assert 'State/observable slots' in seen[0]['objective']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['empty','timeout','no_client'])
+async def test_ode_reference_refinement_keeps_candidate_when_no_repair(tmp_path,monkeypatch,mode):
+    import invar_agent.research.state_machine as module
+    async def refine(*args,**kwargs):
+        if mode=='timeout':
+            raise TimeoutError('bounded provider timeout')
+        return None
+    monkeypatch.setattr(module,'refine_stage_code',refine)
+    machine = ResearchStateMachine(tmp_path,llm_planner=None if mode=='no_client' else object())
+    result = await machine._heal_and_refine(stage=1,round_idx=1,objective='conservation',
+        candidate_code=STAGE1,contracts=[_contract()],failure='VAULT_REFERENCE_MISMATCH: x diverges',
+        attempt=1,max_attempts=3)
+    assert result['code']==STAGE1 and not result['terminated']
+    assert not result.get('applied_ops')
+
+
 # -- accretion ---------------------------------------------------------------
+
+
+def test_nested_scalar_rhs_is_lifted_without_weakening_v9_guard():
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.research.evolution import check_evolution_reference
+    code = '''def simulation_step(buf,dt):
+    x=buf.data[0]
+    k=buf.data[1]
+    def derivative(y):
+        return -k*y*y
+    a=derivative(x)
+    b=derivative(x+dt*a/2)
+    c=derivative(x+dt*b/2)
+    d=derivative(x+dt*c)
+    buf.data[0]=x+dt*(a+2*b+2*c+d)/6
+'''
+    assert any('nested function' in violation for violation in v9_transpiler_violations(code))
+    result = sanitize_intrinsics(code)
+    assert not v9_transpiler_violations(result.code)
+    bp = dict(research_prompt='dx/dt = -k*x*x; k = 0.2 1/s',variable_map={'x':0,'k':1},
+        contracts=[dict(contract_id='c',initial_state=[1.,.2],dt=.1,steps=20,invariants=[])])
+    assert check_evolution_reference(bp,{},result.code)['integration_scheme']=='rk4'
+    assert sanitize_intrinsics(result.code).code==result.code
+
+
+def test_closure_lifting_does_not_accept_escaping_or_recursive_functions():
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    for body in ('callback = derivative', 'value = derivative(x)'):
+        code = 'def simulation_step(buf,dt):\n    x=buf.data[0]\n    def derivative(y):\n        return derivative(y)\n    '+body+'\n'
+        assert any('nested function' in violation for violation in v9_transpiler_violations(sanitize_intrinsics(code).code))
+
+
+def test_declared_dynamics_are_not_replaced_by_contract_projections():
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    from invar_agent.research.evolution import check_evolution_reference
+    code = 'def simulation_step(buf,dt):\n    buf.data[0] -= dt*buf.data[0]\n'
+    contracts = [dict(contract_id='c',initial_state=[1.],dt=.1,steps=20,
+        invariants=[dict(variable_name='mass',assertion='abs(state[0]-initial[0]) <= 0.15',tolerance=.15)])]
+    result = sanitize_intrinsics(code,contracts=contracts,preserve_dynamics=True)
+    bp = dict(research_prompt='dx/dt = -x',variable_map={'x':0},contracts=contracts)
+    assert check_evolution_reference(bp,{},result.code)['integration_scheme']=='euler'
+    assert not any('project' in note or 'upper-bound' in note for note in result.notes)
+
+
+def test_lifted_helpers_do_not_shadow_existing_local_or_argument_names():
+    from invar_agent.healing.deterministic_ast import sanitize_intrinsics
+    code = '''def simulation_step(buf,dt,_invar_local_simulation_step_derivative=1.):
+    _invar_local_simulation_step_derivative_=2.
+    def derivative(x):
+        return -x
+    buf.data[0]+=dt*derivative(buf.data[0])
+'''
+    result=sanitize_intrinsics(code)
+    assert not v9_transpiler_violations(result.code)
+    functions={node.name for node in ast.parse(result.code).body if isinstance(node,ast.FunctionDef)}
+    assert '_invar_local_simulation_step_derivative__' in functions
 
 def test_pin_and_unified_driver():
     pinned = pin_layer_code(STAGE1, 1)

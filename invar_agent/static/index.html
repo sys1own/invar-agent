@@ -13,6 +13,26 @@
 <script src="/static/vendor/addon-fit.min.js"></script>
 <style>
   :root { --bg:#0f1217; --bg-workspace:#0f1217; --bg-panel:#161b22; --bg-card:#1a202c; --bg-surface:#1e2430; --border:#2d3748; --text:#f8fafc; --text2:#cbd5e1; --muted:#94a3b8; --faint:#64748b; --accent:#38bdf8; --green:#34d399; --amber:#fbbf24; --red:#f87171; }
+  #view-builder { overflow:auto; padding:24px; gap:18px; flex-direction:column; }
+  .builder-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+  .builder-card { background:var(--bg-panel); border:1px solid var(--border); border-radius:12px; padding:18px; min-width:0; }
+  .builder-card h3 { margin:0 0 12px; color:var(--text); }
+  .builder-card label { display:block; margin:8px 0; }
+  #view-builder button, #builder-files::file-selector-button { background:#242c3d; color:#e2e8f0; border:1px solid #3b475d; border-radius:6px; padding:6px 12px; font:inherit; font-size:12px; cursor:pointer; transition:background .15s ease, border-color .15s ease; }
+  #view-builder button:hover:not(:disabled), #builder-files::file-selector-button:hover { background:#303b50; border-color:#64748b; }
+  #view-builder button:focus-visible, #builder-files:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  #view-builder button:disabled { opacity:.45; cursor:not-allowed; }
+  #builder-files::file-selector-button { margin-right:10px; }
+  .builder-card input:not([type=checkbox]), .builder-card select, .builder-card textarea { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; }
+  #builder-drop { border:1px dashed var(--accent); padding:18px; border-radius:8px; color:var(--text2); }
+  #builder-drop.dragover { background:#143047; }
+  .builder-table { width:100%; border-collapse:collapse; }
+  .builder-table td,.builder-table th { padding:10px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+  .builder-ok { color:var(--green); } .builder-warn { color:var(--amber); }
+  .builder-wave { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; padding:10px; background:var(--bg); border-radius:8px; }
+  .builder-module { border:1px solid var(--border); border-radius:6px; padding:8px; font-size:12px; }
+  #builder-events { max-height:180px; overflow:auto; white-space:pre-wrap; color:var(--text2); }
+  #builder-receipt { overflow-wrap:anywhere; color:var(--green); }
   * { box-sizing:border-box; }
   body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg-workspace); color:var(--text); font:14px/1.55 "Segoe UI", system-ui, sans-serif; overflow:hidden; }
   header { display:flex; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--border); background:var(--bg-panel); }
@@ -337,6 +357,7 @@
     <div class="sidebar-tabs">
       <button id="sidebar-tab-code" class="sidebar-tab active" onclick="switchSidebarTab('code')">📁 Codebase <span id="code-file-count" class="sidebar-badge">0</span></button>
       <button id="sidebar-tab-research" class="sidebar-tab" onclick="switchSidebarTab('research')">🔬 Research Vault <span id="research-vault-count" class="sidebar-badge badge-accent">0</span></button>
+      <button id="sidebar-tab-builder" class="sidebar-tab" onclick="showView('builder')" title="Builder Studio">⚒ Builder Studio</button>
     </div>
     <div id="code-pane" class="sidebar-pane active">
       <div class="sidebar-toolbar" id="code-toolbar">
@@ -363,6 +384,7 @@
       <button id="view-tab-chat" class="active" onclick="showView('chat')">💬 Chat &amp; Plan</button>
       <button id="view-tab-research" onclick="showView('research')">📖 Research Viewer</button>
       <button id="view-tab-editor" onclick="showView('editor')">📝 Code Editor</button>
+      <button id="view-tab-builder" onclick="showView('builder')">⚒ Builder Studio</button>
     </div>
     <div id="view-chat" class="workspace-view active">
       <div class="research-panel" id="research-panel">
@@ -465,6 +487,38 @@
           <div id="terminal-container"></div>
         </div>
       </div>
+    </div>
+    <div id="view-builder" class="workspace-view">
+      <div><h2 style="margin:0">Builder Studio</h2><span style="color:var(--muted)">Verified research → composable scientific instruments · deterministic first</span></div>
+      <div class="builder-grid">
+        <section class="builder-card"><h3>1 · Research sources</h3>
+          <label for="builder-vault">Attach @research runs</label><select multiple id="builder-vault" aria-label="Research sources"></select>
+          <div id="builder-drop">Drop scientific files here · 50 MB total
+            <input id="builder-files" type="file" multiple accept=".pdf,.tex,.md,.ipynb,.py,.csv,.tsv,.json,.zip" aria-label="Upload scientific files">
+          </div><div id="builder-file-summary"></div>
+          <button id="builder-ingest" onclick="builderIngest()">Extract &amp; verify</button>
+        </section>
+        <section class="builder-card"><h3>2 · Instrument profiles</h3>
+          <label><input type="checkbox" name="builder-profile" value="hybrid_compute_library" checked> Hybrid compute library</label>
+          <label><input type="checkbox" name="builder-profile" value="interactive_workbench" checked> Interactive workbench</label>
+          <label><input type="checkbox" name="builder-profile" value="executable_paper_audit" checked> Executable paper &amp; audit</label>
+          <label><input type="checkbox" name="builder-profile" value="calibration_inverse_design" checked> Calibration &amp; inverse design</label>
+          <label><input id="builder-cpp" type="checkbox" checked> C++20 C-ABI</label><label><input id="builder-adjoint" type="checkbox" checked> Analytical adjoint Jacobian</label>
+          <textarea id="builder-prompt" rows="2" placeholder="Optional leaf intent, e.g. domain_visualization"></textarea>
+        </section>
+      </div>
+      <section class="builder-card"><h3>3 · Extraction verification</h3>
+        <div id="builder-ir-status">Upload a paper or choose a Research Vault source.</div>
+        <div style="overflow:auto"><table class="builder-table"><thead><tr><th>Equation / constant</th><th>Role &amp; checks</th><th>Verified override</th></tr></thead><tbody id="builder-verification"></tbody></table></div>
+        <label for="builder-state-order">State order (comma-separated, required when flagged)</label><input id="builder-state-order" placeholder="e.g. substrate, product">
+        <button id="builder-plan" disabled onclick="builderPlan()">Approve IR &amp; Plan Build</button>
+        <button id="builder-execute" disabled onclick="builderExecute()">Execute verified plan</button>
+      </section>
+      <section class="builder-card"><h3>4 · Live GoI wavefronts</h3><div id="builder-status" role="status">Ready</div>
+        <div id="builder-wavefronts"></div><pre id="builder-events"></pre><div id="builder-receipt"></div>
+        <a id="builder-download" hidden>Download instrument .zip</a>
+        <button id="builder-launch" disabled onclick="builderLaunch()">Launch Workbench</button><a id="builder-instrument" target="_blank" rel="noopener"></a>
+      </section>
     </div>
   </main>
 </div>
@@ -1573,6 +1627,7 @@ function openResearchStream(expectedRunUid) {
   };
   researchSource.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.mode === 'builder') return;
     if (msg.run_uid && activeBackendRunUid && msg.run_uid !== activeBackendRunUid) return;
     if (msg.event === 'run_start') {
       if (msg.run_uid && !activeBackendRunUid) activeBackendRunUid = msg.run_uid;
@@ -1823,11 +1878,101 @@ async function testConnection() {
 let currentView = 'chat';
 function showView(view) {
   currentView = view;
-  ['chat', 'research', 'editor'].forEach(v => {
+  ['chat', 'research', 'editor', 'builder'].forEach(v => {
     document.getElementById('view-' + v).classList.toggle('active', v === view);
     document.getElementById('view-tab-' + v).classList.toggle('active', v === view);
   });
   if (view === 'research' && !currentResearch) loadVault();
+  if (view === 'builder') builderLoadVault();
+}
+const builderState = {ir:null,plan:null,buildId:null,files:[],stream:null};
+async function builderRequest(path,options={}) {
+  const response=await fetch('/api/v1/builder'+path,options);
+  const data=await response.json();
+  if(!response.ok) throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));
+  return data;
+}
+function builderError(error) { document.getElementById('builder-status').textContent=error.message; }
+async function builderLoadVault() {
+  try { const response=await api('/api/v1/research/vault');const select=document.getElementById('builder-vault');
+    const selected=new Set(Array.from(select.selectedOptions).map(option=>option.value));select.replaceChildren();
+    for(const run of response.runs||[]) {const option=document.createElement('option');option.value=run.run_id;option.textContent='@research:'+run.run_id+' · '+(run.title||run.run_id);option.selected=selected.has(run.run_id);select.append(option);}
+  } catch(error) { builderError(error); }
+}
+function builderSetFiles(files) {
+  const allowed=/\.(pdf|tex|md|ipynb|py|csv|tsv|json|zip)$/i;
+  if(files.some(file=>!allowed.test(file.name))||files.reduce((sum,file)=>sum+file.size,0)>50*1024*1024) {builderState.files=[];document.getElementById('builder-file-summary').textContent='Selection rejected';document.getElementById('builder-files').value='';return builderError(new Error('Select supported scientific files totaling no more than 50 MB'));}
+  builderState.files=files;document.getElementById('builder-file-summary').textContent=files.map(file=>file.name).join(', ');
+}
+document.getElementById('builder-files').onchange=event=>builderSetFiles(Array.from(event.target.files));
+const builderDrop=document.getElementById('builder-drop');
+builderDrop.ondragover=event=>{event.preventDefault();builderDrop.classList.add('dragover');};
+builderDrop.ondragleave=()=>builderDrop.classList.remove('dragover');
+builderDrop.ondrop=event=>{event.preventDefault();builderDrop.classList.remove('dragover');builderSetFiles(Array.from(event.dataTransfer.files));};
+async function builderIngest() {
+  try {document.getElementById('builder-status').textContent='Extracting and formally verifying…';const form=new FormData();
+    for(const file of builderState.files) form.append('files',file);
+    form.append('vault_ids',JSON.stringify(Array.from(document.getElementById('builder-vault').selectedOptions).map(option=>option.value)));
+    builderState.ir=await builderRequest('/ingest',{method:'POST',body:form});builderState.plan=null;
+    document.getElementById('builder-execute').disabled=true;builderRenderIR();
+    document.getElementById('builder-status').textContent='Extraction complete · ready for researcher review';
+  } catch(error) {builderError(error);}
+}
+function builderRenderIR() {
+  const ir=builderState.ir,body=document.getElementById('builder-verification');body.replaceChildren();
+  const flags=ir.disambiguation_flags.filter(flag=>!flag.resolved);
+  document.getElementById('builder-ir-status').textContent=ir.source_mode+' · '+ir.equations.length+' equations · '+ir.constants.length+' constants · '+ir.llm_disambiguation_tokens_used+' LLM tokens'+(flags.length?' · Review: '+flags.map(flag=>flag.trigger+' ('+flag.target_symbol_or_eq+')').join(', '):'');
+  for(const equation of ir.equations) {const row=document.createElement('tr'),math=document.createElement('td'),checks=document.createElement('td'),edit=document.createElement('td'),input=document.createElement('input');
+    math.innerHTML=_renderKatexExpr(equation.canonical_latex,false);math.title=equation.provenance.file+' · '+equation.provenance.location+'\n'+equation.provenance.quote;
+    checks.textContent=equation.role+' · HIN '+(equation.hin_homogeneous?'✓':'!')+' · Z3 '+(equation.z3_satisfiable?'✓':'!');checks.className=equation.hin_homogeneous&&equation.z3_satisfiable?'builder-ok':'builder-warn';
+    input.value=equation.canonical_latex;input.dataset.equationId=equation.equation_id;input.setAttribute('aria-label','Override '+equation.equation_id);edit.append(input);row.append(math,checks,edit);body.append(row);
+  }
+  for(const constant of ir.constants) {const row=document.createElement('tr'),name=document.createElement('td'),checks=document.createElement('td'),edit=document.createElement('td'),input=document.createElement('input');
+    name.textContent=constant.symbol+' = '+constant.si_value+' '+constant.dimension.canonical_unit;name.title=constant.provenance.quote;checks.textContent=constant.verification_status;checks.className=['VERIFIED','USER_OVERRIDDEN'].includes(constant.verification_status)?'builder-ok':'builder-warn';
+    input.type='number';input.step='any';input.value=constant.si_value;input.dataset.constantId=constant.constant_id;input.setAttribute('aria-label','Override '+constant.symbol);edit.append(input);row.append(name,checks,edit);body.append(row);
+  }
+  document.getElementById('builder-state-order').value=ir.state_variables.map(state=>state.symbol).join(', ');
+  document.getElementById('builder-plan').disabled=false;
+}
+async function builderPlan() {
+  try {const original=builderState.ir,patch={approve:true,equation_patches:[],constant_patches:[]};
+    for(const input of document.querySelectorAll('#builder-verification input[data-equation-id]')) {const old=original.equations.find(item=>item.equation_id===input.dataset.equationId);if(input.value!==old.canonical_latex)patch.equation_patches.push({equation_id:old.equation_id,canonical_latex:input.value});}
+    for(const input of document.querySelectorAll('#builder-verification input[data-constant-id]')) {const old=original.constants.find(item=>item.constant_id===input.dataset.constantId);if(Number(input.value)!==old.si_value)patch.constant_patches.push({constant_id:old.constant_id,si_value:Number(input.value)});}
+    const order=document.getElementById('builder-state-order').value.split(',').map(value=>value.trim()).filter(Boolean);if(order.length)patch.state_symbol_order=order;
+    builderState.ir=await builderRequest('/ir/'+original.ir_id+'/override',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});builderRenderIR();
+    builderState.plan=await builderRequest('/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ir_id:original.ir_id,profiles:Array.from(document.querySelectorAll('[name=builder-profile]:checked')).map(input=>input.value),enable_cpp_cabi:document.getElementById('builder-cpp').checked,enable_adjoint_jacobian:document.getElementById('builder-adjoint').checked,prompt:document.getElementById('builder-prompt').value})});
+    builderRenderWaves();document.getElementById('builder-status').textContent='Plan verified · spectral radius '+builderState.plan.spectral_radius;document.getElementById('builder-execute').disabled=false;
+  } catch(error) {builderError(error);}
+}
+function builderRenderWaves() {
+  const root=document.getElementById('builder-wavefronts');root.replaceChildren();
+  builderState.plan.wavefronts.forEach((wave,index)=>{const group=document.createElement('div');group.className='builder-wave';const heading=document.createElement('strong');heading.textContent='Wave '+(index+1);group.append(heading);
+    wave.forEach(module=>{const card=document.createElement('div');card.className='builder-module';card.dataset.module=module;card.textContent=module+' · PENDING';group.append(card);});root.append(group);});
+}
+function builderEvent(message) {
+  const healingTier=String(message.tier||'').match(/TIER([012])/);
+  const output=document.getElementById('builder-events');output.textContent+=(message.event+' · '+(message.module_id||message.stage||message.status||'')+'\n');output.scrollTop=output.scrollHeight;
+  if(message.module_id) {const card=Array.from(document.querySelectorAll('.builder-module')).find(card=>card.dataset.module===message.module_id);
+    if(card){let status=message.event==='CACHE_HIT_SKIPPED'?'CACHED':message.event==='builder.fallback_substituted'?'DEGRADED_DETERMINISTIC_FALLBACK':message.event==='builder.fallback_pending'?'FALLBACK_PENDING':message.stage==='Reflex_Heal'?'HEALING_T'+(healingTier?healingTier[1]:0):message.stage==='Overlay_Mutate'?'MUTATING':message.stage==='Adjoint_Commit_or_Rollback'?'COMMITTED':'VERIFYING';card.textContent=message.module_id+' · '+status;card.classList.toggle('builder-warn',status.includes('FALLBACK'));}}
+}
+async function builderExecute() {
+  try {document.getElementById('builder-execute').disabled=true;document.getElementById('builder-events').textContent='';
+    const run=await builderRequest('/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_id:builderState.plan.plan_id})});builderState.buildId=run.build_id;
+    if(builderState.stream)builderState.stream.close();builderState.stream=new EventSource('/api/v1/builder/stream?build_id='+run.build_id);
+    builderState.stream.onmessage=event=>{const message=JSON.parse(event.data);builderEvent(message);if(['builder.completed','builder.failed'].includes(message.event))builderState.stream.close();};
+    document.getElementById('builder-status').textContent='RUNNING · '+run.build_id;
+    const poll=async()=>{try{const status=await builderRequest('/status/'+run.build_id);if(status.status==='RUNNING'){setTimeout(poll,700);return;}
+      document.getElementById('builder-status').textContent=status.status+(status.error?' · '+status.error:'');
+      document.getElementById('builder-receipt').textContent=status.receipt?.merkle_root_blake3?'BLAKE3 Merkle root · '+status.receipt.merkle_root_blake3:'';
+      for(const wave of status.committed_waves||[])for(const module of wave){const card=Array.from(document.querySelectorAll('.builder-module')).find(card=>card.dataset.module===module);const degraded=(status.fallbacks||[]).some(item=>item.module_id===module);if(card){card.textContent=module+' · '+(degraded?'DEGRADED_DETERMINISTIC_FALLBACK':'COMMITTED');card.classList.add(degraded?'builder-warn':'builder-ok');}}
+      const link=document.getElementById('builder-download');link.href='/api/v1/builder/export/'+run.build_id+'.zip';link.hidden=!status.receipt?.merkle_root_blake3;
+      document.getElementById('builder-launch').disabled=!status.status.startsWith('COMPLETED')||!builderState.plan.arch_spec.profiles.includes('interactive_workbench');
+    }catch(error){builderError(error);}};poll();
+  } catch(error) {builderError(error);document.getElementById('builder-execute').disabled=false;}
+}
+async function builderLaunch() {
+  try {const result=await builderRequest('/instrument/'+builderState.buildId+'/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const link=document.getElementById('builder-instrument');link.href=result.url;link.textContent='Open workbench ↗';}
+  catch(error){builderError(error);}
 }
 /* ---- sidebar dual-explorer ---- */
 let sidebarTab = 'code';

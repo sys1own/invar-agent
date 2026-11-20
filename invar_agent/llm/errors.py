@@ -6,6 +6,8 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,6 +19,25 @@ _KEY_PATTERNS = [
 
 _MAX_MESSAGE_LEN = 500
 _MAX_RETRIES = 2  # retries after the initial attempt (429/5xx/timeouts only)
+_BUILDER_TRANSPORT = ContextVar("builder_transport", default=False)
+
+
+@contextmanager
+def builder_transport_policy():
+    token = _BUILDER_TRANSPORT.set(True)
+    try:
+        yield
+    finally:
+        _BUILDER_TRANSPORT.reset(token)
+
+
+def complete_for_builder(client, *args, **kwargs):
+    with builder_transport_policy():
+        return client.complete(*args, **kwargs)
+
+
+def builder_transport_active() -> bool:
+    return _BUILDER_TRANSPORT.get()
 
 
 def redact_secrets(text: Any, api_key: Optional[str] = None) -> str:
@@ -149,7 +170,7 @@ def call_with_retries(fn):
             return fn()
         except LLMProviderError as exc:
             last = exc
-            if exc.retryable and attempt < _MAX_RETRIES:
+            if exc.retryable and attempt < _MAX_RETRIES and not (_BUILDER_TRANSPORT.get() and exc.status_code in {401, 403, 429}):
                 sleep(backoff_delay(attempt))
                 continue
             raise

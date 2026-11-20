@@ -20,6 +20,7 @@ import httpx
 from invar_agent.config import Tier, resolve_tier_model
 from invar_agent.llm.errors import (
     LLMProviderError,
+    builder_transport_active,
     call_with_retries,
     extract_upstream_error,
     is_retryable_status,
@@ -129,7 +130,7 @@ class DeepSeekChatClient:
         start = time.perf_counter()
 
         extra: Dict[str, Any] = {}
-        if thinking is False:
+        if thinking is False or thinking is None and builder_transport_active():
             # DeepSeek thinking mode burns the whole completion budget on
             # reasoning (observed: 1024/1024 tokens, empty content). Planning
             # calls disable it explicitly; the API accepts this on flash.
@@ -137,7 +138,10 @@ class DeepSeekChatClient:
 
         def _attempt():
             try:
-                return self._openai_client().chat.completions.create(
+                client = self._openai_client()
+                if builder_transport_active() and callable(getattr(client, "with_options", None)):
+                    client = client.with_options(max_retries=0)
+                return client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     max_tokens=max_tokens,
@@ -154,7 +158,7 @@ class DeepSeekChatClient:
         # budget is exhausted the visible content comes back empty with
         # finish_reason="length". Retry with a doubled budget (bounded).
         budget = max_tokens
-        for _ in range(2):
+        for _ in range(0 if builder_transport_active() else 2):
             choice0 = response.choices[0]
             if choice0.message.content and choice0.message.content.strip():
                 break

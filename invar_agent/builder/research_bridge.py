@@ -22,6 +22,7 @@ Everything here is deterministic and makes zero LLM calls.
 from __future__ import annotations
 
 import json
+import importlib
 import math
 import os
 import re
@@ -41,6 +42,24 @@ from .archetypes import (ARCHETYPE_REGISTRY, ArchetypeClassificationResult,
 RESEARCH_REF_RE = re.compile(r"@research:([a-zA-Z0-9_\-]+)")
 PARITY_TEST_RELPATH = "tests/test_research_parity.py"
 PROVENANCE_FILENAME = ".invar_research_provenance.json"
+
+
+async def build_research_instrument(workspace_dir, *, vault_ids=(), uploaded_files=(), ir=None,
+                                    profiles=None, leaf_slots=(), build_goal='', llm_client=None,
+                                    progress_cb=None, build_id=None, auto_approve_clean_ir=False):
+    """Additive next-generation route; legacy bridge functions remain unchanged."""
+    workspace_dir = Path(workspace_dir)
+    pipeline = importlib.import_module('.ingestion.pipeline', __package__)
+    schemas = importlib.import_module('.ingestion.schemas', __package__)
+    builder = importlib.import_module('.state_machine', __package__)
+    if ir is None:
+        ir = pipeline.CanonicalResearchIngestionPipeline(workspace_dir, llm_client=llm_client).ingest(
+            schemas.IngestionRequest(vault_run_ids=list(vault_ids), upload_paths=[str(path) for path in uploaded_files]))
+    options = dict(ir=ir, explicit_profiles=profiles, leaf_slots=list(leaf_slots), build_goal=build_goal,
+                   auto_approve_clean_ir=auto_approve_clean_ir)
+    if build_id is not None:
+        options['build_id'] = build_id
+    return await builder.BuilderStateMachine(workspace_dir, llm_client=llm_client, progress_cb=progress_cb).run(builder.BuildRequest(**options))
 
 # ---------------------------------------------------------------------------
 # Software archetypes

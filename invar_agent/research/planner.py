@@ -1916,6 +1916,7 @@ async def generate_plan_with_feasibility(question: str,
             raise
         bp = parse_blueprint(bp_raw2)
     bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
+    bp_dict['research_prompt'] = question
     return {"feasibility": feasibility,
             "blueprint": _attach_evidence(bp_dict, evidence),
             "source": "llm",

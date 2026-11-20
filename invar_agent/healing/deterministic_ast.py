@@ -78,6 +78,59 @@ def _defined_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def sanitize_builder_module(code: str) -> SanitizerResult:
+    """Totalize scalar arithmetic without applying research kernel shape pruning."""
+    helpers = {
+        "_invar_sdiv": "def _invar_sdiv(a, b):\n    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):\n        return a / b\n    if not math.isfinite(a) or not math.isfinite(b) or b == 0:\n        return 0.0\n    value = a / b\n    return value if math.isfinite(value) else 0.0\n",
+        "safe_sqrt": "def safe_sqrt(x):\n    return math.sqrt(max(0.0, x))\n",
+        "safe_log": "def safe_log(x):\n    return math.log(max(1e-300, x))\n",
+        "safe_exp": "def safe_exp(x):\n    return math.exp(max(-700.0, min(700.0, x)))\n",
+        "smooth_clamp": "def smooth_clamp(x, lo, hi):\n    return min(hi, max(lo, x))\n",
+    }
+    needed = set()
+
+    class Guard(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            return node if node.name in helpers else self.generic_visit(node)
+
+        def visit_BinOp(self, node):
+            self.generic_visit(node)
+            if isinstance(node.op, ast.Div):
+                needed.add("_invar_sdiv")
+                return ast.copy_location(ast.Call(func=ast.Name(id="_invar_sdiv", ctx=ast.Load()), args=[node.left, node.right], keywords=[]), node)
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "math" and node.func.attr in {"sqrt", "log", "exp"}:
+                name = "safe_" + node.func.attr
+                needed.add(name)
+                node.func = ast.Name(id=name, ctx=ast.Load())
+            return node
+
+    def transform(tree):
+        tree = Guard().visit(tree)
+        names = _defined_names(tree)
+        index = 0
+        while index < len(tree.body) and (isinstance(tree.body[index], (ast.Import, ast.ImportFrom)) or isinstance(tree.body[index], ast.Expr) and isinstance(tree.body[index].value, ast.Constant) and isinstance(tree.body[index].value.value, str)):
+            index += 1
+        for name in sorted(needed - names):
+            definitions = ast.parse(helpers[name]).body
+            tree.body[index:index] = definitions
+            index += len(definitions)
+        if needed and not any(isinstance(node, ast.Import) and any(a.name == "math" and a.asname in {None, "math"} for a in node.names) for node in tree.body):
+            index = 0
+            while index < len(tree.body) and (isinstance(tree.body[index], ast.Expr) and isinstance(tree.body[index].value, ast.Constant) and isinstance(tree.body[index].value.value, str) or isinstance(tree.body[index], ast.ImportFrom) and tree.body[index].module == "__future__"):
+                index += 1
+            tree.body.insert(index, ast.Import(names=[ast.alias(name="math")]))
+        return tree, bool(needed), ["BUILDER_TOTALIZED_MATH"] if needed else []
+
+    tree, changed, notes = _run_tier0_tree_pass(ast.parse(code), "BUILDER_MODULE", transform)
+    result = ast.unparse(_ensure_nonempty_blocks(tree)) + "\n" if changed else code
+    ast.parse(result)
+    return SanitizerResult(result, notes, result != code)
+
+
 def _call_name(func: ast.expr) -> Optional[str]:
     if isinstance(func, ast.Name):
         return func.id
@@ -1484,6 +1537,54 @@ class _IntrinsicTransformer(ast.NodeTransformer):
                 ast.Attribute(value=ast.Name(id="math", ctx=ast.Load()),
                               attr=node.id, ctx=ast.Load()), node)
         return node
+
+
+def _lift_scalar_helpers_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
+    lifted = []
+    names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    names.update(node.id for node in ast.walk(tree) if isinstance(node, ast.Name))
+    names.update(node.arg for node in ast.walk(tree) if isinstance(node, ast.arg))
+    for outer in list(tree.body):
+        if not isinstance(outer, ast.FunctionDef):
+            continue
+        helpers = [node for node in outer.body if isinstance(node, ast.FunctionDef)]
+        helper_names = {node.name for node in helpers}
+        bound = {arg.arg for arg in outer.args.args}
+        bound.update(node.id for statement in outer.body if not isinstance(statement, ast.FunctionDef)
+                     for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+        for helper in helpers:
+            if (helper.decorator_list or helper.args.defaults or helper.args.kw_defaults or helper.args.vararg
+                    or helper.args.kwarg or helper.args.kwonlyargs or helper.args.posonlyargs
+                    or any(isinstance(node, (ast.Global, ast.Nonlocal, ast.FunctionDef, ast.AsyncFunctionDef))
+                           for statement in helper.body for node in ast.walk(statement))):
+                continue
+            local = {arg.arg for arg in helper.args.args}
+            local.update(node.id for node in ast.walk(helper) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+            reads = {node.id for node in ast.walk(helper) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+            if reads & helper_names:
+                continue
+            parents = {child:parent for parent in ast.walk(outer) for child in ast.iter_child_nodes(parent)}
+            references = [node for node in ast.walk(outer) if isinstance(node, ast.Name) and node.id==helper.name]
+            if any(not isinstance(node.ctx, ast.Load) or not isinstance(parents.get(node), ast.Call)
+                   or parents[node].func is not node for node in references):
+                continue
+            captures = sorted((reads-local) & bound)
+            name = '_invar_local_' + outer.name + '_' + helper.name
+            while name in names:
+                name += '_'
+            names.add(name)
+            for reference in references:
+                call = parents[reference]
+                reference.id = name
+                call.args.extend(ast.Name(id=capture, ctx=ast.Load()) for capture in captures)
+            outer.body.remove(helper)
+            helper.name = name
+            helper.args.args.extend(ast.arg(arg=capture) for capture in captures)
+            lifted.append(helper)
+    if lifted:
+        tree.body.extend(lifted)
+        ast.fix_missing_locations(tree)
+    return tree, bool(lifted), ['lifted scalar helper closures'] if lifted else []
 
 
 def _hoist_intrinsic_helpers(tree: ast.Module) -> bool:
@@ -5659,6 +5760,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     def _record_upper(s_idx: int, op_str: str, val: float, contract: Any, *, is_abs: bool = False) -> None:
         if not math.isfinite(val) or val < -1e-6:
             return
+        initial = _get_contract_initial_list(contract)
+        if s_idx in dyn_set and s_idx < len(initial):
+            value = abs(initial[s_idx]) if is_abs else initial[s_idx]
+            if value > val or op_str == '<' and value == val:
+                return
         if is_abs:
             abs_upper_slots.add(s_idx)
         if 0.25 <= val <= 0.250001 and op_str == "<=" and not is_abs:
@@ -5717,6 +5823,13 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         c_pure_invs: List[ast.AST] = []
         for inv_idx, (_name, assertion, _tol) in enumerate(_contract_invariant_items(contract)):
             is_negative_test = "impossible" in (_name or "").lower()
+            try:
+                initial_assertion = _resolve_initial_in_ast(ast.parse(assertion, mode="eval").body, init_c)
+            except SyntaxError:
+                initial_assertion = None
+            if (initial_assertion is not None and _slots_in_ast(initial_assertion) & dyn_set
+                    and _eval_pure_inv_ast(initial_assertion, init_c) is False):
+                continue
             if not is_negative_test:
                 for _s_decl in _contract_state_slots_from_text(assertion):
                     if _name and _s_decl not in slot_var_names:
@@ -8790,6 +8903,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         all_contracts: Sequence[Any] = (),
                         variable_map: Optional[Dict[str, int]] = None,
                         stabilize_diverged: bool = False,
+                        preserve_dynamics: bool = False,
                         pinned_functions: Optional[Collection[str]] = None) -> SanitizerResult:
     """Rewrite scalar intrinsic/math-namespace hazards before execution."""
     try:
@@ -8804,6 +8918,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
 
     def _run_op(op_name: str, pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]], *args: Any, **kwargs: Any) -> None:
         nonlocal tree, any_changed
+        if preserve_dynamics and op_name in {
+            'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE', 'REPAIR_MONOTONE_OBSERVABLES',
+            'ENFORCE_BLOCH_BALL_PROJECTION', 'ENFORCE_CONSERVATION_PROJECTION', 'ENFORCE_LYAPUNOV_SIGN',
+            'SEED_DISSIPATION_PARAMETERS',
+        }:
+            return
         tree, op_changed, op_notes = _run_tier0_tree_pass(
             tree, op_name, pass_fn, *args, pinned_snapshots=pinned_snaps, **kwargs
         )
@@ -8811,6 +8931,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
             any_changed = True
         all_notes.update(op_notes)
 
+    _run_op("LIFT_SCALAR_HELPERS", _lift_scalar_helpers_tree)
     _run_op("LOWER_RANDOM_CALLS", _lower_random_calls_tree)
     _run_op("NORMALIZE_BUFFER_ALIASES", _normalize_buffer_aliases_tree)
     _run_op("NORMALIZE_STEP_SIGNATURES", _normalize_step_signatures_tree)

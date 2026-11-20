@@ -513,12 +513,28 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
     except Exception:  # noqa: BLE001 - migration must never block startup
         pass
     app = FastAPI(title="invar-agent Web Console", version="0.1.0")
+    builder_service = None
+    try:
+        from invar_agent.builder.api_router import BuilderUploadLimit, create_builder_router
+        builder_router, builder_service = create_builder_router(state)
+        app.include_router(builder_router)
+        app.add_middleware(BuilderUploadLimit)
+    except ModuleNotFoundError as error:
+        if error.name not in {"sympy", "numpy", "scipy", "lark"}:
+            raise
+
+        @app.api_route('/api/v1/builder/{path:path}', methods=['GET', 'POST', 'PATCH', 'DELETE'])
+        def builder_dependencies_unavailable(path: str):
+            raise HTTPException(503, 'Install invar-agent[ingest,scientific] to enable Builder Studio')
+    app.state.builder_service = builder_service
     terminal_manager = TerminalSessionManager(state.workspace_root)
     app.state.terminal_manager = terminal_manager
 
     @app.on_event("shutdown")
     async def _close_terminal_sessions() -> None:  # pragma: no cover - server stop
         terminal_manager.close_all()
+        if builder_service is not None:
+            builder_service.close()
 
     async def _terminal_pump(websocket: WebSocket, session: TerminalSession) -> None:
         """Forward PTY output to the client as UTF-8 text frames (xterm-safe)."""

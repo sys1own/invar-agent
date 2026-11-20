@@ -8,6 +8,29 @@
 
 use std::collections::HashMap;
 
+pub fn domain_separated_blake3_hex(context: &str, payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(context);
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
+}
+
+pub fn compute_fault_fingerprint_json(fields_json: &str) -> Result<String, String> {
+    let fields: [String; 6] = serde_json::from_str(fields_json).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    for field in fields {
+        bytes.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(field.as_bytes());
+    }
+    Ok(domain_separated_blake3_hex("invar.builder.fault_fingerprint.v1", &bytes))
+}
+
+pub fn compute_receipt_merkle_root(receipt_json: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(receipt_json).map_err(|e| e.to_string())?;
+    value.as_object_mut().ok_or("Receipt must be a JSON object")?.remove("merkle_root_blake3");
+    let bytes = crate::uast::canonical_json_bytes(&value.to_string())?;
+    Ok(domain_separated_blake3_hex("invar.receipt.merkle.v1", &bytes))
+}
+
 /// Bulk-to-boundary holographic register core.
 #[derive(Default)]
 pub struct HisBoundaryCore {
@@ -78,6 +101,22 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_blake3_domain_separation() {
+        let a = domain_separated_blake3_hex("invar.his.interface.v2", b"{}");
+        let b = domain_separated_blake3_hex("invar.his.body.v2", b"{}");
+        assert_eq!(a.len(), 64);
+        assert_eq!(b.len(), 64);
+        assert_ne!(a, b);
+        assert_eq!(compute_receipt_merkle_root(r#"{"z":"\u03b1","a":1}"#).unwrap(), compute_receipt_merkle_root(r#"{"a":1,"z":"α"}"#).unwrap());
+        assert_ne!(compute_fault_fingerprint_json(r#"["ab","c","","","",""]"#).unwrap(), compute_fault_fingerprint_json(r#"["a","bc","","","",""]"#).unwrap());
+        assert!(compute_fault_fingerprint_json("[]").is_err());
+        assert!(compute_receipt_merkle_root("not json").is_err());
+        assert!(compute_receipt_merkle_root("[]").is_err());
+        assert_eq!(crate::uast::canonical_json_bytes("[0.00001,1e-7,1e16,1.0,-0.0]").unwrap(), b"[1e-05,1e-07,1e+16,1.0,-0.0]");
+        assert_eq!(crate::uast::canonical_json_bytes(r#"{"x":"😀"}"#).unwrap(), br#"{"x":"\ud83d\ude00"}"#);
+    }
 
     #[test]
     fn digest_is_stable_and_order_independent() {

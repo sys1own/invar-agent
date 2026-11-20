@@ -99,6 +99,16 @@ async def test_generate_plan_with_feasibility_single_call():
 
 
 @pytest.mark.asyncio
+async def test_combined_plan_retains_original_equations_without_llm_restatement():
+    question = 'Follow dx/dt = -k*x; k = 0.2 1/s; x(0) = 1.'
+    async def llm(prompt):
+        return _COMBINED_JSON
+    out = await generate_plan_with_feasibility(question,llm_complete=llm)
+    assert out['blueprint']['research_prompt'] == question
+    assert 'dx/dt' not in out['blueprint']['falsifiable_hypothesis']
+
+
+@pytest.mark.asyncio
 async def test_generate_plan_with_feasibility_refusal_fast_path():
     async def llm(prompt: str):  # pragma: no cover - must not be called
         raise AssertionError("LLM must not be called for clear-cut refusals")

@@ -164,6 +164,7 @@ class ResearchBlueprint(BaseModel):
             return cleaned
         return _clean_text(value) if value is not None else "Untitled Research Blueprint"
     falsifiable_hypothesis: str
+    research_prompt: str = ""
     search_queries: List[str]
     contracts: List[VerificationContract] = Field(min_length=1)
     code_template: str

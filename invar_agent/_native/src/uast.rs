@@ -8,6 +8,49 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub fn canonical_json_bytes(json: &str) -> Result<Vec<u8>, String> {
+    fn compact(value: &Value) -> Result<String, String> {
+        Ok(match value {
+            Value::Number(n) if n.is_f64() => {
+                let repr = format!("{:?}", n.as_f64().ok_or("Invalid JSON number")?);
+                if let Some((mantissa, exponent)) = repr.split_once('e') {
+                    let exponent: i32 = exponent.parse().map_err(|_| "Invalid JSON exponent")?;
+                    format!("{mantissa}e{exponent:+03}")
+                } else { repr }
+            }
+            Value::Array(values) => format!("[{}]", values.iter().map(compact).collect::<Result<Vec<_>, _>>()?.join(",")),
+            Value::Object(values) => {
+                let mut fields: Vec<_> = values.iter().collect();
+                fields.sort_by_key(|(key, _)| *key);
+                format!("{{{}}}", fields.into_iter().map(|(key, value)| {
+                    Ok(format!("{}:{}", serde_json::to_string(key).map_err(|e| e.to_string())?, compact(value)?))
+                }).collect::<Result<Vec<_>, String>>()?.join(","))
+            }
+            _ => serde_json::to_string(value).map_err(|e| e.to_string())?,
+        })
+    }
+    let value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let compact = compact(&value)?;
+    let mut ascii = String::with_capacity(compact.len());
+    for ch in compact.chars() {
+        if ch.is_ascii() {
+            ascii.push(ch);
+        } else {
+            for unit in ch.encode_utf16(&mut [0; 2]) {
+                use std::fmt::Write;
+                write!(&mut ascii, "\\u{unit:04x}").map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(ascii.into_bytes())
+}
+
+impl crate::holographic_hin::CselExpr {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        canonical_json_bytes(&serde_json::to_string(self).map_err(|e| e.to_string())?)
+    }
+}
+
 /// Kind of UAST node (mirrors the transpiler dialect).
 #[pyclass(module = "invar_agent._native", name = "UASTKind")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -50,6 +93,12 @@ pub struct UASTNode {
     pub val_i: Option<i64>,
     pub val_f: Option<f64>,
     pub children: Vec<u64>,
+}
+
+impl UASTNode {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        canonical_json_bytes(&serde_json::to_string(self).map_err(|e| e.to_string())?)
+    }
 }
 
 /// Flat arena storage for UAST nodes.

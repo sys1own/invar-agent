@@ -1,0 +1,258 @@
+{
+  "run_id": "mm_bioreactor_clearance",
+  "title": "Michaelis-Menten Bioreactor with Linear Product Clearance",
+  "status": "VERIFIED",
+  "contracts_summary": [
+    {
+      "contract_id": "c1_positivity_integration",
+      "target_backend": "cpp",
+      "dt": 1,
+      "steps": 20000,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "variable_map": {
+        "0": {
+          "name": "s_new",
+          "unit": "—"
+        },
+        "1": {
+          "name": "p_new",
+          "unit": "—"
+        },
+        "2": {
+          "name": "vmax",
+          "unit": "—"
+        },
+        "3": {
+          "name": "km",
+          "unit": "—"
+        },
+        "4": {
+          "name": "kc",
+          "unit": "—"
+        },
+        "5": {
+          "name": "S_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "6": {
+          "name": "P_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "7": {
+          "name": "mass_balance_residual_small",
+          "unit": "—"
+        },
+        "8": {
+          "name": "P_peak_positive",
+          "unit": "—"
+        },
+        "9": {
+          "name": "total_mass_mol_m3",
+          "unit": "mol/m³"
+        }
+      }
+    },
+    {
+      "contract_id": "c2_conservation_clearance",
+      "target_backend": "cpp",
+      "dt": 1,
+      "steps": 20000,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "variable_map": {
+        "0": {
+          "name": "s_new",
+          "unit": "—"
+        },
+        "1": {
+          "name": "p_new",
+          "unit": "—"
+        },
+        "2": {
+          "name": "vmax",
+          "unit": "—"
+        },
+        "3": {
+          "name": "km",
+          "unit": "—"
+        },
+        "4": {
+          "name": "kc",
+          "unit": "—"
+        },
+        "5": {
+          "name": "S_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "6": {
+          "name": "P_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "7": {
+          "name": "mass_balance_residual_small",
+          "unit": "—"
+        },
+        "8": {
+          "name": "P_peak_positive",
+          "unit": "—"
+        },
+        "9": {
+          "name": "total_mass_mol_m3",
+          "unit": "mol/m³"
+        }
+      }
+    },
+    {
+      "contract_id": "c3_peak_product",
+      "target_backend": "cpp",
+      "dt": 1,
+      "steps": 20000,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "variable_map": {
+        "0": {
+          "name": "s_new",
+          "unit": "—"
+        },
+        "1": {
+          "name": "p_new",
+          "unit": "—"
+        },
+        "2": {
+          "name": "vmax",
+          "unit": "—"
+        },
+        "3": {
+          "name": "km",
+          "unit": "—"
+        },
+        "4": {
+          "name": "kc",
+          "unit": "—"
+        },
+        "5": {
+          "name": "S_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "6": {
+          "name": "P_initial_mol_m3",
+          "unit": "mol/m³"
+        },
+        "7": {
+          "name": "mass_balance_residual_small",
+          "unit": "—"
+        },
+        "8": {
+          "name": "P_peak_positive",
+          "unit": "—"
+        },
+        "9": {
+          "name": "total_mass_mol_m3",
+          "unit": "mol/m³"
+        }
+      }
+    }
+  ],
+  "structured_evidence": {
+    "domains": [],
+    "recommended_backend": "cpp",
+    "recommended_stepper": "rk4",
+    "parameters": {
+      "v_max": {
+        "si_value": 0.00002,
+        "si_unit": "mol/(m^3*s)",
+        "raw_value": 0.00002,
+        "raw_unit": "mol/(m^3*s)",
+        "source": "user_prompt"
+      },
+      "k_clear": {
+        "si_value": 0.001,
+        "si_unit": "",
+        "raw_value": 0.001,
+        "raw_unit": "",
+        "source": "user_prompt"
+      }
+    },
+    "equations": [],
+    "benchmarks": [],
+    "suggested_invariants": []
+  },
+  "extracted_constants": {
+    "v_max": 0.00002,
+    "k_clear": 0.001
+  },
+  "governing_equations": [
+    "c1_positivity_integration",
+    "c2_conservation_clearance",
+    "c3_peak_product"
+  ]
+}

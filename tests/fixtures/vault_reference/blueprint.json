@@ -1,0 +1,250 @@
+{
+  "blueprint_id": "mm_bioreactor_clearance",
+  "title": "Michaelis-Menten Bioreactor with Linear Product Clearance",
+  "falsifiable_hypothesis": "The coupled ODE dS/dt = -V_max S/(K_m+S), dP/dt = V_max S/(K_m+S) - k_clear P with V_max=2.0e-5 mol/(m^3*s), K_m=2.5e-2 mol/m^3, k_clear=1.0e-3 1/s preserves non-negativity of S and P for all t>=0, drives S monotonically to zero, and yields a transient product peak P_peak that remains bounded by the total substrate mass S(0)+P(0)=0.1 mol/m^3.",
+  "contracts": [
+    {
+      "contract_id": "c1_positivity_integration",
+      "target_backend": "cpp",
+      "timeout_seconds": 60,
+      "invariants": [
+        {
+          "variable_name": "S_nonneg",
+          "assertion": "state[0] >= 0.0",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "P_nonneg",
+          "assertion": "state[1] >= 0.0",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "S_finite",
+          "assertion": "math.isfinite(state[0])",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "P_finite",
+          "assertion": "math.isfinite(state[1])",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "trace_S_bounded",
+          "assertion": "trace_max[0] <= initial[0] + 1e-9",
+          "tolerance": 1e-9
+        },
+        {
+          "variable_name": "telemetry_finite",
+          "assertion": "telemetry['finite'] == 1",
+          "tolerance": 0
+        }
+      ],
+      "max_memory_mb": 128,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "dt": 1,
+      "steps": 20000
+    },
+    {
+      "contract_id": "c2_conservation_clearance",
+      "target_backend": "cpp",
+      "timeout_seconds": 60,
+      "invariants": [
+        {
+          "variable_name": "S_monotone_decay",
+          "assertion": "state[25] <= initial[0] + 1e-12",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "S_exhausted",
+          "assertion": "state[25] <= 0.01 * initial[0]",
+          "tolerance": 0.001
+        },
+        {
+          "variable_name": "mass_balance_residual_small",
+          "assertion": "state[7] <= 1e-4",
+          "tolerance": 0.000001
+        },
+        {
+          "variable_name": "P_nonneg_after",
+          "assertion": "state[26] >= 0.0",
+          "tolerance": 1e-12
+        }
+      ],
+      "max_memory_mb": 128,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "dt": 1,
+      "steps": 20000
+    },
+    {
+      "contract_id": "c3_peak_product",
+      "target_backend": "cpp",
+      "timeout_seconds": 60,
+      "invariants": [
+        {
+          "variable_name": "P_peak_bounded",
+          "assertion": "state[8] <= initial[0] + initial[1] + 1e-9",
+          "tolerance": 1e-9
+        },
+        {
+          "variable_name": "P_peak_positive",
+          "assertion": "state[8] > 0.0",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "P_finite_end",
+          "assertion": "math.isfinite(state[28])",
+          "tolerance": 1e-12
+        },
+        {
+          "variable_name": "P_nonneg",
+          "assertion": "state[28] >= 0.0",
+          "tolerance": 1e-12
+        }
+      ],
+      "max_memory_mb": 128,
+      "initial_state": [
+        0.1,
+        0,
+        0.00002,
+        0.025,
+        0.001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "dt": 1,
+      "steps": 20000
+    }
+  ],
+  "code_template": "import math\n\ndef mm_rate(s, vmax, km):\n    denom = km + s\n    if denom <= 0.0:\n        return 0.0\n    return vmax * s / denom\n\ndef simulation_step(buf, dt):\n    s = buf.data[0]\n    p = buf.data[1]\n    vmax = buf.data[2]\n    km = buf.data[3]\n    kc = buf.data[4]\n    if buf.data[5] == 0.0:\n        buf.data[5] = s\n        buf.data[6] = p\n        buf.data[9] = s + p\n    r1 = mm_rate(s, vmax, km)\n    k1s = -r1\n    k1p = r1 - kc * p\n    s2 = s + 0.5 * dt * k1s\n    p2 = p + 0.5 * dt * k1p\n    if s2 < 0.0:\n        s2 = 0.0\n    if p2 < 0.0:\n        p2 = 0.0\n    r2 = mm_rate(s2, vmax, km)\n    k2s = -r2\n    k2p = r2 - kc * p2\n    s3 = s + 0.5 * dt * k2s\n    p3 = p + 0.5 * dt * k2p\n    if s3 < 0.0:\n        s3 = 0.0\n    if p3 < 0.0:\n        p3 = 0.0\n    r3 = mm_rate(s3, vmax, km)\n    k3s = -r3\n    k3p = r3 - kc * p3\n    s4 = s + dt * k3s\n    p4 = p + dt * k3p\n    if s4 < 0.0:\n        s4 = 0.0\n    if p4 < 0.0:\n        p4 = 0.0\n    r4 = mm_rate(s4, vmax, km)\n    k4s = -r4\n    k4p = r4 - kc * p4\n    s_new = s + (dt / 6.0) * (k1s + 2.0 * k2s + 2.0 * k3s + k4s)\n    p_new = p + (dt / 6.0) * (k1p + 2.0 * k2p + 2.0 * k3p + k4p)\n    if s_new < 0.0:\n        s_new = 0.0\n    if p_new < 0.0:\n        p_new = 0.0\n    conv = (s - s_new) - ((p_new - p) + dt * kc * p)\n    buf.data[0] = s_new\n    buf.data[1] = p_new\n    buf.data[7] = buf.data[7] + conv * conv\n    if p_new > buf.data[8]:\n        buf.data[8] = p_new\n",
+  "variable_map": {
+    "substrate_S_mol_m3": 0,
+    "product_P_mol_m3": 1,
+    "V_max_mol_m3_s": 2,
+    "K_m_mol_m3": 3,
+    "k_clear_1_s": 4,
+    "S_initial_mol_m3": 5,
+    "P_initial_mol_m3": 6,
+    "mass_balance_residual": 7,
+    "peak_product_P_mol_m3": 8,
+    "total_mass_mol_m3": 9,
+    "S_nonneg": 0,
+    "P_nonneg": 1,
+    "S_finite": 0,
+    "P_finite": 1,
+    "trace_S_bounded": 0,
+    "S_monotone_decay": 0,
+    "S_exhausted": 0,
+    "mass_balance_residual_small": 7,
+    "P_nonneg_after": 1,
+    "P_peak_positive": 8,
+    "P_finite_end": 1,
+    "s": 0,
+    "p": 1,
+    "vmax": 2,
+    "km": 3,
+    "kc": 4,
+    "s_new": 0,
+    "p_new": 1
+  },
+  "structured_evidence": {
+    "domains": [],
+    "equations": [],
+    "parameters": {
+      "v_max": {
+        "name": "v_max",
+        "symbol": "V_max",
+        "raw_value": 0.00002,
+        "raw_unit": "mol/(m^3*s)",
+        "si_value": 0.00002,
+        "si_unit": "mol/(m^3*s)",
+        "uncertainty": null,
+        "source": "user_prompt",
+        "confidence": 1
+      },
+      "k_clear": {
+        "name": "k_clear",
+        "symbol": "k_clear",
+        "raw_value": 0.001,
+        "raw_unit": "",
+        "si_value": 0.001,
+        "si_unit": "",
+        "uncertainty": null,
+        "source": "user_prompt",
+        "confidence": 1
+      }
+    },
+    "benchmarks": [],
+    "recommended_backend": "cpp",
+    "recommended_stepper": "rk4",
+    "suggested_invariants": [],
+    "summary_markdown_table": "**Domains:** general  \n**Recommended backend / stepper:** `cpp` / `rk4`\n\n| Parameter | Symbol | Raw | SI value | SI unit | Source |\n|---|---|---|---|---|---|\n| v_max | V_max | 2e-05 mol/(m^3*s) | 2e-05 | mol/(m^3*s) | user_prompt |\n| k_clear | k_clear | 0.001  | 0.001 |  | user_prompt |"
+  },
+  "extracted_constants": {
+    "v_max": 0.00002,
+    "k_clear": 0.001
+  },
+  "uast_spec": null
+}

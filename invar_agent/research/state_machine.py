@@ -40,6 +40,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
+from ..runtime.build_utils import rollback_overlay
+from ..runtime.research_reference import ReferenceError
+from .evolution import text_evolutions, check_evolution_reference
+
 from ..schemas.research import (InvariantConstraint, ModuleLayer, ResearchBlueprint,
                                 SimulationResult, StageTelemetry, VerificationContract)
 from ..transpiler.emitters.base import EmitterError
@@ -2380,12 +2384,14 @@ class ResearchStateMachine:
             for c in (getattr(bp, "contracts", None) or [])
         ]
         cumulative_dicts = [c.model_dump() for c in _contracts_through_stage(bp, stage)]
+        declared = text_evolutions(bp.research_prompt or bp.falsifiable_hypothesis)
         san = sanitize_intrinsics(
             candidate_code,
             contracts=contracts,
             all_contracts=all_bp_dicts or cumulative_dicts or contracts,
             variable_map=getattr(bp, "variable_map", None),
             stabilize_diverged=stabilize_diverged,
+            preserve_dynamics=bool(declared),
             pinned_functions=pinned_fn_names or None,
         )
         _apply_backup_slots_to_vmap(bp, getattr(san, "backup_slot_map", {}), san.code)
@@ -2434,6 +2440,7 @@ class ResearchStateMachine:
                 all_contracts=all_bp_dicts or cumulative_dicts or contracts,
                 variable_map=getattr(bp, "variable_map", None),
                 stabilize_diverged=stabilize_diverged,
+                preserve_dynamics=bool(declared),
                 pinned_functions=unified_pinned or None,
             )
             _apply_backup_slots_to_vmap(bp, getattr(san_u, "backup_slot_map", {}), san_u.code)
@@ -2466,6 +2473,15 @@ class ResearchStateMachine:
         # 5. PreWrite_Guard: SHACL/Chiasmus firewall + v9 compliance + lowering.
         state.stage = "PreWrite_Guard"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "PreWrite_Guard"})
+        if declared:
+            try:
+                await asyncio.to_thread(check_evolution_reference, bp.model_dump(), {}, unified)
+            except (ReferenceError, ValueError, ImportError, KeyError) as error:
+                message = f"{getattr(error, 'code', 'RESEARCH_ODE_REFERENCE_FAILED')}: {error}"
+                await emit('accelerator_log', 'guard_reject', {**tag, 'violations': [message]})
+                self._rollback_overlay(scratch)
+                return {'status': 'error', 'result_status': 'ERROR', 'failure': message,
+                        'candidate_code': candidate_code, 'contracts': contracts}
         violations = shacl_chiasmus_firewall(unified) + v9_transpiler_violations(unified)
         if violations:
             await emit("accelerator_log", "guard_reject", {**tag, "violations": violations})
@@ -2788,6 +2804,27 @@ class ResearchStateMachine:
                                pinned_functions: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
+        if "VAULT_REFERENCE_" in str(failure):
+            llm = self.llm_planner or self.llm_fast
+            if llm is None:
+                return {"code": candidate_code, "terminated": False}
+            bp = getattr(self, "blueprint", None)
+            reference_objective = (
+                f"{objective}\nDeclared governing model: {getattr(bp, 'research_prompt', '') or getattr(bp, 'falsifiable_hypothesis', '')}\n"
+                f"State/observable slots: {json.dumps(getattr(bp, 'variable_map', {}) or {})}\n"
+                "Repair the executed derivative/RHS to match the declared ODEs, preserving a valid integration scheme. "
+                "Remove projections that contradict those laws; do not satisfy a counterexample "
+                "by clamping state values or modifying immutable parameters. Preserve pinned functions."
+            )
+            try:
+                refined = await asyncio.wait_for(refine_stage_code(
+                    llm, objective=reference_objective, code=candidate_code,
+                    contracts=[c.model_dump() if hasattr(c, 'model_dump') else c for c in contracts],
+                    failure=str(failure)), timeout=90.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                refined = None
+            return {"code": refined or candidate_code, "terminated": False,
+                    "applied_ops": ["ODE_REFERENCE_REFINE"] if refined else []}
         # Normalize to plain dicts so deterministic healing passes read
         # tolerances/assertions uniformly (pydantic objects hide ``tolerance``).
         all_bp_contracts = (getattr(self, "blueprint", None) and getattr(self.blueprint, "contracts", None)) or contracts
@@ -3471,7 +3508,7 @@ class ResearchStateMachine:
     # -- Adjoint helpers -------------------------------------------------------
     @staticmethod
     def _rollback_overlay(scratch: Path) -> None:
-        shutil.rmtree(scratch, ignore_errors=True)
+        rollback_overlay(scratch)
 
     def _export_checkpoint(self, bp: ResearchBlueprint, stage: int) -> str:
         root = self.workspace / "checkpoints" / bp.blueprint_id

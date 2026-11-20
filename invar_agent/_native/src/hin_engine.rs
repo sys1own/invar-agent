@@ -12,6 +12,200 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+fn strict_builder_dimensions(expr: &crate::holographic_hin::CselExpr, symbols: &HashMap<String, ([i8; 7], u8)>) -> Result<([i8; 7], u8), String> {
+    use crate::holographic_hin::CselExpr;
+    type Dim = ([i8; 7], u8);
+    fn same(a: Dim, b: Dim) -> Result<Dim, String> {
+        if a.1 != 0 && b.1 != 0 && a.1 != b.1 { return Err("SEMANTIC_TAG_MISMATCH".into()); }
+        if a.0 != b.0 { return Err("HIN_SI_DIM_MISMATCH".into()); }
+        Ok((a.0, a.1.max(b.1)))
+    }
+    fn dimensionless(d: Dim) -> Result<(), String> {
+        if d.0 != [0; 7] { Err("HIN_SI_DIM_MISMATCH: dimensionless operand required".into()) } else { Ok(()) }
+    }
+    fn product(a: Dim, b: Dim, sign: i16) -> Result<Dim, String> {
+        let mut out = [0; 7];
+        for i in 0..7 { out[i] = i8::try_from(a.0[i] as i16 + sign * b.0[i] as i16).map_err(|_| "HIN_DIMENSION_OVERFLOW")?; }
+        let tag = if sign == -1 && a.1 == b.1 { 0 } else if a.1 == 0 { b.1 } else if b.1 == 0 || a.1 == b.1 { a.1 } else { 0 };
+        Ok((out, tag))
+    }
+    let zero = ([0; 7], 0);
+    let recurse = |e: &CselExpr| strict_builder_dimensions(e, symbols);
+    match expr {
+        CselExpr::Literal { value } if value.is_finite() => Ok(zero),
+        CselExpr::Literal { .. } => Err("HIN_NONFINITE_LITERAL".into()),
+        CselExpr::Symbol { name } => match name.as_str() {
+            "t" => Ok(([0, 0, 1, 0, 0, 0, 0], 0)),
+            "pi" | "e" => Ok(zero),
+            _ => symbols.get(name).copied().ok_or_else(|| format!("HIN_UNBOUND_SYMBOL: {name}")),
+        },
+        CselExpr::Unary { op, arg } => {
+            if !["+", "-", "neg"].contains(&op.as_str()) { return Err(format!("HIN_UNKNOWN_OPERATOR: {op}")); }
+            recurse(arg)
+        }
+        CselExpr::Binary { op, left, right } => {
+            let a = recurse(left)?;
+            let b = recurse(right)?;
+            match op.as_str() {
+                "+" | "-" => {
+                    if matches!(left.as_ref(), CselExpr::Literal { value } if *value == 0.0) { return Ok(b); }
+                    if matches!(right.as_ref(), CselExpr::Literal { value } if *value == 0.0) { return Ok(a); }
+                    same(a, b)
+                }
+                "*" => product(a, b, 1),
+                "/" => product(a, b, -1),
+                "^" | "**" => {
+                    dimensionless(b)?;
+                    match right.as_ref() {
+                        CselExpr::Literal { value } if value.fract() == 0.0 && value.abs() <= 12.0 => {
+                            let mut out = [0; 7];
+                            for i in 0..7 { out[i] = i8::try_from(a.0[i] as i16 * *value as i16).map_err(|_| "HIN_DIMENSION_OVERFLOW")?; }
+                            Ok((out, if *value == 1.0 { a.1 } else { 0 }))
+                        }
+                        _ => { dimensionless(a)?; Ok(zero) }
+                    }
+                }
+                _ => Err(format!("HIN_UNKNOWN_OPERATOR: {op}")),
+            }
+        }
+        CselExpr::Call { func, args } => {
+            let dims: Vec<_> = args.iter().map(recurse).collect::<Result<_, _>>()?;
+            let arity = match func.as_str() {
+                "safe_div" | "min" | "max" | "kl_term" | "gammainc_reg" => 2,
+                "smooth_clamp" | "where" | "hill_eq" | "michaelis_menten" | "betainc_reg" => 3,
+                "safe_sqrt" | "sqrt" | "safe_exp" | "exp" | "safe_log" | "log" | "log1p" | "expm1" | "safe_sin" | "sin" | "safe_cos" | "cos" | "safe_tanh" | "tanh" | "safe_acos" | "acos" | "safe_asin" | "asin" | "abs" | "fabs" | "norm_cdf" | "norm_ppf" | "logistic_sigmoid" | "logit" | "shannon_term" => 1,
+                _ => return Err(format!("HIN_UNKNOWN_FUNCTION: {func}")),
+            };
+            if dims.len() != arity { return Err(format!("HIN_FUNCTION_ARITY: {func}")); }
+            let a = dims[0];
+            match func.as_str() {
+                "safe_div" => product(a, dims[1], -1),
+                "safe_sqrt" | "sqrt" => {
+                    if a.0.iter().any(|x| x % 2 != 0) { return Err("HIN_FRACTIONAL_DIMENSION".into()); }
+                    Ok((a.0.map(|x| x / 2), 0))
+                }
+                "abs" | "fabs" => Ok(a),
+                "min" | "max" => same(a, dims[1]),
+                "smooth_clamp" => { same(a, dims[1])?; same(a, dims[2]) },
+                "where" => { dimensionless(a)?; same(dims[1], dims[2]) },
+                "michaelis_menten" => { same(a, dims[2])?; Ok(dims[1]) },
+                "hill_eq" => { same(a, dims[1])?; dimensionless(dims[2])?; Ok(([0; 7], 1)) },
+                _ => {
+                    for d in dims { dimensionless(d)?; }
+                    let tag = match func.as_str() {
+                        "norm_cdf" | "logistic_sigmoid" | "gammainc_reg" | "betainc_reg" => 1,
+                        "norm_ppf" | "logit" => 4,
+                        "kl_term" | "shannon_term" => 2,
+                        _ => 0,
+                    };
+                    Ok(([0; 7], tag))
+                }
+            }
+        }
+    }
+}
+
+pub fn check_equation_dimensional_homogeneity_json(csel_expr_json: &str, symbol_dims_json: &str) -> Result<String, String> {
+    use crate::holographic_hin::{CselExpr, HolographicHinArena, QuantitySpec};
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SymbolDimension {
+        exponents: [i8; 7],
+        #[serde(default)]
+        semantic_tag: u8,
+        #[serde(default)]
+        canonical_unit: String,
+        #[serde(default)]
+        interval: Option<[f64; 2]>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Dimensions { Quantities(Vec<QuantitySpec>), Symbols(std::collections::BTreeMap<String, SymbolDimension>) }
+    let expr: CselExpr = serde_json::from_str(csel_expr_json).map_err(|e| e.to_string())?;
+    let quantities = match serde_json::from_str(symbol_dims_json).map_err(|e| e.to_string())? {
+        Dimensions::Quantities(q) => q,
+        Dimensions::Symbols(symbols) => symbols.into_iter().map(|(symbol, dim)| {
+            let _ = dim.canonical_unit;
+            QuantitySpec { symbol, si_dimension:dim.exponents, interval:dim.interval.unwrap_or([-1e300, 1e300]), is_state_variable:false, dimension_unspecified:false, semantic_tag:dim.semantic_tag }
+        }).collect(),
+    };
+    let mut names = HashSet::new();
+    for q in &quantities {
+        if q.symbol.trim().is_empty() || !names.insert(&q.symbol) || q.dimension_unspecified
+            || q.interval.iter().any(|x| !x.is_finite()) || q.interval[0] > q.interval[1] {
+            return Err("HIN_INVALID_SYMBOL_DIMENSIONS".into());
+        }
+    }
+    let symbols = quantities.iter().map(|q| (q.symbol.clone(), (q.si_dimension, q.semantic_tag))).collect();
+    let expected = strict_builder_dimensions(&expr, &symbols)?;
+    let mut arena = HolographicHinArena::new(quantities);
+    let mut report = arena.verify_equation("builder_equation", &expr);
+    report.output_dimensions = expected.0;
+    report.output_semantic_tag = expected.1;
+    let semantic = report.dimensional_warnings.iter().any(|w| w.contains("Semantic Tag Mismatch"));
+    // Research permits inference warnings; Builder treats dimensional warnings as a hard gate.
+    if semantic || !report.dimensional_warnings.is_empty() { report.valid = false; }
+    let json = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+    if !report.valid {
+        let code = if semantic { "SEMANTIC_TAG_MISMATCH" } else { "HIN_SI_DIM_MISMATCH" };
+        return Err(format!("{code}: {json}"));
+    }
+    Ok(json)
+}
+
+pub fn extract_builder_causal_slice_json(uast_json: &str, fault_node_id: &str, max_hops: usize) -> Result<String, String> {
+    let graph = crate::builder_uast::ProjectGraphUAST::from_json(uast_json)?;
+    if !graph.nodes.iter().any(|n| n.node_id() == fault_node_id) { return Err("HIN_UNKNOWN_FAULT_NODE".into()); }
+    let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &graph.edges {
+        adjacent.entry(&edge.from_node).or_default().push(&edge.to_node);
+        adjacent.entry(&edge.to_node).or_default().push(&edge.from_node);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = VecDeque::from([(fault_node_id, 0usize)]);
+    while let Some((node, hops)) = queue.pop_front() {
+        if !seen.insert(node) || hops >= max_hops { continue; }
+        if let Some(neighbors) = adjacent.get(node) {
+            for neighbor in neighbors { queue.push_back((neighbor, hops + 1)); }
+        }
+    }
+    let nodes: Vec<_> = graph.nodes.iter().filter(|n| seen.contains(n.node_id())).collect();
+    let edges: Vec<_> = graph.edges.iter().filter(|e| seen.contains(e.from_node.as_str()) && seen.contains(e.to_node.as_str())).collect();
+    Ok(serde_json::json!({"fault_node_id":fault_node_id, "max_hops":max_hops, "node_ids":seen, "nodes":nodes, "edges":edges}).to_string())
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_hin_semantic_tag_mismatch() {
+        let expr = json!({"kind":"binary", "op":"+", "left":{"kind":"symbol", "name":"p"}, "right":{"kind":"symbol", "name":"u"}}).to_string();
+        let mut dims = json!({"p":{"exponents":[0,0,0,0,0,0,0], "semantic_tag":1}, "u":{"exponents":[0,0,0,0,0,0,0], "semantic_tag":3}});
+        assert!(check_equation_dimensional_homogeneity_json(&expr, &dims.to_string()).unwrap_err().contains("SEMANTIC_TAG_MISMATCH"));
+        dims["u"]["semantic_tag"] = json!(1);
+        assert!(check_equation_dimensional_homogeneity_json(&expr, &dims.to_string()).is_ok());
+        dims["u"]["exponents"][0] = json!(1);
+        assert!(check_equation_dimensional_homogeneity_json(&expr, &dims.to_string()).is_err());
+        assert!(check_equation_dimensional_homogeneity_json(&expr, "{}").is_err());
+        assert!(check_equation_dimensional_homogeneity_json(r#"{"kind":"literal","value":1.0}"#, "{}").is_ok());
+        assert!(check_equation_dimensional_homogeneity_json("bad", "{}").is_err());
+    }
+
+    #[test]
+    fn builder_causal_slice_bounded_and_validated() {
+        use crate::builder_uast::tests::{graph, module};
+        let g = graph((0..5).map(|i| module(&format!("n{i}"))).collect(), (0..4).map(|i| json!({"from_node":format!("n{i}"), "to_node":format!("n{}", i+1), "edge_kind":"data_port", "port_id":null})).collect()).to_string();
+        let result: serde_json::Value = serde_json::from_str(&extract_builder_causal_slice_json(&g, "n0", 3).unwrap()).unwrap();
+        assert_eq!(result["node_ids"], json!(["n0","n1","n2","n3"]));
+        let zero: serde_json::Value = serde_json::from_str(&extract_builder_causal_slice_json(&g, "n2", 0).unwrap()).unwrap();
+        assert_eq!(zero["node_ids"], json!(["n2"]));
+        assert!(extract_builder_causal_slice_json(&g, "missing", 3).is_err());
+        assert!(extract_builder_causal_slice_json("{}", "n0", 3).is_err());
+    }
+}
+
 /// A single Interaction Agent node in the net.
 #[derive(Clone, Debug)]
 pub struct HinAgentNode {

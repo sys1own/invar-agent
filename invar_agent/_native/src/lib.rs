@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 mod adjoint;
+mod builder_uast;
 mod csel_egraph;
 mod deterministic_healer;
 mod egraph_healer;
@@ -38,6 +39,54 @@ use uast::{PyGraphPolyglotMaterializer, PyUASTGraph, PyUASTKind};
 
 fn to_set(items: Vec<String>) -> HashSet<String> {
     items.into_iter().collect()
+}
+
+#[pyfunction]
+#[pyo3(signature = (uast_json))]
+pub fn validate_builder_uast(py: Python<'_>, uast_json: &str) -> PyResult<String> {
+    py.allow_threads(|| crate::builder_uast::validate_uast_json(uast_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (uast_json, feedback_weights_json = None))]
+pub fn schedule_builder_wavefronts(py: Python<'_>, uast_json: &str, feedback_weights_json: Option<&str>) -> PyResult<String> {
+    py.allow_threads(|| crate::goi_wavefront::schedule_project_graph_json(uast_json, feedback_weights_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (resolvent_json, node_order_json, delta_edges_json, changed_his_nodes_json))]
+pub fn compute_builder_smw_delta(py: Python<'_>, resolvent_json: &str, node_order_json: &str, delta_edges_json: &str, changed_his_nodes_json: &str) -> PyResult<String> {
+    py.allow_threads(|| crate::goi_wavefront::smw_rank_k_update_json(resolvent_json, node_order_json, delta_edges_json, changed_his_nodes_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domain_context, canonical_payload_json))]
+pub fn compute_his_digest_v2(domain_context: &str, canonical_payload_json: &str) -> PyResult<String> {
+    Ok(crate::his::domain_separated_blake3_hex(domain_context, canonical_payload_json.as_bytes()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (fields_json))]
+pub fn compute_fault_fingerprint(fields_json: &str) -> PyResult<String> {
+    crate::his::compute_fault_fingerprint_json(fields_json).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (csel_expr_json, symbol_dims_json))]
+pub fn verify_equation_dimensions_hin(py: Python<'_>, csel_expr_json: &str, symbol_dims_json: &str) -> PyResult<String> {
+    py.allow_threads(|| crate::hin_engine::check_equation_dimensional_homogeneity_json(csel_expr_json, symbol_dims_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (uast_json, fault_node_id, max_hops = 3))]
+pub fn extract_hin_causal_slice(py: Python<'_>, uast_json: &str, fault_node_id: &str, max_hops: usize) -> PyResult<String> {
+    py.allow_threads(|| crate::hin_engine::extract_builder_causal_slice_json(uast_json, fault_node_id, max_hops)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (source_code, module_kind = "llm_extension_slot"))]
+pub fn heal_builder_tier0(py: Python<'_>, source_code: &str, module_kind: &str) -> PyResult<String> {
+    py.allow_threads(|| crate::deterministic_healer::heal_builder_module_tier0_json(source_code, module_kind)).map_err(PyValueError::new_err)
 }
 
 /// Geometry of Interaction task scheduler.
@@ -231,6 +280,14 @@ impl PyHisRegister {
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(validate_builder_uast, m)?)?;
+    m.add_function(wrap_pyfunction!(schedule_builder_wavefronts, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_builder_smw_delta, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_his_digest_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_fault_fingerprint, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_equation_dimensions_hin, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_hin_causal_slice, m)?)?;
+    m.add_function(wrap_pyfunction!(heal_builder_tier0, m)?)?;
     m.add_class::<PyGoiSolver>()?;
     m.add_class::<PyHinEngine>()?;
     m.add_class::<PyDeterministicHealer>()?;
