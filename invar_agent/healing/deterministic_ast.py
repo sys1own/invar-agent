@@ -17,7 +17,7 @@ from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Se
 
 from .buffer_api import lower_buffer_clock
 from ..research.slot_schema import observable_name
-from ..research.scientific_integrity import positivity_projection_contracts
+from ..research.scientific_integrity import output_dataflow, physical_projection_contracts, protected_observation_slots
 
 logger = logging.getLogger(__name__)
 
@@ -2220,8 +2220,7 @@ def _protect_parameter_slots_tree(tree: ast.Module, contracts: Sequence[Any]
         all_contract_slots.update(c_slots)
         max_init_len = max(max_init_len, len(_get_contract_initial_list(c)))
     latch_floor = max(max(all_contract_slots, default=-1), max_init_len) + 3
-    cls_slots = classify_buffer_slots(tree, contracts)
-    dyn_slots: Set[int] = set(cls_slots.get("dynamical_slots") or ())
+    dyn_slots: Set[int] = set(output_dataflow(tree)['physical'])
     sum_parts, multi_sums = _detect_declared_simplices(contracts)
     for i_s, j_s, _tgt, _tol, _st in sum_parts:
         dyn_slots.update((i_s, j_s))
@@ -3839,6 +3838,7 @@ def _repair_monotone_observable_body(body: List[ast.stmt], slots: set[int],
 
 def _repair_monotone_observables_tree(tree: ast.Module, contracts: Sequence[Any]
                                       ) -> Tuple[ast.Module, bool, List[str]]:
+    contracts = physical_projection_contracts(tree, contracts, physical_slots=_verified_projection_slots(tree, contracts))
     slots = _small_monotone_slots(contracts)
     entropy_upper_slots = _entropy_monotone_upper_slots(contracts)
     ref_pairs = _monotone_reference_slot_pairs(contracts)
@@ -5677,6 +5677,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_slots = cls["dynamical_slots"]
     dyn_set = set(dyn_slots)
 
+    protected = protected_observation_slots(tree, contracts, variable_map, _verified_projection_slots(tree, contracts))
+
     extrema_slots: Set[int] = set()
     for fn in _simulation_functions(tree):
         aliases = {}
@@ -5810,11 +5812,12 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             return None
         return min(vals) if mode == "upper" else max(vals)
 
-    for c_idx, contract in enumerate(contracts or []):
+    projection_contracts = physical_projection_contracts(tree, contracts, variable_map, _verified_projection_slots(tree, contracts))
+    for c_idx, contract in enumerate(projection_contracts):
         init_c = _get_contract_initial_list(contract)
         c_pure_invs: List[ast.AST] = []
         for inv_idx, (_name, assertion, _tol) in enumerate(_contract_invariant_items(contract)):
-            if set(_contract_state_slots_from_text(assertion)) & extrema_slots:
+            if set(_contract_state_slots_from_text(assertion)) & (extrema_slots | protected):
                 continue
             is_negative_test = "impossible" in (_name or "").lower()
             try:
@@ -7264,6 +7267,22 @@ def _is_sphere_s2_system(tree: ast.Module, contracts: Sequence[Any]) -> bool:
                     if re.search(r"state\[\d+\]\s*<=\s*1e-1[2-6]", assertion):
                         return True
     return False
+
+
+def _verified_projection_slots(tree: ast.Module, contracts: Sequence[Any]) -> Set[int]:
+    slots: Set[int] = set()
+    parts, sums = _detect_declared_simplices(contracts)
+    for left, right, *_ in parts:
+        slots.update((left, right))
+    for members, *_ in sums:
+        slots.update(members)
+    if _is_density_matrix_system(tree, contracts) or _is_mass_kinetics_system(tree, contracts):
+        slots.update(range(4))
+    elif _is_conservative_triad_system(tree, contracts):
+        slots.update(range(6))
+    elif _is_sphere_s2_system(tree, contracts):
+        slots.update(range(3))
+    return slots
 
 
 def _ensure_stabilize_helpers(
@@ -8913,12 +8932,6 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
 
     def _run_op(op_name: str, pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]], *args: Any, **kwargs: Any) -> None:
         nonlocal tree, any_changed
-        if op_name in {'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE',
-                       'REPAIR_MONOTONE_OBSERVABLES', 'ENFORCE_CONSERVATION_PROJECTION',
-                       'ENFORCE_LYAPUNOV_SIGN', 'SEED_DISSIPATION_PARAMETERS'}:
-            return
-        if op_name == 'ENFORCE_BLOCH_BALL_PROJECTION':
-            args = (positivity_projection_contracts(tree, args[0], variable_map),)
         if preserve_dynamics and op_name in {
             'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE', 'REPAIR_MONOTONE_OBSERVABLES',
             'ENFORCE_BLOCH_BALL_PROJECTION', 'ENFORCE_CONSERVATION_PROJECTION', 'ENFORCE_LYAPUNOV_SIGN',

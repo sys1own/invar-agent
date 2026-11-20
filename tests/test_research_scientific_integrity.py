@@ -1,4 +1,5 @@
 """Scientific predicates must test observations rather than manufacture them."""
+import ast
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +7,7 @@ import pytest
 from invar_agent.healing.deterministic_ast import sanitize_intrinsics
 from invar_agent.research.planner import _reconcile_time_horizon
 from invar_agent.research.scientific_integrity import (
-    output_dataflow, validate_observables, validate_protocol, validate_variant_schemes,
+    output_dataflow, physical_projection_contracts, validate_observables, validate_protocol, validate_variant_schemes,
 )
 from invar_agent.research.state_machine import _BufView, _eval_invariant, _guard_contract_initial_state
 from invar_agent.schemas.research import VerificationContract
@@ -109,3 +110,40 @@ def simulation_step(buf, dt):
 def test_module_constant_folding_does_not_enable_capabilities(expression):
     with pytest.raises((ReferenceError, ValueError)):
         _safe_namespace(f'X = {expression}\ndef simulation_step(buf, dt):\n    pass\n')
+
+
+def test_compound_contract_keeps_physical_projection_without_conditioning_ratio():
+    code = 'def simulation_step(buf, dt):\n    buf.data[0] *= 0.9\n    buf.data[1] = buf.data[0] / (1.0 + buf.data[0])\n'
+    c = contract('state[0] >= 0.0 and state[1] >= 0.78')
+    filtered = physical_projection_contracts(ast.parse(code), [c])
+    assert filtered[0]['invariants'][0]['assertion'] == 'state[0] >= 0.0'
+    assert c['invariants'][0]['assertion'] == 'state[0] >= 0.0 and state[1] >= 0.78'
+    ns = _safe_namespace(sanitize_intrinsics(code, contracts=[c]).code)
+    buf = SimpleNamespace(data=[1.0, 0.0] + [0.0] * 62)
+    ns['simulation_step'](buf, 0.1)
+    assert buf.data[1] == pytest.approx(0.9 / 1.9)
+    assert buf.data[1] < 0.78
+
+
+def test_conditioner_does_not_invent_missing_outcome_writes():
+    source = 'def simulation_step(buf, dt):\n    buf.data[0] *= 0.9\n'
+    c = contract('state[1] >= 0.78')
+    lowered = sanitize_intrinsics(source, contracts=[c]).code
+    assert 1 not in output_dataflow(lowered)['writes']
+    with pytest.raises(ValueError, match='uncomputed contract observables'):
+        validate_observables(lowered, [c], {'measurement': 1}, {})
+
+
+@pytest.mark.parametrize('source', ['', 'def simulation_step(buf, dt):\n    pass\n'])
+def test_empty_projection_contract_filter(source):
+    assert physical_projection_contracts(ast.parse(source), []) == []
+
+
+def test_ratio_predicates_do_not_condition_their_physical_inputs():
+    source = 'def simulation_step(buf, dt):\n    buf.data[0] = 1.0\n    buf.data[1] = 4.0\n'
+    c = contract('state[0] / state[1] >= 0.78')
+    assert not physical_projection_contracts(ast.parse(source), [c])[0]['invariants']
+    ns = _safe_namespace(sanitize_intrinsics(source, contracts=[c]).code)
+    buf = SimpleNamespace(data=[0.0] * 64)
+    ns['simulation_step'](buf, 0.1)
+    assert buf.data[:2] == [1.0, 4.0]

@@ -46,7 +46,9 @@ def output_dataflow(code):
                     result |= bindings.get(node.id, set())
             return result
 
-        assignments = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)]
+        assignments = [n if isinstance(n, ast.Assign) else ast.Assign(
+            targets=[n.target], value=ast.BinOp(left=n.target, op=n.op, right=n.value))
+            for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AugAssign))]
         step_slots = {n.value.value for n in assignments if isinstance(n.value, ast.Constant)
                       and type(n.value.value) is int and any(isinstance(t, ast.Name) and t.id == '_invar_step_slot' for t in n.targets)}
         for _ in range(len(assignments) + 1):
@@ -99,10 +101,26 @@ def output_dataflow(code):
                 dynamic_writes=dynamic, scopes=scopes, dependencies=graph)
 
 
-def positivity_projection_contracts(tree, contracts, variable_map=None):
+def protected_observation_slots(tree, contracts=(), variable_map=None, physical_slots=()):
     flow = output_dataflow(tree)
-    physical = flow['physical'] - {slot for name, slot in (variable_map or {}).items()
-        if re.search(r'^(?:peak|min|max|corridor)_|_(?:ratio|peak|residual)$', name, re.I)}
+    protected = {slot for slot in flow['derived'] - set(physical_slots) if flow['dependencies'].get(slot)}
+    labels = list((variable_map or {}).items())
+    required = set()
+    for contract in contracts:
+        value = contract if isinstance(contract, dict) else contract.model_dump()
+        for invariant in value.get('invariants') or []:
+            slots = _state_slots(ast.parse(invariant['assertion'], mode='eval'))
+            required |= slots
+            labels.extend((invariant.get('variable_name', ''), slot) for slot in slots)
+            if len(slots) == 1 and re.search(r'(?:^|_)conservation(?:_|$)', invariant.get('variable_name', ''), re.I):
+                protected |= slots
+    protected |= {slot for name, slot in labels if re.search(
+        r'(?:^|_)(?:peak|min|max|corridor|ratio|error|drift|residual|diagnostic|outcome|threshold)(?:_|$)', name, re.I)}
+    return protected | flow['clocks'] | (required - flow['writes'] - set(physical_slots))
+
+
+def physical_projection_contracts(tree, contracts, variable_map=None, physical_slots=()):
+    protected = protected_observation_slots(tree, contracts, variable_map, physical_slots)
     result = []
     for contract in contracts:
         value = copy.deepcopy(contract if isinstance(contract, dict) else contract.model_dump())
@@ -113,19 +131,22 @@ def positivity_projection_contracts(tree, contracts, variable_map=None):
             except SyntaxError:
                 continue
             parts = expr.values if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.And) else [expr]
-            if all(isinstance(part, ast.Compare) and len(part.ops) == 1
-                   and isinstance(part.ops[0], ast.GtE) and _state_slot(part.left) in physical
-                   and isinstance(part.comparators[0], ast.Constant) and part.comparators[0].value == 0
-                   for part in parts):
-                kept.append(inv)
+            parts = [part for part in parts if not _state_slots(part) & protected
+                     and not (isinstance(part, ast.Compare)
+                              and not any(_state_slot(side) is not None for side in [part.left, *part.comparators])
+                              and any(isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+                                      and _state_slots(node.right) for node in ast.walk(part)))]
+            if parts:
+                predicate = parts[0] if len(parts) == 1 else ast.BoolOp(op=ast.And(), values=parts)
+                kept.append({**inv, 'assertion': ast.unparse(predicate)})
         value['invariants'] = kept
         result.append(value)
     return result
 
 
-def validate_observables(code, contracts, variable_map, roles):
+def validate_observables(code, contracts, variable_map, roles, physical_slots=()):
     flow = output_dataflow(code)
-    protected = flow['derived'] | {slot for name, slot in variable_map.items()
+    protected = protected_observation_slots(code, contracts, variable_map, physical_slots) | {slot for name, slot in variable_map.items()
         if roles.get(name) == 'diagnostic' or re.search(r'^(?:peak|min|max|corridor)_|_(?:ratio|peak|residual)$', name, re.I)}
     required = set()
     for contract in contracts:
