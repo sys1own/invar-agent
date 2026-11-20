@@ -21,7 +21,8 @@ If no parameter setting satisfies the discovery predicates, report no solution, 
 Match the requested physical horizon exactly. Every time-phased protocol must visit every phase
 strictly inside that horizon. A named integration variant must execute that actual numerical scheme;
 use explicit RHS functions and real stage evaluations, not aliases or relabelled Euler updates.
-Keep derived observables separate from physical state and immutable input parameters."""
+Keep derived observables separate from physical state and immutable input parameters.
+Reserve the predicate symbol tol for numerical zero-check bands, not physical bounds."""
 
 
 _NONNEGATIVE_PROOF = '''
@@ -225,9 +226,18 @@ def evaluate_roundoff_predicate(expression, env, allowances):
                 add_terms(node.left); add_terms(node.comparators[0])
                 allowance = max(8, 2 * len(values)) * math.ulp(max(values))
                 return ast.copy_location(ast.Constant(abs(left-right) <= allowance), node)
-            allowance = allowances.get(_state_slot(node.left), 0.0)
+            observed = node.left
+            if isinstance(observed, ast.Call) and isinstance(observed.func, ast.Name) and observed.func.id == 'abs' and len(observed.args) == 1:
+                observed = observed.args[0]
+            allowance = allowances.get(_state_slot(observed), 0.0)
             tolerance = abs(float(env.get('tol', 0.0)))
-            if allowance and abs(right) == tolerance and tolerance <= 2 * allowance:
+            bound = node.comparators[0]
+            zero_band = isinstance(bound, ast.Name) and bound.id == 'tol'
+            zero_band |= (isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub)
+                          and isinstance(bound.operand, ast.Name) and bound.operand.id == 'tol')
+            if allowance and isinstance(node.ops[0], ast.Eq) and isinstance(bound, ast.Constant) and right == 0:
+                return ast.copy_location(ast.Constant(abs(left) <= allowance), node)
+            if allowance and (zero_band and abs(right) == tolerance and tolerance <= 2 * allowance or isinstance(bound, ast.Constant) and right == 0):
                 if isinstance(node.ops[0], ast.LtE) and right >= 0:
                     return ast.copy_location(ast.Constant(left <= right + allowance), node)
                 if isinstance(node.ops[0], ast.GtE) and right <= 0:

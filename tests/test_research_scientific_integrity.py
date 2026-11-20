@@ -199,9 +199,17 @@ def test_roundoff_allowance_is_term_scaled_and_never_changes_observables():
     run = {'state': state, 'trace_min': [0.0, 0.0, 0.0], 'trace_max': [0.5, 0.5, state[2]]}
     scales = observed_roundoff_scales(source, run)
     extra = {'tol': 1e-15, '_roundoff_scales': scales}
-    assert _eval_invariant('state[2] <= 1e-15', state, {}, extra)
+    assert _eval_invariant('state[2] <= tol', state, {}, extra)
+    assert _eval_invariant('abs(state[2]) <= tol', state, {}, extra)
+    assert _eval_invariant('state[2] == 0.0', [0.5, 0.5, scales[2] / 2], {}, extra)
+    assert not _eval_invariant('state[2] == 0.0', state, {}, extra)
+    assert not _eval_invariant('state[2] <= 1e-15', state, {}, extra)
     assert state[2] == 1.0865867827722063e-15
     assert not _eval_invariant('state[2] <= 1e-15', [0.5, 0.5, 1e-9], {}, extra)
+    assert not _eval_invariant('state[2] <= tol', [0.5, 0.5, 1e-9], {}, extra)
+    large = [1e15 + 0.875, 1e15, 0.875]
+    large_scales = observed_roundoff_scales(source, {'state': large, 'initial': large})
+    assert not _eval_invariant('state[2] <= 0.78', large, {}, {'tol': 0.78, '_roundoff_scales': large_scales})
     assert not _eval_invariant('state[2] >= 0.78', [0.5, 0.5, 0.78-1e-16], {}, extra)
     assert not _eval_invariant('state[2] > 0.0', [0.5, 0.5, 0.0], {}, extra)
     assert _eval_invariant('0.1 + 0.2 == 0.3', [], {})

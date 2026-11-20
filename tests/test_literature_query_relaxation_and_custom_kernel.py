@@ -1970,7 +1970,7 @@ def _cayley_kraus_stiff_lindblad_contracts():
             "max_memory_mb": 512,
             "initial_state": list(init_c2),
             "invariants": [
-                inv("spohn_entropy_increase_max", "state[23] <= 1e-15", 1e-15),
+                inv("spohn_entropy_increase_max", "state[23] <= tol", 1e-15),
                 inv("min_eigenvalue_rho", "state[3] >= -1e-15", 1e-15),
                 inv("trace_error_max", "state[5] <= 1e-14", 1e-14),
                 inv("purity_tr_rho_sq", "state[21] > 0.0 and state[21] <= 1.0 + 1e-14", 1e-14),
@@ -2051,7 +2051,7 @@ def test_cayley_kraus_stiff_lindblad_three_stages_verified(tmp_path):
             # The KL probability terms have unit total, even when their logarithms cancel.
             roundoff = observed_roundoff_scales(san.code, run)
             roundoff[23] = max(roundoff.get(23, 0.0), 8 * math.ulp(1.0))
-            assert _eval_invariant('state[23] <= 1e-15', st, tel,
+            assert _eval_invariant('state[23] <= tol', st, tel,
                                    {'tol': 1e-15, '_roundoff_scales': roundoff})
         if c.contract_id == "c3_chiasmus_reversibility":
             assert st[24] > 1e-13

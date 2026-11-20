@@ -14,6 +14,8 @@ from invar_agent.context_compactor import (
     build_software_codebase_context,
 )
 from invar_agent.research.vault import ResearchVaultManager, migrate_legacy_research_artifacts
+from invar_agent.research.broadcaster import ResearchRunManager, ResearchEventBroadcaster
+from invar_agent.research.state_machine import ResearchRunState
 from invar_agent.schemas.research import FeasibilityAssessment, ResearchBlueprint
 
 
@@ -60,6 +62,35 @@ def _populate_vault(workspace: Path) -> ResearchVaultManager:
         telemetry={"obs_peak_g": 16.42, "obs_max_heat_flux_mw_m2": 2.84},
         target_backend="cpp")
     return vault
+
+
+@pytest.mark.parametrize('existing', [0, 2])
+def test_fresh_runs_preserve_archives_and_reserve_an_unused_blueprint_id(tmp_path, monkeypatch, existing):
+    bp = _blueprint()
+    original_id = bp.blueprint_id
+    vault = _populate_vault(tmp_path) if existing else ResearchVaultManager(tmp_path)
+    if existing:
+        vault.run_dir(original_id + '_1').mkdir()
+    previous = {path: path.read_bytes() for path in vault.root.rglob('*') if path.is_file()}
+
+    class Machine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self, blueprint):
+            return ResearchRunState(blueprint=blueprint, status='VERIFIED')
+
+    monkeypatch.setattr('invar_agent.research.broadcaster.ResearchStateMachine', Machine)
+    manager = ResearchRunManager(tmp_path, ResearchEventBroadcaster())
+    assert not manager.approve()
+    manager.request_plan(bp)
+    assert manager.approve()
+    manager._thread.join(5)
+    assert not manager._thread.is_alive()
+    assert bp.blueprint_id == (original_id + '_2' if existing else original_id)
+    assert manager.active_state.blueprint.blueprint_id == bp.blueprint_id
+    assert manager.active_state.status == 'VERIFIED'
+    assert {path: path.read_bytes() for path in previous} == previous
 
 
 # -- Test 1: legacy migration + strict software file tree ----------------------

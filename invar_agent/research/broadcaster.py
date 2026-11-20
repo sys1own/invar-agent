@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from ..schemas.research import ResearchBlueprint
 from .state_machine import ResearchStateMachine, ResearchRunState
+from .vault import ResearchVaultManager
 
 CHANNELS = ("search_log", "goi_stream", "accelerator_log")
 
@@ -120,6 +121,12 @@ class ResearchRunManager:
         bp = self.pending_blueprint
         if bp is None:
             return False
+        vault = ResearchVaultManager(self.workspace_root)
+        base_id = vault.run_dir(bp.blueprint_id).name[:60]
+        suffix = 0
+        while vault.run_dir(bp.blueprint_id).exists():
+            suffix += 1
+            bp.blueprint_id = f"{base_id}_{suffix}"
         self._abort.clear()
         run_uid = uuid.uuid4().hex[:12]
         self.active_run_uid = run_uid
