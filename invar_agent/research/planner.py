@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..schemas.research import FeasibilityAssessment, FeasibilityVerdict, ResearchBlueprint
 from .feasibility import truncate_at_sentence
+from .slot_schema import observable_name
+from .scientific_integrity import SCIENTIFIC_CONTRACT
 
 # -- shared tool-mastery context ----------------------------------------------
 
-TOOLS_CONTEXT = """## Your execution tools (know them exactly)
+TOOLS_CONTEXT = SCIENTIFIC_CONTRACT + "\n\n" + """## Your execution tools (know them exactly)
 - Sandbox_Execute is AIR-GAPPED: no network, no disk, no imports. Your Python is
   transpiled to C++20 (-O3 -std=c++20 -fPIC -shared), compiled, and executed in an
   isolated subprocess with CPU/memory limits. Nothing else runs your code.
@@ -38,9 +41,13 @@ TOOLS_CONTEXT = """## Your execution tools (know them exactly)
   concolically against the real numeric outputs.
 
 ## v9_transpiler_friendly Python (STRICT)
+The blueprint variable_map must identify every initial-state slot bijectively by
+physical symbol. Include slot_roles keyed by the same symbols: read_only_parameter,
+evolving_state, or diagnostic. Never store diagnostics in input parameter slots.
 ALLOWED: top-level pure functions; `def simulation_step(buf, dt):` driver that
 mutates buf.data[i] in place (buf.data is a flat list[float] of length buf.size,
-buf.dt is the step); scalar params/locals of type int/float/bool; local lists via
+ONLY buf.data[i] and buf.size exist; dt is the function argument, never buf.dt,
+buf.steps or other buffer attributes); scalar params/locals of type int/float/bool; local lists via
 `[0.0] * n` or `[a, b, c]`; 2-D via `[[0.0] * n for _ in range(m)]` only;
 `for i in range(stop)` / `range(start, stop, step)`; `while cond:` (an iteration
 guard is injected automatically); if/elif/else; ternary `a if c else b`;
@@ -862,6 +869,7 @@ def _canon_alloc_slot(assigned: set, reserved: set) -> int:
 
 
 _CANON_SEMANTIC_SUFFIXES = (
+    "_finite", "_positivity", "_nonnegative", "_window",
     "_trace_rho2", "_bound", "_limit", "_max", "_min", "_current", "_val",
     "_check", "_error", "_err", "_drift",
 )
@@ -971,7 +979,7 @@ def concept_bucket_slot_map(contracts: List[Dict[str, Any]]
             bucket, direction, _stem, slot = key
             if slot in (0, 1, 2, 3):
                 continue
-            claim = (bucket, direction)
+            claim = (bucket, direction, _stem) if bucket == "POSITIVITY_MIN_EIG" else (bucket, direction)
             canonical = bucket_slot.setdefault(claim, slot)
             if canonical in (0, 1, 2, 3):
                 continue
@@ -990,17 +998,23 @@ def apply_concept_bucket_remap(contracts: List[Dict[str, Any]],
         return contracts
 
     def rewrite(text: str) -> str:
+        slots = set(_canon_slots_in_text(text))
+        if len({remap.get(slot, slot) for slot in slots}) < len(slots):
+            raise ValueError(f'SLOT_SCHEMA_ERROR: remap would merge distinct operands: {text}')
         def repl(m: "re.Match[str]") -> str:
             slot = int(m.group("slot"))
             return f"{m.group('prefix')}[{remap.get(slot, slot)}]"
         return _CONCEPT_REMAP_RE.sub(repl, text or "")
 
+    updates = []
     for contract in contracts or []:
         if not isinstance(contract, dict):
             continue
         for inv in contract.get("invariants") or []:
             if isinstance(inv, dict) and "assertion" in inv:
-                inv["assertion"] = rewrite(str(inv.get("assertion") or ""))
+                updates.append((inv, rewrite(str(inv.get("assertion") or ""))))
+    for inv, assertion in updates:
+        inv['assertion'] = assertion
     return contracts
 _CANON_INITIAL_STATE_RE = re.compile(r"\binitial_state\[(\d+)\]")
 
@@ -1031,6 +1045,8 @@ def _canon_bound_direction(assertion: str) -> str:
 
 
 def _canon_semantic_key(name: str, assertion: str) -> tuple[str, str]:
+    if name.lower().startswith(('peak_', 'min_', 'max_')):
+        return (observable_name(name), "extremum")
     return (_canon_semantic_stem(name) or str(name or "").lower(),
             _canon_bound_direction(assertion))
 
@@ -1520,7 +1536,7 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     variable_map = out.get("variable_map")
     if isinstance(variable_map, dict):
         vm: Dict[str, int] = {}
-        for name, idx in list(variable_map.items())[:64]:
+        for name, idx in list(variable_map.items())[:4096]:
             try:
                 i = int(idx)
             except (TypeError, ValueError):
@@ -1589,6 +1605,7 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _HORIZON_FACTORS = {
+    "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
     "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
     "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
     "d": 86400.0, "day": 86400.0, "days": 86400.0,
@@ -1597,8 +1614,8 @@ _HORIZON_FACTORS = {
 }
 _HORIZON_RE = re.compile(
     r"(?:over|for|across|during|until|horizon(?:\s+of)?|duration(?:\s+of)?|simulate)\s+"
-    r"(?:a\s+|the\s+)?(\d+(?:\.\d+)?)\s*"
-    r"(minutes?|mins?|hours?|hrs?|days?|weeks?|years?|yrs?)\b",
+    r"(?:a\s+|the\s+)?(\d+(?:\.\d+)?)[\s-]*"
+    r"(s|secs?|seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|years?|yrs?)\b",
     re.I,
 )
 _UNIT_DIVISOR_HINTS = {
@@ -1641,8 +1658,6 @@ def _reconcile_time_horizon(
             if getattr(p, "si_unit", "") in ("1/s", "mol/(m^3*s)", "kg/s") and getattr(p, "raw_unit", "") != getattr(p, "si_unit", ""):
                 has_si_rate_conv = True
                 break
-    if not has_si_rate_conv:
-        return bp_dict
     out = copy.deepcopy(bp_dict)
     for c in out.get("contracts") or []:
         if not isinstance(c, dict):
@@ -1659,6 +1674,13 @@ def _reconcile_time_horizon(
         # while the kernel itself uses SI 1/s rates (off by ~unit_factor).
         if 0.5 * raw_val <= sim_t <= 2.0 * raw_val and unit_factor >= 60.0:
             c["dt"] = min(1e8, dt * unit_factor)
+        target = raw_val * unit_factor
+        dt = float(c['dt'])
+        steps = max(1, int(math.ceil(target / dt)))
+        if steps > 100000:
+            raise ValueError('SCIENTIFIC_INTEGRITY: requested horizon exceeds the step budget at the chosen dt')
+        c['steps'] = steps
+        c['dt'] = target / steps
     return out
 
 

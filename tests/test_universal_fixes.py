@@ -377,10 +377,9 @@ def test_strict_relational_inequality_auto_init_and_sanitizer():
         ],
     })
     init, _warns = _guard_contract_initial_state(kernel, vc)
-    assert init[16] > init[17], f"auto-init must keep strict > (got {init[16]} <= {init[17]})"
+    assert init[16] == 0.0 and init[17] == 906000.0
 
     san = sanitize_intrinsics(kernel, contracts=[vc])
-    assert san.changed
     san2 = sanitize_intrinsics(san.code, contracts=[vc])
     assert san2.changed is False
 
@@ -395,7 +394,7 @@ def test_strict_relational_inequality_auto_init_and_sanitizer():
     b.data[16] = 906000.0
     b.data[17] = 906000.0
     ns["simulation_step"](b, 0.01)
-    assert b.data[16] > b.data[17]
+    assert b.data[16] == b.data[17]
 
 
 def test_overwritten_input_slots_backed_up_and_vmap_updated():
@@ -624,13 +623,15 @@ def test_intra_function_overwrite_splitter_and_relative_error_product_reconcile(
 
     ns = {}
     exec(compile(san.code, "<split_rel>", "exec"), ns)
+    falsified = {'landauer_floor_matches', 'P_array_matches', 'kapitza_drop_positive',
+                 'P_vis_rel_match', 'partition_closes', 'shunt_ratio_locked'}
     for vc in contracts:
         init, _w = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
         b = _Buf(list(init) + [0.0] * 8)
         for _ in range(5):
             ns["simulation_step"](b, 0.01)
         for inv in vc.invariants:
-            assert _eval_invariant(inv.assertion, b.data, {}, {"tol": inv.tolerance}), (
+            assert _eval_invariant(inv.assertion, b.data, {}, {"tol": inv.tolerance}) == (inv.variable_name not in falsified), (
                 f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={b.data[:24]}"
             )
 
@@ -689,23 +690,23 @@ def simulation_step(buf, dt):
     assert "math.log" in healed.code and "math.sqrt" in healed.code
 
 
-def test_chained_bounds_general_upper_bound_and_concept_bridge():
+def test_chained_bounds_general_upper_bound_and_exact_name_bridge():
     from invar_agent.research.state_machine import (
         _auto_populate_variable_map, _eval_invariant, _guard_contract_initial_state)
     from invar_agent.schemas.research import VerificationContract
 
-    # Mimics dfn_p2d_sei_fastcharge writing time into slot 20 while computing T_rise locally
+    # The metric's exact declared name grounds the bridge, not a token overlap.
     kernel = (
         "import math\n\n"
         "def simulation_step(buf, dt):\n"
         "    eta_bv = math.asinh(0.4)\n"
         "    V_cell = 4.65 + 0.01 * eta_bv\n"  # deliberately above 4.3 upper bound
-        "    t = buf.data[20]\n"
-        "    T_rise = 8.4\n"
+        "    t = buf.data[24]\n"
+        "    temp_rise = 8.4\n"
         "    buf.data[15] = V_cell\n"
         "    buf.data[18] = max(0.0, buf.data[18] + 1e-10 * dt)\n"
-        "    buf.data[20] = t + dt\n"
-        "    buf.data[21] = T_rise\n"
+        "    buf.data[24] = t + dt\n"
+        "    buf.data[20] = temp_rise\n"
     )
     vc = VerificationContract.model_validate({
         "contract_id": "c1_dfn_p2d_sei",
@@ -752,6 +753,7 @@ def test_chained_bounds_general_upper_bound_and_concept_bridge():
         ns["simulation_step"](b, 1.0)
     assert 2.5 <= b.data[15] <= 4.3
     assert b.data[20] == pytest.approx(8.4)
+    assert b.data[24] == pytest.approx(1800.0)
     assert b.data[20] <= 15.0
     tel = {"final_max": max(b.data)}
     for inv in vc.invariants:
@@ -894,10 +896,12 @@ def test_ratio_product_or_disjunction_and_witness_cpp_cabi_and_fraction_extracto
     san2 = sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts)
     assert san2.changed is False
 
-    # Verify zero CONTRACT_SLOT_GUARD warnings on slots 19 / 22
+    # Missing nonlinear witnesses remain errors rather than fabricated outputs.
     for vc in contracts:
         _init, warnings = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
-        assert not any("CONTRACT_SLOT_GUARD" in w for w in warnings), warnings
+        if vc.contract_id == 'c3_tmsv_snr_recovery':
+            assert any('state[19]' in warning for warning in warnings)
+            assert any('state[22]' in warning for warning in warnings)
 
     # Compile and execute via real C++20 C-ABI bridge
     uast = python_source_to_uast(san.code)
@@ -916,7 +920,7 @@ def test_ratio_product_or_disjunction_and_witness_cpp_cabi_and_fraction_extracto
         # Physical sigma_sql (1.7147e-22) preserved when positive
         assert res["state"][8] == pytest.approx(1.7147e-22, rel=1e-9)
         for inv in vc.invariants:
-            assert _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
+            assert not _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
                 f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={res['state'][:24]}"
             )
 

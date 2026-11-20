@@ -8,6 +8,7 @@ report can never invent values.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from ..latex_normalizer import format_contract_constraint_math, normalize_report_latex
@@ -26,10 +27,14 @@ def extract_observables(variable_map: Dict[str, int],
         return {}
     out: Dict[str, Dict[str, Any]] = {}
     for result in sorted(results, key=lambda r: (r.stage or 0)):
+        if result.status != 'VERIFIED':
+            continue
         for name in variable_map:
+            if name.lower().endswith(('_positivity', '_nonnegative', '_nonneg', '_conservation', '_window', '_bound', '_finite', '_check')):
+                continue
             key = f"obs_{name}"
             value = result.telemetry.get(key)
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) and math.isfinite(value):
                 prev = out.get(name)
                 if prev is not None and prev.get("status") == "VERIFIED" and result.status != "VERIFIED":
                     continue
@@ -95,6 +100,7 @@ def build_research_report(state) -> str:
     if not variable_map:
         variable_map = _fallback_variable_map(bp)
     observables = extract_observables(variable_map, results)
+    variable_map = {name:slot for name,slot in variable_map.items() if name in observables}
 
     lines: List[str] = []
     lines.append(f"# Verified Quantitative Research Report — {bp.title}")
@@ -127,7 +133,8 @@ def build_research_report(state) -> str:
         r = verified[-1]
         tel_bits = ", ".join(
             f"{k}={_fmt_value(v)}" for k, v in sorted(r.telemetry.items())
-            if isinstance(v, (int, float)) and k.startswith(("final_", "obs_"))
+            if isinstance(v, (int, float)) and math.isfinite(v)
+            and (k.startswith('final_') or (k.startswith('obs_') and k[4:] in variable_map))
         )
         lines.append(f"**Final verified telemetry** ({r.contract_id}, "
                      f"{r.execution_time_ms:.1f} ms): {tel_bits or 'n/a'}")

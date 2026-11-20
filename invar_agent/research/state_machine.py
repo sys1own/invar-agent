@@ -41,8 +41,15 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..runtime.build_utils import rollback_overlay
+from ..healing.buffer_api import BUFFER_API
+from ..healing.structural import is_structural_failure, unresolved_symbol
 from ..runtime.research_reference import ReferenceError
 from .evolution import text_evolutions, check_evolution_reference
+from .slot_schema import canonical_variable_map, validate_contract_slots, validate_slot_writes
+from .scientific_integrity import (SCIENTIFIC_CONTRACT, output_dataflow, protected_observation_slots, validate_observables,
+                                   observed_roundoff_scales, evaluate_roundoff_predicate,
+                                   physical_projection_contracts,
+                                   validate_protocol, validate_variant_schemes)
 
 from ..schemas.research import (InvariantConstraint, ModuleLayer, ResearchBlueprint,
                                 SimulationResult, StageTelemetry, VerificationContract)
@@ -108,10 +115,11 @@ from .accretion import (AccretionError, code_hash, layer_driver_name,
                         strip_driver, unified_from_layers)
 from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
+                        _reconcile_time_horizon,
                         refine_stage_code, request_healing_directives,
                         synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
-    _detect_bloch_radius, _ensure_nonempty_blocks,
+    _detect_bloch_radius, _ensure_nonempty_blocks, _verified_projection_slots,
     _restore_pinned_functions, _snapshot_pinned_functions,
     apply_healing_directives, classify_buffer_slots,
     enforce_conservation_projection, enforce_lyapunov_sign,
@@ -165,6 +173,8 @@ def v9_transpiler_violations(code: str) -> List[str]:
         return [f"syntax error: {exc.msg} (line {exc.lineno})"]
     out: List[str] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'buf' and node.attr not in {'data', 'size'}:
+            out.append(f"unsupported buffer attribute buf.{node.attr} at line {node.lineno}: {BUFFER_API}")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] not in ALLOWED_IMPORTS:
@@ -472,7 +482,9 @@ def _eval_invariant(expression: str, state: List[float], telemetry: Dict[str, fl
     expr_clean = expression.replace("&&", " and ").replace("||", " or ").replace("^", "**").strip().rstrip(".;, ")
     env = _invariant_env(state, telemetry, extra)
     try:
-        return bool(eval(expr_clean, {"__builtins__": {}, **env}))  # noqa: S307 - guarded above
+        if bool(eval(expr_clean, {"__builtins__": {}, **env})):
+            return True
+        return evaluate_roundoff_predicate(expr_clean, env, (extra or {}).get('_roundoff_scales', {}))
     except Exception as exc:  # noqa: BLE001
         raise PreWriteGuardError(
             f"invariant evaluation failed: {type(exc).__name__}: {exc}") from exc
@@ -1013,7 +1025,7 @@ def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
                 f"seeded {initial[slot]:.6g}")
 
 
-def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
+def _initialize_physical_state(py_code: str, contract: VerificationContract,
                                   all_contracts: Optional[Sequence[VerificationContract]] = None,
                                   ) -> Tuple[List[float], List[str]]:
     """Static contract-slot guard + auto-initializer.
@@ -1376,6 +1388,29 @@ def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
     return initial, warnings
 
 
+def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
+                                  all_contracts: Optional[Sequence[VerificationContract]] = None,
+                                  diagnostic_slots: Sequence[int] = (),
+                                  ) -> Tuple[List[float], List[str]]:
+    contracts = all_contracts or [contract]
+    tree = ast.parse(py_code)
+    physical = _verified_projection_slots(tree, contracts)
+    protected = protected_observation_slots(tree, contracts, physical_slots=physical)
+    protected.update(diagnostic_slots)
+    protected.update(set(_kernel_assigns_slots(py_code, _contract_state_slots(contract))) - physical)
+    initial, warnings = _initialize_physical_state(py_code, contract, all_contracts)
+    declared = contract.initial_state if contract.initial_state is not None else DEFAULT_INITIAL_STATE
+    for slot in protected:
+        if 0 <= slot < len(initial):
+            initial[slot] = declared[slot] if slot < len(declared) else 0.0
+    warnings = [warning for warning in warnings if not warning.startswith('auto-init:')
+                or not any(f'state[{slot}]' in warning for slot in protected)]
+    if all(initial[slot] == declared[slot] for slot in range(min(3, len(declared)))):
+        warnings = [warning for warning in warnings if 'state[0..2]' not in warning]
+    return initial, warnings
+
+
+
 def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
     """Enforce one canonical buf.data slot per named observable across stages."""
     code = getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
@@ -1423,7 +1458,9 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
             for fn in tree.body:
                 if not isinstance(fn, ast.FunctionDef):
                     continue
-                if fn.name != "simulation_step" and not fn.name.startswith("layer_"):
+                if fn.name.startswith('_invar_'):
+                    continue
+                if not any(arg.arg == 'buf' for arg in fn.args.args):
                     continue
                 for stmt in ast.walk(fn):
                     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -1444,7 +1481,27 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
-    bp.variable_map = dict(list(mapping.items())[:64])
+    bp.variable_map = canonical_variable_map(contracts, mapping)
+    reads, writes = set(), set()
+    try:
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == 'buf' and node.value.attr == 'data' and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                (writes if isinstance(node.ctx, ast.Store) else reads).add(node.slice.value)
+    except SyntaxError:
+        pass
+    for name, slot in bp.variable_map.items():
+        role = ('diagnostic' if name.lower().startswith(('peak_', 'max_', 'min_', '_invar_'))
+                else 'read_only_parameter' if slot in reads - writes or name in bp.extracted_constants
+                else 'evolving_state')
+        bp.slot_roles.setdefault(name, role)
+    try:
+        flow = output_dataflow(src)
+        physical = _verified_projection_slots(ast.parse(src), contracts)
+        for name, slot in bp.variable_map.items():
+            if slot in flow['derived'] - physical and flow['dependencies'].get(slot):
+                bp.slot_roles[name] = 'diagnostic'
+    except SyntaxError:
+        pass
 
 
 def _apply_backup_slots_to_vmap(bp: Optional[ResearchBlueprint],
@@ -2358,6 +2415,13 @@ class ResearchStateMachine:
         if candidate_code is None:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "no candidate module for this stage"}
+        try:
+            validate_slot_writes(candidate_code, bp.variable_map, bp.slot_roles)
+        except SyntaxError:
+            pass
+        except ValueError as error:
+            return {"status": "error", "result_status": "ERROR", "failure": f"PreWrite_Guard: {error}",
+                    "candidate_code": candidate_code, "contracts": contracts}
 
         # Ensure a top-level `simulation_step(buf, dt)` exists if the planner/LLM
         # emitted a helper `*_step(buf, dt)` without the driver wrapper.
@@ -2390,6 +2454,7 @@ class ResearchStateMachine:
             contracts=contracts,
             all_contracts=all_bp_dicts or cumulative_dicts or contracts,
             variable_map=getattr(bp, "variable_map", None),
+            slot_roles=bp.slot_roles,
             stabilize_diverged=stabilize_diverged,
             preserve_dynamics=bool(declared),
             pinned_functions=pinned_fn_names or None,
@@ -2439,6 +2504,7 @@ class ResearchStateMachine:
                 contracts=contracts,
                 all_contracts=all_bp_dicts or cumulative_dicts or contracts,
                 variable_map=getattr(bp, "variable_map", None),
+                slot_roles=bp.slot_roles,
                 stabilize_diverged=stabilize_diverged,
                 preserve_dynamics=bool(declared),
                 pinned_functions=unified_pinned or None,
@@ -2473,6 +2539,27 @@ class ResearchStateMachine:
         # 5. PreWrite_Guard: SHACL/Chiasmus firewall + v9 compliance + lowering.
         state.stage = "PreWrite_Guard"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "PreWrite_Guard"})
+        try:
+            validate_contract_slots(contracts)
+            validate_slot_writes(unified, bp.variable_map, bp.slot_roles)
+            validate_observables(unified, contracts, bp.variable_map, bp.slot_roles,
+                                 _verified_projection_slots(ast.parse(unified), contracts))
+            for contract in contracts:
+                normalized = _reconcile_time_horizon(
+                    {'code_template': unified, 'contracts': [contract.model_dump()]}, bp.research_prompt)
+                expected = normalized['contracts'][0]
+                target = expected['dt'] * expected['steps']
+                if not math.isclose(contract.dt * contract.steps, target, rel_tol=1e-12):
+                    raise ValueError(f'SCIENTIFIC_INTEGRITY: horizon mismatch for {contract.contract_id}')
+                coverage = await asyncio.to_thread(validate_protocol, unified, contract, bp.research_prompt)
+                if coverage:
+                    await emit('accelerator_log', 'phase_coverage', {**tag, 'contract_id': contract.contract_id, 'coverage': coverage})
+            schemes = await asyncio.to_thread(validate_variant_schemes, unified, bp, contracts)
+            if schemes:
+                await emit('accelerator_log', 'integration_schemes', {**tag, 'schemes': schemes})
+        except (ValueError, SyntaxError, ReferenceError) as error:
+            self._rollback_overlay(scratch)
+            return {'status':'error', 'result_status':'ERROR', 'failure':f'PreWrite_Guard: {error}', 'candidate_code':candidate_code, 'contracts':contracts}
         if declared:
             try:
                 await asyncio.to_thread(check_evolution_reference, bp.model_dump(), {}, unified)
@@ -2658,7 +2745,7 @@ class ResearchStateMachine:
         bp_text = ""
         if getattr(self, "blueprint", None) is not None:
             feas_rat = getattr(getattr(self.blueprint, "feasibility", None), "rationale", "") or ""
-            bp_text = f"{self.blueprint.title} {self.blueprint.falsifiable_hypothesis} {feas_rat}"
+            bp_text = f"{self.blueprint.research_prompt} {self.blueprint.title} {self.blueprint.falsifiable_hypothesis} {feas_rat}"
         from .shbt_federation import resolve_shbt_solvability, shbt_literature_dicts
         shbt_res = resolve_shbt_solvability(f"{bp_text} {' '.join(queries)}")
         if shbt_res.should_activate:
@@ -2728,6 +2815,8 @@ class ResearchStateMachine:
                 "channel_counts": meta.get("channel_counts") or {},
                 "raw_counts": meta.get("raw_counts") or {},
                 "channel_errors": meta.get("channel_errors") or {},
+                "by_source": meta.get("by_source") or {},
+                "arxiv_categories": meta.get("arxiv_categories") or [],
                 "relaxed_query": meta.get("relaxed_query") or "",
                 "error": meta.get("error") or "",
                 "offline": bool(meta.get("offline", getattr(self.search_client, "offline", True))),
@@ -2737,6 +2826,8 @@ class ResearchStateMachine:
 
     # -- GoI_Plan helpers ------------------------------------------------------
     async def _synthesize_stage(self, **kw) -> Dict[str, Any]:
+        bp = self.blueprint
+        kw['objective'] += f"\n{BUFFER_API}\nAuthoritative slot table (name -> index): {json.dumps(getattr(bp, 'variable_map', {}))}. Slot roles: {json.dumps(getattr(bp, 'slot_roles', {}))}. Never overwrite input parameter slots with diagnostics; preserve existing slot identities."
         pinned_layers: List[ModuleLayer] = kw.pop("pinned_layers")
         verified_contracts = [c.model_dump() for layer in pinned_layers for c in layer.contracts]
         if self.stage_synthesizer is not None:
@@ -2804,6 +2895,37 @@ class ResearchStateMachine:
                                pinned_functions: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
+        if is_structural_failure(failure):
+            llm = (self.llm_planner if attempt >= 2 else self.llm_fast) or self.llm_fast or self.llm_planner
+            if llm is None:
+                return {"code": candidate_code, "terminated": False, "applied_ops": []}
+            if 'unsupported construct:' in failure:
+                await self._emit('goi_stream', 'heal', {'round': round_idx, 'research_stage': stage,
+                    'tier': 0, 'applied': False, 'notes': ['structural repair required']})
+                plan = await request_healing_directives(llm,
+                    objective=f'Structural/API repair only. {BUFFER_API}\n{objective}', code=candidate_code,
+                    contracts=[], failure=f'{BUFFER_API}\nSource:\n{candidate_code}\n{failure}')
+                directives = [d for d in (plan or {}).get('directives', [])
+                              if isinstance(d, dict) and d.get('op') == 'INLINE_INTRINSIC']
+                patched = apply_healing_directives(candidate_code, directives, contracts=[], pinned_functions=pinned_functions)
+                if directives and not v9_transpiler_violations(patched.code):
+                    await self.emit_activity('HEALING', 'directive_applied', 'Applied structural-only intrinsic repair')
+                    return {'code': patched.code, 'terminated': False, 'applied_ops': ['INLINE_INTRINSIC']}
+            try:
+                repaired = await asyncio.wait_for(refine_stage_code(
+                    llm, objective=f"Structural/API repair only, no bound conditioning. {BUFFER_API}\n{SCIENTIFIC_CONTRACT}\n{objective}\nOriginal question: {getattr(self.blueprint, 'research_prompt', '')}\nContracts: {json.dumps([c.model_dump() for c in contracts])}\nAuthoritative slots: {json.dumps(getattr(self.blueprint, 'variable_map', {}))}. Roles: {json.dumps(getattr(self.blueprint, 'slot_roles', {}))}.",
+                    code=candidate_code, contracts=[], failure=f"{failure}\nNumbered source:\n" + '\n'.join(f'{i}: {line}' for i, line in enumerate(candidate_code.splitlines(), 1))), timeout=90.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                repaired = None
+            if not repaired or repaired.strip() == candidate_code.strip():
+                return {"code": candidate_code, "terminated": True, "applied_ops": []}
+            violations = v9_transpiler_violations(repaired)
+            unresolved = unresolved_symbol(failure, repaired)
+            if unresolved:
+                violations.append(unresolved)
+            if violations:
+                return {"code": candidate_code, "terminated": True, "applied_ops": [], "failure": '; '.join(violations)}
+            return {"code": repaired, "terminated": False, "applied_ops": ["STRUCTURAL_API_REPAIR"]}
         if "VAULT_REFERENCE_" in str(failure):
             llm = self.llm_planner or self.llm_fast
             if llm is None:
@@ -2841,10 +2963,18 @@ class ResearchStateMachine:
         if m_name_err:
             seed_directives.append({"op": "INLINE_INTRINSIC", "name": m_name_err.group(1)})
         bp_vmap = getattr(getattr(self, "blueprint", None), "variable_map", None)
+        bp_roles = getattr(getattr(self, "blueprint", None), "slot_roles", None)
+        try:
+            physics_contracts = physical_projection_contracts(
+                ast.parse(candidate_code), all_contract_dicts or contract_dicts, bp_vmap,
+                _verified_projection_slots(ast.parse(candidate_code), all_contract_dicts or contract_dicts), bp_roles)
+        except SyntaxError:
+            physics_contracts = []
         det = apply_healing_directives(
             candidate_code, seed_directives,
             contracts=all_contract_dicts or contract_dicts,
             variable_map=bp_vmap,
+            slot_roles=bp_roles,
             pinned_functions=pinned_functions,
         )
         healed, notes = candidate_code, list(det.notes)
@@ -2873,6 +3003,8 @@ class ResearchStateMachine:
                     continue
                 slot, bound = int(m.group(1)), float(m.group(2))
                 if bound > 1e-8 or slot in seen_slots:
+                    continue
+                if slot in protected_observation_slots(ast.parse(healed), contract_dicts, bp_vmap, roles=bp_roles):
                     continue
                 if not ("falsified" in fail_text or name in fail_text
                         or f"state[{slot}]" in fail_text):
@@ -2924,7 +3056,7 @@ class ResearchStateMachine:
             contracts=[c.model_dump() for c in contracts], failure=str(failure))
         if plan is None:
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
-                candidate_code, all_contract_dicts or contract_dicts)
+                candidate_code, physics_contracts)
             if fb_code != candidate_code:
                 return {"code": fb_code, "terminated": False,
                         "applied_ops": fb_notes or ["timeout_physics_guard_fallback"]}
@@ -2932,6 +3064,8 @@ class ResearchStateMachine:
                 candidate_code,
                 contracts=all_contract_dicts or contract_dicts,
                 all_contracts=all_contract_dicts or contract_dicts,
+                variable_map=bp_vmap,
+                slot_roles=bp_roles,
                 stabilize_diverged=("diverged" in str(failure or "").lower() or "non-finite" in str(failure or "").lower()),
                 pinned_functions=pinned_functions,
             )
@@ -2968,6 +3102,7 @@ class ResearchStateMachine:
             candidate_code, directives,
             contracts=all_contract_dicts or contract_dicts,
             variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+            slot_roles=bp_roles,
             pinned_functions=pinned_functions,
         )
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
@@ -3038,6 +3173,7 @@ class ResearchStateMachine:
                     contracts=all_contract_dicts or contract_dicts,
                     all_contracts=all_contract_dicts or contract_dicts,
                     variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                    slot_roles=bp_roles,
                     stabilize_diverged=_diverged_fail,
                     pinned_functions=pinned_functions,
                 )
@@ -3065,6 +3201,7 @@ class ResearchStateMachine:
                         contracts=all_contract_dicts or contract_dicts,
                         all_contracts=all_contract_dicts or contract_dicts,
                         variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                        slot_roles=bp_roles,
                         pinned_functions=pinned_functions,
                     )
                     final_ref = san_ref.code if san_ref.changed else refined
@@ -3074,7 +3211,7 @@ class ResearchStateMachine:
                     return {"code": final_ref, "terminated": False,
                             "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
-                candidate_code, contract_dicts)
+                candidate_code, physics_contracts)
             if fb_notes:
                 await self.emit_activity(
                     "HEALING", "deterministic_fallback",
@@ -3093,6 +3230,7 @@ class ResearchStateMachine:
                 contracts=all_contract_dicts or contract_dicts,
                 all_contracts=all_contract_dicts or contract_dicts,
                 variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                slot_roles=bp_roles,
                 stabilize_diverged=("diverged" in fail_text or "non-finite" in fail_text),
                 pinned_functions=pinned_functions,
             )
@@ -3121,6 +3259,7 @@ class ResearchStateMachine:
                         contracts=all_contract_dicts or contract_dicts,
                         all_contracts=all_contract_dicts or contract_dicts,
                         variable_map=getattr(getattr(self, "blueprint", None), "variable_map", None),
+                        slot_roles=bp_roles,
                         pinned_functions=pinned_functions,
                     )
                     final_ref = san_ref.code if san_ref.changed else refined
@@ -3208,7 +3347,8 @@ class ResearchStateMachine:
         if self.search_client is not None and queries:
             try:
                 hits = await asyncio.to_thread(
-                    self.search_client.search, queries[0], 3, None, queries[0])
+                    self.search_client.search, queries[0], 3, None,
+                    f"{blueprint.research_prompt} {blueprint.title} {queries[0]}")
             except TypeError:
                 try:
                     hits = await asyncio.to_thread(
@@ -3317,7 +3457,8 @@ class ResearchStateMachine:
         # Static contract-slot guard: error metrics start at 0.0, dynamical
         # slots are never all-zero, and uncomputed contract slots are logged.
         initial, slot_warnings = _guard_contract_initial_state(
-            py_code or "", contract, all_contracts=getattr(bp, "contracts", None)
+            py_code or "", contract, all_contracts=getattr(bp, "contracts", None),
+            diagnostic_slots=[slot for name, slot in bp.variable_map.items() if bp.slot_roles.get(name) == 'diagnostic'],
         )
         max_vmap_slot = max((idx for idx in (bp.variable_map or {}).values() if isinstance(idx, int)), default=-1)
         if max_vmap_slot >= len(initial) and max_vmap_slot < 4096:
@@ -3407,44 +3548,20 @@ class ResearchStateMachine:
             else:
                 status = "VERIFIED"
                 failed: List[Tuple[InvariantConstraint, Dict[str, Any]]] = []
+                roundoff_scales = observed_roundoff_scales(py_code, run)
                 for inv in contract.invariants:
-                    env_extra = dict(extra, tol=inv.tolerance)
+                    env_extra = dict(extra, tol=inv.tolerance, _roundoff_scales=roundoff_scales)
                     ok = _eval_invariant(inv.assertion, run["state"], telemetry, env_extra)
                     if not ok:
                         observed = _observed_terms(
                             inv.assertion, _invariant_env(run["state"], telemetry, env_extra))
                         failed.append((inv, observed))
                 if failed:
-                    # Tier-0 Reflex_Heal: deterministically reconcile
-                    # hallucinated numeric lower bounds against the verified
-                    # trajectory envelope (finite state, clean execution)
-                    # instead of burning Tier-2 LLM retries.
-                    unresolved: List[Tuple[InvariantConstraint, Dict[str, Any]]] = []
-                    reconciled: List[str] = []
-                    all_finite = all(math.isfinite(float(v)) for v in run["state"])
-                    for inv, observed in failed:
-                        revised = (_reconcile_hallucinated_bounds(
-                            inv.assertion, run["state"], telemetry, extra)
-                            if all_finite else None)
-                        if revised is not None:
-                            reconciled.append(
-                                f"{inv.variable_name}: `{inv.assertion}` -> `{revised}`")
-                            telemetry[f"reconciled_{inv.variable_name}"] = 1.0
-                        else:
-                            unresolved.append((inv, observed))
-                    if reconciled:
-                        telemetry["tier0_bound_reconciled"] = 1.0
-                        await self.emit_activity(
-                            f"STAGE_{stage}_EXEC", "bound_reconciled",
-                            "Tier-0 Reflex_Heal recalibrated hallucinated bound(s) "
-                            "to the verified trajectory envelope: "
-                            + "; ".join(reconciled)[:300])
-                    if unresolved:
-                        status = "FALSIFIED"
-                        counterexample = ("; ".join(
-                            f"`{inv.assertion}` ({inv.variable_name}) observed {observed}"
-                            for inv, observed in unresolved)
-                            + (f"; {run_ctx}" if run_ctx else ""))[:1500]
+                    status = "FALSIFIED"
+                    counterexample = ("; ".join(
+                        f"`{inv.assertion}` ({inv.variable_name}) observed {observed}"
+                        for inv, observed in failed)
+                        + (f"; {run_ctx}" if run_ctx else ""))[:1500]
         except KernelExecutionError as exc:
             status = "DIVERGED" if exc.timed_out else "ERROR"
             counterexample = str(exc)[:1500]

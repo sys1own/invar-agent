@@ -357,7 +357,7 @@ def anchor_or_queries(query: str, max_queries: int = 2) -> List[str]:
 
 
 _ARXIV_DOMAIN_CATS: Dict[str, Tuple[str, ...]] = {
-    "LIFE_SCIENCES_AND_BIOMEDICINE": ("q-bio.PE", "q-bio.QM", "q-bio.BM", "q-bio.CB", "q-bio.GN", "q-bio.MN"),
+    "LIFE_SCIENCES_AND_BIOMEDICINE": ("q-bio.*", "physics.bio-ph"),
     "EPIDEMIOLOGY_AND_ECOLOGY": ("q-bio.PE", "q-bio.QM", "physics.soc-ph"),
     "EARTH_CLIMATE_AND_ENVIRONMENT": ("physics.ao-ph", "physics.geo-ph", "physics.flu-dyn"),
     "STATISTICS_AND_CAUSAL_INFERENCE": ("stat.ME", "stat.TH", "stat.AP", "stat.ML", "econ.EM", "math.ST"),
@@ -514,7 +514,7 @@ _CHANNEL_BY_DOMAIN = {
     "constants": ("wikipedia", "wikidata", "openalex"),
     "discrete_oeis": ("oeis", "arxiv"),
     "chemical_pubchem": ("pubchem", "semantic_scholar"),
-    "biomed_epmc_pubmed": ("europe_pmc", "pubmed"),
+    "biomed_epmc_pubmed": ("europe_pmc", "pubmed", "biorxiv", "medrxiv"),
 }
 
 
@@ -541,6 +541,9 @@ def classify_research_domain(prompt_or_query: str) -> set:
         from .extractor import classify_macro_scientific_domains
         macro_domains = set(classify_macro_scientific_domains(prompt_or_query or ""))
         if macro_domains & {"LIFE_SCIENCES_AND_BIOMEDICINE", "EPIDEMIOLOGY_AND_ECOLOGY"}:
+            channels.add("biomed_epmc_pubmed")
+        if macro_domains & {"LIFE_SCIENCES_AND_BIOMEDICINE", "CHEMICAL_AND_MATERIALS"}:
+            channels.add("chemical_pubchem")
             channels.add("biomed_epmc_pubmed")
     except Exception:  # noqa: BLE001
         pass
@@ -751,7 +754,7 @@ class LiteratureSearchClient:
                 or ("arxiv", "openalex")
             for anchor_q in anchor_or_queries(raw_query):
                 relaxed_trail.append(anchor_q)
-                relaxed_results = _run(pass2_sources, anchor_q, use_arxiv_cats=False)
+                relaxed_results = _run(pass2_sources, anchor_q, use_arxiv_cats=True)
                 _merge_diag()
                 if relaxed_results:
                     results = relaxed_results
@@ -806,6 +809,7 @@ class LiteratureSearchClient:
             "status": "ok" if results else "empty",
             "arxiv_categories": list(arxiv_cats),
             "channel_counts": channel_counts,
+            "by_source": {src: {"count": channel_counts.get(src, 0), "error": channel_errors.get(src)} for src in sources},
             "raw_counts": raw_counts,
             "channel_errors": channel_errors,
             "relaxed_query": relaxed_query,
@@ -887,6 +891,9 @@ class LiteratureSearchClient:
                 raw_count = len(results)
             elif source in ("pubmed", "ncbi_pubmed"):
                 results = self._search_pubmed(query, limit)
+                raw_count = len(results)
+            elif source in ("biorxiv", "medrxiv"):
+                results = self._search_europe_pmc(f'({query}) AND PUBLISHER:"{source}" AND SRC:PPR', limit, source=source)
                 raw_count = len(results)
             else:
                 return cached or []
@@ -1233,7 +1240,7 @@ class LiteratureSearchClient:
             constants=constants)]
 
     def _search_europe_pmc(self, query: str, limit: int = 10,
-                           cursor_mark: str = "*") -> List[LiteratureResult]:
+                           cursor_mark: str = "*", *, source: str = "europe_pmc") -> List[LiteratureResult]:
         """Zero-API-key Europe PMC REST connector with strict 8s timeout and cursorMark support."""
         page_size = min(max(int(limit or 10), 1), 10)
         url = (
@@ -1248,7 +1255,7 @@ class LiteratureSearchClient:
         except Exception as exc:  # noqa: BLE001
             errs = getattr(self, "_channel_errors", None)
             if errs is not None:
-                errs["europe_pmc"] = f"{type(exc).__name__}: {str(exc)[:140]}"
+                errs[source] = f"{type(exc).__name__}: {str(exc)[:140]}"
             return []
         items = ((data.get("resultList") or {}).get("result")) or []
         out: List[LiteratureResult] = []
@@ -1289,12 +1296,12 @@ class LiteratureSearchClient:
                     pass
             out.append(
                 LiteratureResult(
-                    source="europe_pmc",
+                    source=source,
                     title=title,
                     summary=abstract[:1200],
                     url=article_url,
                     year=year,
-                    badge="EuropePMC",
+                    badge="EuropePMC" if source == "europe_pmc" else source,
                     citation_count=citation_count,
                     constants=constants,
                 )

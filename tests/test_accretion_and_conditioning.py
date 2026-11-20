@@ -60,10 +60,10 @@ def simulation_step(buf, dt):
 
     b = Buf()
     ns["simulation_step"](b, 0.05)
-    assert b.data[13] >= -1e-15
+    assert b.data[13] == -1e-12
     assert b.data[14] <= 1.0 + 1e-14
-    assert b.data[15] <= 1e-15
-    assert b.data[11] <= 1e-13
+    assert b.data[15] == 1.83e-9
+    assert b.data[11] == 2.5e-11
 
 
 def test_merge_accretive_module_allows_helper_overrides_during_healing():
@@ -393,11 +393,10 @@ def test_relational_invariant_auto_init_and_unassigned_slot_bridging():
         ],
     )
     san = sanitize_intrinsics(kernel, contracts=[c1], all_contracts=[c1])
-    assert "if buf.data[7] > buf.data[8]:" in san.code
+    assert "if buf.data[7] > buf.data[8]:" not in san.code
 
     init, _ = _guard_contract_initial_state(san.code, c1, all_contracts=[c1])
-    assert init[7] <= init[8] + 1e-12
-    assert init[8] >= 1.5 - 1e-12
+    assert init[7:9] == [1.5, 0.5]
 
 
 def test_mass_simplex_stabilization_and_safe_division_in_patankar_step():
@@ -531,7 +530,7 @@ def test_strict_gt_conditioning_6slot_triad_and_local_var_resync():
     ]
     san_triad = sanitize_intrinsics(triad_code, contracts=triad_contracts, all_contracts=triad_contracts)
     assert "_invar_stabilize_state_6" in san_triad.code
-    assert "if buf.data[17] <= 0.0:" in san_triad.code
+    assert "if buf.data[17] <= 0.0:" not in san_triad.code
 
     patankar_code = '''def simulation_step(buf, dt):
     n1 = buf.data[0] + 0.5
@@ -648,9 +647,7 @@ def test_1arg_signature_normalization_auto_variable_map_and_s2_projection():
 
 
 def test_const_expr_lower_bound_running_min_sentinel_and_tuple_unpacking_cpp(tmp_path):
-    """Constant-expression lower bounds (state[9] >= 3.0 - 1e-12) must fold,
-    running-min sentinel `if buf.data[9] == 0.0` must rewrite to <= 3.0, and
-    tuple unpacking must desugar cleanly for C++20 lowering."""
+    """Running minima retain their sentinel and tuple unpacking lowers to C++20."""
     from invar_agent.research.state_machine import _guard_contract_initial_state, _lower_kernel
     from invar_agent.schemas.research import InvariantConstraint, VerificationContract
 
@@ -676,12 +673,13 @@ def test_const_expr_lower_bound_running_min_sentinel_and_tuple_unpacking_cpp(tmp
     )
     san = sanitize_intrinsics(code, contracts=[c1], all_contracts=[c1, c2])
     assert "_invar_tup_1" in san.code
-    assert "if buf.data[9] < 2.999999999999:" in san.code
+    assert "if buf.data[9] < 2.999999999999:" not in san.code
+    assert "if buf.data[9] == 0.0 or r < buf.data[9]:" in san.code
     _uast, cpp_code = _lower_kernel(san.code)
     assert "simulation_step" in cpp_code
 
     init, _ = _guard_contract_initial_state(san.code, c1, all_contracts=[c1, c2])
-    assert init[9] >= 3.0 - 1e-12
+    assert init[9] == 0.0
 
 
 def test_broadcaster_clear_history_prevents_cross_run_banner_leak():

@@ -163,10 +163,9 @@ def _llm_blueprint_json() -> Dict[str, Any]:
              "timeout_seconds": 60.0, "max_memory_mb": 1024,
              "initial_state": INITIAL_STATE, "dt": DT, "steps": STEPS,
              "invariants": [
-                 # Hallucinated narrow interval (observed peak ~12.1 g): the
-                 # Tier-0 reconciler must relax the lower bound only.
+                 # Feasible interval; impossible discovery bounds are tested separately.
                  {"variable_name": "peak_decel_g",
-                  "assertion": "state[3] >= 15.0 and state[3] < 40.0",
+                  "assertion": "state[3] >= 0.0 and state[3] < 40.0",
                   "tolerance": 0.0},
                  {"variable_name": "velocity_monotone",
                   "assertion": "buf.data[1] <= initial_state[1]", "tolerance": 0.0},
@@ -288,6 +287,18 @@ async def test_cpp_emitter_scientific_constructs_and_fallback(tmp_path):
 # -- Test 2: full 2-contract Mars entry state machine (offline) -----------------
 
 @pytest.mark.asyncio
+async def test_impossible_discovery_bound_is_falsified_without_reconciliation(tmp_path):
+    events, cb = _collect_events()
+    machine = ResearchStateMachine(tmp_path, progress_cb=cb, search_client=_FakeSearch())
+    bp = _mock_blueprint()
+    inv = bp.contracts[0].invariants[0]
+    bp.contracts[0].invariants[0] = inv.model_copy(update={'assertion': 'state[3] >= 15.0 and state[3] < 40.0'})
+    state = await machine.run(bp)
+    assert state.status == 'FAILED'
+    assert any(result['status'] == 'FALSIFIED' for result in _results(events))
+    assert not any(activity['step'] == 'bound_reconciled' for activity in _activity(events))
+
+@pytest.mark.asyncio
 async def test_two_contract_mars_entry_state_machine_offline(tmp_path):
     events, cb = _collect_events()
     machine = ResearchStateMachine(
@@ -313,10 +324,9 @@ async def test_two_contract_mars_entry_state_machine_offline(tmp_path):
     assert "c2_heating_accretion" not in stage1_ids
     assert all(s == "VERIFIED" for s in by_contract["c1_ballistic_kinematics"])
 
-    # Hallucinated lower bound relaxed deterministically (Tier-0), upper kept.
     acts = _activity(events)
     reconciled = [a for a in acts if a["step"] == "bound_reconciled"]
-    assert reconciled and "state[3] < 40.0" in reconciled[0]["message"]
+    assert not reconciled
 
     # Every process log stage emitted, in pipeline order.
     stages = [a["stage"] for a in acts]
