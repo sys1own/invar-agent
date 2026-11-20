@@ -15,6 +15,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from .buffer_api import lower_buffer_clock
+from ..research.slot_schema import observable_name
+from ..research.scientific_integrity import positivity_projection_contracts
+
 logger = logging.getLogger(__name__)
 
 MATH_FUNCS = {
@@ -2743,21 +2747,7 @@ _CANON_SEMANTIC_SUFFIXES = (
 
 
 def _semantic_slot_stem(name: str) -> str:
-    low = str(name or "").lower().strip()
-    if not low:
-        return ""
-    changed = True
-    while changed:
-        changed = False
-        for prefix in ("max_", "min_"):
-            if low.startswith(prefix) and len(low) > len(prefix):
-                low = low[len(prefix):]
-                changed = True
-        for suffix in _CANON_SEMANTIC_SUFFIXES:
-            if low.endswith(suffix) and len(low) > len(suffix):
-                low = low[:-len(suffix)]
-                changed = True
-    return low
+    return observable_name(str(name or '').strip())
 
 
 def _bound_direction(assertion: str) -> str:
@@ -5407,24 +5397,9 @@ def _split_intra_function_stage_overwrites_tree(
                 later_slots_ordered.append(si)
 
     def _score_expr_to_slot(expr_names: Set[str], slot: int) -> int:
-        s_toks = slot_tokens.get(slot)
-        if not s_toks:
-            return 0
-        best = 0
-        for vn in expr_names:
-            v_toks = _expand_slot_match_tokens(vn)
-            # Filter out weak noise tokens so unrelated P_* names don't cross-match
-            overlap = (v_toks & s_toks) - {"bound", "positive", "nonneg", "closes", "locked", "matches", "below", "floor", "passive", "ratio"}
-            if not overlap:
-                continue
-            score = len(overlap) * 10
-            # Exact identifier / specific subscript bonus (e.g. eta_a vs eta_d, p_net, dT_K)
-            vn_low = vn.lower()
-            if vn_low in s_toks:
-                score += 20
-            if score > best:
-                best = score
-        return best
+        exact = {observable_name(str(name)) for name, index in (variable_map or {}).items() if index == slot}
+        exact.update(observable_name(name) for name in _contract_slot_names(contracts).get(slot, []))
+        return 30 if any(observable_name(name) in exact for name in expr_names) else 0
 
     used_all = _used_state_slots(tree) | all_contract_slots
     changed = False
@@ -5702,6 +5677,23 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_slots = cls["dynamical_slots"]
     dyn_set = set(dyn_slots)
 
+    extrema_slots: Set[int] = set()
+    for fn in _simulation_functions(tree):
+        aliases = {}
+        for stmt in ast.walk(fn):
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                slot = _state_subscript_slot(stmt.value)
+                if slot is not None:
+                    aliases[stmt.targets[0].id] = slot
+        for stmt in ast.walk(fn):
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            slot = _state_subscript_slot(stmt.targets[0])
+            value = stmt.value
+            if slot is not None and isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in {'max', 'min'}:
+                if any(_state_subscript_slot(arg) == slot or isinstance(arg, ast.Name) and aliases.get(arg.id) == slot for arg in value.args):
+                    extrema_slots.add(slot)
+
     nonneg_slots: Dict[int, float] = {}
     negative_lower_slots: Dict[int, float] = {}
     strict_gt_slots: Dict[int, float] = {}
@@ -5822,6 +5814,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         init_c = _get_contract_initial_list(contract)
         c_pure_invs: List[ast.AST] = []
         for inv_idx, (_name, assertion, _tol) in enumerate(_contract_invariant_items(contract)):
+            if set(_contract_state_slots_from_text(assertion)) & extrema_slots:
+                continue
             is_negative_test = "impossible" in (_name or "").lower()
             try:
                 initial_assertion = _resolve_initial_in_ast(ast.parse(assertion, mode="eval").body, init_c)
@@ -6447,7 +6441,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 # while buf.data[s_idx] held something else (e.g. elapsed time), bridge it first.
                 bridge_prefix = ""
                 inv_label = slot_var_names.get(s_idx, "")
-                inv_toks = _expand_slot_match_tokens(inv_label) - {"bound", "bounds", "max", "min", "limit", "nonnegative", "positive", "finite"}
+                inv_toks = {observable_name(inv_label)}
                 if inv_toks and not is_abs_u:
                     slot_direct_vars = {
                         stmt.value.id
@@ -6469,7 +6463,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     for lv in top_locals:
                         if lv in slot_direct_vars:
                             continue
-                        ov = (_expand_slot_match_tokens(lv) & inv_toks)
+                        ov = ({observable_name(lv)} & inv_toks)
                         if ov and len(ov) > best_l_score:
                             best_l_score = len(ov)
                             best_local = lv
@@ -7663,7 +7657,7 @@ def _normalize_step_signatures_tree(tree: ast.Module) -> Tuple[ast.Module, bool,
     return tree, changed, notes
 
 
-_STD_BUF_ATTRS = frozenset({"data", "size", "dt", "steps"})
+_STD_BUF_ATTRS = frozenset({"data", "size", "dt", "steps", "step", "step_idx", "step_index", "iter", "iteration", "n_steps", "t", "time", "elapsed", "sim_time"})
 
 
 def _lower_introspection_and_buf_attrs_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[str]]:
@@ -7830,7 +7824,8 @@ def _lower_introspection_and_buf_attrs_tree(tree: ast.Module) -> Tuple[ast.Modul
             if (isinstance(node.ctx, ast.Load)
                     and isinstance(node.value, ast.Name)
                     and node.value.id == "buf"
-                    and node.attr not in _STD_BUF_ATTRS):
+                    and node.attr not in _STD_BUF_ATTRS
+                    and node.attr in custom_buf_attrs):
                 _flag_idx, val_idx = _alloc_attr(node.attr)
                 changed = True
                 return _buf_slot(val_idx, ast.Load())
@@ -8918,6 +8913,12 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
 
     def _run_op(op_name: str, pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]], *args: Any, **kwargs: Any) -> None:
         nonlocal tree, any_changed
+        if op_name in {'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE',
+                       'REPAIR_MONOTONE_OBSERVABLES', 'ENFORCE_CONSERVATION_PROJECTION',
+                       'ENFORCE_LYAPUNOV_SIGN', 'SEED_DISSIPATION_PARAMETERS'}:
+            return
+        if op_name == 'ENFORCE_BLOCH_BALL_PROJECTION':
+            args = (positivity_projection_contracts(tree, args[0], variable_map),)
         if preserve_dynamics and op_name in {
             'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE', 'REPAIR_MONOTONE_OBSERVABLES',
             'ENFORCE_BLOCH_BALL_PROJECTION', 'ENFORCE_CONSERVATION_PROJECTION', 'ENFORCE_LYAPUNOV_SIGN',
@@ -8962,6 +8963,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     _run_op("ENFORCE_LYAPUNOV_SIGN", _enforce_lyapunov_sign_tree, bridge_contracts)
     _run_op("PROTECT_PARAMETER_SLOTS", _protect_parameter_slots_tree, bridge_contracts)
     _run_op("SEED_DISSIPATION_PARAMETERS", _seed_dissipation_parameters_tree, contracts)
+    _run_op("LOWER_BUFFER_CLOCK", lower_buffer_clock, bridge_contracts)
     # Refresh buf.size < N guards after latch/slot allocation so latches and high contract slots stay in-bounds.
     _run_op("RAISE_BUF_SIZE_GUARDS", _strip_buf_size_branches_tree, bridge_contracts)
 
@@ -10195,42 +10197,22 @@ def _bridge_unassigned_concept_slots_tree(
             continue
         metas = slot_meta[slot]
         target = None
-        # Prefer an assigned slot sharing the same concept bucket.
+        # Only identical observable identities can share a value.
         for cand in sorted(assigned):
             if cand in protected:
                 continue
             for _n, direction, tol_f in metas:
-                cand_bucket = next((_concept_bucket_for(nm, d)
-                                    for nm, d, _t in slot_meta.get(cand, [])), "")
-                if cand_bucket and cand_bucket == _concept_bucket_for(_n, direction):
+                if any(observable_name(nm) == observable_name(_n)
+                       for nm, _d, _t in slot_meta.get(cand, [])):
                     target = cand
                     break
             if target is not None:
                 break
-        # Fall back to the same inequality direction + tolerance.
-        if target is None:
-            for cand in sorted(assigned):
-                if cand in protected:
-                    continue
-                for name, direction, tol_f in metas:
-                    for _cn, cd, ct in slot_meta.get(cand, []):
-                        if cd == direction and (abs(ct - tol_f) <= 1e-12
-                                                or (abs(ct - 1.0) <= 1e-6 and abs(tol_f - 1.0) <= 1e-6)):
-                            target = cand
-                            break
-                    if target is not None:
-                        break
-                if target is not None:
-                    break
-        if target is None and assigned:
-            valid_cands = [c for c in sorted(assigned) if c not in protected]
-            if valid_cands:
-                target = valid_cands[0]
         if target is None or target in protected:
             continue
         additions.append(ast.parse(f"buf.data[{slot}] = buf.data[{target}]").body[0])
         notes.append(f"bridged unassigned state[{slot}] <- state[{target}] "
-                     f"(concept bucket / bound match)")
+                     f"(exact observable identity)")
     if not additions:
         return tree, False, []
     driver.body.extend(additions)
@@ -10275,7 +10257,7 @@ def _unify_concept_slots_tree(tree: ast.Module, contracts: Sequence[Any]
             bucket = _concept_bucket_for(name, direction)
             if not bucket:
                 continue
-            slot_meta.setdefault(slot, {"bucket": bucket, "direction": direction,
+            slot_meta.setdefault(slot, {"bucket": observable_name(name), "direction": direction,
                                         "stage": stage})
     if len(slot_meta) < 2:
         return tree, False, []

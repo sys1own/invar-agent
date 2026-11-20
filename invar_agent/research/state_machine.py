@@ -41,8 +41,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..runtime.build_utils import rollback_overlay
+from ..healing.buffer_api import BUFFER_API
+from ..healing.structural import is_structural_failure, unresolved_symbol
 from ..runtime.research_reference import ReferenceError
 from .evolution import text_evolutions, check_evolution_reference
+from .slot_schema import canonical_variable_map, validate_contract_slots, validate_slot_writes
+from .scientific_integrity import (SCIENTIFIC_CONTRACT, output_dataflow, validate_observables,
+                                   validate_protocol, validate_variant_schemes)
 
 from ..schemas.research import (InvariantConstraint, ModuleLayer, ResearchBlueprint,
                                 SimulationResult, StageTelemetry, VerificationContract)
@@ -108,6 +113,7 @@ from .accretion import (AccretionError, code_hash, layer_driver_name,
                         strip_driver, unified_from_layers)
 from .feasibility import _heuristic_verdict
 from .planner import (canonicalize_contract_dicts, guided_queries,
+                        _reconcile_time_horizon,
                         refine_stage_code, request_healing_directives,
                         synthesize_accretive_stage)
 from ..healing.deterministic_ast import (
@@ -165,6 +171,8 @@ def v9_transpiler_violations(code: str) -> List[str]:
         return [f"syntax error: {exc.msg} (line {exc.lineno})"]
     out: List[str] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'buf' and node.attr not in {'data', 'size'}:
+            out.append(f"unsupported buffer attribute buf.{node.attr} at line {node.lineno}: {BUFFER_API}")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] not in ALLOWED_IMPORTS:
@@ -1016,363 +1024,17 @@ def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
 def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                                   all_contracts: Optional[Sequence[VerificationContract]] = None,
                                   ) -> Tuple[List[float], List[str]]:
-    """Static contract-slot guard + auto-initializer.
-
-    1. Contract error/drift metrics (tolerance <= 1e-6) must start at 0.0 —
-       never 1.0 — so an un-triggered stage metric cannot falsify step 0.
-    2. Dynamical slots (classified from the AST, e.g. state[0..2] or state[3..5])
-       must never ALL be zero (trivial fixed point).
-    3. The buffer is padded past the highest slot referenced by the kernel so
-       Tier-0 scratch writes (e.g. buf.data[28]) stay in bounds.
-    Returns (initial_state, warnings).
-    """
-    initial = list(contract.initial_state or DEFAULT_INITIAL_STATE)
+    """Pad the declared initial condition without changing the experiment."""
+    initial = list(contract.initial_state if contract.initial_state is not None else DEFAULT_INITIAL_STATE)
     max_slot = _max_state_slot(py_code, contract)
-    for oc in (all_contracts or ()):
-        max_slot = max(max_slot, _max_state_slot(py_code, oc))
-    needed = max(64, max_slot + 1)
-    while len(initial) < needed:
-        initial.append(0.0)
-    warnings: List[str] = []
-    cls = classify_buffer_slots(py_code, [contract])
-    dyn_slots = list(cls["dynamical_slots"])
-    metric_slots = set(cls["metric_slots"])
-    if len(dyn_slots) < 3 and not ({0, 1, 2} & metric_slots):
-        for i in range(3):
-            if i not in metric_slots and i not in dyn_slots:
-                dyn_slots.append(i)
-        dyn_slots.sort()
-    dyn_set = set(dyn_slots)
-
-    # 1a. Stationary fixed-point guard: the maximally-mixed identity
-    # rho = I/2 is a valid density matrix but a degenerate fixed point for
-    # many channels; perturb it to a non-stationary positive state.
-    if (len(initial) >= 4 and not ({0, 1, 2, 3} & metric_slots)
-            and initial[0] == 0.5 and initial[3] == 0.5
-            and initial[1] == 0.0 and initial[2] == 0.0):
-        initial[0], initial[1], initial[2], initial[3] = 0.7, 0.2, 0.1, 0.3
-        warnings.append("auto-init: perturbed stationary I/2 state to non-degenerate rho")
-    # 1. Error/drift metrics & relational accumulators initialize cleanly
-    # across contracts; only reset error metrics for THIS contract so another
-    # stage's slot layout cannot zero out non-zero inputs here.
-    missing_set = set(_kernel_assigns_slots(py_code, _contract_state_slots(contract)))
-    m0_sum = sum(max(0.0, initial[d]) for d in dyn_slots if d < len(initial))
-    for c_item in (all_contracts or [contract]):
-        for inv in (getattr(c_item, "invariants", None) or []):
-            assertion = str(getattr(inv, "assertion", "") or "")
-            name = (inv.variable_name or "").lower()
-            # Relational invariant: weak (<= / >=) vs strict (< / > / positive margin)
-            m_rel_le = re.search(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(<=|<)\s*"
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]",
-                assertion,
-            )
-            m_rel_ge = re.search(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(>=|>)\s*"
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\](?:\s*\+\s*([0-9.eE+-]+))?",
-                assertion,
-            )
-            m_rel_diff = re.search(
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*-\s*"
-                r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]\s*(>|>=)\s*([0-9.eE+-]+)",
-                assertion,
-            )
-            if m_rel_le or m_rel_ge or m_rel_diff:
-                is_strict_rel = False
-                rel_margin = 0.0
-                if m_rel_diff:
-                    j_idx, i_idx = int(m_rel_diff.group(1)), int(m_rel_diff.group(2))
-                    rel_margin = max(0.0, float(m_rel_diff.group(4)))
-                    is_strict_rel = (m_rel_diff.group(3) == ">") or (rel_margin > 0.0)
-                elif m_rel_le:
-                    i_idx, op_r, j_idx = int(m_rel_le.group(1)), m_rel_le.group(2), int(m_rel_le.group(3))
-                    is_strict_rel = (op_r == "<")
-                else:
-                    assert m_rel_ge is not None
-                    j_idx, op_r, i_idx = int(m_rel_ge.group(1)), m_rel_ge.group(2), int(m_rel_ge.group(3))
-                    rel_margin = float(m_rel_ge.group(4)) if m_rel_ge.group(4) else 0.0
-                    is_strict_rel = (op_r == ">") or (rel_margin > 0.0)
-
-                if i_idx != j_idx and max(i_idx, j_idx) < len(initial):
-                    if is_strict_rel:
-                        if j_idx not in dyn_set:
-                            # If unassigned and concept shares array/gen/total/power with another slot > lo, bridge first
-                            concept_toks = [tok for tok in ("array", "gen", "total", "power") if tok in name]
-                            bridged_val = None
-                            if concept_toks and j_idx in missing_set:
-                                for c2 in (all_contracts or [contract]):
-                                    for inv2 in (getattr(c2, "invariants", None) or []):
-                                        n2 = (getattr(inv2, "variable_name", "") or "").lower()
-                                        if any(tok in n2 for tok in concept_toks):
-                                            for s2_txt in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", str(getattr(inv2, "assertion", "") or "")):
-                                                s2 = int(s2_txt)
-                                                if s2 != j_idx and s2 != i_idx and s2 < len(initial) and initial[s2] > initial[i_idx] + rel_margin:
-                                                    bridged_val = initial[s2]
-                                                    break
-                                        if bridged_val is not None:
-                                            break
-                                    if bridged_val is not None:
-                                        break
-                            if bridged_val is not None and initial[j_idx] <= initial[i_idx] + rel_margin:
-                                old_j = initial[j_idx]
-                                initial[j_idx] = bridged_val
-                                warnings.append(
-                                    f"auto-init: strict relational slot state[{j_idx}] ({inv.variable_name}) "
-                                    f"bridged from {old_j} to {bridged_val}")
-                            elif initial[j_idx] <= initial[i_idx] + rel_margin:
-                                old_j = initial[j_idx]
-                                bump = max(rel_margin + 1e-6, max(1.0, abs(initial[i_idx]) * 0.001))
-                                target_j = initial[i_idx] + bump
-                                initial[j_idx] = target_j
-                                warnings.append(
-                                    f"auto-init: strict relational slot state[{j_idx}] ({inv.variable_name}) "
-                                    f"raised from {old_j} to {target_j}")
-                        continue
-                    if i_idx not in dyn_set and ("max" in name or "bound" in name or "peak" in name):
-                        if initial[i_idx] > 0.0 and (initial[i_idx] > initial[j_idx] or i_idx not in missing_set):
-                            old_i = initial[i_idx]
-                            initial[i_idx] = 0.0
-                            warnings.append(
-                                f"auto-init: running-max slot state[{i_idx}] ({inv.variable_name}) "
-                                f"reset from {old_i} to 0.0")
-                    if j_idx not in dyn_set and (
-                        any(tok in name for tok in ("mass", "m0", "target", "bound"))
-                        or j_idx in missing_set
-                        or initial[j_idx] < initial[i_idx]
-                    ):
-                        target_j = max(initial[j_idx], m0_sum if m0_sum > 0.0 else initial[j_idx], initial[i_idx])
-                        if target_j != initial[j_idx]:
-                            warnings.append(
-                                f"auto-init: relational bound slot state[{j_idx}] ({inv.variable_name}) "
-                                f"raised from {initial[j_idx]} to {target_j}")
-                            initial[j_idx] = target_j
-                    if initial[i_idx] > initial[j_idx] and i_idx not in dyn_set:
-                        initial[i_idx] = initial[j_idx]
-                continue
-
-            from ..healing.deterministic_ast import (
-                _eval_ast_on_state,
-                _eval_const_ast,
-                _eval_numeric_const_expr,
-                _extract_abs_tol,
-                _iter_atomic_invariant_nodes,
-                _match_abs_affine,
-                _match_abs_algebraic,
-                _slot_of_state_ast,
-                _unwrap_abs_or_rel_err,
-            )
-            import ast as _ast
-            for _node in _iter_atomic_invariant_nodes(assertion):
-                if isinstance(_node, _ast.Compare):
-                    _lhs = _node.left
-                    for _cmp_op, _rhs in zip(_node.ops, _node.comparators):
-                        _abs_in, _denom_ast = (None, None)
-                        _tol_v = None
-                        _rhs_rel = False
-                        if isinstance(_cmp_op, (_ast.LtE, _ast.Lt)):
-                            _abs_in, _denom_ast = _unwrap_abs_or_rel_err(_lhs)
-                            if _abs_in is not None:
-                                _tol_v, _rhs_rel = _extract_abs_tol(_rhs)
-                        elif isinstance(_cmp_op, (_ast.GtE, _ast.Gt)):
-                            _abs_in, _denom_ast = _unwrap_abs_or_rel_err(_rhs)
-                            if _abs_in is not None:
-                                _tol_v, _rhs_rel = _extract_abs_tol(_lhs)
-                        if _abs_in is not None and _tol_v is not None and _tol_v >= 0.0:
-                            _denom_c = _eval_const_ast(_denom_ast) if _denom_ast is not None else None
-                            _single_t, _sum_t, _diff_p = _match_abs_affine(_abs_in)
-                            if _single_t is not None and c_item is contract:
-                                _si, _tgt = _single_t
-                                _eff_tol = _tol_v
-                                if _denom_ast is not None or _rhs_rel:
-                                    _scale = abs(_denom_c) if (_denom_c is not None and _denom_c != 0.0) else max(abs(_tgt), 1e-300)
-                                    _eff_tol = _tol_v * _scale
-                                if _si < len(initial) and abs(initial[_si] - _tgt) > _eff_tol:
-                                    warnings.append(
-                                        f"auto-init: target equality slot state[{_si}] ({inv.variable_name}) "
-                                        f"set from {initial[_si]} to {_tgt}")
-                                    initial[_si] = _tgt
-                            elif _sum_t is not None and c_item is contract:
-                                _i_s, _j_s, _tgt = _sum_t
-                                _eff_tol = _tol_v
-                                if _denom_ast is not None or _rhs_rel:
-                                    _scale = abs(_denom_c) if (_denom_c is not None and _denom_c != 0.0) else max(abs(_tgt), 1e-300)
-                                    _eff_tol = _tol_v * _scale
-                                if max(_i_s, _j_s) < len(initial) and abs(initial[_i_s] + initial[_j_s] - _tgt) > _eff_tol:
-                                    if min(0.0, _tgt) <= initial[_i_s] <= max(0.0, _tgt):
-                                        initial[_j_s] = _tgt - initial[_i_s]
-                                    else:
-                                        initial[_i_s] = 0.5 * _tgt
-                                        initial[_j_s] = 0.5 * _tgt
-                                    warnings.append(
-                                        f"auto-init: sum partition slots state[{_i_s}]+state[{_j_s}] "
-                                        f"initialized to {_tgt}")
-                            elif _single_t is None and _sum_t is None and _diff_p is None and c_item is contract:
-                                _alg_m = _match_abs_algebraic(_abs_in)
-                                if _alg_m is not None:
-                                    _ai, _expr_buf, _prod_p = _alg_m
-                                    try:
-                                        _expr_node = _ast.parse(_expr_buf, mode="eval").body
-                                        _alg_val = _eval_ast_on_state(_expr_node, initial)
-                                    except SyntaxError:
-                                        _alg_val = None
-                                    if _alg_val is not None and math.isfinite(_alg_val) and _ai < len(initial):
-                                        _denom_v = (
-                                            _eval_ast_on_state(_denom_ast, initial)
-                                            if _denom_ast is not None else (abs(_alg_val) if _rhs_rel else 1.0)
-                                        )
-                                        _eff_tol = _tol_v * abs(_denom_v) if ((_denom_ast is not None or _rhs_rel) and _denom_v) else _tol_v
-                                        if abs(initial[_ai] - _alg_val) > _eff_tol:
-                                            warnings.append(
-                                                f"auto-init: algebraic target slot state[{_ai}] ({inv.variable_name}) "
-                                                f"set from {initial[_ai]} to {_alg_val}")
-                                            initial[_ai] = _alg_val
-                        else:
-                            # Handle chained and scalar bounds (e.g. `2.5 <= state[15] <= 4.3` or `state[20] <= 15.0`)
-                            _ls = _slot_of_state_ast(_lhs)
-                            _rs = _slot_of_state_ast(_rhs)
-                            if _ls is not None and _ls not in dyn_set and _ls >= 4 and _ls < len(initial):
-                                _bv = _eval_const_ast(_rhs)
-                                if _bv is not None and math.isfinite(_bv):
-                                    if isinstance(_cmp_op, (_ast.GtE, _ast.Gt)) and _bv > 0.0:
-                                        _req = (_bv + 1e-12) if isinstance(_cmp_op, _ast.Gt) else _bv
-                                        if initial[_ls] < _req:
-                                            initial[_ls] = _req
-                                    elif isinstance(_cmp_op, (_ast.LtE, _ast.Lt)) and c_item is contract and _bv > 1.0 + 1e-6:
-                                        _cap = (_bv - 1e-6) if isinstance(_cmp_op, _ast.Lt) else _bv
-                                        if initial[_ls] > _cap:
-                                            initial[_ls] = _cap
-                            elif _rs is not None and _rs not in dyn_set and _rs >= 4 and _rs < len(initial):
-                                _bv = _eval_const_ast(_lhs)
-                                if _bv is not None and math.isfinite(_bv):
-                                    if isinstance(_cmp_op, (_ast.LtE, _ast.Lt)) and _bv > 0.0:
-                                        _req = (_bv + 1e-12) if isinstance(_cmp_op, _ast.Lt) else _bv
-                                        if initial[_rs] < _req:
-                                            initial[_rs] = _req
-                                    elif isinstance(_cmp_op, (_ast.GtE, _ast.Gt)) and c_item is contract and _bv > 1.0 + 1e-6:
-                                        _cap = (_bv - 1e-6) if isinstance(_cmp_op, _ast.Gt) else _bv
-                                        if initial[_rs] > _cap:
-                                            initial[_rs] = _cap
-                        _lhs = _rhs
-
-            distinct_slots = {
-                int(x) for x in re.findall(
-                    r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", assertion)
-            }
-            if len(distinct_slots) != 1:
-                continue
-            if "initial[" in assertion:
-                continue
-            k = next(iter(distinct_slots))
-            if k in dyn_set:
-                continue
-            bound_match = re.search(
-                r"(?:abs\(\s*)?(?:state|initial|buf(?:\.data)?)\[\d+\](?:\s*\))?\s*<=\s*([0-9.eE+-]+)", assertion)
-            bound = float(bound_match.group(1)) if bound_match else None
-            error_metric = any(tok in name for tok in
-                               ("error", "err", "drift", "residual", "violation", "mismatch",
-                                "hold", "bound", "increase", "monotone", "monotonicity"))
-            if bound is not None and c_item is contract:
-                if (0.0 <= bound <= 1e-8) or (error_metric and bound <= 1e-6):
-                    if k < len(initial) and initial[k] != 0.0:
-                        warnings.append(
-                            f"auto-init: contract error metric state[{k}] ({inv.variable_name}) "
-                            f"reset from {initial[k]} to 0.0 (error metrics start at zero)")
-                        initial[k] = 0.0
-                elif abs(bound - 1.0) <= 1e-6:
-                    if k < len(initial) and initial[k] > bound:
-                        warnings.append(
-                            f"auto-init: contract unit upper bound state[{k}] ({inv.variable_name}) "
-                            f"clamped from {initial[k]} to 1.0")
-                        initial[k] = 1.0
-            gt_match = re.search(
-                r"(?:state|initial|buf(?:\.data)?)\[\d+\]\s*(>=?)\s*([0-9.eE+\-\s*/()]+?)(?:\s*(?:$|&&|\|\||and\b|or\b|>|<))",
-                assertion,
-            )
-            if gt_match and k >= 4:
-                op_gt = gt_match.group(1)
-                gt_bound = _eval_numeric_const_expr(gt_match.group(2))
-                if gt_bound is not None:
-                    if op_gt == ">" and -1e-6 <= gt_bound <= 1.0:
-                        new_v = (gt_bound + 1e-3) if gt_bound >= 0.0 else (gt_bound * 0.5)
-                        if k < len(initial) and initial[k] <= gt_bound:
-                            warnings.append(
-                                f"auto-init: strict positivity slot state[{k}] ({inv.variable_name}) "
-                                f"raised from {initial[k]} to {new_v}")
-                            initial[k] = new_v
-                    elif gt_bound > 0.0:
-                        req_v = (gt_bound + 1e-12) if op_gt == ">" else gt_bound
-                        if k < len(initial) and initial[k] < req_v:
-                            warnings.append(
-                                f"auto-init: unified lower bound slot state[{k}] ({inv.variable_name}) "
-                                f"raised from {initial[k]} to {req_v}")
-                            initial[k] = req_v
-    # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
-    # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
-    # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.
-    if _contract_is_closed_or_reversible(contract):
-        for m_rev in re.finditer(
-                r"\b(rev|closed|is_closed|rev_flag|reversible|mode|flag|chiasmus)\s*=\s*"
-                r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
-            rev_var, rev_slot = m_rev.group(1), int(m_rev.group(2))
-            if rev_slot not in dyn_set and rev_slot < len(initial):
-                if re.search(rf"\bif\s+{re.escape(rev_var)}\b", py_code or ""):
-                    if initial[rev_slot] == 0.0:
-                        initial[rev_slot] = 1.0
-                        warnings.append(
-                            f"auto-init: reversibility flag state[{rev_slot}] ({rev_var}) "
-                            f"set to 1.0 for closed/reversibility contract '{contract.contract_id}'")
-        for p_slot, p_var in (cls.get("parameter_vars") or {}).items():
-            if p_var.lower() in {
-                "gx", "gy", "gz", "g", "g1", "g2", "gphi", "g_phi",
-                "gam", "gam1", "gam2", "gam_phi", "gamma", "gamma1",
-                "gamma2", "gamma_phi", "kappa", "stiffness", "damping", "nu",
-            }:
-                if p_slot < len(initial) and initial[p_slot] != 0.0:
-                    initial[p_slot] = 0.0
-                    warnings.append(
-                        f"auto-init: zeroed dissipation state[{p_slot}] ({p_var}) "
-                        f"for closed/reversibility contract '{contract.contract_id}'")
-    # 2. Physical parameter slots must not start as silent zeros.
-    _parameter_initial_defaults(py_code, contract, initial, warnings)
-    # 2b. Bloch ball initial norm contraction: ensure initial dynamical Bloch vector is physical.
-    r_max = _detect_bloch_radius(py_code, [contract])
-    if r_max is not None and len(dyn_slots) >= 3:
-        d0, d1, d2 = dyn_slots[0], dyn_slots[1], dyn_slots[2]
-        if max(d0, d1, d2) < len(initial):
-            r2 = initial[d0] ** 2 + initial[d1] ** 2 + initial[d2] ** 2
-            if r2 > r_max * r_max:
-                sc = (0.85 * r_max) / math.sqrt(r2)
-                initial[d0] *= sc
-                initial[d1] *= sc
-                initial[d2] *= sc
-                warnings.append(
-                    f"auto-init: initial Bloch norm sqrt({r2:.4g}) > {r_max}; "
-                    f"scaled state[{d0}..{d2}] inside Bloch ball")
-    # 3. Never a trivial all-zero dynamical state; polar [0,0,z] gets x-seed (only on dyn_slots).
-    if len(dyn_slots) >= 3:
-        d0, d1, d2 = dyn_slots[0], dyn_slots[1], dyn_slots[2]
-        if max(d0, d1, d2) < len(initial):
-            scale_ref = r_max if r_max is not None else 1.0
-            if initial[d0] == 0.0 and initial[d1] == 0.0 and abs(initial[d2]) > 0.0:
-                initial[d0] = 0.3 * scale_ref
-                if abs(initial[d2]) > 0.8 * scale_ref:
-                    initial[d2] = math.copysign(0.8 * scale_ref, initial[d2])
-                warnings.append(
-                    f"auto-init: polar state[{d0}..{d2}]=[0,0,z] is stationary under "
-                    "z-rotation; seeded non-polar state")
-            elif all(abs(initial[i]) < 1e-12 for i in (d0, d1, d2)):
-                seed_val = 0.6 * scale_ref
-                warnings.append(
-                    f"auto-init: state[{d0}..{d2}] all zero (trivial fixed point); "
-                    f"seeding state[{d0}] = {seed_val:g}")
-                initial[d0] = seed_val
-    # 4. Warn (never silently pass) when a contract slot is never computed.
-    missing = _kernel_assigns_slots(py_code, _contract_state_slots(contract))
-    for k in missing:
-        warnings.append(
-            f"CONTRACT_SLOT_GUARD: state[{k}] is checked by contract "
-            f"'{contract.contract_id}' but is NEVER assigned in the kernel; "
-            "it will hold its initial value.")
+    for other in all_contracts or ():
+        max_slot = max(max_slot, _max_state_slot(py_code, other))
+    initial.extend([0.0] * max(0, max(64, max_slot + 1) - len(initial)))
+    warnings = [
+        f"CONTRACT_SLOT_GUARD: state[{slot}] is checked by contract "
+        f"'{contract.contract_id}' but is NEVER assigned in the kernel."
+        for slot in _kernel_assigns_slots(py_code, _contract_state_slots(contract))
+    ]
     return initial, warnings
 
 
@@ -1423,7 +1085,7 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
             for fn in tree.body:
                 if not isinstance(fn, ast.FunctionDef):
                     continue
-                if fn.name != "simulation_step" and not fn.name.startswith("layer_"):
+                if not any(arg.arg == 'buf' for arg in fn.args.args):
                     continue
                 for stmt in ast.walk(fn):
                     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -1444,7 +1106,26 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
-    bp.variable_map = dict(list(mapping.items())[:64])
+    bp.variable_map = canonical_variable_map(contracts, mapping)
+    reads, writes = set(), set()
+    try:
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == 'buf' and node.value.attr == 'data' and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                (writes if isinstance(node.ctx, ast.Store) else reads).add(node.slice.value)
+    except SyntaxError:
+        pass
+    for name, slot in bp.variable_map.items():
+        role = ('diagnostic' if name.lower().startswith(('peak_', 'max_', 'min_', '_invar_'))
+                else 'read_only_parameter' if slot in reads - writes or name in bp.extracted_constants
+                else 'evolving_state')
+        bp.slot_roles.setdefault(name, role)
+    try:
+        flow = output_dataflow(src)
+        for name, slot in bp.variable_map.items():
+            if slot in flow['derived'] and flow['dependencies'].get(slot):
+                bp.slot_roles[name] = 'diagnostic'
+    except SyntaxError:
+        pass
 
 
 def _apply_backup_slots_to_vmap(bp: Optional[ResearchBlueprint],
@@ -2358,6 +2039,13 @@ class ResearchStateMachine:
         if candidate_code is None:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "no candidate module for this stage"}
+        try:
+            validate_slot_writes(candidate_code, bp.variable_map, bp.slot_roles)
+        except SyntaxError:
+            pass
+        except ValueError as error:
+            return {"status": "error", "result_status": "ERROR", "failure": f"PreWrite_Guard: {error}",
+                    "candidate_code": candidate_code, "contracts": contracts}
 
         # Ensure a top-level `simulation_step(buf, dt)` exists if the planner/LLM
         # emitted a helper `*_step(buf, dt)` without the driver wrapper.
@@ -2473,6 +2161,26 @@ class ResearchStateMachine:
         # 5. PreWrite_Guard: SHACL/Chiasmus firewall + v9 compliance + lowering.
         state.stage = "PreWrite_Guard"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "PreWrite_Guard"})
+        try:
+            validate_contract_slots(contracts)
+            validate_slot_writes(unified, bp.variable_map, bp.slot_roles)
+            validate_observables(unified, contracts, bp.variable_map, bp.slot_roles)
+            for contract in contracts:
+                normalized = _reconcile_time_horizon(
+                    {'code_template': unified, 'contracts': [contract.model_dump()]}, bp.research_prompt)
+                expected = normalized['contracts'][0]
+                target = expected['dt'] * expected['steps']
+                if not math.isclose(contract.dt * contract.steps, target, rel_tol=1e-12):
+                    raise ValueError(f'SCIENTIFIC_INTEGRITY: horizon mismatch for {contract.contract_id}')
+                coverage = await asyncio.to_thread(validate_protocol, unified, contract, bp.research_prompt)
+                if coverage:
+                    await emit('accelerator_log', 'phase_coverage', {**tag, 'contract_id': contract.contract_id, 'coverage': coverage})
+            schemes = await asyncio.to_thread(validate_variant_schemes, unified, bp, contracts)
+            if schemes:
+                await emit('accelerator_log', 'integration_schemes', {**tag, 'schemes': schemes})
+        except (ValueError, SyntaxError, ReferenceError) as error:
+            self._rollback_overlay(scratch)
+            return {'status':'error', 'result_status':'ERROR', 'failure':f'PreWrite_Guard: {error}', 'candidate_code':candidate_code, 'contracts':contracts}
         if declared:
             try:
                 await asyncio.to_thread(check_evolution_reference, bp.model_dump(), {}, unified)
@@ -2658,7 +2366,7 @@ class ResearchStateMachine:
         bp_text = ""
         if getattr(self, "blueprint", None) is not None:
             feas_rat = getattr(getattr(self.blueprint, "feasibility", None), "rationale", "") or ""
-            bp_text = f"{self.blueprint.title} {self.blueprint.falsifiable_hypothesis} {feas_rat}"
+            bp_text = f"{self.blueprint.research_prompt} {self.blueprint.title} {self.blueprint.falsifiable_hypothesis} {feas_rat}"
         from .shbt_federation import resolve_shbt_solvability, shbt_literature_dicts
         shbt_res = resolve_shbt_solvability(f"{bp_text} {' '.join(queries)}")
         if shbt_res.should_activate:
@@ -2728,6 +2436,8 @@ class ResearchStateMachine:
                 "channel_counts": meta.get("channel_counts") or {},
                 "raw_counts": meta.get("raw_counts") or {},
                 "channel_errors": meta.get("channel_errors") or {},
+                "by_source": meta.get("by_source") or {},
+                "arxiv_categories": meta.get("arxiv_categories") or [],
                 "relaxed_query": meta.get("relaxed_query") or "",
                 "error": meta.get("error") or "",
                 "offline": bool(meta.get("offline", getattr(self.search_client, "offline", True))),
@@ -2737,6 +2447,8 @@ class ResearchStateMachine:
 
     # -- GoI_Plan helpers ------------------------------------------------------
     async def _synthesize_stage(self, **kw) -> Dict[str, Any]:
+        bp = self.blueprint
+        kw['objective'] += f"\n{BUFFER_API}\nAuthoritative slot table (name -> index): {json.dumps(getattr(bp, 'variable_map', {}))}. Slot roles: {json.dumps(getattr(bp, 'slot_roles', {}))}. Never overwrite input parameter slots with diagnostics; preserve existing slot identities."
         pinned_layers: List[ModuleLayer] = kw.pop("pinned_layers")
         verified_contracts = [c.model_dump() for layer in pinned_layers for c in layer.contracts]
         if self.stage_synthesizer is not None:
@@ -2804,6 +2516,37 @@ class ResearchStateMachine:
                                pinned_functions: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
+        if is_structural_failure(failure):
+            llm = (self.llm_planner if attempt >= 2 else self.llm_fast) or self.llm_fast or self.llm_planner
+            if llm is None:
+                return {"code": candidate_code, "terminated": False, "applied_ops": []}
+            if 'unsupported construct:' in failure:
+                await self._emit('goi_stream', 'heal', {'round': round_idx, 'research_stage': stage,
+                    'tier': 0, 'applied': False, 'notes': ['structural repair required']})
+                plan = await request_healing_directives(llm,
+                    objective=f'Structural/API repair only. {BUFFER_API}\n{objective}', code=candidate_code,
+                    contracts=[], failure=f'{BUFFER_API}\nSource:\n{candidate_code}\n{failure}')
+                directives = [d for d in (plan or {}).get('directives', [])
+                              if isinstance(d, dict) and d.get('op') == 'INLINE_INTRINSIC']
+                patched = apply_healing_directives(candidate_code, directives, contracts=[], pinned_functions=pinned_functions)
+                if directives and not v9_transpiler_violations(patched.code):
+                    await self.emit_activity('HEALING', 'directive_applied', 'Applied structural-only intrinsic repair')
+                    return {'code': patched.code, 'terminated': False, 'applied_ops': ['INLINE_INTRINSIC']}
+            try:
+                repaired = await asyncio.wait_for(refine_stage_code(
+                    llm, objective=f"Structural/API repair only, no bound conditioning. {BUFFER_API}\n{SCIENTIFIC_CONTRACT}\n{objective}\nOriginal question: {getattr(self.blueprint, 'research_prompt', '')}\nContracts: {json.dumps([c.model_dump() for c in contracts])}\nAuthoritative slots: {json.dumps(getattr(self.blueprint, 'variable_map', {}))}. Roles: {json.dumps(getattr(self.blueprint, 'slot_roles', {}))}.",
+                    code=candidate_code, contracts=[], failure=f"{failure}\nNumbered source:\n" + '\n'.join(f'{i}: {line}' for i, line in enumerate(candidate_code.splitlines(), 1))), timeout=90.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                repaired = None
+            if not repaired or repaired.strip() == candidate_code.strip():
+                return {"code": candidate_code, "terminated": True, "applied_ops": []}
+            violations = v9_transpiler_violations(repaired)
+            unresolved = unresolved_symbol(failure, repaired)
+            if unresolved:
+                violations.append(unresolved)
+            if violations:
+                return {"code": candidate_code, "terminated": True, "applied_ops": [], "failure": '; '.join(violations)}
+            return {"code": repaired, "terminated": False, "applied_ops": ["STRUCTURAL_API_REPAIR"]}
         if "VAULT_REFERENCE_" in str(failure):
             llm = self.llm_planner or self.llm_fast
             if llm is None:
@@ -3208,7 +2951,8 @@ class ResearchStateMachine:
         if self.search_client is not None and queries:
             try:
                 hits = await asyncio.to_thread(
-                    self.search_client.search, queries[0], 3, None, queries[0])
+                    self.search_client.search, queries[0], 3, None,
+                    f"{blueprint.research_prompt} {blueprint.title} {queries[0]}")
             except TypeError:
                 try:
                     hits = await asyncio.to_thread(
@@ -3415,36 +3159,11 @@ class ResearchStateMachine:
                             inv.assertion, _invariant_env(run["state"], telemetry, env_extra))
                         failed.append((inv, observed))
                 if failed:
-                    # Tier-0 Reflex_Heal: deterministically reconcile
-                    # hallucinated numeric lower bounds against the verified
-                    # trajectory envelope (finite state, clean execution)
-                    # instead of burning Tier-2 LLM retries.
-                    unresolved: List[Tuple[InvariantConstraint, Dict[str, Any]]] = []
-                    reconciled: List[str] = []
-                    all_finite = all(math.isfinite(float(v)) for v in run["state"])
-                    for inv, observed in failed:
-                        revised = (_reconcile_hallucinated_bounds(
-                            inv.assertion, run["state"], telemetry, extra)
-                            if all_finite else None)
-                        if revised is not None:
-                            reconciled.append(
-                                f"{inv.variable_name}: `{inv.assertion}` -> `{revised}`")
-                            telemetry[f"reconciled_{inv.variable_name}"] = 1.0
-                        else:
-                            unresolved.append((inv, observed))
-                    if reconciled:
-                        telemetry["tier0_bound_reconciled"] = 1.0
-                        await self.emit_activity(
-                            f"STAGE_{stage}_EXEC", "bound_reconciled",
-                            "Tier-0 Reflex_Heal recalibrated hallucinated bound(s) "
-                            "to the verified trajectory envelope: "
-                            + "; ".join(reconciled)[:300])
-                    if unresolved:
-                        status = "FALSIFIED"
-                        counterexample = ("; ".join(
-                            f"`{inv.assertion}` ({inv.variable_name}) observed {observed}"
-                            for inv, observed in unresolved)
-                            + (f"; {run_ctx}" if run_ctx else ""))[:1500]
+                    status = "FALSIFIED"
+                    counterexample = ("; ".join(
+                        f"`{inv.assertion}` ({inv.variable_name}) observed {observed}"
+                        for inv, observed in failed)
+                        + (f"; {run_ctx}" if run_ctx else ""))[:1500]
         except KernelExecutionError as exc:
             status = "DIVERGED" if exc.timed_out else "ERROR"
             counterexample = str(exc)[:1500]

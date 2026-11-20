@@ -35,6 +35,21 @@ from ..schemas.research import (
 
 _EV = 1.602176634e-19
 
+
+def _electrical_unit(unit):
+    bases = {"F", "S", "V", "A", "C", "Ohm"}
+    prefixes = {"": 1.0, "p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3, "k": 1e3, "M": 1e6}
+    match = re.fullmatch(r"([pnumkM]?)(F|S|V|A|C|Ohm)(?:/(m|cm|mm)(?:\^(\d+))?)?", unit)
+    if not match or match[2] not in bases:
+        return None
+    prefix, base, length, power = match.groups()
+    factor = prefixes[prefix]
+    if length:
+        exponent = int(power or 1)
+        factor /= {"m": 1.0, "cm": 1e-2, "mm": 1e-3}[length] ** exponent
+        base += "/m" + (f"^{exponent}" if exponent != 1 else "")
+    return factor, base
+
 # unit -> (factor to SI, SI unit). Case-sensitive (MW vs mW, T vs t, G vs g).
 _UNIT_TABLE: Dict[str, Tuple[float, str]] = {
     # length
@@ -191,7 +206,7 @@ def normalize_to_si(value: float, unit_str: str) -> Tuple[float, str]:
         return value, ""
     if canonical in ("degC", "°C"):
         return value + 273.15, "K"
-    entry = _UNIT_TABLE.get(canonical)
+    entry = _UNIT_TABLE.get(canonical) or _electrical_unit(canonical)
     if entry is None:
         mapped = _CASE_INSENSITIVE_UNITS.get(canonical.lower())
         entry = _UNIT_TABLE.get(mapped) if mapped else None
@@ -203,7 +218,7 @@ def normalize_to_si(value: float, unit_str: str) -> Tuple[float, str]:
 
 def is_known_unit(unit_str: str) -> bool:
     canonical = _canonical_unit(unit_str)
-    return (canonical in _UNIT_TABLE or canonical.lower() in _CASE_INSENSITIVE_UNITS
+    return (canonical in _UNIT_TABLE or _electrical_unit(canonical) is not None or canonical.lower() in _CASE_INSENSITIVE_UNITS
             or canonical in ("degC", "°C"))
 
 
@@ -743,6 +758,7 @@ def _strip_latex_commands(text: str) -> str:
 
 
 _PARAM_STOPWORDS = {
+    "simulate", "sweep", "verify", "compute", "benchmark", "protocol", "dual_k", "corridor",
     "at", "in", "to", "of", "by", "for", "with", "without", "from", "least", "most",
     "continuous", "raw", "total", "net", "system_physics", "baseline",
     "closure", "model", "stage", "part", "step", "steps", "and", "or", "the", "a",
@@ -807,7 +823,7 @@ def extract_parameters_from_text(text: str, source: str = "",
             return
         # Subscripted state tokens (``z_k``, ``q_0``, ``x_n``, ...) extracted
         # from code-like prompt fragments are not physical constants.
-        if source == "user_prompt" and _SUBSCRIPT_STATE_RE.fullmatch(name):
+        if source == "user_prompt" and not unit and _SUBSCRIPT_STATE_RE.fullmatch(name):
             return
         si_value, si_unit = normalize_to_si(value, unit)
         toks = [t for t in cleaned_raw.split() if re.search(r"[A-Za-z]", t)]
@@ -1331,18 +1347,21 @@ MACRO_SCIENTIFIC_DOMAINS: Tuple[str, ...] = (
 
 _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "PHYSICAL_SCIENCES_AND_ENG": (
+        "mechanics", "acoustics", "optics", "elasticity", "heat transfer",
         "quantum", "relativit", "lorentz", "plasma", "fluid dynamics", "navier-stokes",
         "condensed matter", "astrodynamics", "orbital", "thermodynamic", "electromagnet",
         "maxwell", "hamiltonian", "lindblad", "bloch", "soliton", "korteweg", "kdv",
         "aeroshell", "sutton-graves", "hypersonic", "schrodinger", "magnetism",
     ),
     "CHEMICAL_AND_MATERIALS": (
+        "biochem", "membrane transport", "proton-motive", "chemiosmo",
         "reaction kinetic", "chemical kinetic", "catalys", "electrochem", "battery",
         "degradation", "sei growth", "polymer", "thermochem", "arrhenius", "robertson",
         "oregonator", "stoichiometr", "tungsten", "silicon carbide", "material science",
         "molarity", "redox", "butler-volmer",
     ),
     "LIFE_SCIENCES_AND_BIOMEDICINE": (
+        "bioenerget", "metaboli", "biochem", "physiolog", "cardiolog", "patholog", "membrane transport",
         "systems biology", "michaelis-menten", "enzyme", "genomic", "gene regulatory",
         "population genetics", "hardy-weinberg", "wright-fisher", "pharmacolog",
         "pharmacokinetic", "pharmacodynamic", "pk/pd", "pk-pd", "hill-langmuir",
@@ -1360,6 +1379,7 @@ _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "vaccination", "epidemic", "ecolog", "droplet transmission",
     ),
     "EARTH_CLIMATE_AND_ENVIRONMENT": (
+        "climat", "oceanograph", "atmospher", "seismolog", "meteorolog",
         "radiative-convective", "radiative forcing", "carbon cycle", "carbon-cycle",
         "reservoir", "revelle", "ocean carbonate", "thermohaline", "hydrolog",
         "geophysic", "terrestrial biosphere", "deep ocean", "surface ocean",
@@ -1367,6 +1387,7 @@ _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "greenhouse", "temperature anomaly",
     ),
     "STATISTICS_AND_CAUSAL_INFERENCE": (
+        "regression", "statistic", "likelihood", "randomized trial",
         "bayesian inference", "neyman-pearson", "hypothesis test", "cramer-rao",
         "cramér-rao", "fisher information", "structural causal model", "do-calculus",
         "potential outcome", "average treatment effect", "instrumental variable",
@@ -1375,6 +1396,7 @@ _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "biostatistic", "covariance", "p-value", "estimator variance",
     ),
     "ECONOMICS_AND_GAME_THEORY": (
+        "economic", "monetary", "fiscal", "market equilibrium",
         "game theory", "evolutionary game", "nash equilibrium", "replicator",
         "replicator-mutator", "exploitability", "nikaido-isoda", "rock-paper-scissors",
         "prisoner's dilemma", "mechanism design", "vcg", "bellman", "dynamic programming",
@@ -1382,6 +1404,7 @@ _MACRO_DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "martingale", "utility", "payoff matrix", "regret",
     ),
     "MATHEMATICS_CS_AND_INFO_THEORY": (
+        "algebra", "topology", "computer science", "numerical analysis",
         "information theory", "channel coding", "shannon-hartley", "shannon entropy",
         "kullback-leibler", "source coding", "spectral graph", "markov chain",
         "algorithmic complexity", "combinator", "number theory", "catalan", "fibonacci",
@@ -1609,8 +1632,17 @@ class QuantitativeInsightExtractor:
 
     def equations_from_text(self, text: str, source: str = "") -> List[ExtractedEquation]:
         out = []
-        for m in _INLINE_TEX.finditer(text or ""):
-            eq = parse_equation(m.group(1), source=source)
+        candidates = [m.group(1) for m in _INLINE_TEX.finditer(text or "")]
+        for match in re.finditer(
+                r"(?<![\w])(?:[A-Za-z][A-Za-z0-9_]*(?:\([^\n=;]{1,60}\))?|d[A-Za-z]+/dt)\s*=\s*[^\n;!?$]{1,240}", text or ""):
+            candidate = re.split(r'\.(?:\s|$)', match.group(0), maxsplit=1)[0].strip()
+            rhs = candidate.split('=', 1)[-1].strip()
+            if not re.fullmatch(r'[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', rhs) and not re.search(r'\b[A-Za-z_]\w*\s+[A-Za-z_]\w*\b', candidate):
+                candidates.append(candidate)
+        for candidate in dict.fromkeys(candidates):
+            if '=' not in candidate:
+                continue
+            eq = parse_equation(candidate, source=source)
             if eq is not None:
                 out.append(eq)
         return out
@@ -1688,6 +1720,9 @@ class QuantitativeInsightExtractor:
             invariants.extend(r_inv)
         else:
             domains = classify_registry_domains(" ".join(corpus))
+        macro_domains = classify_macro_scientific_domains(prompt or " ".join(corpus))
+        if macro_domains:
+            domains = list(dict.fromkeys([d for d in domains if d != 'general'] + macro_domains))
 
         # Deduplicate equations by (lhs, rhs) and benchmarks by name.
         seen_eq, uniq_eqs = set(), []
@@ -1786,4 +1821,3 @@ def lookup_reference_registry(text: str) -> List[ExtractedParameter]:
     """Convenience wrapper returning matched reference parameters for ``text``."""
     params, _eqs, _bench, _inv, _doms = registry_evidence(text)
     return params
-

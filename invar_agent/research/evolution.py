@@ -108,6 +108,8 @@ class _SymbolicKernel:
         self.sp = sp
         self.functions = {node.name: node for node in ast.parse(code).body if isinstance(node, ast.FunctionDef)}
         self.slots = {index: sp.Symbol(name) for name, index in slots.items()}
+        self.globals = {}
+        self.block([node for node in ast.parse(code).body if isinstance(node, (ast.Assign, ast.AnnAssign))], self.globals)
 
     def expression(self, node, environment, depth=0):
         sp = self.sp
@@ -119,6 +121,8 @@ class _SymbolicKernel:
             return self.expression(node.value, environment, depth)[node.slice.value]
         if _slot(node) is not None:
             return environment.get(('slot', _slot(node)), self.slots.get(_slot(node), sp.Symbol(f'_slot_{_slot(node)}')))
+        if isinstance(node, ast.Constant) and type(node.value) is bool:
+            return sp.true if node.value else sp.false
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             return sp.Rational(str(node.value))
         if isinstance(node, ast.Name):
@@ -151,8 +155,8 @@ class _SymbolicKernel:
             arguments = [self.expression(arg, environment, depth) for arg in node.args]
             if name in {'_invar_sdiv', 'safe_div', 'div_eps'} and len(arguments)==2:
                 return arguments[0]/arguments[1]
-            if name in {'sin', 'cos', 'exp', 'log', 'sqrt', 'abs'}:
-                return {'abs': sp.Abs}.get(name, getattr(sp, name, None))(*arguments)
+            if name in {'sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'min', 'max'}:
+                return {'abs': sp.Abs, 'min': sp.Min, 'max': sp.Max}.get(name, getattr(sp, name, None))(*arguments)
             function = environment.get(('function',name),self.functions.get(name))
             if function is not None:
                 local = dict(environment)
@@ -194,7 +198,7 @@ class _SymbolicKernel:
         driver = self.functions.get('simulation_step')
         if driver is None:
             return {}
-        environment = {'dt':self.sp.Symbol('_dt')}
+        environment = {**self.globals, 'dt':self.sp.Symbol('_dt')}
         if len(driver.args.args)>1:
             environment[driver.args.args[1].arg] = environment['dt']
         self.block(driver.body,environment)

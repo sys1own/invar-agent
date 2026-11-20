@@ -33,7 +33,7 @@ def _native():
 
 
 def unit_dimension(unit: str) -> SIDimensionVectorModel:
-    aliases = {"Pa": "kg/(m*s^2)", "J": "kg*m^2/s^2", "W": "kg*m^2/s^3",
+    aliases = {"F": "s^4*A^2/(kg*m^2)", "S": "s^3*A^2/(kg*m^2)", "Pa": "kg/(m*s^2)", "J": "kg*m^2/s^2", "W": "kg*m^2/s^3",
                "T": "kg/(s^2*A)", "Hz": "1/s", "N": "kg*m/s^2", "C": "A*s",
                "V": "kg*m^2/(s^3*A)", "L": "m^3", "rad": "1", "Morgan": "1",
                "fraction": "1", "bit": "1", "bp": "1", "kg/kg": "1"}

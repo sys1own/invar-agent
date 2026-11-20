@@ -180,7 +180,8 @@ class ResearchBlueprint(BaseModel):
     # Named observables: human-readable metric (with units, e.g.
     # "magnetic_field_B_tesla") -> index into the final buf.data state vector.
     # Sandbox_Execute publishes each mapping as telemetry["obs_<name>"].
-    variable_map: Dict[str, int] = Field(default_factory=dict, max_length=64)
+    variable_map: Dict[str, int] = Field(default_factory=dict, max_length=4096)
+    slot_roles: Dict[str, Literal['read_only_parameter', 'evolving_state', 'diagnostic']] = Field(default_factory=dict, max_length=4096)
     # Zero-LLM deterministic extraction of quantitative literature evidence
     # (SI-normalized constants, LaTeX equations, benchmarks) attached by the
     # planner before blueprint synthesis and persisted into the vault.

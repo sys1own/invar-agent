@@ -111,6 +111,33 @@ def evaluate_predicate(node, context):
     raise ReferenceError('VAULT_RUNTIME_PREDICATE_UNSUPPORTED', type(node).__name__)
 
 
+def _constant_value(node, constants):
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError):
+        pass
+    if isinstance(node, ast.Name) and node.id in constants:
+        value = constants[node.id]
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _constant_value(node.operand, constants) * (-1 if isinstance(node.op, ast.USub) else 1)
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+        left, right = _constant_value(node.left, constants), _constant_value(node.right, constants)
+        if type(left) not in (int, float) or type(right) not in (int, float):
+            raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Non-numeric constant arithmetic')
+        if isinstance(node.op, ast.Pow) and abs(right) > 1024:
+            raise ReferenceError('VAULT_REFERENCE_LIMIT', 'Constant exponent exceeds budget')
+        if isinstance(node.op, ast.Add): value = left + right
+        elif isinstance(node.op, ast.Sub): value = left - right
+        elif isinstance(node.op, ast.Mult): value = left * right
+        elif isinstance(node.op, ast.Div): value = left / right
+        else: value = left ** right
+    else:
+        raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Non-static module constant')
+    if type(value) not in (int, float) or not math.isfinite(value) or isinstance(value, int) and value.bit_length() > 16384:
+        raise ReferenceError('VAULT_REFERENCE_LIMIT', 'Invalid numeric constant')
+    return value
+
+
 def _safe_namespace(code):
     tree = ast.parse(code)
     forbidden = (ast.ClassDef, ast.With, ast.AsyncWith, ast.Global, ast.Nonlocal,
@@ -124,9 +151,14 @@ def _safe_namespace(code):
             raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Only math imports are permitted')
     if any(not isinstance(node, (ast.FunctionDef, ast.Import, ast.Assign, ast.AnnAssign)) for node in tree.body):
         raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Unsupported module-level statement')
+    constants = {}
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            ast.literal_eval(node.value)
+            value = _constant_value(node.value, constants)
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = value
+            node.value = ast.copy_location(ast.parse(repr(value), mode='eval').body, node.value)
         if isinstance(node, ast.FunctionDef):
             if node.decorator_list:
                 raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Decorators are not permitted')
@@ -145,6 +177,7 @@ def _safe_namespace(code):
                          'zip', 'pow', 'ValueError', 'OverflowError', 'ZeroDivisionError')}
     safe['__import__'] = importer
     namespace = {'__builtins__': safe, 'math': math}
+    ast.fix_missing_locations(tree)
     exec(compile(tree, '<pinned-research-reference>', 'exec'), namespace)
     return namespace
 
@@ -219,6 +252,7 @@ def _run(payload):
         if not (all(passed) if isinstance(passed, (list, tuple)) else passed):
             failures.append(assertion)
     return {'samples': samples, 'state': buffer.data, 'initial': initial,
+            'phase_hits': namespace.get('_invar_phase_hits', []),
             'trace_max': high, 'trace_min': low, 'telemetry': telemetry, 'failures': failures}
 
 

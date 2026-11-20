@@ -689,23 +689,23 @@ def simulation_step(buf, dt):
     assert "math.log" in healed.code and "math.sqrt" in healed.code
 
 
-def test_chained_bounds_general_upper_bound_and_concept_bridge():
+def test_chained_bounds_general_upper_bound_and_exact_name_bridge():
     from invar_agent.research.state_machine import (
         _auto_populate_variable_map, _eval_invariant, _guard_contract_initial_state)
     from invar_agent.schemas.research import VerificationContract
 
-    # Mimics dfn_p2d_sei_fastcharge writing time into slot 20 while computing T_rise locally
+    # The metric's exact declared name grounds the bridge, not a token overlap.
     kernel = (
         "import math\n\n"
         "def simulation_step(buf, dt):\n"
         "    eta_bv = math.asinh(0.4)\n"
         "    V_cell = 4.65 + 0.01 * eta_bv\n"  # deliberately above 4.3 upper bound
         "    t = buf.data[20]\n"
-        "    T_rise = 8.4\n"
+        "    temp_rise = 8.4\n"
         "    buf.data[15] = V_cell\n"
         "    buf.data[18] = max(0.0, buf.data[18] + 1e-10 * dt)\n"
         "    buf.data[20] = t + dt\n"
-        "    buf.data[21] = T_rise\n"
+        "    buf.data[21] = temp_rise\n"
     )
     vc = VerificationContract.model_validate({
         "contract_id": "c1_dfn_p2d_sei",
