@@ -43,7 +43,10 @@ TOOLS_CONTEXT = SCIENTIFIC_CONTRACT + "\n\n" + """## Your execution tools (know 
 ## v9_transpiler_friendly Python (STRICT)
 The blueprint variable_map must identify every initial-state slot bijectively by
 physical symbol. Include slot_roles keyed by the same symbols: read_only_parameter,
-evolving_state, or diagnostic. Never store diagnostics in input parameter slots.
+evolving_state, or diagnostic. Time-varying ODE states MUST be `evolving_state`, and
+derived instantaneous rates/fluxes/slopes/currents/extrema initialized to 0.0 MUST
+be `diagnostic` — NEVER mark ODE states or computed fluxes/rates as `read_only_parameter`.
+Never store diagnostics in input parameter slots.
 ALLOWED: top-level pure functions; `def simulation_step(buf, dt):` driver that
 mutates buf.data[i] in place (buf.data is a flat list[float] of length buf.size,
 ONLY buf.data[i] and buf.size exist; dt is the function argument, never buf.dt,
@@ -108,14 +111,22 @@ entropy_drift, energy_drift, residuals) must be RECOMPUTED each step and
 start at 0.0 — never left at an arbitrary initial value.
 Invariants must be falsifiable and physically meaningful; never write vacuous
 invariants (like x == x) and never loosen tolerances to force a pass.
-CRITICAL INVARIANT RULE: Do NOT guess narrow arbitrary numeric lower/upper
-intervals (e.g. `15.0 <= state[7] <= 70.0`) before the ODE is integrated. Only
-write invariants for: (a) explicit bounds stated by the user (e.g.
-`state[3] < 40.0`), (b) physical positivity and finiteness (`state[i] >= 0.0`,
-`math.isfinite(state[i])`), (c) monotonic conservation laws
-(`state[1] <= initial_state[1]`), or (d) exact analytical identities within a
-generous relative tolerance (>= 15% for exponential atmosphere entry
-approximations).
+CRITICAL INVARIANT RULE: Do NOT guess ungrounded arbitrary narrow intervals when no
+scale or bound exists. ALWAYS faithfully encode: (a) explicit target windows,
+bands, corridors, and ceilings stated by the user (`*_band`, `*_window`,
+`*_corridor`, `*_bound`, `*_max`, `*_limit` MUST encode their finite lower AND
+upper bounds — NEVER degrade a two-sided band or upper ceiling to `state[i] >= 0.0`),
+(b) physical positivity, finiteness, and realistic physical plausibility envelopes
+(e.g. keeping intensive potentials, temperatures, or concentrations within
+physically plausible finite ceilings so numerical blowups are falsified and
+repaired rather than passing silently), (c) conserved pool sums and monotone/extrema
+relations (`peak_*`/`max_*`/`min_*` invariants MUST reference the matching extrema
+slot in `variable_map`, never the instantaneous state slot), and (d) exact analytical
+identities within a generous tolerance. When a parameter sweep across control ranges
+is requested, instantiate distinct control-parameter values (`initial_values`) across
+stages/contracts (or an explicit sweep kernel) rather than copying identical
+`initial_state` vectors. Always emit `initial_values` keyed by canonical
+`variable_map` names (with `time_s`/`t` starting at `0.0`) alongside `initial_state`.
 
 ## Domain observables & variable_map (MANDATORY for quantitative problems)
 - The blueprint MUST include `variable_map`: {"<metric_name_with_units>": <buf.data index>, ...}
@@ -178,6 +189,48 @@ approximations).
   unconditionally positive semi-implicit / Patankar update
   `C_new = (C + dt * inflow) / (1.0 + dt * outflow_rate)` instead of explicit
   Euler `C + dt * (-outflow_rate * C + inflow)` which explodes on large `dt`.
+- BASELINE PLAUSIBILITY & THERMODYNAMIC FLUX SCALING (Stage 1 CRITICAL):
+  Under baseline/control=0 conditions in Stage 1, include explicit physical
+  plausibility envelopes on primary intensive state variables (e.g. potentials,
+  temperatures, concentrations, energy ratios) so uncalibrated source rates
+  causing 2x+ unphysical drift are caught in Stage 1 BEFORE `layer_1_step` is
+  pinned. Any driving flux coupled to an intensive potential/gradient MUST
+  include thermodynamic back-pressure / reversal saturation consistent with SI
+  flux-to-conductance units so baseline stays in the physiological/physical
+  envelope while moderate dissipation sweeps remain energetically viable. In
+  capacitive/potential ODEs (`C * dX/dt = +J_source - J_sink - J_leak - J_control`),
+  verify sign polarity (`+J_source` charges/increases `X`, `-J_sink - J_leak`
+  discharges/lowers `X`) so `X` stabilizes inside the physiological envelope
+  rather than collapsing to a lower clamp. Always store electrical potentials
+  in SI Volts (`V`, matching `structured_evidence` `si_value`, e.g. `0.165` V
+  for `165 mV`, corridor `[0.115, 0.155]` V) rather than `mV`, recompute
+  derived energy ratios (e.g. `aec = (atp + 0.5 * adp) / pool_total`) AFTER any
+  simplex/pool conservation projection on every step, and allocate distinct
+  slots for instantaneous vs. running-maximum (`peak_x = max(peak_x, x)`) metrics.
+- NO MULTI-TUPLE RHS/STATE HELPERS & MANDATORY CLOCK/CONTROL SLOTS (CRITICAL):
+  NEVER define helper functions returning 3+ element tuples (such as `def rhs(...)`
+  returning an 8-tuple of derivatives or `def write_state(...)` returning a 7-tuple),
+  because tuple scalarization clones the entire helper function once per tuple element.
+  Instead, compute all state updates directly inside `simulation_step(buf, dt)` (or
+  `layer_k_step(buf, dt)`). Always assign dedicated `variable_map` slots for `"time_s"`
+  and every swept control parameter, read them from `buf.data[slot]` at the top of
+  `simulation_step` (NEVER hardcode `t = 0.0` or fixed control constants inside
+  `simulation_step`), and advance `buf.data[time_slot] = t + dt` on every step.
+- CORRIDOR / EXISTENTIAL REGIME DISCOVERY SWEEPS (Stage 3 CRITICAL):
+  When a prompt asks to identify whether a non-empty parameter corridor
+  `[p_lo, p_hi]` simultaneously satisfies multiple target bounds (e.g. low
+  hazard, preserved energy ratio, and an interior intensive window), NEVER place
+  every narrow interior target constraint as a hard PASS invariant on ALL
+  extreme low/mid/high endpoint probes simultaneously (excessive dissipation
+  at high control MUST push intensive state below the interior band in any
+  physically coupled model). Instead:
+  (a) extreme endpoint probes enforce safety, finiteness, conservation,
+      positivity, and regime sensitivity (e.g. peak hazard or excessive collapse);
+  (b) Stage `k` corridor discovery either implements a deterministic multi-point
+      grid search inside `layer_k_step` (with bounded sub-steps, total work <=
+      20000 steps) outputting `corridor_feasible_count` and best corridor state
+      and asserting `corridor_feasible_count >= 1`, OR tests a calibrated interior
+      operating point inside the feasible corridor against the full target triad.
 - DISJOINT PARAMETER & OBSERVABLE SLOTS: static parameters (e.g. `V_max`,
   `K_m`, `EC_50`, `E_max`, `beta_0`) and derived outputs (e.g. `occ`, `E_eff`,
   `R_eff`) MUST occupy separate indices in `buf.data[...]` and `variable_map`;
@@ -189,12 +242,19 @@ approximations).
   (single-shot ensemble contract); otherwise accumulate 1 replication per step
   with `steps = M`. Also keep `O(N)` sample-accumulation loops directly inside
   the step/accumulation function rather than returning a 4+ tuple from an
-  `O(N)` helper (tuple scalarization multiplies runtime by tuple arity)."""
+  `O(N)` helper (tuple scalarization multiplies runtime by tuple arity).
+- SI CONCENTRATION & UNIT CONVERSIONS (CRITICAL): `1 M = 1 mol/L = 1000 mol/m^3`;
+  `1 mM = 1 mmol/L = 1.0 mol/m^3` (numerically identical: e.g. `12.0 mM = 12.0 mol/m^3`,
+  `3.0 mM = 3.0 mol/m^3` — NEVER divide `mM` by `1000` when converting to `mol/m^3`!);
+  `1 uM = 1e-3 mol/m^3` (when a threshold is stated in `uM`, keep the observable in `uM`
+  scale, e.g. `peak_ros_uM < 2.0`, matching its `variable_map` name);
+  `1 uF/cm^2 = 0.01 F/m^2`."""
 
-PLANNER_PROMPT = """You are the Research Agent planner of a mathematically verified computational
+PLANNER_PROMPT = """{tools}
+
+## Task — Research Agent Planner
+You are the Research Agent planner of a mathematically verified computational
 research engine. Produce ONE falsifiable research blueprint for the request.
-
-{tools}
 
 ## Output: strict JSON object with keys
 blueprint_id (lowercase snake_case, under 32 chars, e.g. 'mars_entry_probe'),
@@ -209,7 +269,7 @@ stage_objectives (one short objective per stage, stage 1 first), contracts
 (staged contracts across stages 1..target_research_stages, prefixed c1_...,
 c2_..., c3_...: list of {{contract_id, target_backend, timeout_seconds,
 invariants: [{{variable_name, assertion, tolerance}}], max_memory_mb,
-initial_state: [floats], dt, steps}}),
+initial_values: {{"<variable_map_name>": float}}, initial_state: [floats], dt, steps}}),
 code_template (the unified module implementing all staged contracts, v9_transpiler_friendly Python),
 variable_map ({{"<metric_with_units>": <buf.data index>}} for every numerical
 quantity the user requested), max_feedback_rounds (2-4). Across stages each named
@@ -238,19 +298,30 @@ No markdown fences, no <think> blocks. Output JSON only.
 Research request: {question}
 """
 
-ACCRETION_PROMPT = """You are extending a VERIFIED computational research module (cumulative
+ACCRETION_PROMPT = """{tools}
+
+## Task — Cumulative Blueprint Evolution (Accretive Stage Integration)
+You are extending a VERIFIED computational research module (cumulative
 blueprint evolution, stage {stage} of {total}).
 
-{tools}
-
 ## Rules for accretive integration (MANDATORY)
-- The verified module below is pinned. Copy every verified function VERBATIM
-  (same name, same body) or omit it (it is re-inserted automatically); NEVER
-  modify or rename verified functions or constants.
+- The verified module below is pinned. Pinned functions are shown as signature + slot
+  contract stubs (or full code) and are re-inserted automatically by the merger;
+  NEVER modify or rename verified functions or constants.
 - Add NEW helper functions for the new physics/algorithm and write a NEW
   `simulation_step(buf, dt)` driver that CALLS the verified functions (e.g. the
   verified force/energy helpers or `layer_{prev}_step(buf, dt)`) so the new logic
   executes integrated with the verified foundation. An uncoupled driver is rejected.
+- NON-NO-OP STAGE LAYER RULE (CRITICAL): NEVER emit a bare forwarding `simulation_step(buf, dt)`
+  whose body is just `layer_{prev}_step(buf, dt)` (with or without positivity clamps).
+  Stage {stage}'s `simulation_step(buf, dt)` MUST execute genuinely new computational
+  statements addressing Stage {stage}'s objective (e.g. evaluating corridor/regime
+  margins or control feedback, integrating Stage {stage}'s extended dynamics, or
+  computing comparative stepper/error diagnostics into Stage {stage}'s `buf.data` slots)
+  alongside calling the pinned foundation.
+- DO NOT DOUBLE-INCREMENT TIME: `layer_{prev}_step(buf, dt)` ALREADY advances the time
+  slot (e.g. `buf.data[0]`) by `dt`. Never add a second `buf.data[0] = buf.data[0] + dt`
+  after calling `layer_{prev}_step(buf, dt)`.
 - Verified layers are re-verified with their original contracts inside the same
   compiled module, so do not change the meaning of shared buffer slots used by
   verified layers; use new slots (append beyond the existing ones) for new state.
@@ -274,19 +345,28 @@ blueprint evolution, stage {stage} of {total}).
   `while` searches across history, or variable-length arrays, as they cannot
   lower to C++ C-ABI.
 
+## Output: strict JSON object with keys
+code (new functions + new simulation_step calling `layer_{prev}_step(buf, dt)`; pinned
+functions are restored automatically), contracts (NEW contracts for this stage, same
+schema as before, initial_state long enough for all slots), rationale (one paragraph).
+No markdown fences. Output JSON only.
+
 ## Stage objective
 {objective}
 
-## Verified module (stages 1..{prev})
+## Verified pinned signatures & slot contracts (stages 1..{prev})
 ```python
 {verified_code}
 ```
 
-## Verified contracts (still enforced)
-{verified_contracts}
-
 ## Canonical slot map (reuse exactly; do not renumber)
 {canonical_slots}
+
+## Verified contracts summary (still enforced)
+{verified_contracts}
+
+## Planned contracts & required slots for Stage {stage} (MUST compute every listed slot)
+{stage_contracts}
 
 ## Telemetry of the last verified stage
 {telemetry}
@@ -296,15 +376,12 @@ blueprint evolution, stage {stage} of {total}).
 
 ## Previous failed attempts for this stage (fix these)
 {failures}
-
-## Output: strict JSON object with keys
-code (the full unified module: verified functions + new functions + new
-simulation_step), contracts (NEW contracts for this stage, same schema as before,
-initial_state long enough for all slots), rationale (one paragraph).
-No markdown fences. Output JSON only.
 """
 
-REFINE_PROMPT = """Your research kernel failed verification. Fix the CODE ONLY; the contracts
+REFINE_PROMPT = """{tools}
+
+## Task — Kernel Verification Repair (Contracts Fixed)
+Your research kernel failed verification. Fix the CODE ONLY; the contracts
 and invariants are fixed and must not be weakened.
 
 CRITICAL — v9_transpiler_friendly subset (violations are rejected by PreWrite_Guard):
@@ -318,13 +395,14 @@ Each variable/invariant has a dedicated global `buf.data[idx]` slot. Write every
 computed quantity to its exact assigned `buf.data[idx]` slot on every step. NEVER
 branch on `buf.size` or `len(buf.data)` (e.g. `if buf.size > 10:`), and NEVER
 overwrite input parameter slots (`N_cells`, `P_cell`, etc.) with output observables.
-
-{tools}
+Pinned functions marked `[PINNED VERIFIED LAYER]` are restored automatically by the
+merger; focus your repair on the active driver and unpinned functions.
+Output strict JSON: {{"code": "<fixed module>", "rationale": "..."}}. No fences.
 
 ## Stage objective
 {objective}
 
-## Failing module
+## Failing module (pinned layer bodies omitted for token economy)
 ```python
 {code}
 ```
@@ -334,8 +412,6 @@ overwrite input parameter slots (`N_cells`, `P_cell`, etc.) with output observab
 
 ## Counterexample / diagnostics
 {failure}
-
-Output strict JSON: {{"code": "<fixed full module>", "rationale": "..."}}. No fences.
 """
 
 HEALING_DIRECTIVE_PROMPT = """You are the directive-only healing controller for a verified research kernel.
@@ -358,21 +434,23 @@ Failure/counterexample:
 """
 
 QUERY_PROMPT = """You steer literature search for a computational research loop.
+Write 3 precise literature search queries (arXiv/OpenAlex style, <= 12 words each)
+that target the higher-order effects, couplings, closures or algorithmic fixes the
+telemetry points to. Output a JSON list of strings only.
+
 Stage {stage} objective: {objective}
 Hypothesis: {hypothesis}
 Numerical telemetry from the previous stage: {telemetry}
-Failures so far: {failures}
-Write 3 precise literature search queries (arXiv/OpenAlex style, <= 12 words each)
-that target the higher-order effects, couplings, closures or algorithmic fixes the
-telemetry points to. Output a JSON list of strings only."""
+Failures so far: {failures}"""
 
 # -- combined feasibility + blueprint (single Tier-2 call, Task 4 latency fix) --
 
-COMBINED_PLAN_PROMPT = """You are the Epistemic Feasibility Gate AND the Research Agent planner
+COMBINED_PLAN_PROMPT = """{tools}
+
+## Task — Epistemic Feasibility Gate & Research Blueprint Planner
+You are the Epistemic Feasibility Gate AND the Research Agent planner
 of a mathematically verified computational research engine, in ONE pass. Produce
 ONE strict JSON object with two keys: "feasibility" and "blueprint".
-
-{tools}
 
 ## Part 1 — feasibility (gate)
 Classify the request into EXACTLY ONE verdict:
@@ -404,7 +482,7 @@ stage_objectives (one short objective per stage, stage 1 first), contracts
 (staged contracts across stages 1..target_research_stages, prefixed c1_...,
 c2_..., c3_...: list of {{contract_id, target_backend, timeout_seconds,
 invariants: [{{variable_name, assertion, tolerance}}], max_memory_mb,
-initial_state: [floats], dt, steps}}), code_template (the unified module
+initial_values: {{"<variable_map_name>": float}}, initial_state: [floats], dt, steps}}), code_template (the unified module
 implementing all staged contracts, v9_transpiler_friendly Python), variable_map ({{"<metric_with_units>":
 <buf.data index>}} for every numerical quantity the user requested),
 max_feedback_rounds (2-4).
@@ -665,7 +743,10 @@ def _extract_json(text: str) -> Optional[Any]:
                 try:
                     parsed = json.loads(chunk)
                 except json.JSONDecodeError:
-                    continue
+                    try:
+                        parsed = json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', chunk))
+                    except json.JSONDecodeError:
+                        continue
                 if first_valid is None and parsed != {}:
                     first_valid = parsed
                 if isinstance(parsed, dict) and parsed:
@@ -698,11 +779,11 @@ _BLUEPRINT_FIELDS = {
     "contracts", "code_template", "max_feedback_rounds", "verified_layers",
     "target_research_stages", "stage_objectives", "current_stage",
     "evolution_history", "unified_module_code", "feasibility", "variable_map",
-    "structured_evidence", "extracted_constants",
+    "slot_roles", "structured_evidence", "extracted_constants",
 }
 _CONTRACT_FIELDS = {
     "contract_id", "target_backend", "timeout_seconds", "invariants",
-    "max_memory_mb", "initial_state", "dt", "steps",
+    "max_memory_mb", "initial_values", "initial_state", "dt", "steps",
 }
 _INVARIANT_FIELDS = {"variable_name", "assertion", "tolerance"}
 _BACKENDS = {"rust_hin", "cpp", "cuda", "multi_variant"}
@@ -768,6 +849,27 @@ def _coerce_contract(raw: Any, index: int) -> Optional[Dict[str, Any]]:
         contract["max_memory_mb"] = max(64, min(8192, int(contract.get("max_memory_mb", 1024))))
     except (TypeError, ValueError):
         return None
+    raw_iv = contract.get("initial_values")
+    if isinstance(raw_iv, dict):
+        iv_clean: Dict[str, float] = {}
+        for k, v in raw_iv.items():
+            if len(iv_clean) >= 4096:
+                break
+            ks = str(k).strip()[:120]
+            if not ks:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv == fv and abs(fv) != float("inf"):
+                iv_clean[ks] = fv
+        if iv_clean:
+            contract["initial_values"] = iv_clean
+        else:
+            contract.pop("initial_values", None)
+    else:
+        contract.pop("initial_values", None)
     initial = _as_float_list(contract.get("initial_state"))
     if initial is not None:
         contract["initial_state"] = initial[:4096]
@@ -834,7 +936,7 @@ _CANON_OBSERVABLE_TOKENS = (
     "trace", "max", "min", "observable", "metric", "loss", "fidelity",
     "infidelity", "distance", "residual", "violation", "bound",
 )
-_CANON_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)[_-]", re.IGNORECASE)
+_CANON_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)(?:[a-z](?=[_-])|[_-])", re.IGNORECASE)
 
 
 def _canon_stage_index(contract_id: str) -> int:
@@ -1090,6 +1192,96 @@ def canonicalize_contract_dicts(
     notes: List[str] = []
     contracts = copy.deepcopy(contracts or [])
     vm = {str(k): int(v) for k, v in (variable_map or {}).items() if str(k).strip()}
+    if vm:
+        from .slot_schema import observable_name
+        _qual_re_c = re.compile(
+            r"_(?:plausible|target|envelope|ceiling|floor|bounds?|window|final|baseline|initial|check|limit|corridor|steady|range|valid|ok|horizon|s|v|mv|mm|um|mol|m3|k|m|hz|db|s_m2|mmhg|units|frac|j_m2)$",
+            re.I,
+        )
+        def _strip_qual_c(s_name: str) -> str:
+            base = observable_name(s_name)
+            prev = None
+            while base and base != prev:
+                prev = base
+                base = _qual_re_c.sub("", base)
+            return base or observable_name(s_name)
+
+        _slot_to_vnames_c: Dict[int, List[str]] = {}
+        _sem_to_vslot_c: Dict[str, int] = {}
+        for _vn, _vs in vm.items():
+            _slot_to_vnames_c.setdefault(int(_vs), []).append(str(_vn))
+            _sem_to_vslot_c.setdefault(observable_name(str(_vn)), int(_vs))
+            _sem_to_vslot_c.setdefault(_strip_qual_c(str(_vn)), int(_vs))
+        for _c_item in contracts:
+            if not isinstance(_c_item, dict):
+                continue
+            for _inv_item in (_c_item.get("invariants") or []):
+                if not isinstance(_inv_item, dict):
+                    continue
+                _inm = str(_inv_item.get("variable_name") or "").strip()
+                _ias = str(_inv_item.get("assertion") or "")
+                _islots = sorted(set(_canon_slots_in_text(_ias)))
+                if len(_islots) >= 2:
+                    # Multi-slot additive conservation alignment: if an invariant asserts
+                    # abs(state[i] + state[j] (+ ...) - target) <= tol and references any
+                    # unmapped slot (not in variable_map) or slots whose initial_state sum
+                    # disagrees with `target`, rebind to the matching contiguous mapped
+                    # slot tuple in `variable_map` whose initial_state values sum to `target`.
+                    _sum_m = re.search(
+                        r"abs\(\s*\(?\s*((?:state|buf\.data|data)\[\d+\](?:\s*\+\s*(?:state|buf\.data|data)\[\d+\])+)\s*\)?\s*-\s*\(?\s*([0-9.eE+\-\s*/()]+?)\s*\)?\s*\)\s*<=?",
+                        _ias,
+                    )
+                    if _sum_m:
+                        try:
+                            _sum_target = float(eval(_sum_m.group(2), {"__builtins__": {}}, {}))
+                        except Exception:
+                            _sum_target = None
+                        _c_init_l = _c_item.get("initial_state") if isinstance(_c_item.get("initial_state"), list) else []
+                        if _sum_target is not None and _sum_target > 0.0 and _c_init_l:
+                            _k = len(_islots)
+                            _has_unmapped = any(s not in _slot_to_vnames_c for s in _islots)
+                            _cur_sum = sum(float(_c_init_l[s]) for s in _islots if s < len(_c_init_l))
+                            _cur_ok = (not _has_unmapped) and abs(_cur_sum - _sum_target) <= 1e-3 * max(1.0, abs(_sum_target))
+                            if not _cur_ok:
+                                _mapped_sorted = sorted(s for s in _slot_to_vnames_c if s < len(_c_init_l))
+                                _best_tuple = None
+                                for _start_i in range(len(_mapped_sorted) - _k + 1):
+                                    _cand = _mapped_sorted[_start_i:_start_i + _k]
+                                    if _cand == _islots:
+                                        continue
+                                    _cand_sum = sum(float(_c_init_l[s]) for s in _cand)
+                                    if abs(_cand_sum - _sum_target) <= 1e-3 * max(1.0, abs(_sum_target)):
+                                        _best_tuple = _cand
+                                        break
+                                if _best_tuple is not None:
+                                    _new_ias = _ias
+                                    for _pos, (_old_s, _new_s) in enumerate(zip(_islots, _best_tuple)):
+                                        _new_ias = re.sub(
+                                            rf"\b(state|buf\.data|data)\[{_old_s}\]",
+                                            rf"\1[__POOL_TMP_{_pos}__]",
+                                            _new_ias,
+                                        )
+                                    for _pos, _new_s in enumerate(_best_tuple):
+                                        _new_ias = _new_ias.replace(f"[__POOL_TMP_{_pos}__]", f"[{_new_s}]")
+                                    _inv_item["assertion"] = _new_ias
+                                    notes.append(f"rebound multi-slot conservation {_inm}: {_islots} -> {_best_tuple}")
+                    continue
+                if len(_islots) != 1:
+                    continue
+                _s_cur = _islots[0]
+                _target_vs = vm.get(_inm)
+                if _target_vs is None:
+                    _target_vs = _sem_to_vslot_c.get(observable_name(_inm))
+                if _target_vs is None:
+                    _target_vs = _sem_to_vslot_c.get(_strip_qual_c(_inm))
+                if _target_vs is None:
+                    continue
+                _target_vsi = int(_target_vs)
+                if _target_vsi != _s_cur:
+                    _cur_owners = _slot_to_vnames_c.get(_s_cur, [])
+                    if _inm in vm or not _cur_owners or all(_strip_qual_c(o) != _strip_qual_c(_inm) for o in _cur_owners):
+                        _inv_item["assertion"] = _canon_rewrite_slots(_ias, _s_cur, _target_vsi)
+                        notes.append(f"rebound {_inm}: state[{_s_cur}] -> state[{_target_vsi}]")
     prior = copy.deepcopy(prior_contracts or [])
     all_contracts = prior + contracts
     _materialize_initial_state_bounds(all_contracts)
@@ -1176,24 +1368,61 @@ def canonicalize_contract_dicts(
             if init_cid is None or init_cid == c_id or init_rval is None:
                 return False
             # Earlier contract initialized slot_idx to a non-zero value without
-            # claiming it in an invariant; detect incompatible initial_state or target.
+            # claiming it in an invariant; detect incompatible initial_state.
+            # Final-time bounds on an evolving variable (e.g. initialized at 0.165,
+            # relaxing into [0.115, 0.155]) do not clash when initial_state agrees
+            # or when the slot is explicitly mapped in variable_map.
+            if slot_idx in {int(v) for v in vm.values()} and (name not in vm or vm[name] == slot_idx):
+                return False
             diff_init = (
                 init_v is None
                 or abs(float(init_v) - init_rval) > 1e-6 * max(1.0, abs(init_rval), abs(float(init_v)))
             )
-            eq_target = _extract_eq_target(assertion)
-            lo_new, hi_new = _extract_interval(assertion, slot_idx)
-            target_clash = (
-                (eq_target is not None and abs(eq_target - init_rval) > 1e-3 * max(1.0, abs(init_rval), abs(eq_target)))
-                or (hi_new is not None and hi_new < init_rval - 1e-6)
-                or (lo_new is not None and lo_new > init_rval + 1e-6)
-            )
-            return bool(diff_init or target_clash)
+            return bool(diff_init)
         if prev_cid == c_id or prev_owner == name:
             return False
+        prev_iv = slot_init_val.get(slot_idx)
+        same_init = (
+            init_v is None
+            or prev_iv is None
+            or abs(float(init_v) - float(prev_iv)) <= 1e-6 * max(1.0, abs(float(prev_iv)), abs(float(init_v)))
+        )
+        explicit_vm_slots = {int(v) for v in vm.values()}
+        if (
+            slot_idx in explicit_vm_slots
+            and (name not in vm or vm[name] == slot_idx)
+            and (prev_owner not in vm or vm[prev_owner] == slot_idx)
+        ):
+            eq_t_cur = _extract_eq_target(assertion)
+            prev_t_cur = slot_eq_target.get(slot_idx)
+            sum_t_cur = _extract_sum_target(assertion)
+            prev_sum_cur = slot_sum_target.get(slot_idx)
+            eq_clash = (
+                eq_t_cur is not None
+                and prev_t_cur is not None
+                and abs(prev_t_cur - eq_t_cur) > 1e-3 * max(1.0, abs(prev_t_cur), abs(eq_t_cur))
+            )
+            sum_clash = (
+                sum_t_cur is not None
+                and prev_sum_cur is not None
+                and abs(prev_sum_cur - sum_t_cur) > 1e-3 * max(1.0, abs(prev_sum_cur), abs(sum_t_cur))
+            )
+            lo_cur, hi_cur = _extract_interval(assertion, slot_idx)
+            prev_lo_cur = slot_lower.get(slot_idx)
+            prev_hi_cur = slot_upper.get(slot_idx)
+            target_bound_clash = (
+                (eq_t_cur is not None and prev_hi_cur is not None and eq_t_cur > prev_hi_cur + 1e-6)
+                or (eq_t_cur is not None and prev_lo_cur is not None and eq_t_cur < prev_lo_cur - 1e-6)
+                or (prev_t_cur is not None and hi_cur is not None and prev_t_cur > hi_cur + 1e-6)
+                or (prev_t_cur is not None and lo_cur is not None and prev_t_cur < lo_cur - 1e-6)
+            )
+            if not eq_clash and not sum_clash and not target_bound_clash:
+                # Both contracts inspect the exact same model slot declared in `variable_map`
+                # under compatible equality/sum targets (even if testing different initial states
+                # or sub-intervals). Never clone it to an uncomputed phantom slot outside `variable_map`.
+                return False
         prev_t = slot_eq_target.get(slot_idx)
         prev_sum = slot_sum_target.get(slot_idx)
-        prev_iv = slot_init_val.get(slot_idx)
         prev_lo = slot_lower.get(slot_idx)
         prev_hi = slot_upper.get(slot_idx)
         eq_target = _extract_eq_target(assertion)
@@ -1364,6 +1593,7 @@ def canonicalize_contract_dicts(
     # Build a unified initial_state layout across c1..cN so every contract carries
     # valid initial values for both Stage 1's slots and Stage k's de-collided slots.
     ordered_contracts = [all_contracts[idx] for idx in order if isinstance(all_contracts[idx], dict)]
+    orig_lens = {id(c_ord): len(c_ord.get("initial_state") or []) for c_ord in ordered_contracts}
     if any(isinstance(c.get("initial_state"), list) for c in ordered_contracts):
         unified_len = max((len(c.get("initial_state") or []) for c in ordered_contracts), default=0)
         if unified_len > 0:
@@ -1380,14 +1610,21 @@ def canonicalize_contract_dicts(
                         if fv != 0.0:
                             merged_init[s_i] = fv
                             break
+            from .slot_schema import ROLE_CONTROL_PARAM, ROLE_TIME_STEP, classify_slot_roles
+            slot_roles = classify_slot_roles(vm) if vm else {}
             for c_ord in ordered_contracts:
                 ci = c_ord.get("initial_state")
                 if not isinstance(ci, list):
                     continue
+                orig_l = orig_lens.get(id(c_ord), 0)
+                has_iv = isinstance(c_ord.get("initial_values"), dict) and bool(c_ord.get("initial_values"))
                 while len(ci) < unified_len:
                     ci.append(0.0)
-                for s_i in range(unified_len):
+                start_idx = orig_l if (has_iv or bool(vm)) else 0
+                for s_i in range(start_idx, unified_len):
                     if ci[s_i] == 0.0 and merged_init[s_i] != 0.0:
+                        if slot_roles.get(s_i) in (ROLE_CONTROL_PARAM, ROLE_TIME_STEP):
+                            continue
                         ci[s_i] = merged_init[s_i]
 
     # Canonicalize explicit variable_map entries against contract-owned names.
@@ -1442,6 +1679,61 @@ def canonicalize_contract_dicts(
                 if nm and len(distinct_slots) == 1 and nm not in first:
                     first[nm] = distinct_slots[0]
         vm = dict(list(first.items())[:64]) or {f"state_{i}": i for i in range(4)}
+
+    # Compile initial_state deterministically from named initial_values when present,
+    # and repair single-slot extrema invariants accidentally bound to instantaneous slots.
+    try:
+        from .slot_schema import compile_initial_state_from_values, observable_name
+        stem_to_slot: Dict[str, int] = {}
+        extrema_stem_to_slot: Dict[str, int] = {}
+        for vname, vslot in vm.items():
+            sem = observable_name(vname)
+            stem_to_slot.setdefault(sem, int(vslot))
+            if sem.startswith(("peak_", "max_", "min_")):
+                extrema_stem_to_slot.setdefault(sem, int(vslot))
+        for c in contracts:
+            if not isinstance(c, dict):
+                continue
+            iv = c.get("initial_values")
+            if isinstance(iv, dict) and iv and vm:
+                c["initial_state"] = compile_initial_state_from_values(
+                    vm, iv, c.get("initial_state")
+                )
+            for inv in (c.get("invariants") or []):
+                if not isinstance(inv, dict):
+                    continue
+                iname = observable_name(str(inv.get("variable_name") or ""))
+                if not iname.startswith(("peak_", "max_", "min_")):
+                    continue
+                base_stem = iname.split("_", 1)[1]
+                # Find matching extrema slot in variable_map (exact stem or prefix match)
+                target_ext_slot = extrema_stem_to_slot.get(iname)
+                if target_ext_slot is None:
+                    prefix = iname.split("_", 1)[0] + "_"
+                    base_tok = base_stem.split("_")[0]
+                    for esem, eslot in extrema_stem_to_slot.items():
+                        if esem.startswith(prefix) and (
+                            esem.split("_", 1)[1] == base_stem
+                            or esem.split("_", 1)[1].startswith(base_tok)
+                        ):
+                            target_ext_slot = eslot
+                            break
+                if target_ext_slot is None:
+                    continue
+                slots_in_assert = sorted(set(_canon_slots_in_text(str(inv.get("assertion") or ""))))
+                if len(slots_in_assert) == 1 and slots_in_assert[0] != target_ext_slot:
+                    bad_slot = slots_in_assert[0]
+                    inv["assertion"] = re.sub(
+                        rf"\bstate\s*\[\s*{bad_slot}\s*\]",
+                        f"state[{target_ext_slot}]",
+                        str(inv.get("assertion") or ""),
+                    )
+                    notes.append(
+                        f"rebound extrema invariant '{inv.get('variable_name')}' "
+                        f"from state[{bad_slot}] to extrema slot state[{target_ext_slot}]"
+                    )
+    except Exception:  # noqa: BLE001
+        pass
     return contracts, vm, notes
 
 
@@ -1546,8 +1838,105 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         out["variable_map"] = vm
     elif variable_map is not None:
         out.pop("variable_map", None)
+    raw_roles = out.get("slot_roles")
+    if isinstance(raw_roles, dict):
+        from .slot_schema import _CONTROL_PARAM_NAME_RE, from_blueprint_role, to_blueprint_role
+
+        _rate_diag_re = re.compile(
+            r"(?:_(?:rate|flux|load|slope|current)(?:_[a-z0-9]+)*$|^d[A-Z0-9_]+_slope)",
+            re.I,
+        )
+        vm_slots = out.get("variable_map") or {}
+        contracts_list = out.get("contracts") or []
+        roles_clean: Dict[str, str] = {}
+        for k, v in list(raw_roles.items())[:4096]:
+            ks = str(k).strip()[:120]
+            if not ks:
+                continue
+            b_role = to_blueprint_role(from_blueprint_role(str(v).strip()))
+            if (
+                b_role == "read_only_parameter"
+                and _rate_diag_re.search(ks)
+                and not _CONTROL_PARAM_NAME_RE.match(ks)
+            ):
+                # Check if initial values for this slot are zero/unset across contracts
+                slot_idx = vm_slots.get(ks)
+                inits: List[float] = []
+                for c in contracts_list:
+                    if not isinstance(c, dict):
+                        continue
+                    iv = c.get("initial_values") or {}
+                    if isinstance(iv, dict) and ks in iv:
+                        try:
+                            inits.append(float(iv[ks]))
+                            continue
+                        except (TypeError, ValueError):
+                            pass
+                    init_list = c.get("initial_state") or []
+                    if slot_idx is not None and 0 <= int(slot_idx) < len(init_list):
+                        try:
+                            inits.append(float(init_list[int(slot_idx)]))
+                        except (TypeError, ValueError):
+                            pass
+                if not inits or all(abs(val) <= 1e-15 for val in inits):
+                    b_role = "diagnostic"
+            roles_clean[ks] = b_role
+        out["slot_roles"] = roles_clean
+    elif raw_roles is not None:
+        out.pop("slot_roles", None)
     if isinstance(out.get("contracts"), list):
         if isinstance(out.get("code_template"), str) and out["code_template"].strip():
+            _vm_pre = out.get("variable_map") if isinstance(out.get("variable_map"), dict) else {}
+            if _vm_pre:
+                from .slot_schema import _analyze_code_slot_flow, observable_name
+                _qual_re = re.compile(
+                    r"_(?:plausible|target|envelope|ceiling|floor|bounds?|window|final|baseline|initial|check|limit|corridor|steady|range|valid|ok|horizon|s|v|mv|mm|um|mol|m3|k|m|hz|db|s_m2|mmhg|units|frac|j_m2)$",
+                    re.I,
+                )
+                def _strip_qual(s_name: str) -> str:
+                    base = observable_name(s_name)
+                    prev = None
+                    while base and base != prev:
+                        prev = base
+                        base = _qual_re.sub("", base)
+                    return base or observable_name(s_name)
+
+                _flow_pre = _analyze_code_slot_flow(out["code_template"])
+                _written_pre = _flow_pre.get("all_writes", _flow_pre["writes"])
+                _slot_to_vnames: Dict[int, List[str]] = {}
+                _sem_to_vslot: Dict[str, int] = {}
+                for _vn, _vs in _vm_pre.items():
+                    try:
+                        _vsi = int(_vs)
+                    except (TypeError, ValueError):
+                        continue
+                    _slot_to_vnames.setdefault(_vsi, []).append(str(_vn))
+                    _sem_to_vslot.setdefault(observable_name(str(_vn)), _vsi)
+                    _sem_to_vslot.setdefault(_strip_qual(str(_vn)), _vsi)
+                for _c_pre in out["contracts"]:
+                    if not isinstance(_c_pre, dict):
+                        continue
+                    for _inv_pre in (_c_pre.get("invariants") or []):
+                        if not isinstance(_inv_pre, dict):
+                            continue
+                        _inm = str(_inv_pre.get("variable_name") or "").strip()
+                        _ias = str(_inv_pre.get("assertion") or "")
+                        _islots = sorted(set(_canon_slots_in_text(_ias)))
+                        if len(_islots) != 1:
+                            continue
+                        _s_cur = _islots[0]
+                        _target_vs = _vm_pre.get(_inm)
+                        if _target_vs is None:
+                            _target_vs = _sem_to_vslot.get(observable_name(_inm))
+                        if _target_vs is None:
+                            _target_vs = _sem_to_vslot.get(_strip_qual(_inm))
+                        if _target_vs is None:
+                            continue
+                        _target_vsi = int(_target_vs)
+                        if _target_vsi != _s_cur and _target_vsi in _written_pre:
+                            _cur_owners = _slot_to_vnames.get(_s_cur, [])
+                            if (_cur_owners and all(_strip_qual(o) != _strip_qual(_inm) for o in _cur_owners)) or _s_cur not in _written_pre:
+                                _inv_pre["assertion"] = _canon_rewrite_slots(_ias, _s_cur, _target_vsi)
             from ..healing.deterministic_ast import resolve_slot_collisions
             new_code, new_contracts, _ = resolve_slot_collisions(
                 out["code_template"], out["contracts"], out["contracts"]
@@ -1696,15 +2085,386 @@ def _fill(template: str, **values: Any) -> str:
     return out.replace("\x00", "{").replace("\x01", "}")
 
 
-def format_literature(items: List[Dict[str, Any]], limit: int = 8) -> str:
+def compact_literature_digest(
+    items: List[Dict[str, Any]],
+    limit: int = 6,
+    max_chars: int = 2800,
+    *,
+    question: str = "",
+    title: str = "",
+    hypothesis: str = "",
+) -> str:
+    """Bounded, relevance-ranked evidence digest (top-K citations, equations, SI constants)."""
     if not items:
         return "(none retrieved)"
-    lines = []
-    for it in items[:limit]:
+    try:
+        from .report import rank_literature_by_relevance
+        ranked = rank_literature_by_relevance(
+            items, prompt=question, title=title, hypothesis=hypothesis
+        )
+    except Exception:  # noqa: BLE001
+        ranked = list(items)
+    lines: List[str] = []
+    total_chars = 0
+    for it in ranked[:limit]:
+        if not isinstance(it, dict):
+            continue
         year = f" ({it.get('year')})" if it.get("year") else ""
-        summary = (it.get("summary") or "")[:400]
-        lines.append(f"- [{it.get('source')}] {it.get('title')}{year}: {summary}")
-    return "\n".join(lines)
+        summary = truncate_at_sentence(str(it.get("summary") or ""), 220)
+        eqs = [str(e) for e in (it.get("equations") or [])[:2] if str(e).strip()]
+        consts = it.get("constants") or {}
+        const_bits = [f"{k}={v}" for k, v in list(consts.items())[:4]] if isinstance(consts, dict) else []
+        extra_bits: List[str] = []
+        if eqs:
+            extra_bits.append("eqs: " + "; ".join(eqs)[:160])
+        if const_bits:
+            extra_bits.append("consts: " + ", ".join(const_bits)[:120])
+        extra_str = f" [{'; '.join(extra_bits)}]" if extra_bits else ""
+        line = f"- [{it.get('source')}] {it.get('title')}{year}: {summary}{extra_str}"
+        if total_chars + len(line) + 1 > max_chars and lines:
+            break
+        lines.append(line[:max_chars])
+        total_chars += len(line) + 1
+    return "\n".join(lines) if lines else "(none retrieved)"
+
+
+def format_literature(
+    items: List[Dict[str, Any]],
+    limit: int = 6,
+    max_chars: int = 2800,
+    *,
+    question: str = "",
+) -> str:
+    return compact_literature_digest(items, limit=limit, max_chars=max_chars, question=question)
+
+
+def summarize_pinned_code_for_prompt(
+    code: str,
+    pinned_functions: Optional[List[str]] = None,
+) -> str:
+    """Delta-only code view: replace already-pinned function bodies with signature + slot stubs.
+
+    Pinned functions (`layer_1_step..layer_{k-1}_step` and explicitly listed
+    `pinned_functions`) are immutable and automatically restored by the accretion
+    merger, so omitting their full bodies saves thousands of tokens on Stage k > 1
+    accretion and healing retries.
+    """
+    import ast as _ast
+
+    raw = (code or "").strip()
+    if not raw:
+        return ""
+    try:
+        tree = _ast.parse(raw)
+    except SyntaxError:
+        return raw[:8000]
+
+    pinned_set = set(pinned_functions or ())
+    if pinned_functions is None:
+        # Auto-detect prior layer_*_step functions only when caller did not
+        # provide an explicit pinned_functions list; never stub the active
+        # highest layer if simulation_step is a thin wrapper calling it.
+        layer_nums = []
+        for node in tree.body:
+            if isinstance(node, _ast.FunctionDef) and node.name.startswith("layer_") and node.name.endswith("_step"):
+                mid = node.name[6:-5]
+                if mid.isdigit():
+                    layer_nums.append((int(mid), node.name))
+        if layer_nums:
+            max_num = max(n for n, _ in layer_nums)
+            has_non_wrapper_sim = any(
+                isinstance(n, _ast.FunctionDef)
+                and n.name == "simulation_step"
+                and len(n.body) > 2
+                for n in tree.body
+            )
+            for num, lname in layer_nums:
+                if num < max_num or has_non_wrapper_sim:
+                    pinned_set.add(lname)
+
+    if not pinned_set:
+        return raw
+
+    out_stmts: List[str] = []
+    for node in tree.body:
+        if isinstance(node, _ast.FunctionDef) and node.name in pinned_set:
+            reads: List[int] = []
+            writes: List[int] = []
+            has_value_return = False
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Return) and sub.value is not None:
+                    has_value_return = True
+                if (
+                    isinstance(sub, _ast.Subscript)
+                    and isinstance(sub.value, _ast.Attribute)
+                    and sub.value.attr == "data"
+                    and isinstance(sub.slice, _ast.Constant)
+                    and isinstance(sub.slice.value, int)
+                ):
+                    idx = int(sub.slice.value)
+                    if isinstance(sub.ctx, _ast.Store):
+                        if idx not in writes:
+                            writes.append(idx)
+                    else:
+                        if idx not in reads:
+                            reads.append(idx)
+            args_str = ", ".join(a.arg for a in node.args.args)
+            reads_s = sorted(reads)[:16]
+            writes_s = sorted(writes)[:16]
+            stub_stmt = "return 0.0" if has_value_return else "pass"
+            out_stmts.append(
+                f"def {node.name}({args_str}):\n"
+                f"    # [PINNED VERIFIED LAYER — body omitted; restored automatically; "
+                f"reads slots {reads_s}, writes slots {writes_s}]\n"
+                f"    {stub_stmt}"
+            )
+        else:
+            out_stmts.append(_ast.unparse(node))
+    return "\n\n".join(out_stmts)
+
+
+def summarize_contracts_for_prompt(contracts: List[Dict[str, Any]], max_chars: int = 4500) -> str:
+    """Compact deterministic JSON serialization of contracts for LLM prompts."""
+    slim: List[Dict[str, Any]] = []
+    for c in contracts or []:
+        if not isinstance(c, dict):
+            c = c.model_dump() if hasattr(c, "model_dump") else {}
+        entry: Dict[str, Any] = {
+            "contract_id": c.get("contract_id"),
+            "dt": c.get("dt"),
+            "steps": c.get("steps"),
+            "invariants": [
+                {
+                    "variable_name": inv.get("variable_name"),
+                    "assertion": inv.get("assertion"),
+                    "tolerance": inv.get("tolerance", 1e-6),
+                }
+                for inv in (c.get("invariants") or [])
+                if isinstance(inv, dict)
+            ],
+        }
+        if c.get("initial_values"):
+            entry["initial_values"] = c.get("initial_values")
+        elif c.get("initial_state"):
+            entry["initial_state"] = list(c.get("initial_state") or [])[:24]
+        slim.append(entry)
+    return json.dumps(slim, sort_keys=True, separators=(",", ":"))[:max_chars]
+
+
+def compute_healing_error_fingerprint(failure: str, code: str = "") -> str:
+    """Canonical error fingerprint `(error_class + normalized_message + offending_symbol/line)`."""
+    import hashlib as _hashlib
+
+    raw = str(failure or "").strip()
+    low = raw.lower()
+    err_class = "GENERIC_FAILURE"
+    for candidate in (
+        "prewrite_guard",
+        "scientific_integrity",
+        "slot_schema_error",
+        "slot_alignment_error",
+        "contract_faithfulness_error",
+        "noop_accretion_layer",
+        "vault_reference",
+        "research_ode_reference_failed",
+        "transpiler",
+        "syntaxerror",
+        "nameerror",
+        "unboundlocalerror",
+        "typeerror",
+        "zerodivisionerror",
+        "diverged",
+        "falsified",
+    ):
+        if candidate in low:
+            err_class = candidate.upper()
+            break
+
+    # Extract offending symbol, variable name, or state[k] slot
+    slots = sorted(set(re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", raw)))
+    symbols = sorted(set(re.findall(r"'([A-Za-z_][A-Za-z0-9_]{1,48})'", raw)))[:4]
+    # Normalize volatile floating-point numbers so minor telemetry jitter on the
+    # same broken invariant or syntax error hashes to the same fingerprint
+    first_line = raw.splitlines()[0] if raw else ""
+    norm_msg = re.sub(r"[-+]?\d+\.\d+(?:[eE][-+]?\d+)?", "<NUM>", first_line.lower())
+    norm_msg = re.sub(r"\s+", " ", norm_msg).strip()[:240]
+    key = f"{err_class}|{norm_msg}|slots={','.join(slots[:6])}|syms={','.join(symbols)}"
+    return _hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _autofix_blueprint_contract_alignment(
+    bp_dict: Dict[str, Any],
+    question: str,
+) -> Dict[str, Any]:
+    """Tier-0 deterministic repair of blueprint contract alignment & sweep coverage (0 tokens)."""
+    if not isinstance(bp_dict, dict):
+        return bp_dict
+    contracts = bp_dict.get("contracts")
+    vm = bp_dict.get("variable_map")
+    if not isinstance(contracts, list) or not contracts or not isinstance(vm, dict) or not vm:
+        return bp_dict
+
+    from .slot_schema import (
+        ROLE_CONTROL_PARAM,
+        ROLE_TIME_STEP,
+        _BAND_NAME_RE,
+        _NONZERO_T0_RE,
+        _STRICT_POS_SWEEP_RE,
+        _UPPER_CEIL_NAME_RE,
+        _bound_directions_in_assertion,
+        classify_variable_roles,
+        compile_initial_state_from_values,
+        observable_name,
+    )
+
+    code = str(bp_dict.get("code_template") or "")
+    slot_roles = bp_dict.get("slot_roles") if isinstance(bp_dict.get("slot_roles"), dict) else {}
+    var_roles = classify_variable_roles(vm, code, contracts, explicit_roles=slot_roles)
+
+    explicit_nonzero_t0 = False
+    for m in _NONZERO_T0_RE.finditer(question or ""):
+        try:
+            if abs(float(m.group(1))) > 1e-12:
+                explicit_nonzero_t0 = True
+                break
+        except ValueError:
+            pass
+
+    param_ranges: Dict[str, Tuple[float, float]] = {}
+    for m in _STRICT_POS_SWEEP_RE.finditer(question or ""):
+        try:
+            p_key = m.group(1).lower()
+            lo, hi = float(m.group(2)), float(m.group(3))
+            if hi >= lo:
+                param_ranges[p_key] = (lo, hi)
+        except ValueError:
+            continue
+
+    n_contracts = len(contracts)
+    for c_idx, c in enumerate(contracts):
+        if not isinstance(c, dict):
+            continue
+        init = list(c.get("initial_state") or [])
+        max_slot = max((int(s) for s in vm.values() if isinstance(s, int)), default=-1)
+        while len(init) <= max_slot:
+            init.append(0.0)
+        iv = dict(c.get("initial_values") or {})
+        frac = (c_idx + 1) / (n_contracts + 1) if n_contracts > 1 else 0.5
+        for name, raw_slot in vm.items():
+            slot = int(raw_slot)
+            role = var_roles.get(name)
+            cur_val = float(iv.get(name, init[slot] if slot < len(init) else 0.0))
+            if role == ROLE_TIME_STEP and not explicit_nonzero_t0:
+                cur_val = 0.0
+            elif role == ROLE_CONTROL_PARAM:
+                nlow = name.lower()
+                for p_stem, (lo, hi) in param_ranges.items():
+                    if nlow == p_stem or nlow.startswith(p_stem + "_"):
+                        if (lo > 0.0 and abs(cur_val) <= 1e-15) or (n_contracts >= 2 and c_idx > 0 and "initial_values" not in c):
+                            cur_val = lo + frac * (hi - lo)
+                        break
+            iv[name] = cur_val
+            if 0 <= slot < len(init):
+                init[slot] = cur_val
+        c["initial_values"] = iv
+        c["initial_state"] = compile_initial_state_from_values(vm, iv, init)
+
+    # Ensure parameter sweep variation across contracts when prompt requests a sweep
+    if n_contracts >= 2 and param_ranges:
+        for p_stem, (lo, hi) in param_ranges.items():
+            if hi <= lo:
+                continue
+            matching = [
+                (name, int(slot))
+                for name, slot in vm.items()
+                if var_roles.get(name) == ROLE_CONTROL_PARAM
+                and (name.lower() == p_stem or name.lower().startswith(p_stem + "_"))
+            ]
+            for name, slot in matching:
+                vals = [
+                    round(float((c.get("initial_state") or [0.0] * (slot + 1))[slot]), 12)
+                    for c in contracts
+                    if isinstance(c, dict) and slot < len(c.get("initial_state") or [])
+                ]
+                if len(set(vals)) <= 1:
+                    for c_idx, c in enumerate(contracts):
+                        if not isinstance(c, dict):
+                            continue
+                        frac = (c_idx + 1) / (n_contracts + 1)
+                        new_v = lo + frac * (hi - lo)
+                        if isinstance(c.get("initial_values"), dict):
+                            c["initial_values"][name] = new_v
+                        if isinstance(c.get("initial_state"), list) and slot < len(c["initial_state"]):
+                            c["initial_state"][slot] = new_v
+
+    # Repair one-sided band/ceiling invariant names or rebind extrema slots
+    extrema_map: Dict[str, int] = {
+        observable_name(k): int(v)
+        for k, v in vm.items()
+        if observable_name(k).startswith(("peak_", "max_", "min_"))
+    }
+    for c in contracts:
+        if not isinstance(c, dict):
+            continue
+        for inv in c.get("invariants") or []:
+            if not isinstance(inv, dict):
+                continue
+            iname = str(inv.get("variable_name") or "")
+            assertion = str(inv.get("assertion") or "")
+            has_lo, has_hi = _bound_directions_in_assertion(assertion)
+            if _BAND_NAME_RE.search(iname) and not (has_lo and has_hi):
+                # Rename one-sided assertion so it does not claim to be a two-sided band
+                inv["variable_name"] = re.sub(
+                    r"(?:^|_)(?:band|window|corridor|range)(?=_|$)",
+                    "_positivity" if has_lo else "_check",
+                    iname,
+                    flags=re.I,
+                ).strip("_") or "state_check"
+            elif (
+                _UPPER_CEIL_NAME_RE.search(iname)
+                and not iname.lower().startswith(("min_", "lower_"))
+                and not iname.lower().endswith(("_nonneg", "_nonnegative", "_positivity", "_finite"))
+                and not has_hi
+            ):
+                inv["variable_name"] = re.sub(
+                    r"(?:^|_)(?:bound|max|limit|ceiling|cap)(?=_|$)",
+                    "_positivity" if has_lo else "_check",
+                    iname,
+                    flags=re.I,
+                ).strip("_") or "state_positivity"
+            sem = observable_name(str(inv.get("variable_name") or ""))
+            if sem in extrema_map:
+                target_slot = extrema_map[sem]
+                slots_in_a = sorted(set(_canon_slots_in_text(assertion)))
+                if len(slots_in_a) == 1 and slots_in_a[0] != target_slot:
+                    inv["assertion"] = _canon_rewrite_slots(assertion, slots_in_a[0], target_slot)
+    return bp_dict
+
+
+async def _emit_plan_progress(
+    progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]],
+    step: str,
+    message: str,
+    **extra: Any,
+) -> None:
+    """Emit immediate, flushed console & SSE progress logs during blueprint planning."""
+    import inspect as _inspect
+    import sys as _sys
+
+    line = f"[PLAN_PROGRESS:{step}] {message}"
+    try:
+        _sys.stderr.write(line + "\n")
+        _sys.stderr.flush()
+    except Exception:
+        pass
+    if progress_cb is not None:
+        payload = {"event": "activity", "stage": "PLAN", "step": step, "message": message, **extra}
+        try:
+            res = progress_cb("search_log", payload)
+            if _inspect.isawaitable(res):
+                await res
+        except Exception:
+            pass
 
 
 def _feasibility_context(feasibility: Any) -> str:
@@ -1737,22 +2497,26 @@ async def generate_research_plan(question: str,
     ``fallback`` must be False whenever an LLM provider is configured: the canned
     KdV stub is restricted to explicit offline (no-key) unit-test mode.
     """
+    from ..llm.telemetry import llm_call_context
+
     error: Optional[str] = None
     evidence = _compute_structured_evidence(question, literature)
     if llm_complete is not None:
         try:
             prompt = _fill(PLANNER_PROMPT, tools=TOOLS_CONTEXT,
                            feasibility=_feasibility_context(feasibility),
-                           literature=format_literature(literature or []),
+                           literature=compact_literature_digest(literature or [], question=question),
                            question=question)
             prompt += _evidence_prompt_block(evidence)
             if extra_context:
                 prompt += "\n\n" + extra_context
-            raw = await llm_complete(prompt)
+            with llm_call_context("blueprint_planning", attempt=1):
+                raw = await llm_complete(prompt)
             data = _extract_json(str(raw))
             if isinstance(data, dict):
                 bp = parse_blueprint(data)
                 bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
+                bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
                 return {"blueprint": _attach_evidence(bp_dict, evidence),
                         "source": "llm", "structured_evidence": evidence.model_dump() if evidence else None}
             error = "planner returned no JSON object"
@@ -1803,19 +2567,16 @@ async def generate_plan_with_feasibility(question: str,
                                          literature: Optional[List[Dict[str, Any]]] = None,
                                          assume_feasible: bool = False,
                                          extra_context: str = "",
+                                         progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
                                          ) -> Dict[str, Any]:
-    """Single Tier-2 call: feasibility gate + blueprint (Task 4 latency fix).
+    """Single call: feasibility gate + blueprint with immediate progress logging and Tier-0 alignment autofix.
 
     Returns {"feasibility": FeasibilityAssessment|None, "blueprint": dict|None,
     "source": "llm"|"fallback"|"heuristic", ...}. When the verdict is a refusal,
     ``blueprint`` is None. With ``fallback=False`` (live provider configured) any
     synthesis failure raises instead of returning the canned KdV stub.
-
-    ``assume_feasible=True`` is set when Plan Mode already approved this prompt
-    (OPTIMAL_DIRECT / REFORMULATED_SURROGATE): the pre-flight substring
-    heuristics must not reject the approved expert prompt on re-submission;
-    the LLM feasibility assessment inside the combined call still decides.
     """
+    from ..llm.telemetry import llm_call_context
     from .feasibility import (
         _heuristic_verdict,
         is_computational_dynamical_benchmark,
@@ -1823,6 +2584,12 @@ async def generate_plan_with_feasibility(question: str,
     )
 
     heuristic = _heuristic_verdict(question)
+    await _emit_plan_progress(
+        progress_cb,
+        "feasibility_precheck",
+        f"Heuristic feasibility pre-check: verdict={heuristic.verdict}",
+        verdict=str(heuristic.verdict),
+    )
     bypass = assume_feasible and llm_complete is not None
     if heuristic.verdict.startswith("REFUSED") and not bypass:
         # Fast path: clear-cut refusals never reach the LLM.
@@ -1832,10 +2599,19 @@ async def generate_plan_with_feasibility(question: str,
             return {"feasibility": heuristic,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback"}
         raise RuntimeError("research plan synthesis failed: no LLM planner configured")
-    prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
-                   literature=format_literature(literature or []),
-                   question=question)
+
+    compacted_lit = compact_literature_digest(literature or [], question=question)
     evidence = _compute_structured_evidence(question, literature)
+    await _emit_plan_progress(
+        progress_cb,
+        "evidence_compaction",
+        f"Compacted {len(literature or [])} literature sources into {len(compacted_lit)} chars.",
+        raw_sources=len(literature or []),
+        compacted_chars=len(compacted_lit),
+    )
+    prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
+                   literature=compacted_lit,
+                   question=question)
     prompt += _evidence_prompt_block(evidence)
     from .shbt_federation import resolve_shbt_solvability
     shbt_res = resolve_shbt_solvability(question)
@@ -1851,8 +2627,33 @@ async def generate_plan_with_feasibility(question: str,
         )
     if extra_context:
         prompt += "\n\n" + extra_context
-    raw = await llm_complete(prompt)
+
+    est_tokens = max(1, len(prompt) // 4)
+    await _emit_plan_progress(
+        progress_cb,
+        "blueprint_llm_dispatch",
+        f"Dispatching combined feasibility + blueprint synthesis (~{est_tokens} est. input tokens)...",
+        estimated_input_tokens=est_tokens,
+    )
+    seen_error_fingerprints: set = set()
+    with llm_call_context("blueprint_planning", attempt=1):
+        raw = await llm_complete(prompt)
     data = _extract_json(str(raw))
+    if not isinstance(data, dict) and not fallback:
+        fp = compute_healing_error_fingerprint("combined planner returned no JSON object", str(raw)[:400])
+        seen_error_fingerprints.add(fp)
+        await _emit_plan_progress(
+            progress_cb,
+            "blueprint_json_repair",
+            "Initial response lacked valid JSON object; running bounded JSON repair pass...",
+        )
+        with llm_call_context("blueprint_json_repair", attempt=2):
+            raw_json_retry = await llm_complete(
+                prompt
+                + "\n\nCRITICAL: Your previous response did not contain a complete, valid JSON object. "
+                "Emit ONLY one complete valid JSON object matching the required schema."
+            )
+        data = _extract_json(str(raw_json_retry))
     if not isinstance(data, dict):
         if fallback:
             return {"feasibility": heuristic,
@@ -1865,7 +2666,7 @@ async def generate_plan_with_feasibility(question: str,
     if feasibility.verdict.startswith("REFUSED") or (shbt_res.should_activate and (llm_refused or not isinstance(data.get("blueprint"), dict))):
         if shbt_res.should_activate:
             feasibility = heuristic
-            if not isinstance(data.get("blueprint"), dict):
+            if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
                 shbt_prompt = (
                     prompt
                     + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "
@@ -1873,7 +2674,8 @@ async def generate_plan_with_feasibility(question: str,
                     "refuse and NEVER set `blueprint` to null. Output a complete valid `blueprint` "
                     "JSON object using the exact SHBT equations, SI constants, and invariants provided above."
                 )
-                raw2 = await llm_complete(shbt_prompt)
+                with llm_call_context("blueprint_shbt_rescue", attempt=2):
+                    raw2 = await llm_complete(shbt_prompt)
                 data2 = _extract_json(str(raw2))
                 if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
                     data = data2
@@ -1881,7 +2683,7 @@ async def generate_plan_with_feasibility(question: str,
                     data = data2
         elif is_computational_dynamical_benchmark(question):
             feasibility = override_refusal_for_computational_benchmark(question, feasibility)
-            if not isinstance(data.get("blueprint"), dict):
+            if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
                 surrogate_prompt = (
                     prompt
                     + "\n\nIMPORTANT OVERRIDE: The feasibility verdict is REFORMULATED_SURROGATE. "
@@ -1889,7 +2691,8 @@ async def generate_plan_with_feasibility(question: str,
                     "symmetric/compatible surrogate coupling parameters so all stated invariants "
                     "are mathematically consistent and falsifiable."
                 )
-                raw2 = await llm_complete(surrogate_prompt)
+                with llm_call_context("blueprint_surrogate_rescue", attempt=2):
+                    raw2 = await llm_complete(surrogate_prompt)
                 data2 = _extract_json(str(raw2))
                 if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
                     data = data2
@@ -1898,13 +2701,6 @@ async def generate_plan_with_feasibility(question: str,
     bp_raw = data.get("blueprint")
     if not isinstance(bp_raw, dict) and isinstance(data.get("contracts"), list) and data.get("title"):
         bp_raw = data
-    if not isinstance(bp_raw, dict) and not fallback:
-        raw_retry = await llm_complete(prompt)
-        data_retry = _extract_json(str(raw_retry))
-        if isinstance(data_retry, dict):
-            bp_raw = data_retry.get("blueprint")
-            if not isinstance(bp_raw, dict) and isinstance(data_retry.get("contracts"), list) and data_retry.get("title"):
-                bp_raw = data_retry
     if not isinstance(bp_raw, dict):
         if fallback:
             return {"feasibility": feasibility,
@@ -1918,6 +2714,10 @@ async def generate_plan_with_feasibility(question: str,
             return {"feasibility": feasibility,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
                     "planner_error": str(exc)[:300]}
+        fp = compute_healing_error_fingerprint(str(exc))
+        if fp in seen_error_fingerprints:
+            raise
+        seen_error_fingerprints.add(fp)
         repair_prompt = (
             prompt
             + "\n\nCRITICAL SCHEMA VALIDATION ERROR on your previous JSON output: "
@@ -1927,7 +2727,8 @@ async def generate_plan_with_feasibility(question: str,
             "and a non-empty `invariants` list), plus `blueprint_id`, `title`, `falsifiable_hypothesis`, "
             "`search_queries`, `variable_map`, and `code_template`."
         )
-        raw_retry2 = await llm_complete(repair_prompt)
+        with llm_call_context("blueprint_schema_repair", attempt=2):
+            raw_retry2 = await llm_complete(repair_prompt)
         data_retry2 = _extract_json(str(raw_retry2))
         bp_raw2 = None
         if isinstance(data_retry2, dict):
@@ -1938,7 +2739,71 @@ async def generate_plan_with_feasibility(question: str,
             raise
         bp = parse_blueprint(bp_raw2)
     bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
-    bp_dict['research_prompt'] = question
+    bp_dict["research_prompt"] = question
+    # Tier-0 deterministic contract alignment autofix BEFORE running validation checks (0 tokens)
+    bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
+    try:
+        from .slot_schema import audit_contract_alignment, validate_contract_faithfulness
+        _plan_issues: List[str] = []
+        for fn in (
+            lambda: audit_contract_alignment(
+                bp_dict.get("contracts") or [],
+                bp_dict.get("variable_map") or {},
+                prompt=question,
+                code=str(bp_dict.get("code_template") or ""),
+            ),
+            lambda: validate_contract_faithfulness(
+                bp_dict.get("contracts") or [],
+                bp_dict.get("variable_map") or {},
+                prompt=question,
+                code=str(bp_dict.get("code_template") or ""),
+                require_sweep_coverage=True,
+            ),
+        ):
+            try:
+                fn()
+            except ValueError as err:
+                _plan_issues.append(str(err))
+        if _plan_issues and llm_complete is not None:
+            issue_fp = compute_healing_error_fingerprint("; ".join(_plan_issues))
+            if issue_fp not in seen_error_fingerprints:
+                seen_error_fingerprints.add(issue_fp)
+                fix_prompt = (
+                    f"{prompt}\n\n"
+                    "VALIDATION FAILURE ON YOUR PREVIOUS BLUEPRINT JSON:\n- "
+                    + "\n- ".join(_plan_issues)
+                    + "\n\nFix ALL validation issues and emit the complete corrected JSON object:\n"
+                    "1) Every contract MUST include `initial_values` keyed by exact `variable_map` names "
+                    "(TIME_STEP initialized to 0.0, strictly positive CONTROL_PARAMs initialized cleanly inside their ranges).\n"
+                    "2) Every `*_band`, `*_window`, `*_corridor`, `*_bound`, `*_max`, `*_limit` invariant MUST encode its finite upper (and lower) bounds — NEVER collapse to `state[i] >= 0.0`.\n"
+                    "3) Every `peak_*`/`max_*`/`min_*` invariant MUST reference the extrema slot in `variable_map`.\n"
+                    "4) When the prompt requests a parameter sweep, vary CONTROL_PARAM `initial_values` across stages or include an explicit sweep loop in `code_template`."
+                )
+                try:
+                    with llm_call_context("blueprint_alignment_repair", attempt=2):
+                        raw_fix = await llm_complete(fix_prompt)
+                    data_fix = _extract_json(str(raw_fix))
+                    bp_fix = None
+                    if isinstance(data_fix, dict):
+                        bp_fix = data_fix.get("blueprint")
+                        if not isinstance(bp_fix, dict) and isinstance(data_fix.get("contracts"), list) and data_fix.get("title"):
+                            bp_fix = data_fix
+                    if isinstance(bp_fix, dict):
+                        bp2 = parse_blueprint(bp_fix)
+                        bp_dict = _reconcile_time_horizon(bp2.model_dump(), question, evidence)
+                        bp_dict["research_prompt"] = question
+                        bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    await _emit_plan_progress(
+        progress_cb,
+        "blueprint_parse_validation",
+        f"Blueprint '{bp_dict.get('blueprint_id')}' parsed and validated ({len(bp_dict.get('contracts') or [])} contracts).",
+        blueprint_id=bp_dict.get("blueprint_id"),
+        contracts_count=len(bp_dict.get("contracts") or []),
+    )
     return {"feasibility": feasibility,
             "blueprint": _attach_evidence(bp_dict, evidence),
             "source": "llm",
@@ -1958,6 +2823,7 @@ async def generate_expert_research_prompt(question: str,
     without a JSON object are wrapped as the expert prompt (never a canned
     stub, never a 502 for parse drift).
     """
+    from ..llm.telemetry import llm_call_context
     from .feasibility import (
         _heuristic_verdict,
         is_computational_dynamical_benchmark,
@@ -1970,11 +2836,12 @@ async def generate_expert_research_prompt(question: str,
     if llm_complete is None:
         raise RuntimeError("expert prompt synthesis failed: no LLM planner configured")
     prompt = _fill(EXPERT_PROMPT_PLANNER_PROMPT, tools="",
-                   literature=format_literature(literature or []),
+                   literature=compact_literature_digest(literature or [], question=question),
                    question=question)
     if extra_context:
         prompt += "\n\n" + extra_context
-    raw = await llm_complete(prompt)
+    with llm_call_context("expert_prompt_planning", attempt=1):
+        raw = await llm_complete(prompt)
     text = _clean_prompt_text(raw)
     data = _extract_json(text)
     if not isinstance(data, dict):
@@ -1997,7 +2864,8 @@ async def generate_expert_research_prompt(question: str,
                     "Do NOT refuse. Emit the complete expert_prompt using symmetric/compatible "
                     "surrogate coupling parameters."
                 )
-                raw2 = await llm_complete(surrogate_prompt)
+                with llm_call_context("expert_prompt_surrogate_rescue", attempt=2):
+                    raw2 = await llm_complete(surrogate_prompt)
                 text2 = _clean_prompt_text(raw2)
                 data2 = _extract_json(text2)
                 if isinstance(data2, dict) and str(data2.get("expert_prompt") or "").strip():
@@ -2021,42 +2889,73 @@ async def synthesize_accretive_stage(llm_complete: Callable[[str], Any], *,
                                      verified_code: str, verified_contracts: List[Dict[str, Any]],
                                      telemetry: Dict[str, Any],
                                      literature: List[Dict[str, Any]],
-                                     failures: List[str]) -> Dict[str, Any]:
-    """Tier-2: synthesize the stage-k unified module + new contracts."""
+                                     failures: List[str],
+                                     pinned_functions: Optional[List[str]] = None,
+                                     stage_contracts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Synthesize the stage-k delta module + new contracts with delta-only pinned stubs."""
+    from ..llm.telemetry import llm_call_context
+
+    compact_code = summarize_pinned_code_for_prompt(verified_code.strip(), pinned_functions)
+    stage_contracts_text = (
+        summarize_contracts_for_prompt(stage_contracts, max_chars=3000)
+        if stage_contracts
+        else "(none pre-planned; emit stage-specific contracts)"
+    )
     prompt = _fill(
         ACCRETION_PROMPT, tools=TOOLS_CONTEXT, stage=stage, total=total, prev=stage - 1,
-        objective=objective, verified_code=verified_code.strip(),
-        verified_contracts=json.dumps(verified_contracts, indent=1)[:6000],
-        canonical_slots=canonical_slot_map_text(verified_contracts),
-        telemetry=json.dumps(telemetry, default=str)[:3000],
-        literature=format_literature(literature),
+        objective=objective, verified_code=compact_code,
+        verified_contracts=summarize_contracts_for_prompt(verified_contracts, max_chars=3500),
+        stage_contracts=stage_contracts_text,
+        canonical_slots=canonical_slot_map_text(verified_contracts + list(stage_contracts or [])),
+        telemetry=json.dumps(telemetry, sort_keys=True, default=str)[:2000],
+        literature=compact_literature_digest(literature, limit=4, max_chars=1800, question=objective),
         failures="\n".join(f"- {f}" for f in failures[-3:]) or "(none)")
-    raw = await llm_complete(prompt)
+    with llm_call_context(f"stage_{stage}_accretion_synthesis", attempt=len(failures) + 1):
+        raw = await llm_complete(prompt)
     data = _extract_json(str(raw))
     if not isinstance(data, dict) or not isinstance(data.get("code"), str):
-        raise ValueError("accretion synthesis returned no {code, contracts} JSON")
+        code_block = ""
+        text = str(raw or "")
+        for m in _FENCE_RE.finditer(text):
+            blk = m.group(1).strip()
+            if "def " in blk and ("simulation_step" in blk or f"layer_{stage}_step" in blk or "buf" in blk):
+                code_block = blk
+                break
+        if not code_block:
+            stripped = text.strip()
+            if stripped.startswith(("def ", "import ", "#")) and ("simulation_step" in stripped or f"layer_{stage}_step" in stripped):
+                code_block = stripped
+        if not code_block:
+            raise ValueError("accretion synthesis returned no {code, contracts} JSON")
+        data = {"code": code_block, "contracts": []}
     if not isinstance(data.get("contracts"), list) or not data["contracts"]:
-        raise ValueError("accretion synthesis returned no contracts")
-    data["contracts"], data["variable_map"], _ = canonicalize_contract_dicts(
-        data["contracts"], data.get("variable_map"), prior_contracts=verified_contracts)
+        data["contracts"] = []
+    if data["contracts"]:
+        data["contracts"], data["variable_map"], _ = canonicalize_contract_dicts(
+            data["contracts"], data.get("variable_map"), prior_contracts=verified_contracts)
     return data
 
 
 async def request_healing_directives(llm_complete: Callable[[str], Any], *,
                                      objective: str, code: str,
                                      contracts: List[Dict[str, Any]],
-                                     failure: str) -> Optional[Dict[str, Any]]:
+                                     failure: str,
+                                     pinned_functions: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Ask the LLM for structured healing directives only (never source code)."""
     import asyncio
     import inspect
-    prompt = _fill(HEALING_DIRECTIVE_PROMPT, objective=objective,
-                   code=code.strip()[:12000],
-                   contracts=json.dumps(contracts, indent=1)[:6000],
-                   failure=str(failure)[:3000])
+    from ..llm.telemetry import llm_call_context
+
+    compact_code = summarize_pinned_code_for_prompt(code.strip(), pinned_functions)[:8000]
+    prompt = _fill(HEALING_DIRECTIVE_PROMPT, objective=objective[:1500],
+                   code=compact_code,
+                   contracts=summarize_contracts_for_prompt(contracts, max_chars=3000),
+                   failure=str(failure)[:2500])
     try:
-        result = llm_complete(prompt)
-        raw = (await asyncio.wait_for(result, timeout=60.0)
-               if inspect.isawaitable(result) else result)
+        with llm_call_context("reflex_heal_directives"):
+            result = llm_complete(prompt)
+            raw = (await asyncio.wait_for(result, timeout=60.0)
+                   if inspect.isawaitable(result) else result)
     except Exception:  # noqa: BLE001 - directive call is best-effort
         return None
     data = _extract_json(str(raw))
@@ -2071,14 +2970,20 @@ async def request_healing_directives(llm_complete: Callable[[str], Any], *,
 
 async def refine_stage_code(llm_complete: Callable[[str], Any], *, objective: str,
                             code: str, contracts: List[Dict[str, Any]],
-                            failure: str) -> Optional[str]:
-    """Tier-2: repair failing kernel code using the counterexample (contracts fixed)."""
+                            failure: str,
+                            pinned_functions: Optional[List[str]] = None) -> Optional[str]:
+    """Repair failing kernel code using the counterexample (contracts fixed, pinned bodies omitted)."""
+    from ..llm.telemetry import llm_call_context
+
     slot_table = canonical_slot_map_text(contracts)
+    compact_code = summarize_pinned_code_for_prompt(code.strip(), pinned_functions)
     prompt = _fill(REFINE_PROMPT, tools=TOOLS_CONTEXT,
                    objective=f"{objective}\n\n## Canonical Global State Slot Table\n{slot_table}",
-                   code=code.strip(),
-                   contracts=json.dumps(contracts, indent=1)[:6000], failure=failure[:3000])
-    raw = await llm_complete(prompt)
+                   code=compact_code,
+                   contracts=summarize_contracts_for_prompt(contracts, max_chars=4000),
+                   failure=failure[:2500])
+    with llm_call_context("reflex_heal_refine"):
+        raw = await llm_complete(prompt)
     data = _extract_json(str(raw))
     if isinstance(data, dict) and isinstance(data.get("code"), str) and data["code"].strip():
         return data["code"]
@@ -2166,12 +3071,15 @@ async def guided_queries(llm_fast: Optional[Callable[[str], Any]], *, stage: int
                          objective: str, hypothesis: str, telemetry: Dict[str, Any],
                          failures: List[str]) -> Dict[str, Any]:
     """Tier-1 FAST: telemetry-guided literature queries for the next stage."""
+    from ..llm.telemetry import llm_call_context
+
     if llm_fast is not None:
         try:
-            raw = await llm_fast(_fill(
-                QUERY_PROMPT, stage=stage, objective=objective, hypothesis=hypothesis,
-                telemetry=json.dumps(telemetry, default=str)[:2000],
-                failures="; ".join(failures[-3:]) or "none"))
+            with llm_call_context(f"stage_{stage}_query_gen", tier="fast", attempt=1):
+                raw = await llm_fast(_fill(
+                    QUERY_PROMPT, stage=stage, objective=objective, hypothesis=hypothesis,
+                    telemetry=json.dumps(telemetry, sort_keys=True, default=str)[:1500],
+                    failures="; ".join(failures[-3:]) or "none"))
             data = _extract_json(str(raw))
             if isinstance(data, list):
                 qs = [str(q).strip()[:160] for q in data if str(q).strip()]

@@ -208,7 +208,7 @@ def test_instrument_process_terminates_on_app_shutdown(builder_client,tmp_path,m
         launched=client.post('/api/v1/builder/instrument/'+build_id+'/launch',json={})
         assert launched.status_code==200,launched.text
         pid=launched.json()['pid']
-    with pytest.raises(ProcessLookupError):
+    with pytest.raises((ProcessLookupError, OSError, SystemError)):
         os.kill(pid,0)
     assert not app.state.builder_service.instruments
 

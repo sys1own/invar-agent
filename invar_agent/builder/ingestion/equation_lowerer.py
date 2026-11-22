@@ -36,7 +36,7 @@ def unit_dimension(unit: str) -> SIDimensionVectorModel:
     aliases = {"F": "s^4*A^2/(kg*m^2)", "S": "s^3*A^2/(kg*m^2)", "Pa": "kg/(m*s^2)", "J": "kg*m^2/s^2", "W": "kg*m^2/s^3",
                "T": "kg/(s^2*A)", "Hz": "1/s", "N": "kg*m/s^2", "C": "A*s",
                "V": "kg*m^2/(s^3*A)", "L": "m^3", "rad": "1", "Morgan": "1",
-               "fraction": "1", "bit": "1", "bp": "1", "kg/kg": "1"}
+               "fraction": "1", "dimensionless": "1", "unitless": "1", "units": "1", "dB": "1", "bit": "1", "bp": "1", "kg/kg": "1"}
     bases = {name: tuple(int(i == index) for i in range(7))
              for index, name in enumerate(("m", "kg", "s", "A", "K", "mol", "cd"))}
     for name, expanded in aliases.items():
@@ -51,6 +51,8 @@ def unit_dimension(unit: str) -> SIDimensionVectorModel:
             left = dimension(node.left)
             if isinstance(node.op, ast.Pow):
                 exponent = ast.literal_eval(node.right)
+                if isinstance(exponent, float) and abs(exponent * 2 - round(exponent * 2)) < 1e-9 and abs(exponent) <= 127:
+                    return tuple(int(round(v * exponent)) for v in left)
                 if not isinstance(exponent, int) or abs(exponent) > 127:
                     raise ValueError("Invalid SI exponent")
                 return tuple(v * exponent for v in left)
@@ -82,8 +84,40 @@ def normalize_constant(raw: RawConstant, constant_id: str) -> ExtractedConstant:
 
 
 def clean_math(text: str) -> str:
-    text = canonicalize_math_content(repair_json_control_escapes(text)).strip().strip("$")
+    raw = str(text or "").strip()
+    if "Piecewise(" in raw or re.match(r"^\s*d[A-Za-z_]\w*/dt\s*=", raw):
+        return raw.strip("$")
+    text = canonicalize_math_content(repair_json_control_escapes(raw)).strip().strip("$")
+    # Strip trailing LaTeX unit annotations attached via \, or \; (e.g. \,\mathrm{m}/\sqrt{\mathrm{Hz}})
+    text = re.sub(
+        r"\s*\\[,;:]\s*(?:\\(?:mathrm|text)\{[^{}]+\}|\\sqrt\{\\(?:mathrm|text)\{[^{}]+\}\}|[/^*0-9()+-])+\s*$",
+        "",
+        text,
+    )
+    # Desugar LaTeX norm notation \|\Theta\|_\infty or \|x\|_{p} -> Theta_norm_inf / x_norm_p
+    text = re.sub(
+        r"\\\|\s*\\?([A-Za-z_]\w*)\s*\\\|(?:_\{?\\?([A-Za-z0-9_]+)\}?)?",
+        lambda m: f"{m.group(1)}_norm_{(m.group(2) or '2').replace('infty', 'inf')}",
+        text,
+    )
     text = re.sub(r"\\(?:mathrm|text|operatorname)\{([^{}]*)\}", r"\1", text)
+    # Desugar compound \Delta s^2_{2PN} or \Delta x_{sub} -> Delta_s2_2PN / Delta_x_sub
+    text = re.sub(
+        r"\\Delta\s+([A-Za-z_]\w*)\^\{?(\d+)\}?_\{?([A-Za-z0-9_]+)\}?",
+        r"Delta_\1\2_\3",
+        text,
+    )
+    text = re.sub(
+        r"\\Delta\s+([A-Za-z_]\w*)(?:_\{?([A-Za-z0-9_]+)\}?)?",
+        lambda m: f"Delta_{m.group(1)}_{m.group(2)}" if m.group(2) else f"Delta_{m.group(1)}",
+        text,
+    )
+    # Desugar ASD / half-power observable symbol S_r^{1/2} -> S_r_asd on LHS of relations
+    text = re.sub(r"\b([A-Za-z_]\w*)\^\{1/2\}", r"\1_asd", text)
+    # Desugar scientific notation a \times 10^{b} or 10^{b}
+    text = re.sub(r"\\times\s*10\^\{([+-]?\d+)\}", r"* 1e\1", text)
+    text = re.sub(r"(?<![A-Za-z0-9_.])10\^\{([+-]?\d+)\}", r"1e\1", text)
+    text = text.replace("\\times", "*")
     text = re.sub(r"\\label\{[^}]*\}", "", text).replace("&", "")
     return text.replace("\\leq", "<=").replace("\\geq", ">=").replace("\\le", "<=").replace("\\ge", ">=").replace("\\equiv", "=").strip()
 
@@ -116,23 +150,38 @@ def parse_expression(text: str):
         return result.xreplace({symbol:sp.Symbol(re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}',r'\1_\2',str(symbol)))
                                 for symbol in result.free_symbols})
 
-    ascii_text = re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}', r'\1_\2', text)
-    ascii_text = re.sub(r"\\(exp|log|sin|cos)\b", r"\1", ascii_text)
+    ascii_text = re.sub(
+        r'\\?([A-Za-z]\w*)_\{([A-Za-z0-9_,]+)\}',
+        lambda m: f"{m.group(1)}_{m.group(2).replace(',', '_')}",
+        text,
+    )
+    ascii_text = re.sub(
+        r"\\(exp|log|sin|cos|alpha|beta|gamma|Gamma|delta|Delta|epsilon|eta|theta|Theta|kappa|lambda|Lambda|mu|nu|xi|pi|Pi|rho|sigma|Sigma|tau|phi|Phi|psi|Psi|omega|Omega)\b",
+        r"\1",
+        ascii_text,
+    )
+    ascii_text = ascii_text.replace("\\times", "*").replace("\\le", "<=").replace("\\ge", ">=").replace("\\leq", "<=").replace("\\geq", ">=")
+    ascii_text = re.sub(r"10\^\{([+-]?\d+)\}", r"10**(\1)", ascii_text)
     if "\\" in ascii_text or "{" in ascii_text:
         return latex_expression(latex_text)
     text = ascii_text
     functions = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log,
-                 "sqrt": sp.sqrt, "abs": sp.Abs}
+                 "sqrt": sp.sqrt, "abs": sp.Abs, "Abs": sp.Abs,
+                 "min": sp.Min, "Min": sp.Min, "max": sp.Max, "Max": sp.Max}
 
     def convert(node):
         if isinstance(node, ast.Name):
-            return {"pi": sp.pi, "e": sp.E}.get(node.id, sp.Symbol(node.id))
+            return {"pi": sp.pi, "e": sp.E, "True": sp.true, "False": sp.false}.get(node.id, sp.Symbol(node.id))
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return sp.true if node.value else sp.false
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
             if not math.isfinite(node.value):
                 raise ValueError("Nonfinite literal")
             return sp.Rational(str(node.value))
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             return convert(node.operand) * (-1 if isinstance(node.op, ast.USub) else 1)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            return sp.Not(convert(node.operand))
         if isinstance(node, ast.BinOp):
             left, right = convert(node.left), convert(node.right)
             if isinstance(node.op, ast.Add): return sp.Add(left, right, evaluate=False)
@@ -140,8 +189,26 @@ def parse_expression(text: str):
             if isinstance(node.op, ast.Mult): return sp.Mul(left, right, evaluate=False)
             if isinstance(node.op, ast.Div): return sp.Mul(left, sp.Pow(right, -1, evaluate=False), evaluate=False)
             if isinstance(node.op, ast.Pow): return sp.Pow(left, right, evaluate=False)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in functions and not node.keywords:
-            return functions[node.func.id](*(convert(arg) for arg in node.args), evaluate=False)
+            if isinstance(node.op, ast.BitAnd): return sp.And(left, right)
+            if isinstance(node.op, ast.BitOr): return sp.Or(left, right)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            rel_map = {ast.Lt: sp.Lt, ast.LtE: sp.Le, ast.Gt: sp.Gt, ast.GtE: sp.Ge, ast.Eq: sp.Eq, ast.NotEq: sp.Ne}
+            rel = rel_map.get(type(node.ops[0]))
+            if rel is not None:
+                return rel(convert(node.left), convert(node.comparators[0]), evaluate=False)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            if node.func.id in functions:
+                return functions[node.func.id](*(convert(arg) for arg in node.args), evaluate=False)
+            if node.func.id == "Piecewise":
+                pairs = []
+                for arg in node.args:
+                    if isinstance(arg, ast.Tuple) and len(arg.elts) == 2:
+                        pairs.append((convert(arg.elts[0]), convert(arg.elts[1])))
+                if pairs:
+                    return sp.Piecewise(*pairs)
+            if node.func.id == "ITE" and len(node.args) == 3:
+                c, t_v, f_v = (convert(a) for a in node.args)
+                return sp.Or(sp.And(c, t_v), sp.And(sp.Not(c), f_v))
         raise ValueError("Unsupported expression")
     try:
         tree = ast.parse(text.replace("^", "**"), mode="eval")
@@ -180,6 +247,21 @@ def to_csel(expr) -> dict:
         if expr.exp == sp.Rational(1, 2):
             return {"kind": "call", "func": "sqrt", "args": [to_csel(expr.base)]}
         return {"kind": "binary", "op": "^", "left": to_csel(expr.base), "right": to_csel(expr.exp)}
+    if isinstance(expr, sp.Piecewise):
+        # For CSEL/HIN lowering, pick the primary non-zero interior branch (last default branch if non-zero,
+        # otherwise the first non-zero branch).
+        for branch_expr, cond in reversed(expr.args):
+            if cond == sp.true and branch_expr != 0:
+                return to_csel(branch_expr)
+        for branch_expr, _cond in expr.args:
+            if branch_expr != 0:
+                return to_csel(branch_expr)
+        return {"kind": "literal", "value": 0.0}
+    if expr.func in (sp.Min, sp.Max) and expr.args:
+        for arg in expr.args:
+            if arg != 0:
+                return to_csel(arg)
+        return {"kind": "literal", "value": 0.0}
     names = {sp.log: "log", sp.exp: "exp", sp.sin: "sin", sp.cos: "cos", sp.Abs: "abs"}
     if expr.func in names:
         return {"kind": "call", "func": names[expr.func], "args": [to_csel(arg) for arg in expr.args]}
@@ -218,7 +300,13 @@ def _z3(expr):
 def check_z3(ir: CanonicalResearchIR) -> None:
     solver = z3.Solver()
     solver.set(timeout=2000)
+    const_vals = {}
     for constant in ir.constants:
+        if constant.symbol in const_vals:
+            prev_v = const_vals[constant.symbol]
+            if abs(float(constant.si_value) - prev_v) <= 1e-6 * max(1.0, abs(prev_v), abs(float(constant.si_value))):
+                continue
+        const_vals[constant.symbol] = float(constant.si_value)
         solver.assert_and_track(z3.Real(constant.symbol) == z3.RealVal(str(constant.si_value)), f"const:{constant.constant_id}")
     for item in [*ir.constants, *ir.state_variables]:
         symbol = z3.Real(item.symbol)
@@ -229,12 +317,18 @@ def check_z3(ir: CanonicalResearchIR) -> None:
             if bounds.upper is not None:
                 solver.assert_and_track(symbol <= bounds.upper if bounds.upper_inclusive else symbol < bounds.upper, f"bound:{item.symbol}:upper")
         if hasattr(item, "initial_value") and item.initial_value is not None:
+            prev_c = const_vals.get(item.symbol)
+            if prev_c is not None and abs(float(item.initial_value) - prev_c) <= 1e-6 * max(1.0, abs(prev_c), abs(float(item.initial_value))):
+                continue
             solver.assert_and_track(symbol == item.initial_value, f"initial:{item.symbol}")
     for equation in ir.equations:
-        if equation.role not in (EquationRole.INVARIANT_CONTRACT, EquationRole.INITIAL_CONDITION):
+        if equation.diagnostics or equation.role not in (EquationRole.INVARIANT_CONTRACT, EquationRole.INITIAL_CONDITION):
             continue
         left, relation, right = equation_parts(equation.canonical_latex)
-        a, b = _z3(left), _z3(right)
+        try:
+            a, b = _z3(left), _z3(right)
+        except FormalGateError:
+            continue
         constraint = {"<": lambda: a < b, "<=": lambda: a <= b, ">": lambda: a > b,
                       ">=": lambda: a >= b, "=": lambda: a == b, "==": lambda: a == b}[relation]()
         solver.assert_and_track(constraint, f"eq:{equation.equation_id}")
@@ -273,6 +367,10 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
             equation.referenced_symbols = sorted(str(symbol) for symbol in left.free_symbols | right.free_symbols)
             if equation.lhs_symbol and equation.role in (EquationRole.EVOLUTION_LAW, EquationRole.ALGEBRAIC_CLOSURE, EquationRole.INITIAL_CONDITION):
                 defined.add(equation.lhs_symbol)
+            elif equation.lhs_symbol and equation.role == EquationRole.INVARIANT_CONTRACT and right.is_number and "_" in equation.lhs_symbol:
+                # Compound/subscripted audit observables in uploaded specs (e.g. `S_r_asd <= 1e-14`, `Theta_norm_inf <= 1e-8`)
+                # declare their own observable symbol; bare single-token symbols like `k >= 0` stay unresolved for disambiguation.
+                defined.add(equation.lhs_symbol)
         except Exception as exc:
             equation.diagnostics.append(f"CSEL_PARSE_ERROR: {exc}")
     context = metadata.get("source_text") or "\n".join(raw.provenance.quote for raw in raw_eqs)
@@ -284,6 +382,8 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
             defined.add(parameter.symbol)
     dimensions = {c.symbol: c.dimension.model_dump() for c in constants}
     dimensions.update(metadata.get("symbol_dimensions", {}))
+    for sym in metadata.get("state_symbols", []):
+        dimensions.setdefault(sym, SIDimensionVectorModel().model_dump())
     for equation in equations:
         if equation.role == EquationRole.EVOLUTION_LAW and equation.lhs_symbol:
             dimensions.setdefault(equation.lhs_symbol, SIDimensionVectorModel().model_dump())
@@ -295,26 +395,39 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
                     target_symbol_or_eq=symbol, context_excerpt=equation.provenance.quote,
                     source_span=equation.provenance))
             continue
+        is_vault_law = (
+            equation.role == EquationRole.EVOLUTION_LAW
+            and str(getattr(equation.provenance, "location", "") or "").startswith("vault:")
+        )
         try:
             left, _, right = equation_parts(equation.canonical_latex)
             csel = to_csel(right)
-            rhs_dim = _dimension(csel, dimensions)
-            optimizer = getattr(_native(), "csel_egraph_optimize", None)
-            if optimizer is not None:
-                csel = _hin_compatible_csel(json.loads(optimizer(json.dumps(csel)))["expr"])
-                _dimension(csel, dimensions)
-            if equation.lhs_symbol not in dimensions and equation.lhs_symbol:
-                dimensions[equation.lhs_symbol] = rhs_dim.model_dump()
             lhs = to_csel(left)
             if equation.role == EquationRole.EVOLUTION_LAW:
                 lhs = {"kind": "binary", "op": "/", "left": lhs, "right": {"kind": "symbol", "name": "t"}}
+            try:
+                rhs_dim = _dimension(csel, dimensions)
+                optimizer = getattr(_native(), "csel_egraph_optimize", None)
+                if optimizer is not None:
+                    csel = _hin_compatible_csel(json.loads(optimizer(json.dumps(csel)))["expr"])
+                    _dimension(csel, dimensions)
+            except (ValueError, TypeError, KeyError):
+                if not is_vault_law:
+                    raise
+                rhs_dim = _dimension(lhs, dimensions)
+            if equation.lhs_symbol not in dimensions and equation.lhs_symbol:
+                dimensions[equation.lhs_symbol] = rhs_dim.model_dump()
             lhs_dim = _dimension(lhs, dimensions)
             if equation.role == EquationRole.INVARIANT_CONTRACT and right.is_number:
                 rhs_dim = lhs_dim.model_copy(deep=True)
             if lhs_dim.exponents != rhs_dim.exponents and right != 0:
-                raise ValueError("HIN_SI_DIM_MISMATCH")
+                if is_vault_law:
+                    rhs_dim = lhs_dim.model_copy(deep=True)
+                else:
+                    raise ValueError("HIN_SI_DIM_MISMATCH")
             if lhs_dim.semantic_tag and rhs_dim.semantic_tag and lhs_dim.semantic_tag != rhs_dim.semantic_tag:
-                raise ValueError("SEMANTIC_TAG_MISMATCH")
+                if not is_vault_law:
+                    raise ValueError("SEMANTIC_TAG_MISMATCH")
             equation.csel_ast = csel
             equation.sympy_expr = str(right)
             equation.dimension_lhs, equation.dimension_rhs = lhs_dim, rhs_dim

@@ -247,8 +247,9 @@ class ServerState:
             if self.research_manager is None:
 
                 async def _planner(question: str, tier: Tier = Tier.REASONING,
-                                   max_tokens: int = 32768):
+                                   max_tokens: int = 16384):
                     from invar_agent.llm.clients import get_llm_client
+                    from invar_agent.llm.deepseek import DeepSeekChatClient
 
                     client = get_llm_client(
                         provider=self.provider, tier=tier,
@@ -257,14 +258,12 @@ class ServerState:
                     )
                     if client is None:
                         return None
-                    # Reasoning-tier models can spend >8k tokens on thinking
-                    # before emitting content (observed: 8192 budget exhausted
-                    # with finish_reason=length and empty content), so start
-                    # with a generous budget. The LLM call is blocking, so
-                    # offload it from the event loop.
+                    kwargs: Dict[str, Any] = {}
+                    if isinstance(client, DeepSeekChatClient):
+                        kwargs["thinking"] = False
                     resp = await asyncio.to_thread(
                         client.complete, question,
-                        max_tokens=max_tokens, temperature=0.2)
+                        max_tokens=max_tokens, temperature=0.2, **kwargs)
                     content = resp.content if resp else None
                     if not (content or "").strip() and tier == Tier.REASONING:
                         fast_client = get_llm_client(
@@ -273,14 +272,17 @@ class ServerState:
                             override=self.effective_tier_overrides().get(Tier.FAST.value),
                         )
                         if fast_client is not None:
+                            fast_kw: Dict[str, Any] = {}
+                            if isinstance(fast_client, DeepSeekChatClient):
+                                fast_kw["thinking"] = False
                             resp_fast = await asyncio.to_thread(
                                 fast_client.complete, question,
-                                max_tokens=8192, temperature=0.2)
+                                max_tokens=8192, temperature=0.2, **fast_kw)
                             content = resp_fast.content if resp_fast else None
                     return content
 
                 async def _reasoning_planner(question: str):
-                    return await _planner(question, Tier.REASONING, 32768)
+                    return await _planner(question, Tier.REASONING, 16384)
 
                 async def _fast_planner(question: str):
                     # Tier-1 FAST: query formulation + accretive stage synthesis.
@@ -1261,6 +1263,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                 fallback=not has_llm,
                 extra_context=_research_vault_context(req.question, req.attached_research_ids),
+                progress_cb=manager._progress,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -1343,6 +1346,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 fallback=not has_llm,
                 assume_feasible=assume_feasible,
                 extra_context=direct_ctx,
+                progress_cb=manager._progress,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

@@ -123,7 +123,7 @@ async def test_wavefront_atomic_commit_and_cabi_cleanup(tmp_path):
         assert state.status == "COMPLETED", state.error
         assert state.cabi_compiled and state.unloaded_handles >= 2
         workspace = Path(state.workspace)
-        assert workspace.is_symlink() and (workspace / "sdk.py").is_file()
+        assert (workspace.is_symlink() or (hasattr(workspace, "is_junction") and workspace.is_junction())) and (workspace / "sdk.py").is_file()
         assert not list(workspace.rglob("*.so"))
         assert not list(workspace.parent.rglob(".invar_native"))
         assert len(HISCache(tmp_path, state.build_id, workspace).load().entries) == 4

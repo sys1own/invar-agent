@@ -16,7 +16,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .buffer_api import lower_buffer_clock
-from ..research.slot_schema import observable_name
+from ..research.slot_schema import (
+    ROLE_CONTROL_PARAM,
+    ROLE_DIAGNOSTIC,
+    ROLE_STATE,
+    ROLE_TIME_STEP,
+    classify_slot_roles,
+    observable_name,
+)
 from ..research.scientific_integrity import output_dataflow, physical_projection_contracts, protected_observation_slots
 
 logger = logging.getLogger(__name__)
@@ -5670,6 +5677,7 @@ def _is_estimator_comparison_invariant(
 
 def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[Any],
                                         variable_map: Optional[Dict[str, int]] = None,
+                                        slot_roles: Optional[Dict[str, str]] = None,
                                         ) -> Tuple[ast.Module, bool, List[str]]:
     """Ensure 3D Bloch coordinates and contract slot bounds/equalities are satisfied."""
     r_max = _detect_bloch_radius(tree, contracts)
@@ -5677,7 +5685,17 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
     dyn_slots = cls["dynamical_slots"]
     dyn_set = set(dyn_slots)
 
-    protected = protected_observation_slots(tree, contracts, variable_map, _verified_projection_slots(tree, contracts))
+    role_by_slot = classify_slot_roles(variable_map, tree, contracts, explicit_roles=slot_roles)
+    non_state_slots = {
+        s for s, r in role_by_slot.items()
+        if r in (ROLE_DIAGNOSTIC, ROLE_CONTROL_PARAM, ROLE_TIME_STEP)
+    }
+    protected = (
+        protected_observation_slots(
+            tree, contracts, variable_map, _verified_projection_slots(tree, contracts), roles=slot_roles,
+        )
+        | non_state_slots
+    )
 
     extrema_slots: Set[int] = set()
     for fn in _simulation_functions(tree):
@@ -5734,6 +5752,9 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         except (TypeError, ValueError):
             pass
 
+    flow_phys = set(output_dataflow(tree).get("physical") or ())
+    evolving_corridor_lower: Set[int] = set()
+
     def _record_lower(s_idx: int, op_ge: str, val: float) -> None:
         if op_ge == ">=" and -1e-6 <= val <= 0.0:
             nonneg_slots[s_idx] = max(nonneg_slots.get(s_idx, val), val)
@@ -5741,6 +5762,12 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             if s_idx not in strict_gt_slots or val > strict_gt_slots[s_idx]:
                 strict_gt_slots[s_idx] = val
         elif val > 0.0:
+            # Never clamp evolving physical ODE states (flow_phys) up to nonzero discovery thresholds
+            # (e.g. `Delta_Psi >= 0.115 V`), which must stay falsifiable!
+            if s_idx in flow_phys and val > 1e-6:
+                evolving_corridor_lower.add(s_idx)
+                nonneg_slots.setdefault(s_idx, 0.0)
+                return
             adj_val = (val + 1e-12) if op_ge == ">" else val
             if s_idx not in positive_lower_slots or adj_val > positive_lower_slots[s_idx]:
                 positive_lower_slots[s_idx] = adj_val
@@ -5812,12 +5839,15 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
             return None
         return min(vals) if mode == "upper" else max(vals)
 
-    projection_contracts = physical_projection_contracts(tree, contracts, variable_map, _verified_projection_slots(tree, contracts))
+    projection_contracts = physical_projection_contracts(
+        tree, contracts, variable_map, _verified_projection_slots(tree, contracts), roles=slot_roles,
+    )
     for c_idx, contract in enumerate(projection_contracts):
         init_c = _get_contract_initial_list(contract)
         c_pure_invs: List[ast.AST] = []
         for inv_idx, (_name, assertion, _tol) in enumerate(_contract_invariant_items(contract)):
-            if set(_contract_state_slots_from_text(assertion)) & (extrema_slots | protected):
+            inv_slots_all = set(_contract_state_slots_from_text(assertion))
+            if inv_slots_all & (extrema_slots | protected):
                 continue
             is_negative_test = "impossible" in (_name or "").lower()
             try:
@@ -5977,6 +6007,8 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     # Scalar comparison: state[i] >= C, state[i] <= C, or reversed C <= state[i] (resolving initial[k])
                     l_slot = _slot_of_state_ast(lhs)
                     r_slot = _slot_of_state_ast(rhs)
+                    l_base = lhs.value.id if isinstance(lhs, ast.Subscript) and isinstance(lhs.value, ast.Name) else ""
+                    r_base = rhs.value.id if isinstance(rhs, ast.Subscript) and isinstance(rhs.value, ast.Name) else ""
                     matched_cmp = False
                     if l_slot is not None:
                         val = _eval_tight_bound_across_contracts(
@@ -5989,11 +6021,15 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                             val = _eval_const_ast(rhs)
                         if val is not None:
                             if isinstance(cmp_op, (ast.GtE, ast.Gt)):
-                                _record_lower(l_slot, ">=" if isinstance(cmp_op, ast.GtE) else ">", val)
+                                # trace_max[k] >= L is an existential peak milestone, not a universal lower bound
+                                if l_base != "trace_max":
+                                    _record_lower(l_slot, ">=" if isinstance(cmp_op, ast.GtE) else ">", val)
                                 matched_ast_bound = True
                                 matched_cmp = True
                             elif isinstance(cmp_op, (ast.LtE, ast.Lt)):
-                                _record_upper(l_slot, "<=" if isinstance(cmp_op, ast.LtE) else "<", val, contract)
+                                # trace_min[k] <= U is an existential dip milestone, not a universal upper bound
+                                if l_base != "trace_min":
+                                    _record_upper(l_slot, "<=" if isinstance(cmp_op, ast.LtE) else "<", val, contract)
                                 matched_ast_bound = True
                                 matched_cmp = True
                     elif r_slot is not None:
@@ -6007,11 +6043,15 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                             val = _eval_const_ast(lhs)
                         if val is not None:
                             if isinstance(cmp_op, (ast.LtE, ast.Lt)):
-                                _record_lower(r_slot, ">=" if isinstance(cmp_op, ast.LtE) else ">", val)
+                                # C <= trace_max[k] is an existential peak milestone, not a universal lower bound
+                                if r_base != "trace_max":
+                                    _record_lower(r_slot, ">=" if isinstance(cmp_op, ast.LtE) else ">", val)
                                 matched_ast_bound = True
                                 matched_cmp = True
                             elif isinstance(cmp_op, (ast.GtE, ast.Gt)):
-                                _record_upper(r_slot, "<=" if isinstance(cmp_op, ast.GtE) else "<", val, contract)
+                                # U >= trace_min[k] is an existential dip milestone, not a universal upper bound
+                                if r_base != "trace_min":
+                                    _record_upper(r_slot, "<=" if isinstance(cmp_op, ast.GtE) else "<", val, contract)
                                 matched_ast_bound = True
                                 matched_cmp = True
                     if not matched_cmp:
@@ -6077,7 +6117,18 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                     full_ast = _resolve_initial_in_ast(raw_full_ast, init_c)
                 except SyntaxError:
                     full_ast = None
-                if full_ast is not None and _has_only_pure_state_names(full_ast) and _slots_in_ast(full_ast):
+                has_existential_trace_bound = any(
+                    isinstance(n, ast.Subscript)
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id in ("trace_min", "trace_max")
+                    for n in ast.walk(full_ast)
+                ) if full_ast is not None else False
+                if (
+                    full_ast is not None
+                    and not has_existential_trace_bound
+                    and _has_only_pure_state_names(full_ast)
+                    and _slots_in_ast(full_ast)
+                ):
                     c_pure_invs.append(full_ast)
                     if not matched_ast_bound and not has_rel_match:
                         uncovered_pure_invs.append((c_idx, inv_idx, str(_name or ""), contract, full_ast))
@@ -6347,6 +6398,11 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
         fn_tgt for fn_tgt in target_fns
         if not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn_tgt))
     ]
+    for _corr_s in evolving_corridor_lower:
+        other_upper_slots.pop(_corr_s, None)
+        other_upper_strict.discard(_corr_s)
+        unit_upper_slots.discard(_corr_s)
+        quarter_upper_slots.discard(_corr_s)
     if target_fns:
         for fn_tgt in target_fns:
             fn_src = ast.unparse(fn_tgt)
@@ -7007,6 +7063,10 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
                 )
                 if not w_map:
                     continue
+                # Never emit witness resets onto DIAGNOSTIC, CONTROL_PARAM, or TIME_STEP slots.
+                w_map = {ws: wv for ws, wv in w_map.items() if ws not in protected and ws not in extrema_slots}
+                if not w_map:
+                    continue
                 witness_slots.update(w_map)
                 assign_body = "\n".join(f"    buf.data[{ws}] = {wv!r}" for ws, wv in sorted(w_map.items()))
                 w_node = ast.parse(f"if not ({cond_buf}):\n{assign_body}\n").body[0]
@@ -7022,7 +7082,7 @@ def _enforce_bloch_ball_projection_tree(tree: ast.Module, contracts: Sequence[An
 
             assigned_now = _collect_assigned_slots(fn_tgt)
             for s_cov in sorted(pure_contract_slots):
-                if s_cov in assigned_now:
+                if s_cov in assigned_now or s_cov in protected or s_cov in extrema_slots:
                     continue
                 if s_cov in eq_target_slots:
                     fb_v = float(eq_target_slots[s_cov][0])
@@ -8906,6 +8966,242 @@ def _lower_random_calls_tree(tree: ast.Module) -> Tuple[ast.Module, bool, List[s
     return tree, changed, notes
 
 
+_PROJ_TEMP_PREFIXES = (
+    "_ks2_cur_", "_ks2_sc_", "_msum_rem_", "_msum_cur_", "_msum_sc_",
+    "_bloch_", "_alg_target_", "_eb_lim_", "_ratio_den_", "_ratio_lim_",
+    "_prod_pos_", "_invar_sz", "_invar_p",
+)
+
+
+def _is_tier0_projection_stmt(stmt: ast.stmt, state_slots: Set[int]) -> bool:
+    """True when ``stmt`` is a Tier-0 post-step projection, stabilizer, or finiteness guard."""
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id.startswith(_PROJ_TEMP_PREFIXES)
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        cname = _call_name(stmt.value.func)
+        return cname.startswith(("_invar_project_", "_invar_stabilize_state"))
+    if isinstance(stmt, ast.If):
+        test_src = ast.unparse(stmt.test)
+        if any(tok in test_src for tok in ("_ks2_", "_msum_", "_bloch_", "_eb_lim_", "_ratio_", "_prod_pos_", "math.isfinite", "isfinite")):
+            written = _collect_assigned_slots(stmt)
+            if not written or written.issubset(state_slots) or "_invar_" in test_src or "_ks2_" in test_src or "_msum_" in test_src:
+                return True
+    return False
+
+
+def _inline_local_expr(expr: ast.AST, env: Dict[str, ast.AST]) -> ast.AST:
+    """Substitute local variable names using ``env`` (preserving original if unbound)."""
+    class _Sub(ast.NodeTransformer):
+        def __init__(self, seen: Set[str]) -> None:
+            self.seen = seen
+
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if isinstance(node.ctx, ast.Load) and node.id in env and node.id not in self.seen:
+                return _Sub(self.seen | {node.id}).visit(copy.deepcopy(env[node.id]))
+            return node
+
+    return ast.fix_missing_locations(_Sub(set()).visit(copy.deepcopy(expr)))
+
+
+def _is_pure_diagnostic_expr(expr: ast.AST) -> bool:
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Call):
+            cname = _call_name(node.func)
+            if not (cname.startswith("math.") or cname in {"abs", "min", "max", "int", "float", _SAFE_DIV_HELPER}):
+                return False
+    return True
+
+
+def _resync_post_projection_diagnostics_tree(
+    tree: ast.Module,
+    contracts: Sequence[Any] = (),
+    *,
+    variable_map: Optional[Dict[str, int]] = None,
+    slot_roles: Optional[Dict[str, str]] = None,
+) -> Tuple[ast.Module, bool, List[str]]:
+    """Relocate/re-evaluate algebraic DIAGNOSTIC writes after Tier-0 state projections.
+
+    Whenever Tier-0 appends positivity clamps or K-simplex projections at the
+    end of a step function, any pure algebraic DIAGNOSTIC write (or running
+    extremum) that depends on projected STATE slots is moved/re-evaluated
+    after the projection block so reported diagnostics never hold stale
+    pre-projection values.
+    """
+    flow = output_dataflow(tree)
+    phys_proj = _verified_projection_slots(tree, contracts)
+    role_by_slot = classify_slot_roles(
+        variable_map, tree, contracts, explicit_roles=slot_roles, physical_slots=phys_proj,
+    )
+    state_slots = {s for s, r in role_by_slot.items() if r == ROLE_STATE}
+    diag_slots = (
+        {s for s, r in role_by_slot.items() if r == ROLE_DIAGNOSTIC}
+        | (flow["derived"] - phys_proj - flow["clocks"])
+    )
+    if not diag_slots or not state_slots:
+        return tree, False, []
+
+    fn_map = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def _extract_diag_rules(fn_node: ast.FunctionDef, limit_idx: int) -> Tuple[List[Tuple[int, int, ast.AST, Optional[str], bool]], List[Tuple[int, int, int, ast.stmt]]]:
+        body = fn_node.body
+        env: Dict[str, ast.AST] = {}
+        last_state_write: Dict[int, int] = {}
+        alg_writes: List[Tuple[int, int, ast.AST, Optional[str], bool]] = []
+        ext_writes: List[Tuple[int, int, int, ast.stmt]] = []
+        for idx, stmt in enumerate(body[:limit_idx]):
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                tgt, val = stmt.targets[0], stmt.value
+                s_tgt = _state_subscript_slot(tgt)
+                if s_tgt is not None:
+                    if s_tgt in state_slots:
+                        last_state_write[s_tgt] = idx
+                        if isinstance(val, ast.Name) and not val.id.startswith("_"):
+                            env[val.id] = ast.parse(f"buf.data[{s_tgt}]", mode="eval").body
+                        # Invalidate locals computed from earlier pre-write values of s_tgt
+                        for k_name in list(env):
+                            if isinstance(val, ast.Name) and k_name == val.id:
+                                continue
+                            if s_tgt in _slots_in_ast(env[k_name]):
+                                env.pop(k_name, None)
+                    elif s_tgt in diag_slots and s_tgt not in flow["clocks"]:
+                        expanded = _inline_local_expr(val, env)
+                        used = _slots_in_ast(expanded)
+                        if s_tgt not in used and _is_pure_diagnostic_expr(expanded):
+                            src_var = val.id if isinstance(val, ast.Name) and not val.id.startswith("_") else None
+                            read_later = any(
+                                s_tgt in _slots_in_ast(later)
+                                for later in body[idx + 1 : limit_idx]
+                            )
+                            alg_writes.append((idx, s_tgt, expanded, src_var, not read_later))
+                        elif isinstance(val, ast.Call) and _call_name(val.func) in {"min", "max"} and s_tgt in used:
+                            other_slots = used - {s_tgt}
+                            if other_slots & state_slots:
+                                ext_writes.append((idx, s_tgt, min(other_slots & state_slots), copy.deepcopy(stmt)))
+                elif isinstance(tgt, ast.Name) and not tgt.id.startswith("_"):
+                    s_val = _state_subscript_slot(val)
+                    if s_val is not None:
+                        env[tgt.id] = ast.parse(f"buf.data[{s_val}]", mode="eval").body
+                    else:
+                        env[tgt.id] = _inline_local_expr(val, env)
+            elif isinstance(stmt, ast.AugAssign):
+                s_tgt = _state_subscript_slot(stmt.target)
+                if s_tgt is not None and s_tgt in state_slots:
+                    last_state_write[s_tgt] = idx
+            elif isinstance(stmt, ast.If) and len(stmt.body) == 1 and not stmt.orelse:
+                sub = stmt.body[0]
+                if isinstance(sub, ast.Assign) and len(sub.targets) == 1:
+                    d_slot = _state_subscript_slot(sub.targets[0])
+                    s_rhs = _state_subscript_slot(sub.value)
+                    if d_slot in diag_slots and s_rhs in state_slots and d_slot in _slots_in_ast(stmt.test):
+                        ext_writes.append((idx, d_slot, s_rhs, copy.deepcopy(stmt)))
+            else:
+                for w_s in _collect_assigned_slots(stmt):
+                    if w_s in state_slots:
+                        last_state_write[w_s] = idx
+        return alg_writes, ext_writes
+
+    changed = False
+    notes: List[str] = []
+    step_fns = [
+        fn for fn in _simulation_functions(tree)
+        if isinstance(fn, ast.FunctionDef)
+        and not fn.name.startswith("_invar_")
+        and not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn))
+    ]
+    for fn in step_fns:
+        body = fn.body
+        if not body:
+            continue
+        end_limit = len(body) - 1 if isinstance(body[-1], ast.Return) else len(body)
+        proj_indices = [i for i in range(end_limit) if _is_tier0_projection_stmt(body[i], state_slots)]
+        if not proj_indices:
+            continue
+        # Last contiguous run of Tier-0 projection statements
+        proj_end = proj_indices[-1]
+        proj_start = proj_end
+        while proj_start > 0 and _is_tier0_projection_stmt(body[proj_start - 1], state_slots):
+            proj_start -= 1
+        projected_slots: Set[int] = set()
+        for p_stmt in body[proj_start : proj_end + 1]:
+            projected_slots |= (_collect_assigned_slots(p_stmt) & state_slots)
+            if isinstance(p_stmt, ast.Expr) and isinstance(p_stmt.value, ast.Call):
+                cname = _call_name(p_stmt.value.func)
+                if cname.startswith(("_invar_project_mass", "_invar_project_density", "_invar_stabilize_state")):
+                    projected_slots |= (state_slots & {0, 1, 2, 3})
+        if not projected_slots:
+            continue
+
+        alg_writes, ext_writes = _extract_diag_rules(fn, proj_start)
+        # Also pull algebraic diagnostic rules from directly called layer_*_step functions if this stage projected state
+        for called_name in [
+            c.func.id for c in ast.walk(fn)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id.startswith("layer_") and c.func.id in fn_map
+        ]:
+            c_fn = fn_map[called_name]
+            c_alg, c_ext = _extract_diag_rules(c_fn, len(c_fn.body))
+            for _, d_s, exp_rhs, _, _ in c_alg:
+                if not any(x[1] == d_s for x in alg_writes):
+                    alg_writes.append((-1, d_s, exp_rhs, None, False))
+            for _, d_s, s_s, estmt in c_ext:
+                if not any(x[1] == d_s for x in ext_writes):
+                    ext_writes.append((-1, d_s, s_s, estmt))
+
+        existing_post_srcs = {
+            ast.unparse(s)
+            for s in body[proj_end + 1 : end_limit]
+        }
+        to_append: List[ast.stmt] = []
+        indices_to_remove: Set[int] = set()
+
+        for orig_idx, d_slot, expanded_rhs, src_var, relocatable in alg_writes:
+            if not (_slots_in_ast(expanded_rhs) & projected_slots):
+                continue
+            new_assign = ast.parse(
+                f"buf.data[{d_slot}] = {ast.unparse(expanded_rhs)}",
+                mode="exec",
+            ).body[0]
+            ast.fix_missing_locations(new_assign)
+            src_new = ast.unparse(new_assign)
+            if src_new in existing_post_srcs:
+                continue
+            if relocatable and orig_idx >= 0:
+                indices_to_remove.add(orig_idx)
+                if src_var and orig_idx > 0:
+                    prev_s = body[orig_idx - 1]
+                    if (isinstance(prev_s, ast.Assign) and len(prev_s.targets) == 1
+                            and isinstance(prev_s.targets[0], ast.Name) and prev_s.targets[0].id == src_var):
+                        used_after = any(
+                            isinstance(n, ast.Name) and n.id == src_var and isinstance(n.ctx, ast.Load)
+                            for k_i, k_st in enumerate(body)
+                            if k_i not in (orig_idx - 1, orig_idx)
+                            for n in ast.walk(k_st)
+                        )
+                        if not used_after:
+                            indices_to_remove.add(orig_idx - 1)
+            to_append.append(new_assign)
+            existing_post_srcs.add(src_new)
+
+        for orig_idx, d_slot, s_slot, ext_stmt in ext_writes:
+            if s_slot not in projected_slots:
+                continue
+            src_ext = ast.unparse(ext_stmt)
+            if src_ext in existing_post_srcs:
+                continue
+            to_append.append(copy.deepcopy(ext_stmt))
+            existing_post_srcs.add(src_ext)
+
+        if to_append:
+            insert_pos = proj_end + 1
+            body[insert_pos:insert_pos] = to_append
+            if indices_to_remove:
+                fn.body = [st for k_i, st in enumerate(body) if k_i not in indices_to_remove]
+            ast.fix_missing_locations(fn)
+            changed = True
+            notes.append(f"resynced post-projection diagnostic(s) in {fn.name}")
+
+    return tree, changed, notes
+
+
 def _invar_project_k_simplex(code: str, contracts: Sequence[Any] = ()) -> SanitizerResult:
     """Public entry point for Generalized Arbitrary-K Simplex Projection (K >= 2)."""
     return sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
@@ -8940,7 +9236,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
         nonlocal tree, any_changed
         if preserve_dynamics and op_name in conditioning_ops:
             return
-        if slot_roles and op_name in conditioning_ops and args:
+        if op_name in conditioning_ops and args and (slot_roles or variable_map):
             projection_contracts = physical_projection_contracts(
                 tree, args[0], variable_map, _verified_projection_slots(tree, args[0]), slot_roles)
             args = (projection_contracts, *args[1:])
@@ -8972,7 +9268,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     _run_op("REPAIR_HISTORY_SLOTS", _repair_history_slots_tree)
     _run_op("STABILIZE_DYNAMICAL_STATE", _stabilize_dynamical_state_tree, list(contracts or bridge_contracts), stabilize_diverged=stabilize_diverged)
     _run_op("REPAIR_MONOTONE_OBSERVABLES", _repair_monotone_observables_tree, bridge_contracts)
-    _run_op("ENFORCE_BLOCH_BALL_PROJECTION", _enforce_bloch_ball_projection_tree, bridge_contracts, variable_map=variable_map)
+    _run_op("ENFORCE_BLOCH_BALL_PROJECTION", _enforce_bloch_ball_projection_tree, bridge_contracts, variable_map=variable_map, slot_roles=slot_roles)
     _run_op("STRIP_NONE_LITERALS", _strip_none_literals_tree)
     _run_op("LOWER_COMPLEX_TO_REAL", _lower_complex_tree, pinned_functions=pinned_functions)
     _run_op("LOWER_SAFE_DIVISION", _lower_safe_division_tree)
@@ -8980,6 +9276,7 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     _run_op("BRIDGE_UNASSIGNED_CONCEPT_SLOTS", _bridge_unassigned_concept_slots_tree, bridge_contracts)
     _run_op("ENFORCE_CONSERVATION_PROJECTION", _enforce_conservation_projection_tree, bridge_contracts)
     _run_op("ENFORCE_LYAPUNOV_SIGN", _enforce_lyapunov_sign_tree, bridge_contracts)
+    _run_op("RESYNC_POST_PROJECTION_DIAGNOSTICS", _resync_post_projection_diagnostics_tree, bridge_contracts, variable_map=variable_map, slot_roles=slot_roles)
     _run_op("PROTECT_PARAMETER_SLOTS", _protect_parameter_slots_tree, bridge_contracts)
     _run_op("SEED_DISSIPATION_PARAMETERS", _seed_dissipation_parameters_tree, contracts)
     _run_op("LOWER_BUFFER_CLOCK", lower_buffer_clock, bridge_contracts)

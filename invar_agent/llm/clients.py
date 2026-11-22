@@ -16,6 +16,7 @@ from .errors import (
     is_retryable_status,
     is_unsupported_param_error,
 )
+from .telemetry import current_llm_context, extract_usage_tokens, record_llm_call
 
 
 @dataclass
@@ -25,6 +26,20 @@ class LLMResponse:
     output_tokens: int = 0
     model: str = ""
     latency_ms: float = 0.0
+    reasoning_tokens: int = 0
+    cache_hit_tokens: int = 0
+    tier: str = ""
+    phase: str = ""
+    attempt: int = 1
+    latency_s: float = 0.0
+
+    @property
+    def prompt_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    def completion_tokens(self) -> int:
+        return self.output_tokens
 
 
 class LLMClient(Protocol):
@@ -167,12 +182,32 @@ class ChatLLMClient:
                 raise
         choice = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
+        tok_meta = extract_usage_tokens(usage)
+        ctx = current_llm_context()
+        tier_val = self.tier.value if isinstance(self.tier, Tier) else str(self.tier)
+        rec = record_llm_call(
+            model=self.model,
+            tier=ctx.get("tier") or tier_val,
+            phase=ctx.get("phase") or "chat_generate",
+            prompt_tokens=tok_meta["prompt_tokens"],
+            completion_tokens=tok_meta["completion_tokens"],
+            reasoning_tokens=tok_meta["reasoning_tokens"],
+            cache_hit_tokens=tok_meta["cache_hit_tokens"],
+            latency_s=latency / 1000.0,
+            attempt=ctx.get("attempt") or 1,
+        )
         self._last_response = LLMResponse(
             content=choice,
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
+            input_tokens=tok_meta["prompt_tokens"],
+            output_tokens=tok_meta["completion_tokens"],
             model=self.model,
             latency_ms=latency,
+            reasoning_tokens=tok_meta["reasoning_tokens"],
+            cache_hit_tokens=tok_meta["cache_hit_tokens"],
+            tier=rec.tier,
+            phase=rec.phase,
+            attempt=rec.attempt,
+            latency_s=rec.latency_s,
         )
         return choice
 

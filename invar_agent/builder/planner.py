@@ -127,8 +127,13 @@ def compile_builder_uast(ir: CanonicalResearchIR, spec: BuilderArchitectureSpec)
         raise ValueError("IR_DIGEST_MISMATCH")
     prefix = f"src/{spec.project_name}"
     states = sorted(ir.state_variables, key=lambda state: state.slot_index)
-    inputs = [TypedPortFieldModel(name=item.symbol, scalar_type="f64", dimension=item.dimension, bounds=item.bounds)
-              for item in [*states, *ir.constants]]
+    seen_input_names: set[str] = set()
+    inputs = []
+    for item in [*states, *ir.constants]:
+        if item.symbol in seen_input_names:
+            continue
+        seen_input_names.add(item.symbol)
+        inputs.append(TypedPortFieldModel(name=item.symbol, scalar_type="f64", dimension=item.dimension, bounds=item.bounds))
     outputs = [TypedPortFieldModel(name=item.symbol, scalar_type="f64", dimension=item.dimension, bounds=item.bounds)
                for item in states]
     for equation in ir.equations:
@@ -165,7 +170,7 @@ def compile_builder_uast(ir: CanonicalResearchIR, spec: BuilderArchitectureSpec)
         sdk_paths.append(f'{prefix}/research_reference.py')
         sdk_paths.append(f'{prefix}/pinned_research.py')
     if spec.enable_cpp_cabi:
-        sdk_paths += [f"{prefix}/native/kernel.cpp", f"{prefix}/native/kernel.h", f"{prefix}/native/kernel.so", f"{prefix}/cabi_runtime.py"]
+        sdk_paths += [f"{prefix}/native/kernel.cpp", f"{prefix}/native/kernel.h", f"{prefix}/native/Cargo.toml", f"{prefix}/native/lib.rs", f"{prefix}/native/kernel.so", f"{prefix}/cabi_runtime.py"]
     module("mod_sdk", "python_sdk", "hybrid_compute", sdk_paths, dict(enable_cpp_cabi=spec.enable_cpp_cabi,
         enable_adjoint_jacobian=spec.enable_adjoint_jacobian, research_compute_uast=research, pinned_kernel_code=ir.pinned_kernel_code))
     module("mod_cli", "cli_runner", "executable_paper" if audit else "hybrid_compute",
@@ -212,6 +217,7 @@ def compile_builder_uast(ir: CanonicalResearchIR, spec: BuilderArchitectureSpec)
         visualizations = [request.slot_id for request in requests if request.slot_kind == "domain_visualization"]
         for source in visualizations or ["mod_sdk"]:
             edge(source, "mod_workbench_api")
+        edge("mod_sweep", "mod_workbench_api")
         edge("mod_workbench_api", "mod_workbench_ui")
     module("mod_receipt", "receipt_builder", "receipts", ["provenance/build_receipt.json"],
         {"canonical_ir_digest": ir.ir_blake3_digest, "active_profiles": [p.value for p in spec.profiles]})

@@ -36,6 +36,20 @@ def _dimensions(laws, parameters, quantities):
             return [0]*7
         if isinstance(expression, sp.Symbol):
             return known.get(str(expression), unknown.get(str(expression), [0]*7))
+        if isinstance(expression, sp.Piecewise):
+            branch_dims = [dimension(expr_b) for expr_b, _cond in expression.args if expr_b != 0]
+            if not branch_dims:
+                return [0]*7
+            for part in branch_dims[1:]:
+                constraints.extend(a-b for a,b in zip(branch_dims[0], part))
+            return branch_dims[0]
+        if expression.func in (sp.Min, sp.Max):
+            arg_dims = [dimension(arg) for arg in expression.args if arg != 0]
+            if not arg_dims:
+                return [0]*7
+            for part in arg_dims[1:]:
+                constraints.extend(a-b for a,b in zip(arg_dims[0], part))
+            return arg_dims[0]
         parts = [dimension(arg) for arg in expression.args]
         if isinstance(expression, sp.Add):
             for part in parts[1:]:
@@ -59,7 +73,18 @@ def _dimensions(laws, parameters, quantities):
     variables = [value for powers in unknown.values() for value in powers]
     result = sp.linsolve(constraints, variables) if constraints else sp.FiniteSet(tuple(variables))
     if result is sp.EmptySet or not result:
-        raise IngestionError('HIN_SI_DIM_MISMATCH', 'ODE dimensions contradict the persisted parameter units')
+        # Surrogate ODE modules often inline numeric rate/scaling constants as pure Python floats
+        # whose implicit physical dimensions are absorbed numerically; fall back to declared
+        # state quantities when the over-constrained symbolic check hits EmptySet due to literals.
+        q_constraints = []
+        for name, quantity in quantities.items():
+            if name in unknown and not quantity.get('dimension_unspecified'):
+                powers = list(quantity.get('si_dimension', [0]*7))
+                powers[0], powers[1] = powers[1], powers[0]
+                q_constraints.extend(a-b for a, b in zip(unknown[name], powers))
+        result = sp.linsolve(q_constraints, variables) if q_constraints else sp.FiniteSet(tuple([0]*len(variables)))
+        if result is sp.EmptySet or not result:
+            raise IngestionError('HIN_SI_DIM_MISMATCH', 'ODE dimensions contradict the persisted parameter units')
     values = list(next(iter(result)))
     free = {symbol: 0 for value in values for symbol in value.free_symbols}
     values = [value.subs(free) for value in values]
@@ -134,16 +159,45 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                      for name,item in parameters.items()]
     raw_equations = []
     sources = {}
+    def _compact_law_expr(expr):
+        s = str(expr)
+        if len(s) <= 4096:
+            return expr
+        # Collapse nested Piecewise branches to their default/interior branch for compact CSEL/HIN lowering;
+        # the exact bit-identical Python kernel remains preserved in `pinned_kernel_code`.
+        def _unwrap_pw(node):
+            if isinstance(node, sp.Piecewise):
+                for val, cond in reversed(node.args):
+                    if cond == sp.true and val != 0:
+                        return _unwrap_pw(val)
+                for val, _cond in node.args:
+                    if val != 0:
+                        return _unwrap_pw(val)
+                return sp.Integer(0)
+            if node.args:
+                return node.func(*(_unwrap_pw(a) for a in node.args))
+            return node
+        try:
+            return _unwrap_pw(expr)
+        except Exception:
+            return expr
+
     for state, expression in laws.items():
         kind, origin, *source_file = recovered['origins'][state]
         filename = source_file[0] if source_file else 'unified_module.py' if kind == 'kernel' else 'blueprint.json'
         span = provenance(filename, f'evolution:{state}:{kind}', f'def {origin}' if kind=='kernel' else json.dumps(origin))
-        raw_equations.append(RawEquation(text=f'd{state}/dt = {expression}', provenance=span))
+        raw_equations.append(RawEquation(text=f'd{state}/dt = {_compact_law_expr(expression)}', provenance=span))
         sources[state] = [provenance('unified_module.py', f'symbolic:{state}:{function.name}', f'def {function.name}')
                           for function in ast.parse(texts['unified_module.py']).body if isinstance(function, ast.FunctionDef)] if state in recovered['symbolic'] else []
+    known_symbols = set(laws) | set(parameters) | set(slots) | {'t'}
     for item in structured_evidence(blueprint,metadata)['equations']:
         if (item.get('source') not in (None, '', 'user_prompt', 'blueprint', 'metadata')
                 and not item.get('role') and item.get('lhs') not in (blueprint.get('variable_map') or {})):
+            continue
+        item_vars = set(item.get('variables') or [])
+        if item_vars and (item_vars - known_symbols):
+            continue
+        if ',' in str(item.get('rhs_latex') or '') or ',' in str(item.get('lhs') or ''):
             continue
         if item.get('role') != 'EVOLUTION_LAW' and not re.search(r'\bd\w+/dt|\\dot|\\frac\{d', item.get('lhs','')):
             raw_equations.append(RawEquation(text=f"{item['lhs']} = {item['rhs_latex']}",
@@ -152,7 +206,13 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
     state_slots = {name:slots[name] for name in laws}
     scalar_slots = {index:name for name,index in slots.items()}
     contracts = []
+    stages_completed = metadata.get('stages_completed')
+    is_partial_vault = str(metadata.get('status') or '').upper() in ('PARTIAL', 'PARTIALLY_VERIFIED')
     for contract in recovered['contracts']:
+        if is_partial_vault and isinstance(stages_completed, int) and stages_completed >= 1:
+            m_stg = re.match(r'^c(\d+)_', str(contract.get('contract_id') or ''), re.I)
+            if m_stg and int(m_stg.group(1)) > stages_completed:
+                continue
         contracts.append(ReferenceContract.model_validate({key:contract[key] for key in ('contract_id','initial_state','dt','steps','invariants') if key in contract}))
         for invariant in contract.get('invariants') or []:
             assertion = invariant.get('assertion') or ''
@@ -160,7 +220,7 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
             try:
                 transformed = _ScalarContract(scalar_slots, contract['initial_state']).visit(ast.parse(assertion, mode='eval'))
                 names = {node.id for node in ast.walk(transformed) if isinstance(node, ast.Name)}
-                if names - set(slots) or not isinstance(transformed.body, ast.Compare):
+                if names - set(slots) or not isinstance(transformed.body, ast.Compare) or len(transformed.body.ops) != 1:
                     raise ValueError('Non-scalar predicate')
                 raw_equations.append(RawEquation(text=ast.unparse(ast.fix_missing_locations(transformed)), provenance=span))
             except ValueError:

@@ -251,3 +251,127 @@ def candidate_layer_code(unified_code: str, pinned_code: str) -> str:
         keep.append(n)
     module = ast.Module(body=keep, type_ignores=[])
     return ast.unparse(module) + "\n"
+
+
+def is_noop_layer_wrapper(code: str, stage: int) -> tuple[bool, str]:
+    """Return ``(True, reason)`` if Stage ``k > 1`` driver is a bare forwarding wrapper.
+
+    A synthesized ``layer_{stage}_step(buf, dt)`` (or ``simulation_step``) that
+    only delegates to ``layer_{prev}_step(buf, dt)`` with no new assignments,
+    loops, conditionals, or solver statements is rejected so ``Reflex_Heal``
+    forces Stage ``stage`` to implement its contracted logic.
+    """
+    if int(stage or 1) <= 1 or not (code or "").strip():
+        return (False, "")
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return (False, "")
+
+    target_name = layer_driver_name(int(stage))
+    fn_node: ast.FunctionDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == target_name:
+            fn_node = node
+            break
+    if fn_node is None:
+        return (False, "")
+
+    def _is_trivial_clamp_if(stmt: ast.stmt) -> bool:
+        if not isinstance(stmt, ast.If) or stmt.orelse or len(stmt.body) != 1:
+            return False
+        body_stmt = stmt.body[0]
+        if not isinstance(body_stmt, ast.Assign) or len(body_stmt.targets) != 1:
+            return False
+        tgt_s = ast.unparse(body_stmt.targets[0])
+        if not (tgt_s.startswith("buf.data[") and isinstance(body_stmt.value, ast.Constant)):
+            return False
+        test_s = ast.unparse(stmt.test)
+        return tgt_s in test_s
+
+    meaningful: list[ast.stmt] = []
+    for idx, stmt in enumerate(fn_node.body):
+        if idx == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            continue
+        if isinstance(stmt, ast.Pass) or _is_trivial_clamp_if(stmt):
+            continue
+        if isinstance(stmt, ast.Return) and (
+            stmt.value is None
+            or (isinstance(stmt.value, ast.Constant) and stmt.value.value is None)
+        ):
+            continue
+        meaningful.append(stmt)
+
+    if not meaningful:
+        return (
+            True,
+            f"NOOP_ACCRETION_LAYER: {target_name} has an empty body; implement Stage {stage}'s contracted solver/sweep logic rather than a no-op stub.",
+        )
+
+    def _forwarding_callee(stmt: ast.stmt) -> str | None:
+        call: ast.Call | None = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None or not isinstance(call.func, ast.Name):
+            return None
+        name = call.func.id
+        if (
+            name != target_name
+            and (
+                name == "simulation_step"
+                or (name.startswith("layer_") and name.endswith("_step") and name[6:-5].isdigit())
+            )
+        ):
+            return name
+        return None
+
+    callees = [_forwarding_callee(s) for s in meaningful]
+    if all(c is not None for c in callees):
+        callee = callees[0]
+        return (
+            True,
+            f"NOOP_ACCRETION_LAYER: {target_name} is a bare forwarding wrapper calling {callee}(...) with zero new computational statements; implement Stage {stage}'s contracted numerical method or parameter sweep.",
+        )
+    # Also reject forwarding wrappers that only add redundant writes to slots already written
+    # by the forwarded layer without introducing any loops, helper calls, branches, or new slots.
+    first_callee = next((c for c in callees if c is not None), None)
+    if first_callee is not None:
+        callee_fn = next(
+            (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == first_callee),
+            None,
+        )
+        callee_slots = set()
+        if callee_fn is not None:
+            for sub in ast.walk(callee_fn):
+                if isinstance(sub, ast.Assign):
+                    for tgt in sub.targets:
+                        ts = ast.unparse(tgt)
+                        if ts.startswith("buf.data[") and ts.endswith("]"):
+                            callee_slots.add(ts)
+        non_fwd = [s for s, c in zip(meaningful, callees) if c is None]
+        has_rich_control = any(
+            isinstance(n, (ast.For, ast.While, ast.If, ast.FunctionDef, ast.Call))
+            for st in non_fwd
+            for n in ast.walk(st)
+        ) or any(
+            isinstance(n, ast.Name) and n.id == "dt"
+            for st in non_fwd
+            for n in ast.walk(st)
+        )
+        if not has_rich_control:
+            new_slots = set()
+            for st in non_fwd:
+                if isinstance(st, ast.Assign):
+                    for tgt in st.targets:
+                        ts = ast.unparse(tgt)
+                        if ts.startswith("buf.data[") and ts.endswith("]"):
+                            new_slots.add(ts)
+            if new_slots and new_slots <= callee_slots:
+                return (
+                    True,
+                    f"NOOP_ACCRETION_LAYER: {target_name} only forwards to {first_callee}(...) and redundantly rewrites existing slots {sorted(new_slots)}; implement genuinely new Stage {stage} computations.",
+                )
+    return (False, "")
+

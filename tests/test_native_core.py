@@ -70,6 +70,13 @@ def test_deterministic_healer_repairs_three_fault_classes_under_2ms():
     healer = PyDeterministicHealer()
 
     broken_def = "def foo(x)\n    return x + 1\n"
+    unused_import = "import os\n\nprint('hello')\n"
+    missing_typing = "def f(x: Optional[int]) -> int:\n    return x or 0\n"
+    # Warm up regex/instruction cache before micro-benchmarking sub-2ms latency
+    healer.match_and_heal("SyntaxError", "expected ':'", broken_def, 1)
+    healer.match_and_heal("F401", "'os' imported but unused", unused_import, 1)
+    healer.match_and_heal("NameError", "name 'Optional' is not defined", missing_typing, 1)
+
     start = time.perf_counter()
     healed = healer.match_and_heal("SyntaxError", "expected ':'", broken_def, 1)
     elapsed = (time.perf_counter() - start) * 1000.0

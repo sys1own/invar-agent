@@ -185,7 +185,15 @@ class HISCache:
                 output.write(canonical_json(state.model_dump(mode="json")))
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary, self.path)
+            for _attempt in range(5):
+                try:
+                    os.replace(temporary, self.path)
+                    break
+                except PermissionError:
+                    if _attempt == 4:
+                        raise
+                    import time
+                    time.sleep(0.01 * (2 ** _attempt))
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)

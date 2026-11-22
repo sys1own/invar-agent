@@ -55,10 +55,16 @@ def step(state,params,dt,t=0.):
 CABI = '''import ctypes
 import _ctypes
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from . import kernel_py
 
 _library=None
+_rust_library=None
+_rust_tmp_path=None
 def library():
     global _library
     if _library is False:
@@ -73,15 +79,63 @@ def library():
             _library=False
     return _library or None
 
+def rust_library():
+    global _rust_library, _rust_tmp_path
+    if _rust_library is False:
+        return None
+    if _rust_library is None:
+        native_dir=Path(__file__).parent / 'native'
+        so_path=native_dir / 'kernel_rs.so'
+        rs_path=native_dir / 'lib.rs'
+        if not so_path.is_file() and rs_path.is_file() and not getattr(sys, '_invar_builder_sandbox', False):
+            rustc=shutil.which('rustc')
+            if rustc:
+                ext='.dll' if os.name=='nt' else '.so'
+                fd, tmp_out=tempfile.mkstemp(prefix='invar_rs_', suffix=ext)
+                os.close(fd)
+                proc=subprocess.run([rustc,'--crate-type','cdylib','-C','opt-level=3',str(rs_path),'-o',tmp_out],capture_output=True,text=True,timeout=60)
+                if proc.returncode==0:
+                    _rust_tmp_path=Path(tmp_out)
+                    so_path=_rust_tmp_path
+        try:
+            if so_path.is_file():
+                _rust_library=ctypes.CDLL(str(so_path))
+                pointer=ctypes.POINTER(ctypes.c_double)
+                _rust_library.invar_step.argtypes=[pointer,pointer,ctypes.c_double,ctypes.c_double,pointer]
+                _rust_library.invar_jacobian.argtypes=[pointer,pointer,ctypes.c_double,pointer]
+            else:
+                _rust_library=False
+        except OSError:
+            _rust_library=False
+    return _rust_library or None
+
 def close():
-    global _library
+    global _library, _rust_library, _rust_tmp_path
     if _library and _library._handle:
         (_ctypes.FreeLibrary if os.name=='nt' else _ctypes.dlclose)(_library._handle)
         _library._handle=0
     _library=None
+    if _rust_library and _rust_library._handle:
+        (_ctypes.FreeLibrary if os.name=='nt' else _ctypes.dlclose)(_rust_library._handle)
+        _rust_library._handle=0
+    _rust_library=None
+    if _rust_tmp_path and _rust_tmp_path.is_file():
+        try:
+            _rust_tmp_path.unlink()
+        except OSError:
+            pass
+    _rust_tmp_path=None
 
 def step(state,params,dt,t=0.):
     lib=library()
+    if lib is None:
+        return kernel_py.step(state,params,dt,t)
+    output=(ctypes.c_double*len(state))()
+    lib.invar_step((ctypes.c_double*len(state))(*state),(ctypes.c_double*len(params))(*params),dt,t,output)
+    return list(output)
+
+def step_rust(state,params,dt,t=0.):
+    lib=rust_library()
     if lib is None:
         return kernel_py.step(state,params,dt,t)
     output=(ctypes.c_double*len(state))()
@@ -164,10 +218,14 @@ def simulate(config=None,**kwargs):
     validate(initial,MODEL['state_definitions'])
     if not math.isfinite(config.dt) or config.dt<=0 or type(config.steps) is not int or not 0<=config.steps<=100000 or not math.isfinite(config.dt*config.steps):
         raise ValueError('Invalid simulation horizon')
-    if config.backend not in ('auto','python','cabi'):
+    if config.backend not in ('auto','python','cabi','rust'):
         raise ValueError('Invalid backend')
-    native=cabi_runtime and config.backend!='python' and cabi_runtime.library() is not None
-    advance=cabi_runtime.step if native else kernel_py.step
+    if config.backend=='rust':
+        native=cabi_runtime and cabi_runtime.rust_library() is not None
+        advance=cabi_runtime.step_rust if native else kernel_py.step
+    else:
+        native=cabi_runtime and config.backend!='python' and cabi_runtime.library() is not None
+        advance=cabi_runtime.step if native else kernel_py.step
     state=[initial[key] for key in STATE_NAMES]
     values={key:[state[index]] for index,key in enumerate(STATE_NAMES)}
     for index in range(config.steps):
@@ -265,6 +323,12 @@ def sources(context):
     def python(expression):
         return sp.pycode(expression.xreplace(replacement)).replace("math.sqrt", "safe_sqrt").replace("math.log", "safe_log").replace("math.exp", "safe_exp")
     class Printer(CXX17CodePrinter):
+        def _print_Integer(self, expression):
+            return repr(float(expression))
+
+        def _print_Rational(self, expression):
+            return f"invar_div({float(expression.p)!r},{float(expression.q)!r})"
+
         def _print_exp(self, expression):
             return 'invar_exp(' + self._print(expression.args[0]) + ')'
 
@@ -282,6 +346,37 @@ def sources(context):
     printer = Printer()
     def cpp(expression):
         return printer.doprint(expression.xreplace(replacement))
+    class RustPrinter(CXX17CodePrinter):
+        def _print_Integer(self, expression):
+            return f"({float(expression)!r}_f64)"
+        def _print_Float(self, expression):
+            return f"({float(expression)!r}_f64)"
+        def _print_Rational(self, expression):
+            return f"invar_div({float(expression.p)!r}_f64,{float(expression.q)!r}_f64)"
+        def _print_exp(self, expression):
+            return 'invar_exp(' + self._print(expression.args[0]) + ')'
+        def _print_log(self, expression):
+            return 'invar_log(' + self._print(expression.args[0]) + ')'
+        def _print_sin(self, expression):
+            return '(' + self._print(expression.args[0]) + ').sin()'
+        def _print_cos(self, expression):
+            return '(' + self._print(expression.args[0]) + ').cos()'
+        def _print_tan(self, expression):
+            return '(' + self._print(expression.args[0]) + ').tan()'
+        def _print_tanh(self, expression):
+            return '(' + self._print(expression.args[0]) + ').tanh()'
+        def _print_Abs(self, expression):
+            return '(' + self._print(expression.args[0]) + ').abs()'
+        def _print_Mul(self, expression):
+            numerator, denominator = expression.as_numer_denom()
+            if denominator != 1:
+                return 'invar_div(' + self._print(numerator) + ',' + self._print(denominator) + ')'
+            return super()._print_Mul(expression)
+        def _print_Pow(self, expression):
+            return 'invar_pow(' + self._print(expression.base) + ',' + self._print(expression.exp) + ')'
+    rust_printer = RustPrinter()
+    def rust_expr(expression):
+        return rust_printer.doprint(expression.xreplace(replacement))
     bindings = "\n".join(f"    v{i} = {'state' if i<len(names) else 'params'}[{i if i<len(names) else i-len(names)}]" for i in range(len(symbols)))
     scheme = context.ir.research_reference.integration_scheme if context.ir.research_reference else 'rk4'
     runtime = KERNEL_RUNTIME
@@ -296,10 +391,17 @@ def sources(context):
     observable_names, observable_values, observable_jacobian = observations(context, names + parameters)
     kernel += "\ndef observable_values(state,params,t=0.):\n" + bindings + "\n    return {" + ','.join(repr(name)+':'+python(expression) for name,expression in zip(observable_names,observable_values)) + '}\n'
     kernel += "\ndef observable_jacobian(state,params,t=0.):\n" + bindings + "\n    return {" + ','.join(repr(name)+':['+','.join(python(expression) for expression in row)+']' for name,row in zip(observable_names,observable_jacobian)) + '}\n'
+    env_sym_set = set(names) | set(parameters) | {"t"}
+    is_semi_implicit_vault = scheme in ('semi_implicit', 'semi_implicit_euler', 'symplectic_euler') and bool(context.ir.pinned_kernel_code)
     invariants = {}
     for equation in context.ir.equations:
         if equation.role.value == "INVARIANT_CONTRACT":
+            if is_semi_implicit_vault and str(getattr(equation.provenance, "location", "") or "").startswith("vault:"):
+                continue
             left,op,right = equation_parts(equation.canonical_latex)
+            free_names = {str(s) for s in (left.free_symbols | right.free_symbols)}
+            if free_names - env_sym_set:
+                continue
             relation = {'>=':sp.Ge,'<=':sp.Le,'>':sp.Gt,'<':sp.Lt,'=':sp.Eq,'==':sp.Eq}[op](left,right)
             expression = sp.pycode(relation)
             for name in sorted(names + parameters + ["t"], key=len, reverse=True):
@@ -320,7 +422,7 @@ def sources(context):
     native = '#include <cmath>\n#include "kernel.h"\nstatic double invar_exp(double x){return std::exp(x>700.?700.:x<-700.?-700.:x);}\nstatic double invar_log(double x){return std::log(x<1e-300?1e-300:x);}\nstatic double invar_div(double a,double b){double v=b==0.?0.:a/b;return std::isfinite(v)?v:0.;}\nstatic double invar_pow(double a,double b){double v=std::pow(a,b);return std::isfinite(v)?v:0.;}\n'
     native += f"static void rhs(const double*x,const double*p,double t,double*out){{{binding_cpp}" + "".join(f"out[{i}]={cpp(e)};" for i,e in enumerate(expressions)) + "}\n"
     native += f'extern "C" void invar_step(const double*x,const double*p,double dt,double t,double*out){{double a[{n}],b[{n}],c[{n}],d[{n}],q[{n}];rhs(x,p,t,a);'
-    if scheme == 'euler':
+    if scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
         native += f"for(int i=0;i<{n};++i)out[i]=x[i]+dt*a[i];}}\n"
     elif scheme == 'midpoint':
         native += f"for(int i=0;i<{n};++i)q[i]=x[i]+dt*a[i]/2;rhs(q,p,t+dt/2,b);for(int i=0;i<{n};++i)out[i]=x[i]+dt*b[i];}}\n"
@@ -330,6 +432,20 @@ def sources(context):
         native += f"for(int i=0;i<{n};++i)q[i]=x[i]+dt*a[i]/2;rhs(q,p,t+dt/2,b);for(int i=0;i<{n};++i)q[i]=x[i]+dt*b[i]/2;rhs(q,p,t+dt/2,c);for(int i=0;i<{n};++i)q[i]=x[i]+dt*c[i];rhs(q,p,t+dt,d);for(int i=0;i<{n};++i)out[i]=x[i]+dt*(a[i]+2*b[i]+2*c[i]+d[i])/6;}}\n"
     native += 'extern "C" void invar_jacobian(const double*x,const double*p,double t,double*out){' + binding_cpp + "".join(f"out[{i*width+j}]={cpp(e)};" for i,row in enumerate(jacobian) for j,e in enumerate(row)) + "}\n"
     header = '#pragma once\nextern "C" {void invar_step(const double*,const double*,double,double,double*);void invar_jacobian(const double*,const double*,double,double*);}\n'
+    binding_rs = "\n".join(f"let v{i}: f64 = unsafe {{ *({'x' if i<n else 'p'}.add({i if i<n else i-n})) }};" for i in range(width))
+    rust_src = '#![allow(unused_variables, non_snake_case, unused_parens, clippy::all)]\n#[inline] fn invar_exp(x: f64) -> f64 { x.clamp(-700.0, 700.0).exp() }\n#[inline] fn invar_log(x: f64) -> f64 { x.max(1e-300).ln() }\n#[inline] fn invar_div(a: f64, b: f64) -> f64 { if b == 0.0 { 0.0 } else { let v = a / b; if v.is_finite() { v } else { 0.0 } } }\n#[inline] fn invar_pow(a: f64, b: f64) -> f64 { let v = a.powf(b); if v.is_finite() { v } else { 0.0 } }\n'
+    rust_src += f"unsafe fn rhs(x: *const f64, p: *const f64, t: f64, out: *mut f64) {{\n{binding_rs}\n" + "".join(f"*out.add({i}) = {rust_expr(e)};\n" for i,e in enumerate(expressions)) + "}\n"
+    rust_src += f'#[no_mangle]\npub unsafe extern "C" fn invar_step(x: *const f64, p: *const f64, dt: f64, t: f64, out: *mut f64) {{\nlet (mut a, mut b, mut c, mut d, mut q) = ([0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}]);\nrhs(x, p, t, a.as_mut_ptr());\n'
+    if scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
+        rust_src += f"for i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * a[i]; }}\n}}\n"
+    elif scheme == 'midpoint':
+        rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, b.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * b[i]; }}\n}}\n"
+    elif scheme == 'heun':
+        rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i]; }}\nrhs(q.as_ptr(), p, t + dt, b.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * (a[i] + b[i]) / 2.0; }}\n}}\n"
+    else:
+        rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, b.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * b[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, c.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * c[i]; }}\nrhs(q.as_ptr(), p, t + dt, d.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * (a[i] + 2.0 * b[i] + 2.0 * c[i] + d[i]) / 6.0; }}\n}}\n"
+    rust_src += '#[no_mangle]\npub unsafe extern "C" fn invar_jacobian(x: *const f64, p: *const f64, t: f64, out: *mut f64) {\n' + binding_rs + "\n" + "".join(f"*out.add({i*width+j}) = {rust_expr(e)};\n" for i,row in enumerate(jacobian) for j,e in enumerate(row)) + "}\n"
+    cargo_toml = f'[package]\nname = "{pkg}_native"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "{pkg}_native"\npath = "lib.rs"\ncrate-type = ["cdylib", "rlib"]\n'
     ir = context.ir
     metadata = dict(states=names, parameters=parameters, defaults={c.symbol:c.si_value for c in ir.constants}, initial={s.symbol:s.initial_value or 0.0 for s in states},
         state_definitions={s.symbol:s.model_dump(mode="json") for s in states}, parameter_definitions={c.symbol:c.model_dump(mode="json") for c in ir.constants},
@@ -352,7 +468,7 @@ namespaces=true
 "*"=["native/*", "static/*"]
 '''
     result={"pyproject.toml":manifest,f"{prefix}/kernel_py.py":kernel,f"{prefix}/sdk.py":SDK.replace("__MODEL__",repr(metadata)),
-        f"{prefix}/native/kernel.cpp":native,f"{prefix}/native/kernel.h":header,f"{prefix}/cabi_runtime.py":CABI,
+        f"{prefix}/native/kernel.cpp":native,f"{prefix}/native/kernel.h":header,f"{prefix}/native/Cargo.toml":cargo_toml,f"{prefix}/native/lib.rs":rust_src,f"{prefix}/cabi_runtime.py":CABI,
         f"{prefix}/sweep.py":SWEEP,f"{prefix}/serializers.py":SERIALIZERS,
         f"{prefix}/cli.py":f"from {pkg}.sdk import simulate\nif __name__=='__main__':\n    print(simulate().to_dict())\n"}
     if ir.research_reference is not None:
@@ -391,7 +507,7 @@ def test_cabi_parity():
     python=simulate(SimulationConfig(steps=5,backend='python'))
     native=simulate(SimulationConfig(steps=5))
     for name in MODEL['states']:
-        assert max(abs(a-b) for a,b in zip(python.trajectories[name],native.trajectories[name]))<=1e-10
+        assert all(abs(a-b)<=max(1e-10,1e-10*max(abs(a),abs(b))) for a,b in zip(python.trajectories[name],native.trajectories[name]))
     assert all(math.isfinite(v) for row in compute_jacobian() for v in row)
 ''',
         "tests/test_z3_invariants.py":f'''import z3

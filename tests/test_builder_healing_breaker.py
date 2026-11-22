@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -68,7 +69,8 @@ def test_leaf_response_contract_fences_and_private_redacted_capture(tmp_path, fe
     result=HealingController(Client(),diagnostics_dir=tmp_path).tier2("",node,port,graph,"",BuildBreakerBudget())
     assert result.source==source and result.tokens_used==5
     capture=next(tmp_path.glob('*.json'))
-    assert capture.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert capture.stat().st_mode & 0o777 == 0o600
     assert json.loads(capture.read_text())['raw_response'].startswith('```')
     client=Client()
     client.complete=lambda *args,**kwargs: LLMResponse(content=client.api_key, input_tokens=0, output_tokens=0)

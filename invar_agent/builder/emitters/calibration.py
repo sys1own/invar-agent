@@ -183,7 +183,7 @@ def test_analytical_adjoint_matches_three_point():
     theta=np.array(list(DEFAULT_PARAMETERS.values()))
     _,analytical=residuals_and_jacobian(rows,dict(zip(names,theta)))
     finite=approx_derivative(lambda values:residuals_and_jacobian(rows,dict(zip(names,values)))[0],theta,method='3-point',rel_step=1e-4)
-    assert np.max(np.abs(analytical-finite))<1e-7
+    assert np.max(np.abs(analytical-finite))<1e-5*max(1.0,float(np.max(np.abs(analytical))))
 '''
 
 

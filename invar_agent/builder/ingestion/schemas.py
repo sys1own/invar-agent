@@ -176,7 +176,7 @@ class ReferenceContract(StrictModel):
 
 
 class ResearchReference(StrictModel):
-    integration_scheme: Literal['euler','midpoint','heun','rk4'] = 'rk4'
+    integration_scheme: Literal['euler','midpoint','heun','rk4','semi_implicit'] = 'rk4'
     state_slots: dict[str, int]
     variable_map: dict[str, int] = Field(default_factory=dict)
     parameter_slots: dict[str, int] = Field(default_factory=dict)

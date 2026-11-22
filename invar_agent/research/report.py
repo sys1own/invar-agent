@@ -66,13 +66,79 @@ def _stage_rows(state) -> List[str]:
     return rows
 
 
-def _literature_rows(literature: List[Dict[str, Any]], limit: int = 8) -> List[str]:
+def rank_literature_by_relevance(
+    literature: List[Dict[str, Any]],
+    *,
+    prompt: str = "",
+    title: str = "",
+    hypothesis: str = "",
+) -> List[Dict[str, Any]]:
+    """Rank deduplicated literature hits by prompt/domain relevance and Stage 1 priority."""
+    import re as _re
+    stop = {
+        "with", "from", "that", "this", "into", "over", "under", "between",
+        "using", "model", "models", "system", "state", "stage", "stages",
+        "verify", "verification", "simulate", "simulation", "sweep", "protocol",
+        "across", "explicit", "euler", "step", "steps", "time", "initial",
+        "final", "range", "values", "bound", "bounds", "finite", "nonneg",
+    }
+    ctx_tokens = {
+        tok for tok in _re.findall(r"[a-z]{4,}", f"{prompt} {title} {hypothesis}".lower())
+        if tok not in stop
+    }
+    off_re = _re.compile(
+        r"\b(?:covid[- ]?19|sars[- ]?cov[- ]?2|burn\s+contracture|post[- ]?burn|"
+        r"wound\s+healing|randomized\s+controlled\s+trial|case\s+report)\b",
+        _re.I,
+    )
+    clinical_ctx = bool(off_re.search(prompt or "") or off_re.search(hypothesis or ""))
+    scored: List[Tuple[float, int, Dict[str, Any]]] = []
+    seen: set = set()
+    for idx, item in enumerate(literature or []):
+        if not isinstance(item, dict):
+            continue
+        title_s = str(item.get("title") or "untitled")
+        source_s = str(item.get("source") or "?")
+        url_s = str(item.get("url") or "").strip().lower().rstrip("/")
+        norm_t = _re.sub(r"[^a-z0-9]+", " ", title_s.lower()).strip()
+        key = ("url", url_s) if url_s else ("title", source_s, norm_t or title_s)
+        if key in seen:
+            continue
+        seen.add(key)
+        summary_s = str(item.get("summary") or "")
+        t_toks = set(_re.findall(r"[a-z]{4,}", title_s.lower()))
+        s_toks = set(_re.findall(r"[a-z]{4,}", summary_s.lower()))
+        score = 3.0 * len(ctx_tokens & t_toks) + 1.0 * len(ctx_tokens & s_toks)
+        if int(item.get("stage", 1) or 1) == 1:
+            score += 4.0
+        if item.get("equations"):
+            score += 1.5
+        if item.get("constants"):
+            score += 1.0
+        if not clinical_ctx and off_re.search(f"{title_s} {summary_s}"):
+            score -= 8.0
+        scored.append((score, -idx, item))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [x[2] for x in scored]
+
+
+def _literature_rows(
+    literature: List[Dict[str, Any]],
+    limit: int = 12,
+    *,
+    prompt: str = "",
+    title: str = "",
+    hypothesis: str = "",
+) -> List[str]:
+    ranked = rank_literature_by_relevance(
+        literature, prompt=prompt, title=title, hypothesis=hypothesis
+    )
     rows = []
-    for item in literature[:limit]:
-        title = str(item.get("title") or "untitled")[:90]
+    for item in ranked[:limit]:
+        t = str(item.get("title") or "untitled")[:90]
         year = item.get("year") or "n/d"
         source = item.get("source") or "?"
-        rows.append(f"| {source} | {title} | {year} |")
+        rows.append(f"| {source} | {t} | {year} |")
     return rows
 
 
@@ -164,7 +230,12 @@ def build_research_report(state) -> str:
     # 3. Literature & governing equations used
     lines.append("## 3. Literature Retrieved")
     lines.append("")
-    rows = _literature_rows(state.literature)
+    rows = _literature_rows(
+        state.literature,
+        prompt=getattr(bp, "research_prompt", "") or "",
+        title=getattr(bp, "title", "") or "",
+        hypothesis=getattr(bp, "falsifiable_hypothesis", "") or "",
+    )
     if rows:
         lines.append("| Source | Title | Year |")
         lines.append("|---|---|---|")

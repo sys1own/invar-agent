@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import zipfile
 from pathlib import Path
@@ -315,7 +316,7 @@ def test_disambiguation_failure_capture_is_private_and_redacted(tmp_path,content
     assert 'provider-bound-secret' not in path.read_text() and 'sk-synthetic123456' not in path.read_text()
     assert payload['input_tokens']==2 and payload['output_tokens']==3
     assert payload['raw_response']==content.replace('<KEY>','sk-****').replace('sk-synthetic123456','sk-****')
-    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_mode & 0o777 in ({0o600, 0o666} if os.name == 'nt' else {0o600})
     assert str(path) in result.disambiguation_flags[0].resolution_note
 
 

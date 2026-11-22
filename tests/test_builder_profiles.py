@@ -78,8 +78,9 @@ def test_compose_all_four_profiles_michaelis_menten(instrument):
     result=run_python(root,args=['-m','pytest','-q','-p','no:cacheprovider'])
     assert result.returncode==0,result.stdout+result.stderr
     destination=Path('/home/ubuntu/.devin-files/invar-m5-example')
-    if destination.exists(): shutil.rmtree(destination)
-    shutil.copytree(root,destination,ignore=shutil.ignore_patterns('__pycache__','.pytest_cache'))
+    if Path('/home/ubuntu').exists():
+        if destination.exists(): shutil.rmtree(destination)
+        shutil.copytree(root,destination,ignore=shutil.ignore_patterns('__pycache__','.pytest_cache'))
 
 
 def test_profile1_cabi_vs_python_parity(instrument):

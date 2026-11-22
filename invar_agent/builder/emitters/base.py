@@ -63,7 +63,12 @@ def model(context):
     ir = context.ir
     states = sorted(ir.state_variables, key=lambda item: item.slot_index)
     names = [item.symbol for item in states]
-    parameters = [item.symbol for item in ir.constants]
+    seen_params = set(names)
+    parameters = []
+    for item in ir.constants:
+        if item.symbol not in seen_params:
+            seen_params.add(item.symbol)
+            parameters.append(item.symbol)
     equations = {item.lhs_symbol: item for item in ir.equations if item.role == EquationRole.EVOLUTION_LAW}
     if not names or set(names) != set(equations):
         raise ValueError("Every state must have exactly one evolution equation")

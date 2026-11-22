@@ -112,6 +112,43 @@ class BuildRunState(StrictModel):
     total_llm_tokens_used: int = 0
 
 
+def _link_directory(link_path: Path, target_dir: Path) -> None:
+    """Create a directory symlink, falling back to an NTFS junction on Windows without SeCreateSymbolicLinkPrivilege."""
+    try:
+        link_path.symlink_to(target_dir, target_is_directory=True)
+    except OSError:
+        if os.name == "nt":
+            import _winapi
+
+            _winapi.CreateJunction(str(Path(target_dir).resolve()), str(link_path))
+        else:
+            raise
+
+
+def _unlink_directory_link(link_path: Path) -> None:
+    """Remove a directory symlink or Windows NTFS junction without touching its target."""
+    try:
+        link_path.unlink(missing_ok=True)
+    except (PermissionError, IsADirectoryError, OSError):
+        if os.name == "nt":
+            try:
+                os.rmdir(link_path)
+            except OSError:
+                pass
+
+
+def _replace_directory_link(src_link: Path, dst_link: Path) -> None:
+    """Atomically replace directory symlink/junction `dst_link` with `src_link`."""
+    try:
+        os.replace(src_link, dst_link)
+    except (PermissionError, OSError):
+        if os.name == "nt":
+            _unlink_directory_link(dst_link)
+            os.replace(src_link, dst_link)
+        else:
+            raise
+
+
 def _atomic_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid4().hex)
@@ -228,9 +265,9 @@ class BuilderStateMachine:
                         self.state.pytest_passed = prior['verification']['pytest_passed']
                         self.state.pytest_failed = prior['verification']['pytest_failed']
             if not self.workspace.exists():
-                initial = self.root / "generations" / ("initial_" + uuid4().hex)
+                initial = self.root / "generations" / ("i_" + uuid4().hex[:8])
                 initial.mkdir(parents=True)
-                self.workspace.symlink_to(initial, target_is_directory=True)
+                _link_directory(self.workspace, initial)
             cache = HISCache(self.workspace_root, request.build_id, self.workspace)
             checkpoint = cache.new_state(self.uast, plan)
             if previous:
@@ -502,7 +539,9 @@ class BuilderStateMachine:
                                 cases.append({**case, item.name: value if inclusive else math.nextafter(value, direction)})
             (overlay / ".sandbox_tmp").mkdir(exist_ok=True)
             environment = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR") if key in os.environ}
-            environment.update(HOME=str(overlay), TMPDIR=str(overlay / ".sandbox_tmp"), PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+            sandbox_tmp_str = str(overlay / ".sandbox_tmp")
+            environment.update(HOME=str(overlay), TMPDIR=sandbox_tmp_str, TMP=sandbox_tmp_str, TEMP=sandbox_tmp_str,
+                PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
                 PYTHONPATH=os.pathsep.join([str(overlay), str(overlay / "src")]), OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
             config = dict(root=str(overlay), primary=node.target_relpath if node.kind == "llm_extension_slot" else emission.port_file, port=port.model_dump(mode="json") if port else None,
                 cases=cases, imports=[path for path in emission.files if path.endswith(".py") and not Path(path).name.startswith("test_")],
@@ -529,10 +568,10 @@ class BuilderStateMachine:
             collect_transients(overlay / ".sandbox_tmp")
 
     def _commit(self, nodes, outcomes, checkpoint):
-        candidate = self.root / "generations" / ("wave_" + uuid4().hex)
+        candidate = self.root / "generations" / ("w_" + uuid4().hex[:8])
         shutil.copytree(self.workspace.resolve(), candidate)
-        pending = self.root / (".pending_" + uuid4().hex)
-        rollback = self.root / (".rollback_" + uuid4().hex)
+        pending = self.root / (".p_" + uuid4().hex[:8])
+        rollback = self.root / (".r_" + uuid4().hex[:8])
         old = self.workspace.resolve()
         promoted = False
         try:
@@ -547,16 +586,16 @@ class BuilderStateMachine:
                     ownership[relpath] = node.node_id
                     target = artifact_path(candidate, relpath)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = target.with_name(target.name + ".pending")
+                    temporary = target.with_name(target.name + ".tmp")
                     shutil.copyfile(artifact_path(overlay, relpath), temporary)
                     os.replace(temporary, target)
             updated = checkpoint.model_copy(deep=True, update={"artifact_root": str(candidate)})
             cache = HISCache(self.workspace_root, self.state.build_id, candidate)
             for node, (_, emission, fallback) in zip(nodes, outcomes):
                 cache.record_verified(updated, self.uast, node.node_id, list(emission.files), fallback=fallback)
-            pending.symlink_to(candidate, target_is_directory=True)
-            rollback.symlink_to(old, target_is_directory=True)
-            os.replace(pending, self.workspace)
+            _link_directory(pending, candidate)
+            _link_directory(rollback, old)
+            _replace_directory_link(pending, self.workspace)
             promoted = True
             cache.save(updated)
             for node in nodes:
@@ -564,14 +603,14 @@ class BuilderStateMachine:
             return updated
         except BaseException:
             if promoted:
-                os.replace(rollback, self.workspace)
+                _replace_directory_link(rollback, self.workspace)
             rollback_overlay(candidate)
             for node in nodes:
                 self._rollback_module(node.node_id)
             raise
         finally:
-            pending.unlink(missing_ok=True)
-            rollback.unlink(missing_ok=True)
+            _unlink_directory_link(pending)
+            _unlink_directory_link(rollback)
 
     def _receipt(self):
         artifacts = []
@@ -586,7 +625,7 @@ class BuilderStateMachine:
             nodes = {node.node_id: node for node in self.uast.nodes} if self.uast else {}
             for path in sorted(self.workspace.rglob("*")):
                 if path.is_file() and path.relative_to(self.workspace).as_posix() != 'provenance/build_receipt.json':
-                    relpath = str(path.relative_to(self.workspace))
+                    relpath = path.relative_to(self.workspace).as_posix()
                     entry = owners.get(relpath)
                     node = nodes.get(entry.module_id) if entry else None
                     emitted_by = "deterministic_fallback" if entry and entry.verified_status == "FALLBACK_VERIFIED" else "llm_extension_slot" if node and node.kind == "llm_extension_slot" else "deterministic_emitter"

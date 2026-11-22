@@ -229,10 +229,17 @@ def generate_comprehensive_research_report(
     lines.append("## 3. Literature Ingest & Parameter Extraction")
     lines.append("")
     if search_history:
+        from .report import rank_literature_by_relevance
+        ranked_history = rank_literature_by_relevance(
+            search_history,
+            prompt=getattr(bp, "research_prompt", "") or "",
+            title=getattr(bp, "title", "") or "",
+            hypothesis=getattr(bp, "falsifiable_hypothesis", "") or "",
+        )
         lines.append("| Source | Title | Year | URL |")
         lines.append("| :--- | :--- | :--- | :--- |")
         seen_rows = set()
-        for item in search_history:
+        for item in ranked_history:
             title = str(item.get("title") or "untitled")
             source = str(item.get("source") or "?")
             # Collapse duplicate rows (multiple queries hitting the offline

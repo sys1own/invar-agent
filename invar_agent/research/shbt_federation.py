@@ -421,7 +421,7 @@ _SIGNAL_PATTERNS: Dict[str, Tuple[re.Pattern[str], ...]] = {
         re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I),
     ),
     "sys1own/shbt-ghost": (
-        re.compile(r"\bghost[- ]seed\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz)\b", re.I),
+        re.compile(r"\b(?:ghost[- ]seed|m_seed|r_congestion|topological\s+mass[- ]congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz|94\.20%)\b", re.I | re.S),
     ),
     "sys1own/shbt-sglt": (
         re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b(?:21\.715\s*db|10\^-14|minimum[- ]jerk)\b", re.I),

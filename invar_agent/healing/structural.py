@@ -7,7 +7,8 @@ def is_structural_failure(failure: str) -> bool:
     if 'VAULT_REFERENCE_' in failure:
         return False
     return any(marker in failure for marker in (
-        'PreWrite_Guard', 'transpiler:', 'AttributeError', 'NameError',
+        'PreWrite_Guard', 'SCIENTIFIC_INTEGRITY', 'CONTRACT_FAITHFULNESS_ERROR',
+        'SLOT_ALIGNMENT_ERROR', 'transpiler:', 'AttributeError', 'NameError',
         'TypeError', 'SyntaxError', 'IndexError', 'AST firewall', 'SLOT_SCHEMA_ERROR'))
 
 

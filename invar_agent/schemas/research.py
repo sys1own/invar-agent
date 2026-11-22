@@ -49,6 +49,7 @@ class VerificationContract(BaseModel):
     max_memory_mb: int = Field(default=1024, le=8192)
     # Simulation parameters consumed by Sandbox_Execute.
     initial_state: Optional[List[float]] = Field(default=None, max_length=4096)
+    initial_values: Optional[Dict[str, float]] = Field(default=None, max_length=4096)
     dt: float = Field(default=0.01, gt=0.0, le=1e8)
     steps: int = Field(default=1000, ge=1, le=100000)
 

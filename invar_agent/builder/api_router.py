@@ -30,7 +30,7 @@ from .ingestion.archive_guard import IngestionError
 from .ingestion.pipeline import CanonicalResearchIngestionPipeline, apply_ir_override
 from .ingestion.schemas import CanonicalResearchIR, IngestionRequest, IRReviewOverride, StrictModel
 from .planner import BuilderPlanner
-from .state_machine import BuildRequest, BuilderStateMachine, _FORMAL_LOCK, _atomic_json
+from .state_machine import BuildRequest, BuilderStateMachine, _FORMAL_LOCK, _atomic_json, _link_directory
 from .uast_models import BuilderArchitectureSpec, BuilderProfile, BuilderUAST, LLMExtensionSlotRequest
 from .wavefront_scheduler import WavefrontScheduler
 
@@ -382,7 +382,7 @@ def create_builder_router(state):
             new_root = service.build_root(next_id)
             new_root.mkdir(parents=True)
             shutil.copytree((old_root/'workspace').resolve(),new_root/'seed')
-            (new_root/'workspace').symlink_to(new_root/'seed',target_is_directory=True)
+            _link_directory(new_root/'workspace', new_root/'seed')
             if previous:
                 previous.build_id=next_id; previous.artifact_root=str((new_root/'workspace').resolve())
                 HISCache(state.workspace_root,next_id,new_root/'workspace').save(previous)
@@ -443,8 +443,13 @@ def create_builder_router(state):
             environment={key:os.environ[key] for key in ('PATH','SYSTEMROOT','WINDIR') if key in os.environ}
             environment.update(PYTHONPATH=str(workspace/'src'),PYTHONDONTWRITEBYTECODE='1',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1')
             try:
-                process=subprocess.Popen([sys.executable,'-m','uvicorn',package+'.workbench.app:app','--fd',str(listener.fileno())],
-                    pass_fds=(listener.fileno(),),cwd=workspace,env=environment,stdout=log,stderr=log)
+                if os.name == 'nt':
+                    listener.close()
+                    process=subprocess.Popen([sys.executable,'-m','uvicorn',package+'.workbench.app:app','--host','127.0.0.1','--port',str(port)],
+                        cwd=workspace,env=environment,stdout=log,stderr=log)
+                else:
+                    process=subprocess.Popen([sys.executable,'-m','uvicorn',package+'.workbench.app:app','--fd',str(listener.fileno())],
+                        pass_fds=(listener.fileno(),),cwd=workspace,env=environment,stdout=log,stderr=log)
             except Exception:
                 log.close(); raise
             finally:

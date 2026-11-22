@@ -770,6 +770,9 @@ _PARAM_STOPWORDS = {
     "service", "servicing", "covering", "drop", "cell", "accuracy",
     "calculating", "computing", "modeling", "verifying", "coupling",
     "overcoming", "connecting", "incorporating", "shunting", "via",
+    "initialized", "initialised", "configured", "maintained", "kept",
+    "dropping", "rising", "preventing", "coupled", "spanning", "starting",
+    "reoxygenating", "set", "fixed", "held", "ramped", "varied", "ranging",
 }
 
 _BARE_PROSE_NOUNS = {
@@ -815,7 +818,7 @@ def extract_parameters_from_text(text: str, source: str = "",
             return
         if assign_op in (":", "of", "is") and not unit and "_" not in name and len(name) > 3 and name.islower():
             return
-        if source == "user_prompt" and len(name) <= 1:
+        if source == "user_prompt" and len(name) <= 1 and not (assign_op == "=" and bool(unit)):
             return
         # Check if raw identifier is a reserved math function/constant such as `ln(2)`
         raw_tail = re.split(r"[\s,;]+", cleaned_raw.lower())[-1].strip()
@@ -828,7 +831,16 @@ def extract_parameters_from_text(text: str, source: str = "",
         si_value, si_unit = normalize_to_si(value, unit)
         toks = [t for t in cleaned_raw.split() if re.search(r"[A-Za-z]", t)]
         last_tok = toks[-1] if toks else ""
-        symbol = last_tok if (last_tok and len(last_tok) <= 8 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", last_tok)) else ""
+        symbol = (
+            last_tok
+            if (
+                last_tok
+                and len(last_tok) <= 16
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", last_tok)
+                and last_tok.lower() not in (_BARE_PROSE_NOUNS | _PARAM_STOPWORDS)
+            )
+            else ""
+        )
         params.append(ExtractedParameter(
             name=name, symbol=symbol,
             raw_value=value, raw_unit=unit, si_value=si_value, si_unit=si_unit,
@@ -841,15 +853,43 @@ def extract_parameters_from_text(text: str, source: str = "",
         unit = m.group("unit")
         if not is_known_unit(unit):
             continue
-        before = text[max(0, m.start() - 48):m.start()]
-        before = re.split(r"[.;,()\n=\[\]]|>=|<=", before)[-1].strip()
-        # Strip trailing stopwords/prepositions/operators; if empty, inspect trailing noun phrase.
-        words = [
-            w for w in re.split(r"\s+", before)
-            if w and not re.fullmatch(r"(?:>=|<=|==|!=|~=|[<>=\u2264\u2265]+)", w)
-        ]
-        while words and (words[-1].lower() in _PARAM_STOPWORDS or re.match(r"^\d", words[-1])):
-            words.pop()
+        before_raw = text[max(0, m.start() - 72):m.start()]
+        if re.search(
+            r"(?:below|under|above|exceed|exceeding|exceeds|less\s+than|greater\s+than|at\s+most|at\s+least|<=|>=|<|>|\u2264|\u2265)\s*$",
+            before_raw,
+            re.I,
+        ):
+            continue
+        before = re.split(r"[.;,()\n=\[\]]|>=|<=", before_raw)[-1].strip()
+        # Strip trailing stopwords/prepositions/operators; if empty (e.g. parenthetical
+        # `Delta_Psi (initialized at 165 mV)`), walk back across `(` to bind the
+        # preceding scientific identifier or concise parameter phrase.
+        def _clean_words(segment: str) -> List[str]:
+            ws = [
+                w for w in re.split(r"\s+", segment.strip())
+                if w and not re.fullmatch(r"(?:>=|<=|==|!=|~=|[<>=\u2264\u2265:]+)", w)
+            ]
+            while ws and (ws[-1].lower().strip("():;,") in _PARAM_STOPWORDS or re.match(r"^\d", ws[-1])):
+                ws.pop()
+            while ws and ws[0].lower().strip("():;,") in _PARAM_STOPWORDS:
+                ws.pop(0)
+            return [w.strip("():;,") for w in ws if w.strip("():;,")]
+
+        words = _clean_words(before)
+        if not words and "(" in before_raw:
+            after_paren = before_raw.rsplit("(", 1)[-1]
+            if not re.search(r"(?:>=|<=|==|!=|~=|[<>=\u2264\u2265:])|\d", after_paren):
+                pre_paren = re.split(r"\(", before_raw)[-2] if len(before_raw.split("(")) >= 2 else ""
+                pre_seg = re.split(r"[.;,\n=\[\]]|>=|<=", pre_paren)[-1].strip()
+                paren_words = _clean_words(pre_seg)
+                if paren_words:
+                    tail = paren_words[-1]
+                    if (
+                        "_" in tail
+                        or any(ch.isupper() for ch in tail)
+                        or len(paren_words) <= 2
+                    ):
+                        words = paren_words[-2:] if source == "user_prompt" else paren_words[-3:]
         if source == "user_prompt":
             # Filter out long un-assigned prose phrases (e.g. "visible sensory reset dissipation")
             # while keeping genuine variable identifiers or compact 1-2 word parameter names.
@@ -863,14 +903,24 @@ def extract_parameters_from_text(text: str, source: str = "",
                 continue
         candidate_name = " ".join(words[-4:]) if words else ""
         if not candidate_name or candidate_name.lower() in _PARAM_STOPWORDS or re.match(r"^\d", candidate_name):
-            if source == "user_prompt":
-                continue
             after = text[m.end():min(len(text), m.end() + 48)]
             after = re.split(r"[.;,()\n]", after)[0].strip()
             awords = [w for w in re.split(r"\s+", after) if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", w)]
             while awords and awords[0].lower() in _PARAM_STOPWORDS:
                 awords.pop(0)
-            candidate_name = " ".join(awords[:4]) if awords else ""
+            if source == "user_prompt":
+                if (
+                    awords
+                    and unit
+                    and (len(awords) == 1 or awords[1].lower() in _PARAM_STOPWORDS)
+                    and len(awords[0]) >= 3
+                    and awords[0].lower() not in (_PARAM_STOPWORDS | _BARE_PROSE_NOUNS)
+                ):
+                    candidate_name = awords[0]
+                else:
+                    continue
+            else:
+                candidate_name = " ".join(awords[:4]) if awords else ""
         if candidate_name:
             _add(candidate_name, m.group("num"), unit, m.span())
     return params[:limit]
@@ -1631,16 +1681,80 @@ class QuantitativeInsightExtractor:
         return out
 
     def equations_from_text(self, text: str, source: str = "") -> List[ExtractedEquation]:
-        out = []
-        candidates = [m.group(1) for m in _INLINE_TEX.finditer(text or "")]
-        for match in re.finditer(
-                r"(?<![\w])(?:[A-Za-z][A-Za-z0-9_]*(?:\([^\n=;]{1,60}\))?|d[A-Za-z]+/dt)\s*=\s*[^\n;!?$]{1,240}", text or ""):
-            candidate = re.split(r'\.(?:\s|$)', match.group(0), maxsplit=1)[0].strip()
-            rhs = candidate.split('=', 1)[-1].strip()
-            if not re.fullmatch(r'[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', rhs) and not re.search(r'\b[A-Za-z_]\w*\s+[A-Za-z_]\w*\b', candidate):
+        out: List[ExtractedEquation] = []
+        raw_text = text or ""
+        candidates = [m.group(1) for m in _INLINE_TEX.finditer(raw_text)]
+        for pat in (
+            r"\\\[(.{3,400}?)\\\]",
+            r"\\\((.{3,400}?)\\\)",
+            r"\\begin\{(?:equation|align|gather)\*?\}(.{3,600}?)\\end\{(?:equation|align|gather)\*?\}",
+        ):
+            for m in re.finditer(pat, raw_text, re.DOTALL):
+                candidates.append(m.group(1).strip())
+        # Prose-safe extraction of inline symbolic equations such as
+        # `dV/dt = -(I_res - I_leak) / C_m, where ...`, `J_ATP = V_max * ...`,
+        # or conservation laws like `ATP + ADP + AMP = 12.0 mM`.
+        eq_pat = re.compile(
+            r"(?<![\w])(?:[A-Za-z][A-Za-z0-9_\\^{}]*(?:\s*\+\s*[A-Za-z][A-Za-z0-9_\\^{}+-]*){1,5}|[A-Za-z][A-Za-z0-9_\\^{}]*(?:\([^\n=;]{1,60}\))?|d[A-Za-z_][A-Za-z0-9_]*/d[A-Za-z_]+)\s*=\s*[^\n;!?$=]{2,240}"
+        )
+        clauses = re.split(
+            r"\s+(?:and|or|where|with|while)\s+(?=[A-Za-z_][A-Za-z0-9_+\s/\\^{}()\-]{0,48}=)",
+            raw_text,
+            flags=re.I,
+        )
+        for clause in clauses:
+            for match in eq_pat.finditer(clause):
+                candidate = match.group(0)
+                # Trim sentence terminators and trailing English prose clauses
+                candidate = re.split(r"\.(?:\s|$)", candidate, maxsplit=1)[0]
+                candidate = re.split(
+                    r"(?:,\s*|\s+)(?:where|with|for|when|which|representing|denoting|given\s+by|indicating|yielding|such\s+that|respectively)\b",
+                    candidate,
+                    maxsplit=1,
+                    flags=re.I,
+                )[0].strip().rstrip(",.;:")
+                if "=" not in candidate:
+                    continue
+                lhs, rhs = candidate.split("=", 1)
+                lhs_s, rhs_s = lhs.strip(), rhs.strip()
+                # Truncate RHS at any unmatched closing parenthesis (from parentheticals like `(C_m = 1.0 uF/cm^2)`)
+                depth_p = 0
+                for idx_c, ch in enumerate(rhs_s):
+                    if ch == "(":
+                        depth_p += 1
+                    elif ch == ")":
+                        if depth_p == 0:
+                            rhs_s = rhs_s[:idx_c].strip()
+                            break
+                        depth_p -= 1
+                # Clean trailing prose words (`and X`) before another clause
+                rhs_s = re.sub(r"\s+(?:and|or)\s+[A-Za-z_][A-Za-z0-9_/\\^{}]*$", "", rhs_s).strip()
+                # Strip trailing standalone physical unit from pure numeric conservation RHS (e.g. `12.0 mM`)
+                has_lhs_op = bool(re.search(r"[+\-*/]", lhs_s))
+                if has_lhs_op:
+                    rhs_s = re.sub(r"^([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+[A-Za-zμµ°/^\d\-]+$", r"\1", rhs_s).strip()
+                # Reject label/colon annotations (`3 species: [ATP]...`) or scalar value+unit pairs (`1.0 uF/cm^2`)
+                if ":" in rhs_s or (not has_lhs_op and re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?\s+[A-Za-zμµ°/^\d\-]+", rhs_s)):
+                    continue
+                candidate = f"{lhs_s} = {rhs_s}"
+                # Reject statistical/clinical summary scalars (`p = 0.05`, `n = 42`, `r = 0.91`) unless LHS is multi-term equation
+                if not has_lhs_op and re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?", rhs_s):
+                    continue
+                if re.fullmatch(r"[pnrPNRF]|CI|OR|HR|SD|SE", lhs_s):
+                    continue
+                # Require at least one math operator or function on RHS (or multi-term LHS conservation sum)
+                has_math_op = bool(
+                    re.search(r"[+\-*/^(){}\\]|\b(?:exp|log|ln|sqrt|sin|cos|tan|tanh|pow|min|max)\s*\(", rhs_s)
+                    or has_lhs_op
+                )
+                if not has_math_op:
+                    continue
+                # Reject multi-word English sentences on LHS/RHS (3+ consecutive lowercase prose words of len>=2)
+                if re.search(r"\b[a-z]{2,}\s+[a-z]{2,}\s+[a-z]{2,}\b", candidate):
+                    continue
                 candidates.append(candidate)
         for candidate in dict.fromkeys(candidates):
-            if '=' not in candidate:
+            if "=" not in candidate:
                 continue
             eq = parse_equation(candidate, source=source)
             if eq is not None:
@@ -1661,10 +1775,11 @@ class QuantitativeInsightExtractor:
             if current is None or p.confidence > current.confidence:
                 params[p.name] = p
 
-        # 1. Explicit user-prompt quantities are authoritative (verbatim).
+        # 1. Explicit user-prompt quantities and equations are authoritative (verbatim).
         for p in extract_parameters_from_text(prompt or "", source="user_prompt",
                                               confidence=1.0):
             add_param(p)
+        equations.extend(self.equations_from_text(prompt or "", source="user_prompt"))
 
         # 2. Literature hits from every connector.
         for item in search_results or []:

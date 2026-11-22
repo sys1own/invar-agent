@@ -45,7 +45,18 @@ from ..healing.buffer_api import BUFFER_API
 from ..healing.structural import is_structural_failure, unresolved_symbol
 from ..runtime.research_reference import ReferenceError
 from .evolution import text_evolutions, check_evolution_reference
-from .slot_schema import canonical_variable_map, validate_contract_slots, validate_slot_writes
+from .slot_schema import (
+    ROLE_CONTROL_PARAM,
+    _CONTROL_PARAM_NAME_RE,
+    _analyze_code_slot_flow,
+    audit_contract_alignment,
+    canonical_variable_map,
+    classify_variable_roles,
+    to_blueprint_role,
+    validate_contract_faithfulness,
+    validate_contract_slots,
+    validate_slot_writes,
+)
 from .scientific_integrity import (SCIENTIFIC_CONTRACT, output_dataflow, protected_observation_slots, validate_observables,
                                    observed_roundoff_scales, evaluate_roundoff_predicate,
                                    physical_projection_contracts,
@@ -110,11 +121,13 @@ for _pan_fn_name, _pan_fn in (
     ("betainc_reg", betainc_reg),
 ):
     setattr(math, _pan_fn_name, _pan_fn)
-from .accretion import (AccretionError, code_hash, layer_driver_name,
-                        merge_accretive_module, pin_layer_code, candidate_layer_code,
+from .accretion import (AccretionError, code_hash, is_noop_layer_wrapper,
+                        layer_driver_name, merge_accretive_module,
+                        pin_layer_code, candidate_layer_code,
                         strip_driver, unified_from_layers)
 from .feasibility import _heuristic_verdict
-from .planner import (canonicalize_contract_dicts, guided_queries,
+from .planner import (canonicalize_contract_dicts, compute_healing_error_fingerprint,
+                        guided_queries, summarize_pinned_code_for_prompt,
                         _reconcile_time_horizon,
                         refine_stage_code, request_healing_directives,
                         synthesize_accretive_stage)
@@ -515,7 +528,7 @@ def _l2(xs: List[float]) -> float:
 
 
 # -- contract stage staging ---------------------------------------------------
-_CONTRACT_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)[_-]", re.IGNORECASE)
+_CONTRACT_STAGE_RE = re.compile(r"^(?:c|stage)(\d+)(?:[a-z](?=[_-])|[_-])", re.IGNORECASE)
 
 
 def _contract_stage_index(contract_id: str) -> int:
@@ -1198,7 +1211,11 @@ def _initialize_physical_state(py_code: str, contract: VerificationContract,
                                 if _denom_ast is not None or _rhs_rel:
                                     _scale = abs(_denom_c) if (_denom_c is not None and _denom_c != 0.0) else max(abs(_tgt), 1e-300)
                                     _eff_tol = _tol_v * _scale
-                                if _si < len(initial) and abs(initial[_si] - _tgt) > _eff_tol:
+                                if (
+                                    _si < len(initial)
+                                    and abs(initial[_si] - _tgt) > _eff_tol
+                                    and not re.search(r'(?:^|_)(?:time(?:_s|_ms|_min|_hr)?|t_s|sim_time|elapsed|horizon)(?:_|$)', str(getattr(inv, 'variable_name', '') or ''), re.I)
+                                ):
                                     warnings.append(
                                         f"auto-init: target equality slot state[{_si}] ({inv.variable_name}) "
                                         f"set from {initial[_si]} to {_tgt}")
@@ -1391,13 +1408,18 @@ def _initialize_physical_state(py_code: str, contract: VerificationContract,
 def _guard_contract_initial_state(py_code: str, contract: VerificationContract,
                                   all_contracts: Optional[Sequence[VerificationContract]] = None,
                                   diagnostic_slots: Sequence[int] = (),
+                                  variable_map: Optional[Dict[str, int]] = None,
                                   ) -> Tuple[List[float], List[str]]:
     contracts = all_contracts or [contract]
     tree = ast.parse(py_code)
     physical = _verified_projection_slots(tree, contracts)
-    protected = protected_observation_slots(tree, contracts, physical_slots=physical)
+    from .slot_schema import ROLE_CONTROL_PARAM, ROLE_TIME_STEP, classify_slot_roles
+    role_map = classify_slot_roles(variable_map, tree, contracts, physical_slots=physical)
+    ctrl_slots = {s for s, r in role_map.items() if r == ROLE_CONTROL_PARAM}
+    time_slots = {s for s, r in role_map.items() if r == ROLE_TIME_STEP}
+    protected = (protected_observation_slots(tree, contracts, variable_map=variable_map, physical_slots=physical) - ctrl_slots) | time_slots
     protected.update(diagnostic_slots)
-    protected.update(set(_kernel_assigns_slots(py_code, _contract_state_slots(contract))) - physical)
+    protected.update(set(_kernel_assigns_slots(py_code, _contract_state_slots(contract))) - physical - ctrl_slots)
     initial, warnings = _initialize_physical_state(py_code, contract, all_contracts)
     declared = contract.initial_state if contract.initial_state is not None else DEFAULT_INITIAL_STATE
     for slot in protected:
@@ -1451,6 +1473,16 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
             if inv.variable_name:
                 mapping.setdefault(inv.variable_name, slot)
     # Also scan simulation_step / layer_* AST for `<var> = buf.data[idx]` and `buf.data[idx] = <var>`
+    # ONLY for slots referenced by invariants or already within declared initial_state bounds (never
+    # polluting variable_map with uncontracted internal RK4/scratch slots like `buf.data[21..28]`).
+    initial_vm = dict(getattr(bp, "variable_map", None) or {})
+    mapped_slots = set(mapping.values())
+    inv_referenced_slots: Set[int] = set()
+    for _c in contracts:
+        for _inv in (getattr(_c, "invariants", None) or []):
+            for _sx in re.findall(r"(?:state|initial|buf(?:\.data)?|data)\[(\d+)\]", str(getattr(_inv, "assertion", "") or "")):
+                inv_referenced_slots.add(int(_sx))
+    max_decl_len = max((len(getattr(_c, "initial_state", None) or []) for _c in contracts), default=0)
     src = code_text or getattr(bp, "unified_module_code", None) or getattr(bp, "code_template", None) or ""
     if src.strip():
         try:
@@ -1468,11 +1500,15 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
                         if isinstance(tgt, ast.Name) and isinstance(val, ast.Subscript):
                             m_idx = re.search(r"\[(\d+)\]", ast.unparse(val))
                             if m_idx and not tgt.id.startswith("_"):
-                                mapping.setdefault(tgt.id, int(m_idx.group(1)))
+                                s_i = int(m_idx.group(1))
+                                if s_i not in mapped_slots and (not initial_vm or s_i in inv_referenced_slots or s_i < max_decl_len):
+                                    mapping.setdefault(tgt.id, s_i)
                         elif isinstance(val, ast.Name) and isinstance(tgt, ast.Subscript):
                             m_idx = re.search(r"\[(\d+)\]", ast.unparse(tgt))
                             if m_idx and not val.id.startswith("_"):
-                                mapping.setdefault(val.id, int(m_idx.group(1)))
+                                s_i = int(m_idx.group(1))
+                                if s_i not in mapped_slots and (not initial_vm or s_i in inv_referenced_slots or s_i < max_decl_len):
+                                    mapping.setdefault(val.id, s_i)
         except SyntaxError:
             pass
     if len(mapping) > 4 and all(f"state_{i}" in mapping for i in range(4)):
@@ -1481,27 +1517,76 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
     if not mapping:
         for i in range(4):
             mapping[f"state_{i}"] = i
-    bp.variable_map = canonical_variable_map(contracts, mapping)
-    reads, writes = set(), set()
     try:
-        for node in ast.walk(ast.parse(src)):
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == 'buf' and node.value.attr == 'data' and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
-                (writes if isinstance(node.ctx, ast.Store) else reads).add(node.slice.value)
-    except SyntaxError:
-        pass
-    for name, slot in bp.variable_map.items():
-        role = ('diagnostic' if name.lower().startswith(('peak_', 'max_', 'min_', '_invar_'))
-                else 'read_only_parameter' if slot in reads - writes or name in bp.extracted_constants
-                else 'evolving_state')
-        bp.slot_roles.setdefault(name, role)
+        bp.variable_map = canonical_variable_map(contracts, mapping)
+    except ValueError as _slot_err:
+        if "has conflicting slots" not in str(_slot_err):
+            raise
+        # Reconcile cross-stage contract invariant slot conflicts against the authoritative mapping
+        # (or the first contract's slot for observables not yet in `mapping`).
+        _first_seen_slot: Dict[str, int] = {str(k): int(v) for k, v in mapping.items()}
+        for _c in contracts:
+            for _inv in getattr(_c, "invariants", None) or []:
+                _iname = str(getattr(_inv, "variable_name", "") or "").strip()
+                if not _iname:
+                    continue
+                _ias = str(getattr(_inv, "assertion", "") or "")
+                _found = sorted(set(int(m) for m in re.findall(r"\b(?:state|buf\.data|data)\[(\d+)\]", _ias)))
+                if len(_found) != 1:
+                    continue
+                if _iname not in _first_seen_slot:
+                    _first_seen_slot[_iname] = _found[0]
+                elif _found[0] != _first_seen_slot[_iname]:
+                    _target_s = _first_seen_slot[_iname]
+                    _inv.assertion = re.sub(
+                        rf"\b(state|buf\.data|data)\[{_found[0]}\]",
+                        rf"\1[{_target_s}]",
+                        _ias,
+                    )
+        bp.variable_map = canonical_variable_map(contracts, mapping)
+    phys_slots: List[int] = []
+    written_slots: set[int] = set()
     try:
-        flow = output_dataflow(src)
-        physical = _verified_projection_slots(ast.parse(src), contracts)
-        for name, slot in bp.variable_map.items():
-            if slot in flow['derived'] - physical and flow['dependencies'].get(slot):
-                bp.slot_roles[name] = 'diagnostic'
+        _parsed_src = ast.parse(src)
+        phys_slots = sorted(_verified_projection_slots(_parsed_src, contracts))
+        written_slots = {
+            int(s) for s in (_analyze_code_slot_flow(_parsed_src).get("all_writes") or ())
+        }
     except SyntaxError:
-        pass
+        phys_slots = []
+        written_slots = set()
+    unified_roles = classify_variable_roles(
+        bp.variable_map,
+        src,
+        contracts,
+        extracted_constants=getattr(bp, "extracted_constants", None),
+        explicit_roles=bp.slot_roles,
+        physical_slots=phys_slots,
+    )
+    _derived_rate_diag_re = re.compile(
+        r"(?:_(?:rate|flux|load|slope|current)(?:_[a-z0-9]+)*$|^d[A-Z0-9_]+_slope)",
+        re.I,
+    )
+    for name, unified_role in unified_roles.items():
+        slot_idx = bp.variable_map.get(name)
+        is_written_derived = (
+            bool(_derived_rate_diag_re.search(name))
+            and not _CONTROL_PARAM_NAME_RE.match(name)
+            and slot_idx is not None
+            and int(slot_idx) in written_slots
+        )
+        if name in bp.slot_roles:
+            if bp.slot_roles[name] == "read_only_parameter" and is_written_derived:
+                bp.slot_roles[name] = "diagnostic"
+            continue
+        if unified_role == ROLE_CONTROL_PARAM and is_written_derived:
+            bp.slot_roles[name] = "diagnostic"
+            continue
+        # Never permanently latch read_only_parameter onto physical state slots
+        # solely because an unverified candidate omitted writing them.
+        if unified_role == ROLE_CONTROL_PARAM and (src or "").strip() and not _CONTROL_PARAM_NAME_RE.match(name):
+            continue
+        bp.slot_roles[name] = to_blueprint_role(unified_role)
 
 
 def _apply_backup_slots_to_vmap(bp: Optional[ResearchBlueprint],
@@ -1607,6 +1692,7 @@ class ResearchRunState:
     status: str = "PENDING"  # VERIFIED | PARTIAL | FAILED | REFUSED | ABORTED
     research_stage: int = 1
     literature: List[Dict[str, Any]] = field(default_factory=list)
+    rolled_back_stages: set = field(default_factory=set)
     checkpoint_path: Optional[str] = None
     refusal: Optional[Dict[str, Any]] = None
     report: Optional[str] = None  # Final Quantitative Research Report (markdown)
@@ -1873,6 +1959,7 @@ class ResearchStateMachine:
             healing_stall = 0
             healing_terminated = False
             had_divergence = False
+            seen_error_fingerprints: Dict[str, int] = {}
             while attempt < max_attempts:
                 if self._aborted(state):
                     break
@@ -1984,6 +2071,18 @@ class ResearchStateMachine:
                     state.status = "REFUSED"
                     state.refusal = outcome.get("refusal")
                     return state
+                err_fp = compute_healing_error_fingerprint(str(failure), str(used_candidate or ""))
+                seen_error_fingerprints[err_fp] = seen_error_fingerprints.get(err_fp, 0) + 1
+                # Short-circuit only after Tier-2 has had a chance to attempt repair (attempt >= 3),
+                # or if the exact same error fingerprint repeats 3+ times.
+                if seen_error_fingerprints[err_fp] >= 3:
+                    await self.emit_activity(
+                        "HEALING", "circuit_breaker_identical_error",
+                        f"[HEALING_TERMINATED] Identical-error circuit breaker triggered "
+                        f"(fingerprint {err_fp} repeated {seen_error_fingerprints[err_fp]} times).",
+                        level="warning")
+                    healing_terminated = True
+                    break
                 # Retry bound reached: stop BEFORE dispatching another heal.
                 # No "Attempt {max+1}/{max}" synthesis and no further adjoint
                 # rollback events may follow the final attempt.
@@ -2064,10 +2163,22 @@ class ResearchStateMachine:
                         "note": "stage retries exhausted; last verified unified "
                                 "checkpoint preserved"})
                     if stage < total and not self._aborted(state):
+                        state.rolled_back_stages.add(stage)
+                        rolled_ids = {rc.contract_id for rc in contracts}
+                        purged_contracts = [
+                            c for c in (state.blueprint.contracts or [])
+                            if c.contract_id not in rolled_ids
+                            and _contract_stage_index(c.contract_id) != stage
+                        ]
+                        state.blueprint = state.blueprint.model_copy(
+                            update={"contracts": purged_contracts}
+                        )
+                        self.blueprint = state.blueprint
+                        blueprint = state.blueprint
                         await self.emit_activity(
                             "VAULT", "stage_rollback_continue",
                             f"Stage {stage} retries exhausted after {max_attempts} attempts; "
-                            f"rolling back Stage {stage} delta and continuing to Stage {stage + 1}/{total}...")
+                            f"rolling back Stage {stage} delta and purging Stage {stage} contracts before continuing to Stage {stage + 1}/{total}...")
                         stage += 1
                         continue
                     state.status = "ABORTED" if state.aborted else "PARTIAL"
@@ -2143,10 +2254,18 @@ class ResearchStateMachine:
         report_path: Optional[Path] = None
         try:
             from .vault import ResearchVaultManager
+            from ..llm.telemetry import get_llm_telemetry_summary
             vault = ResearchVaultManager(self.workspace_root)
             telemetry_all: Dict[str, Any] = {}
             for result in state.results or []:
                 telemetry_all.update(getattr(result, "telemetry", {}) or {})
+            llm_summary = get_llm_telemetry_summary()
+            telemetry_all["llm_prompt_tokens"] = float(llm_summary.get("prompt_tokens", 0))
+            telemetry_all["llm_completion_tokens"] = float(llm_summary.get("completion_tokens", 0))
+            telemetry_all["llm_reasoning_tokens"] = float(llm_summary.get("reasoning_tokens", 0))
+            telemetry_all["llm_cache_hit_tokens"] = float(llm_summary.get("cache_hit_tokens", 0))
+            telemetry_all["llm_total_calls"] = float(llm_summary.get("total_calls", 0))
+            telemetry_all["llm_total_latency_s"] = float(llm_summary.get("total_latency_s", 0.0))
             backend = ""
             for key in ("backend", "target_backend", "accelerator"):
                 if key in telemetry_all:
@@ -2292,8 +2411,9 @@ class ResearchStateMachine:
         emit = self._emit
         tag = {"round": round_idx, "research_stage": stage, "attempt": attempt}
 
-        # Zero-LLM fast path for stage > 1 before running literature search
-        if stage > 1 and candidate_code is None and attempt == 1:
+        # Zero-LLM fast path for stage > 1 (only when no LLM/synthesizer is active
+        # so multi-stage synthesized experiments never skip Stage > 1 synthesis/ingest)
+        if stage > 1 and candidate_code is None and attempt == 1 and self.llm_fast is None and self.stage_synthesizer is None:
             cumulative = _contracts_through_stage(bp, stage)
             fast_candidate = _deterministic_accretion_candidate(pinned_code, stage)
             if contracts and cumulative and fast_candidate:
@@ -2328,41 +2448,61 @@ class ResearchStateMachine:
                                                 "steered_by": _json_safe(
                                                     {k: v for k, v in last_telemetry.items()
                                                      if isinstance(v, (int, float))})})
-            prev_shbt = [
+            prev_lit = [
                 h for h in (state.literature or [])
-                if isinstance(h, dict) and h.get("source") == "shbt_federation"
+                if isinstance(h, dict)
             ]
+            for h in prev_lit:
+                h.setdefault("stage", 1)
             fresh_lit = await self._literature_search(queries, tag)
             merged_lit: List[Dict[str, Any]] = []
             seen_lit: set = set()
-            for h in prev_shbt + list(fresh_lit or []):
+            for h in prev_lit + list(fresh_lit or []):
                 if not isinstance(h, dict):
                     continue
-                k = (h.get("source"), h.get("badge"), h.get("title"))
+                if h not in prev_lit:
+                    h.setdefault("stage", stage)
+                norm_title = re.sub(r"[^a-z0-9]+", " ", str(h.get("title") or "").lower()).strip()
+                norm_url = str(h.get("url") or "").strip().lower().rstrip("/")
+                k = (
+                    ("title", h.get("source"), h.get("badge"), norm_title)
+                    if norm_title
+                    else ("url", norm_url)
+                )
                 if k not in seen_lit:
                     seen_lit.add(k)
                     merged_lit.append(h)
             state.literature = merged_lit
-            # Literature constants come ONLY from ingested sources
+            # Literature constants & equations come ONLY from ingested sources
             # (equations/invariants + numeric constants). Blueprint state
             # variables and contract evaluation metrics are NEVER literature
             # constants and must not be conflated with them.
+            from .extractor import QuantitativeInsightExtractor, extract_parameters_from_text
+            q_ext = QuantitativeInsightExtractor()
+            for h in state.literature:
+                summary = str((h or {}).get("summary") or "")
+                title = str((h or {}).get("title") or "")
+                blob = f"{title}. {summary}".strip() if summary else ""
+                if not blob:
+                    continue
+                src_label = str((h or {}).get("source") or "literature")
+                existing_eqs = list((h or {}).get("equations") or [])
+                seen_eqs = {str(x) for x in existing_eqs}
+                for eq in q_ext.equations_from_text(blob, source=src_label):
+                    lhs_s = str(getattr(eq, "lhs", "") or "").strip()
+                    rhs_s = str(getattr(eq, "rhs_latex", "") or getattr(eq, "rhs_python_hint", "") or "").strip()
+                    eq_txt = f"{lhs_s} = {rhs_s}".strip() if (lhs_s and rhs_s) else ""
+                    if eq_txt and eq_txt not in seen_eqs:
+                        seen_eqs.add(eq_txt)
+                        existing_eqs.append(eq_txt)
+                if existing_eqs:
+                    h["equations"] = existing_eqs[:12]
+                params = extract_parameters_from_text(blob, source=src_label)
+                if params:
+                    h.setdefault("constants", {}).update(
+                        {p.name: p.si_value for p in params[:8] if p.name not in (h.get("constants") or {})})
             eq_count = sum(len((h or {}).get("equations") or []) for h in state.literature)
             const_count = sum(len((h or {}).get("constants") or {}) for h in state.literature)
-            if eq_count == 0 and const_count == 0 and state.literature:
-                # Extraction runs HERE, before the INGEST log, so M/K reflect
-                # what was actually pulled from the ingested abstracts.
-                from .extractor import extract_parameters_from_text
-                for h in state.literature:
-                    summary = str((h or {}).get("summary") or "")
-                    if not summary:
-                        continue
-                    params = extract_parameters_from_text(summary, source=str((h or {}).get("source") or "literature"))
-                    if params:
-                        h.setdefault("constants", {}).update(
-                            {p.name: p.si_value for p in params[:8]})
-                eq_count = sum(len((h or {}).get("equations") or []) for h in state.literature)
-                const_count = sum(len((h or {}).get("constants") or {}) for h in state.literature)
             contract_vars = sorted(
                 {str(k) for k in (getattr(bp, "variable_map", {}) or {})}
                 | {str(i.variable_name) for c in contracts for i in c.invariants})
@@ -2386,6 +2526,7 @@ class ResearchStateMachine:
                 synth = await self._synthesize_stage(
                     stage=stage, total=bp.target_research_stages, objective=objective,
                     pinned_code=pinned_code, pinned_layers=pinned_layers,
+                    stage_contracts=[c.model_dump() for c in contracts],
                     telemetry=last_telemetry, literature=state.literature,
                     failures=failures)
                 candidate_code = synth["code"]
@@ -2443,16 +2584,28 @@ class ResearchStateMachine:
             pass
 
         pinned_fn_names = _pinned_function_names(pinned_code, pinned_layers) if stage > 1 else []
+        rolled_back = set(getattr(state, "rolled_back_stages", None) or ())
         all_bp_dicts = [
             c.model_dump() if hasattr(c, "model_dump") else c
             for c in (getattr(bp, "contracts", None) or [])
+            if _contract_stage_index(
+                str(c.get("contract_id") if isinstance(c, dict) else getattr(c, "contract_id", ""))
+            ) not in rolled_back
         ]
-        cumulative_dicts = [c.model_dump() for c in _contracts_through_stage(bp, stage)]
+        cumulative_dicts = [
+            c.model_dump() for c in _contracts_through_stage(bp, stage)
+            if _contract_stage_index(c.contract_id) not in rolled_back
+        ]
+        # Populate unified slot_roles using pinned_code + candidate_code BEFORE Tier-0 runs,
+        # so Stage > 1 knows full upstream dataflow and never projects diagnostic slots.
+        pre_san_candidate = candidate_code
+        combined_role_src = f"{pinned_code}\n\n{candidate_code}" if (stage > 1 and pinned_code) else candidate_code
+        _auto_populate_variable_map(bp, combined_role_src)
         declared = text_evolutions(bp.research_prompt or bp.falsifiable_hypothesis)
         san = sanitize_intrinsics(
             candidate_code,
             contracts=contracts,
-            all_contracts=all_bp_dicts or cumulative_dicts or contracts,
+            all_contracts=cumulative_dicts or contracts,
             variable_map=getattr(bp, "variable_map", None),
             slot_roles=bp.slot_roles,
             stabilize_diverged=stabilize_diverged,
@@ -2466,7 +2619,10 @@ class ResearchStateMachine:
                 f"STAGE_{stage}_BUILD", "deterministic_sanitizer",
                 "Tier-0 sanitizer normalized scalar intrinsics/math domains "
                 f"({'; '.join(san.notes[:3])}).")
-        _auto_populate_variable_map(bp, candidate_code)
+        _auto_populate_variable_map(
+            bp,
+            f"{pinned_code}\n\n{candidate_code}" if (stage > 1 and pinned_code) else candidate_code,
+        )
 
         if stage > 1:
             try:
@@ -2496,13 +2652,14 @@ class ResearchStateMachine:
                 "coupled_calls": merge.coupled_calls})
         else:
             unified = candidate_code
+        pre_san_unified = unified
 
         if stage > 1:
             unified_pinned = sorted(set(pinned_fn_names) | set(merge.pinned_functions))
             san_u = sanitize_intrinsics(
                 unified,
                 contracts=contracts,
-                all_contracts=all_bp_dicts or cumulative_dicts or contracts,
+                all_contracts=cumulative_dicts or contracts,
                 variable_map=getattr(bp, "variable_map", None),
                 slot_roles=bp.slot_roles,
                 stabilize_diverged=stabilize_diverged,
@@ -2540,10 +2697,32 @@ class ResearchStateMachine:
         state.stage = "PreWrite_Guard"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "PreWrite_Guard"})
         try:
-            validate_contract_slots(contracts)
+            validate_contract_slots(contracts, bp.variable_map)
             validate_slot_writes(unified, bp.variable_map, bp.slot_roles)
-            validate_observables(unified, contracts, bp.variable_map, bp.slot_roles,
-                                 _verified_projection_slots(ast.parse(unified), contracts))
+            try:
+                validate_observables(unified, contracts, bp.variable_map, bp.slot_roles,
+                                     _verified_projection_slots(ast.parse(unified), contracts))
+            except ValueError as _obs_err:
+                if pre_san_unified != unified:
+                    try:
+                        validate_observables(pre_san_unified, contracts, bp.variable_map, bp.slot_roles,
+                                             _verified_projection_slots(ast.parse(pre_san_unified), contracts))
+                    except ValueError as _raw_obs_err:
+                        raise _raw_obs_err from _obs_err
+                raise
+            validate_contract_faithfulness(
+                contracts,
+                bp.variable_map,
+                prompt=bp.research_prompt,
+                code=unified,
+                require_sweep_coverage=False,
+            )
+            if stage > 1 and self.llm_fast is not None:
+                noop_bad, noop_reason = is_noop_layer_wrapper(pre_san_candidate, stage)
+                if not noop_bad:
+                    noop_bad, noop_reason = is_noop_layer_wrapper(pre_san_unified, stage)
+                if noop_bad:
+                    raise ValueError(noop_reason)
             for contract in contracts:
                 normalized = _reconcile_time_horizon(
                     {'code_template': unified, 'contracts': [contract.model_dump()]}, bp.research_prompt)
@@ -2755,7 +2934,7 @@ class ResearchStateMachine:
                     **tag, "query": "shbt_federation", "source": item["source"],
                     "badge": item["badge"], "title": item["title"][:200],
                     "year": item["year"], "url": item["url"], "citation_count": None})
-        from .search import strip_internal_diagnostic_tokens
+        from .search import is_numerical_method_query, strip_internal_diagnostic_tokens
         for q in queries:
             q = strip_internal_diagnostic_tokens(q)
             if not q:
@@ -2764,7 +2943,7 @@ class ResearchStateMachine:
             await self.emit_activity("INGEST", "literature_query",
                                      f"Querying multi-channel literature for '{q}'...")
             try:
-                ctx_query = f"{bp_text} {q}".strip() if bp_text else q
+                ctx_query = q if is_numerical_method_query(q) else (f"{bp_text} {q}".strip() if bp_text else q)
                 hits = await asyncio.to_thread(
                     self.search_client.search, q, 3, None, ctx_query)
             except TypeError:
@@ -2829,6 +3008,7 @@ class ResearchStateMachine:
         bp = self.blueprint
         kw['objective'] += f"\n{BUFFER_API}\nAuthoritative slot table (name -> index): {json.dumps(getattr(bp, 'variable_map', {}))}. Slot roles: {json.dumps(getattr(bp, 'slot_roles', {}))}. Never overwrite input parameter slots with diagnostics; preserve existing slot identities."
         pinned_layers: List[ModuleLayer] = kw.pop("pinned_layers")
+        stage_contracts = kw.pop("stage_contracts", None)
         verified_contracts = [c.model_dump() for layer in pinned_layers for c in layer.contracts]
         if self.stage_synthesizer is not None:
             return await self.stage_synthesizer(
@@ -2868,21 +3048,24 @@ class ResearchStateMachine:
             raise RuntimeError("accretive stages require a Tier-1 FAST LLM "
                                "(configure a provider) or a stage synthesizer")
         pinned_code = kw["pinned_code"]
-        concise_lit = list((kw.get("literature") or [])[:3])
+        pinned_fn_list = _pinned_function_names(pinned_code, pinned_layers)
+        concise_lit = list((kw.get("literature") or [])[:4])
         try:
             return await asyncio.wait_for(synthesize_accretive_stage(
                 synth_llm, stage=kw["stage"], total=kw["total"],
                 objective=kw["objective"],
                 verified_code=unified_from_layers(pinned_code, kw["stage"] - 1),
                 verified_contracts=verified_contracts, telemetry=kw["telemetry"],
-                literature=concise_lit, failures=kw["failures"]), timeout=45.0)
-        except (asyncio.TimeoutError, TimeoutError):
+                literature=concise_lit, failures=kw["failures"],
+                pinned_functions=pinned_fn_list,
+                stage_contracts=stage_contracts), timeout=75.0)
+        except (asyncio.TimeoutError, TimeoutError, ValueError):
             fb = _deterministic_accretion_candidate(pinned_code, kw["stage"])
             if fb is not None:
                 return {
                     "code": fb,
                     "contracts": [],
-                    "rationale": f"Tier-0 deterministic accretion fallback for Stage {kw['stage']} after 45s LLM timeout",
+                    "rationale": f"Tier-0 deterministic accretion fallback for Stage {kw['stage']} after synthesis fallback",
                 }
             raise
 
@@ -2895,6 +3078,7 @@ class ResearchStateMachine:
                                pinned_functions: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if candidate_code is None:
             return {"code": None, "terminated": False}
+        pinned_fn_list = list(pinned_functions or [])
         if is_structural_failure(failure):
             llm = (self.llm_planner if attempt >= 2 else self.llm_fast) or self.llm_fast or self.llm_planner
             if llm is None:
@@ -2904,21 +3088,65 @@ class ResearchStateMachine:
                     'tier': 0, 'applied': False, 'notes': ['structural repair required']})
                 plan = await request_healing_directives(llm,
                     objective=f'Structural/API repair only. {BUFFER_API}\n{objective}', code=candidate_code,
-                    contracts=[], failure=f'{BUFFER_API}\nSource:\n{candidate_code}\n{failure}')
+                    contracts=[], failure=str(failure),
+                    **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}))
                 directives = [d for d in (plan or {}).get('directives', [])
                               if isinstance(d, dict) and d.get('op') == 'INLINE_INTRINSIC']
                 patched = apply_healing_directives(candidate_code, directives, contracts=[], pinned_functions=pinned_functions)
                 if directives and not v9_transpiler_violations(patched.code):
                     await self.emit_activity('HEALING', 'directive_applied', 'Applied structural-only intrinsic repair')
                     return {'code': patched.code, 'terminated': False, 'applied_ops': ['INLINE_INTRINSIC']}
+            _is_noop_err = "noop_accretion" in str(failure or "").lower()
+            _noop_hint = ""
+            if _is_noop_err:
+                _pinned_src = str(getattr(getattr(self, "blueprint", None), "unified_module_code", "") or "")
+                _used_slots = [int(x) for x in re.findall(r"buf\.data\[(\d+)\]", f"{_pinned_src}\n{candidate_code}")]
+                _vmap_slots = [int(v) for v in (getattr(getattr(self, "blueprint", None), "variable_map", None) or {}).values() if isinstance(v, int)]
+                _next_free = max(_used_slots + _vmap_slots + [15]) + 1
+                _noop_hint = (
+                    f"\nCRITICAL NO-OP REPAIR (Stage {stage}): PreWrite_Guard rejected `layer_{stage}_step(buf, dt)` as a bare forwarding "
+                    f"wrapper (or with only trivial clamps) around `layer_{max(1, stage - 1)}_step(buf, dt)`. "
+                    f"Keep pinned functions ({', '.join(pinned_functions or []) or 'none'}) UNTOUCHED verbatim, AND inside `def layer_{stage}_step(buf, dt):` "
+                    f"(not merely inside `simulation_step`) add >= 2 substantive computational assignment statements addressing `{objective}` — such as computing Stage {stage} "
+                    f"regime/corridor feasibility margins, conservation residuals, or auxiliary control/coupling calculations into Stage {stage}'s assigned slots or free diagnostic slots starting at `buf.data[{_next_free}]`."
+                )
+            _name_err_hint = (
+                "\nCRITICAL NAME/SCOPE REPAIR: You referenced an undefined local identifier (such as a pinned helper's local variable). "
+                "Define every local variable inside the current function from its canonical `buf.data[idx]` slot in the Global State Slot Table."
+                if any(tok in str(failure or "").lower() for tok in ("nameerror", "unboundlocalerror")) else ""
+            )
+            _repair_contracts = [c.model_dump() if hasattr(c, "model_dump") else c for c in (contracts or [])]
+            _compact_source = summarize_pinned_code_for_prompt(candidate_code, pinned_fn_list)
+            _src_lines = _compact_source.splitlines()
+            if len(_src_lines) > 60:
+                _m_ln = re.search(r"\bline\s+(\d+)\b", str(failure or ""))
+                _center = int(_m_ln.group(1)) if _m_ln else 15
+                _lo = max(1, _center - 12)
+                _hi = min(len(_src_lines), _center + 12)
+                _numbered_compact = "\n".join(f"{i}: {_src_lines[i - 1]}" for i in range(_lo, _hi + 1))
+            else:
+                _numbered_compact = "\n".join(f"{i}: {line}" for i, line in enumerate(_src_lines, 1))
+            _repair_obj = (
+                f"Structural/API repair only, no bound conditioning. {BUFFER_API}\n{objective}{_noop_hint}{_name_err_hint}\n"
+                f"Authoritative slots: {json.dumps(getattr(self.blueprint, 'variable_map', {}) or {}, sort_keys=True)}. "
+                f"Roles: {json.dumps(getattr(self.blueprint, 'slot_roles', {}) or {}, sort_keys=True)}.\n"
+                f"Numbered source:\n{_numbered_compact}"
+            )
             try:
                 repaired = await asyncio.wait_for(refine_stage_code(
-                    llm, objective=f"Structural/API repair only, no bound conditioning. {BUFFER_API}\n{SCIENTIFIC_CONTRACT}\n{objective}\nOriginal question: {getattr(self.blueprint, 'research_prompt', '')}\nContracts: {json.dumps([c.model_dump() for c in contracts])}\nAuthoritative slots: {json.dumps(getattr(self.blueprint, 'variable_map', {}))}. Roles: {json.dumps(getattr(self.blueprint, 'slot_roles', {}))}.",
-                    code=candidate_code, contracts=[], failure=f"{failure}\nNumbered source:\n" + '\n'.join(f'{i}: {line}' for i, line in enumerate(candidate_code.splitlines(), 1))), timeout=90.0)
+                    llm, objective=_repair_obj, code=candidate_code, contracts=_repair_contracts,
+                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=120.0)
             except (asyncio.TimeoutError, TimeoutError):
                 repaired = None
+            if (not repaired or repaired.strip() == candidate_code.strip()) and _is_noop_err and self.llm_planner and self.llm_planner is not llm:
+                try:
+                    repaired = await asyncio.wait_for(refine_stage_code(
+                        self.llm_planner, objective=_repair_obj, code=candidate_code, contracts=_repair_contracts,
+                        failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=120.0)
+                except (asyncio.TimeoutError, TimeoutError):
+                    repaired = None
             if not repaired or repaired.strip() == candidate_code.strip():
-                return {"code": candidate_code, "terminated": True, "applied_ops": []}
+                return {"code": candidate_code, "terminated": attempt >= max_attempts, "applied_ops": []}
             violations = v9_transpiler_violations(repaired)
             unresolved = unresolved_symbol(failure, repaired)
             if unresolved:
@@ -2933,7 +3161,7 @@ class ResearchStateMachine:
             bp = getattr(self, "blueprint", None)
             reference_objective = (
                 f"{objective}\nDeclared governing model: {getattr(bp, 'research_prompt', '') or getattr(bp, 'falsifiable_hypothesis', '')}\n"
-                f"State/observable slots: {json.dumps(getattr(bp, 'variable_map', {}) or {})}\n"
+                f"State/observable slots: {json.dumps(getattr(bp, 'variable_map', {}) or {}, sort_keys=True)}\n"
                 "Repair the executed derivative/RHS to match the declared ODEs, preserving a valid integration scheme. "
                 "Remove projections that contradict those laws; do not satisfy a counterexample "
                 "by clamping state values or modifying immutable parameters. Preserve pinned functions."
@@ -2942,7 +3170,7 @@ class ResearchStateMachine:
                 refined = await asyncio.wait_for(refine_stage_code(
                     llm, objective=reference_objective, code=candidate_code,
                     contracts=[c.model_dump() if hasattr(c, 'model_dump') else c for c in contracts],
-                    failure=str(failure)), timeout=90.0)
+                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=90.0)
             except (asyncio.TimeoutError, TimeoutError):
                 refined = None
             return {"code": refined or candidate_code, "terminated": False,
@@ -3029,19 +3257,34 @@ class ResearchStateMachine:
         llm = self.llm_fast or self.llm_planner
         if llm is None:
             return {"code": candidate_code, "terminated": False}
+        _refine_stage_guidance = (
+            f"{objective}\n"
+            + (
+                f"CRITICAL (Stage {stage}): Keep pinned functions ({', '.join(pinned_functions or [])}) UNTOUCHED verbatim. "
+                f"Preserve ALL governing physical ODE equations and swept CONTROL_PARAM dependencies (e.g., conductance, forcing, coupling); "
+                f"NEVER replace coupled dynamics with fixed constant-target relaxation or bypass swept parameters. "
+                f"If a pinned layer uses miscalibrated rate parameters causing FALSIFIED targets in Stage {stage}, calibrate the physical "
+                f"rate constants inside Stage {stage}'s ODE step while preserving conservation, positivity, and regression."
+                if stage > 1 else
+                "Calibrate any unphysical model rate/conductance parameters or stiffness stability from the counterexample while preserving governing ODE physics, swept parameter dependencies, conservation, and positivity."
+            )
+        )
+        refine_called = False
         if (attempt >= max_attempts and self.llm_planner is not None
                 and ("falsified" in fail_text or "diverged" in fail_text or "non-finite" in fail_text)):
+            refine_called = True
             refined = None
             try:
                 refined = await asyncio.wait_for(
                     refine_stage_code(
                         self.llm_planner,
-                        objective=objective,
+                        objective=_refine_stage_guidance,
                         code=healed,
                         contracts=contract_dicts,
                         failure=str(failure),
+                        **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                     ),
-                    timeout=90.0,
+                    timeout=120.0,
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 refined = None
@@ -3053,7 +3296,8 @@ class ResearchStateMachine:
                         "applied_ops": ["TIER2_REFINE_STAGE_CODE"]}
         plan = await request_healing_directives(
             llm, objective=objective, code=candidate_code,
-            contracts=[c.model_dump() for c in contracts], failure=str(failure))
+            contracts=[c.model_dump() for c in contracts], failure=str(failure),
+            **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}))
         if plan is None:
             fb_code, fb_notes = _deterministic_physics_guard_fallback(
                 candidate_code, physics_contracts)
@@ -3098,6 +3342,15 @@ class ResearchStateMachine:
                         continue
                 filtered_dirs.append(_d)
             directives = filtered_dirs
+        if is_structural_failure(str(failure or "")):
+            # Never apply bound-conditioning directives that re-inject projections on SCIENTIFIC_INTEGRITY / structural failures
+            directives = [
+                _d for _d in directives
+                if not (
+                    isinstance(_d, dict)
+                    and str(_d.get("op") or "").upper().startswith(("CLAMP_", "CONDITION_", "PROJECT_"))
+                )
+            ]
         patched = apply_healing_directives(
             candidate_code, directives,
             contracts=all_contract_dicts or contract_dicts,
@@ -3106,11 +3359,15 @@ class ResearchStateMachine:
             pinned_functions=pinned_functions,
         )
         ops = [str(d.get("op")) for d in directives if isinstance(d, dict) and d.get("op")]
-        _is_code_level_fail = any(
+        _is_code_level_fail = is_structural_failure(str(failure or "")) or any(
             tok in fail_text
             for tok in (
                 "transpiler:",
                 "prewrite_guard",
+                "scientific_integrity",
+                "noop_accretion",
+                "contract_faithfulness",
+                "slot_alignment",
                 "syntaxerror",
                 "nameerror",
                 "typeerror",
@@ -3120,7 +3377,12 @@ class ResearchStateMachine:
                 "unsupported",
             )
         )
-        _is_final_heal = (attempt >= max_attempts)
+        _is_final_heal = (attempt + 1 >= max_attempts)
+        _blind_scaling_only = bool(ops) and set(ops) <= {
+            "REDUCE_RATE_COEFFICIENT",
+            "SCALE_STEP_DT",
+            "CLAMP_STEP_DELTA",
+        }
         _missing_eq_slot = (
             _is_final_heal
             and (plan.get("fixable") is not False or _is_code_level_fail)
@@ -3131,11 +3393,12 @@ class ResearchStateMachine:
             )
         )
         _eq_target_falsified = (
-            _is_final_heal
-            and (plan.get("fixable") is not False or _is_code_level_fail)
-            and self.llm_planner is not None
+            self.llm_planner is not None
             and "falsified" in str(failure or "").lower()
             and "ENFORCE_CONSERVATION_PROJECTION" not in set(ops)
+            and "REWRITE_MONOTONE_DRIFT" not in set(ops)
+            and (not ops or _blind_scaling_only or not patched.changed or patched.code == candidate_code)
+            and (_is_final_heal or plan.get("fixable") is False)
         )
         _diverged_fail = ("diverged" in fail_text or "non-finite" in fail_text)
         _need_source_repair_on_code_fail = (
@@ -3155,6 +3418,7 @@ class ResearchStateMachine:
             )
             and (
                 not ops
+                or _blind_scaling_only
                 or not patched.changed
                 or patched.code == candidate_code
                 or _missing_eq_slot
@@ -3164,7 +3428,7 @@ class ResearchStateMachine:
             )
         )
         if fallback_needed:
-            if (_eq_target_falsified or _missing_eq_slot or _diverged_fail or _need_source_repair_on_code_fail) and (
+            if not refine_called and (_eq_target_falsified or _missing_eq_slot or _diverged_fail or _need_source_repair_on_code_fail) and (
                 plan.get("fixable") is not False or _is_code_level_fail or _diverged_fail
             ):
                 # Re-run full Tier-0 lowering before invoking full-source LLM repair
@@ -3180,18 +3444,20 @@ class ResearchStateMachine:
                 if san_pre.changed and san_pre.code != candidate_code:
                     return {"code": san_pre.code, "terminated": False,
                             "applied_ops": san_pre.notes or ["tier0_scalar_ir_lowering"]}
-                tier2_llm = self.llm_planner or llm
+                refine_called = True
+                tier2_llm = (self.llm_planner if _is_final_heal else (self.llm_fast or self.llm_planner)) or llm
                 refined = None
                 try:
                     refined = await asyncio.wait_for(
                         refine_stage_code(
                             tier2_llm,
-                            objective=objective,
+                            objective=_refine_stage_guidance,
                             code=healed,
                             contracts=contract_dicts,
                             failure=str(failure),
+                            **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                         ),
-                        timeout=90.0,
+                        timeout=120.0,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
@@ -3237,19 +3503,23 @@ class ResearchStateMachine:
             if san_fb.changed and san_fb.code != candidate_code:
                 return {"code": san_fb.code, "terminated": False,
                         "applied_ops": san_fb.notes or ["zero_diff_slot_conditioner"]}
-            if _is_final_heal and (plan.get("fixable") is not False or _is_code_level_fail):
-                tier2_llm = self.llm_planner or llm
+            if not refine_called and (
+                plan.get("fixable") is not False or _is_code_level_fail
+            ):
+                refine_called = True
+                tier2_llm = (self.llm_planner if _is_final_heal else (self.llm_fast or self.llm_planner)) or self.llm_planner
                 refined = None
                 try:
                     refined = await asyncio.wait_for(
                         refine_stage_code(
                             tier2_llm,
-                            objective=objective,
+                            objective=_refine_stage_guidance,
                             code=healed,
                             contracts=contract_dicts,
                             failure=str(failure),
+                            **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                         ),
-                        timeout=90.0,
+                        timeout=120.0,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
@@ -3459,6 +3729,7 @@ class ResearchStateMachine:
         initial, slot_warnings = _guard_contract_initial_state(
             py_code or "", contract, all_contracts=getattr(bp, "contracts", None),
             diagnostic_slots=[slot for name, slot in bp.variable_map.items() if bp.slot_roles.get(name) == 'diagnostic'],
+            variable_map=getattr(bp, "variable_map", None),
         )
         max_vmap_slot = max((idx for idx in (bp.variable_map or {}).values() if isinstance(idx, int)), default=-1)
         if max_vmap_slot >= len(initial) and max_vmap_slot < 4096:
@@ -3526,7 +3797,10 @@ class ResearchStateMachine:
                 regression_of is None
                 or any("variants" in str(getattr(i, "assertion", "") or "") for i in (contract.invariants or []))
             ):
-                variants = await self._run_variants(cpp_code, entries, initial, contract, run)
+                variants = await self._run_variants(
+                    cpp_code, entries, initial, contract, run,
+                    variable_map=bp.variable_map, slot_roles=bp.slot_roles,
+                )
                 extra["variants"] = variants
                 for name, v in variants.items():
                     telemetry[f"variant_{name}_residual"] = v["residual"]
@@ -3583,9 +3857,21 @@ class ResearchStateMachine:
 
     async def _run_variants(self, cpp_code: str, entries: List[str], initial: List[float],
                             contract: VerificationContract,
-                            reference: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+                            reference: Dict[str, Any],
+                            variable_map: Optional[Dict[str, int]] = None,
+                            slot_roles: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, float]]:
         variants: Dict[str, Dict[str, float]] = {}
         ref_state = reference["state"]
+        compare_indices: Optional[List[int]] = None
+        if variable_map:
+            from .slot_schema import ROLE_STATE, classify_slot_roles
+            roles = classify_slot_roles(variable_map, None, [contract], explicit_roles=slot_roles)
+            state_idxs = sorted(
+                idx for idx, role in roles.items()
+                if role == ROLE_STATE and 0 <= idx < len(ref_state)
+            )
+            if state_idxs:
+                compare_indices = state_idxs
         for name in entries:
             if not name.startswith("simulation_step_"):
                 continue
@@ -3594,7 +3880,12 @@ class ResearchStateMachine:
                 run = await asyncio.to_thread(
                     self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
                     entry_symbol(name), contract.timeout_seconds, contract.max_memory_mb)
-                residual = (_l2([a - b for a, b in zip(run["state"], ref_state)])
+                if compare_indices:
+                    st_vec = run["state"]
+                    diffs = [st_vec[i] - ref_state[i] for i in compare_indices if i < len(st_vec)]
+                else:
+                    diffs = [a - b for a, b in zip(run["state"], ref_state)]
+                residual = (_l2(diffs)
                             if run.get("finite", True) else float("inf"))
                 variants[vname] = {"residual": residual,
                                    "ms": float(run["execution_time_ms"]),

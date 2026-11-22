@@ -10,13 +10,18 @@ import inspect
 import json
 import math
 import os
+import socket
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
 
 def main(config):
     root = Path(config["root"]).resolve()
+    sandbox_tmp = root / ".sandbox_tmp"
+    sandbox_tmp.mkdir(exist_ok=True)
+    tempfile.tempdir = str(sandbox_tmp)
     sys.path[:0] = [str(root / "src"), str(root)]
     handles = []
     cdll = ctypes.CDLL
@@ -28,14 +33,30 @@ def main(config):
 
     ctypes.CDLL = tracking_cdll
     ctypes.cdll._dlltype = tracking_cdll
+    in_socketpair = 0
+    orig_socketpair = socket.socketpair
+
+    def tracking_socketpair(*args, **kwargs):
+        nonlocal in_socketpair
+        in_socketpair += 1
+        try:
+            return orig_socketpair(*args, **kwargs)
+        finally:
+            in_socketpair -= 1
+
+    socket.socketpair = tracking_socketpair
 
     def audit(event, args):
+        if event in {'socket.connect', 'socket.bind'} and in_socketpair > 0 and len(args) >= 2 and isinstance(args[1], tuple) and args[1][:1] in {("127.0.0.1",), ("::1",)}:
+            return
         if event in {'socket.connect', 'socket.bind', 'socket.getaddrinfo', 'socket.sendto'} or event.startswith(("subprocess.", "os.exec", "os.spawn", "os.system", "os.fork")):
             raise PermissionError("SANDBOX_SECURITY_VIOLATION: external execution/network forbidden")
         if event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
             mode, flags = args[1:3]
             writing = bool(isinstance(mode, str) and any(letter in mode for letter in "wax+")) or isinstance(flags, int) and bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
-            if writing and os.fsdecode(args[0]) != os.devnull and not Path(os.fsdecode(args[0])).resolve().is_relative_to(root):
+            raw_p = os.fsdecode(args[0])
+            is_devnull = raw_p == os.devnull or raw_p.lower() in {"nul", r"\\.\nul", os.path.abspath(os.devnull).lower()}
+            if writing and not is_devnull and not Path(raw_p).resolve().is_relative_to(root):
                 raise PermissionError("SANDBOX_SECURITY_VIOLATION: write outside overlay")
         if event in {"os.remove", "os.rmdir", "os.mkdir", "os.rename", "os.chmod", "os.symlink", "os.link"}:
             for path in args[:2] if event in {"os.rename", "os.symlink", "os.link"} else args[:1]:

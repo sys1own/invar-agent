@@ -367,8 +367,31 @@ _ARXIV_DOMAIN_CATS: Dict[str, Tuple[str, ...]] = {
 }
 
 
+_NUMERICAL_METHOD_QUERY_RE = re.compile(
+    r"\b(?:patankar|runge[- ]kutta|rk\d+|rk45|dopri\d*|semi[- ]implicit|"
+    r"implicit[- ]euler|explicit[- ]euler|positivity[- ]preserving|"
+    r"stiff\s+(?:ode|system|solver|integrat)|jacobian|newton[- ]raphson|"
+    r"bdf\d*|rosenbrock|crank[- ]nicolson|finite[- ](?:difference|volume|element)|"
+    r"cfl|time[- ]stepping|symplectic|splitting\s+scheme|numerical\s+integrat)\b",
+    re.I,
+)
+_CLINICAL_SUBJECT_RE = re.compile(
+    r"\b(?:patient|patients|clinical\s+trial|cohort|hospital|covid|sars-cov-2|"
+    r"burn|contracture|wound|surgery|surgical|chemotherapy|diagnosis|prognosis)\b",
+    re.I,
+)
+
+
+def is_numerical_method_query(query: str) -> bool:
+    """Return True when ``query`` specifically targets numerical ODE/PDE solver methods."""
+    q = (query or "").strip()
+    return bool(_NUMERICAL_METHOD_QUERY_RE.search(q) and not _CLINICAL_SUBJECT_RE.search(q))
+
+
 def _arxiv_categories_for_prompt(prompt_or_query: str) -> Tuple[str, ...]:
     """Derive macro-domain arXiv category filters from ``classify_macro_scientific_domains``."""
+    if is_numerical_method_query(prompt_or_query or ""):
+        return ("math.NA", "cs.NA", "physics.comp-ph")
     try:
         from .extractor import classify_macro_scientific_domains
         domains = classify_macro_scientific_domains(prompt_or_query or "")
@@ -553,6 +576,8 @@ def classify_research_domain(prompt_or_query: str) -> set:
 
 
 def _channels_for_prompt(prompt_or_query: str) -> List[str]:
+    if is_numerical_method_query(prompt_or_query or ""):
+        return ["arxiv", "openalex", "crossref", "semantic_scholar", "wikipedia"]
     channels = classify_research_domain(prompt_or_query)
     sources: List[str] = []
     for channel in ("biomed_epmc_pubmed", "peer_reviewed", "equations", "constants",
@@ -620,6 +645,14 @@ _CV_PROMPT_RE = re.compile(
 )
 
 
+_OFF_DOMAIN_CLINICAL_RE = re.compile(
+    r"\b(?:covid[- ]?19|sars[- ]?cov[- ]?2|burn\s+contracture|post[- ]?burn|"
+    r"wound\s+healing|randomized\s+controlled\s+trial|surgical\s+reconstruction|"
+    r"case\s+report|chemotherapy\s+regimen|outpatient\s+clinic)\b",
+    re.I,
+)
+
+
 def strip_internal_diagnostic_tokens(text: str) -> str:
     """Remove internal invar-agent diagnostic tokens and raw unit/sci-notation noise from search queries."""
     cleaned = _INTERNAL_DIAG_RE.sub(" ", text or "")
@@ -629,10 +662,13 @@ def strip_internal_diagnostic_tokens(text: str) -> str:
 
 
 def _is_off_domain_hit(hit: LiteratureResult, context: str) -> bool:
-    if _CV_PROMPT_RE.search(context or ""):
-        return False
+    ctx = context or ""
     blob = f"{hit.title} {hit.summary}"
-    return bool(_OFF_DOMAIN_CV_RE.search(blob))
+    if not _CV_PROMPT_RE.search(ctx) and _OFF_DOMAIN_CV_RE.search(blob):
+        return True
+    if not _CLINICAL_SUBJECT_RE.search(ctx) and _OFF_DOMAIN_CLINICAL_RE.search(blob):
+        return True
+    return False
 
 
 class LiteratureSearchClient:
@@ -679,9 +715,10 @@ class LiteratureSearchClient:
         else:
             query = _sanitize_query(raw_query)
         limit = max_results or self.max_results
+        routing_ctx = raw_query if is_numerical_method_query(raw_query) else (prompt_or_query or raw_query)
         if sources is None:
-            sources = tuple(_channels_for_prompt(prompt_or_query or raw_query))
-        arxiv_cats = _arxiv_categories_for_prompt(prompt_or_query or raw_query)
+            sources = tuple(_channels_for_prompt(routing_ctx))
+        arxiv_cats = _arxiv_categories_for_prompt(routing_ctx)
         channel_counts: Dict[str, int] = {}
         raw_counts: Dict[str, int] = {}
         channel_errors: Dict[str, str] = {}
@@ -863,6 +900,16 @@ class LiteratureSearchClient:
                 payload = self._fetch_with_backoff(self._arxiv_url(query, limit, categories=arxiv_categories))
                 raw_count = payload.count("<entry>")
                 results = self._parse_arxiv(payload)
+                upgraded = 0
+                for item in results:
+                    if upgraded >= 2:
+                        break
+                    m_arx = re.search(r"arxiv\.org/abs/([0-9]+\.[0-9]+|[a-z\-]+/[0-9]+)", item.url or "", re.I)
+                    if m_arx:
+                        eqs = self._fetch_ar5iv_equations(m_arx.group(1))
+                        if eqs:
+                            item.equations = eqs
+                            upgraded += 1
             elif source == "openalex":
                 payload = self._fetch_with_backoff(self._openalex_url(query, limit))
                 raw_count = _count_json_list(payload, "results")

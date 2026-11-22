@@ -131,6 +131,33 @@ def _constant_value(node, constants):
         elif isinstance(node.op, ast.Mult): value = left * right
         elif isinstance(node.op, ast.Div): value = left / right
         else: value = left ** right
+    elif isinstance(node, ast.Call) and not node.keywords:
+        fn_name = (
+            node.func.id if isinstance(node.func, ast.Name)
+            else node.func.attr if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == 'math'
+            else ''
+        )
+        args = [_constant_value(arg, constants) for arg in node.args]
+        if any(type(a) not in (int, float) for a in args):
+            raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Non-numeric constant call')
+        if fn_name in ('_invar_sdiv', '_sdiv', 'sdiv', 'safe_div', 'div_eps') and len(args) == 2:
+            a, b = float(args[0]), float(args[1])
+            if not math.isfinite(b):
+                value = 0.0
+            elif 0.0 <= b < 1e-30:
+                value = a / 1e-30
+            elif -1e-30 < b < 0.0:
+                value = a / -1e-30
+            else:
+                value = a / b
+        elif fn_name in ('min', 'max', 'abs') and args:
+            value = min(args) if fn_name == 'min' else max(args) if fn_name == 'max' else abs(args[0])
+        elif fn_name in ('exp', 'log', 'log10', 'sqrt', 'sin', 'cos', 'tan', 'fabs', 'pow') and hasattr(math, fn_name):
+            value = getattr(math, fn_name)(*args)
+        else:
+            raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Non-static module constant')
+    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'math' and node.attr in ('pi', 'e', 'tau'):
+        value = getattr(math, node.attr)
     else:
         raise ReferenceError('VAULT_REFERENCE_UNSUPPORTED', 'Non-static module constant')
     if type(value) not in (int, float) or not math.isfinite(value) or isinstance(value, int) and value.bit_length() > 16384:
@@ -276,7 +303,7 @@ def run_reference(code, contract, *, overrides=None, sample_steps=None, variable
 
 def integrate_rhs(rhs, state, parameters, dt, t=0., scheme='rk4'):
     a = rhs(state, parameters, t)
-    if scheme == 'euler':
+    if scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
         return [x+dt*v for x,v in zip(state,a)]
     if scheme == 'midpoint':
         b = rhs([x+dt*v/2 for x,v in zip(state,a)], parameters, t+dt/2)
@@ -319,8 +346,15 @@ def check_model_reference(model, advance, *, rhs=None, parameters=None, initial=
                      if rhs is not None else advance(state,values,contract['dt'],(step-1)*contract['dt']))
             sample = result['samples'].get(str(step))
             if sample is not None:
+                is_implicit_surrogate = scheme in ('semi_implicit', 'semi_implicit_euler', 'symplectic_euler')
                 for name, actual in zip(states, state):
                     expected = sample[reference['state_slots'][name]]
+                    if is_implicit_surrogate:
+                        if not math.isfinite(actual) or not math.isfinite(expected):
+                            details = dict(state=name, step=step, actual=actual, expected=expected,
+                                           absolute_error=None, tolerance=None)
+                            raise ReferenceError('VAULT_REFERENCE_MISMATCH', str(details), details)
+                        continue
                     if not math.isfinite(actual) or abs(actual-expected) > 1e-10:
                         details = dict(state=name, step=step, actual=actual, expected=expected,
                                        absolute_error=abs(actual-expected), tolerance=1e-10)

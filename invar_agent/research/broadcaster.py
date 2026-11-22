@@ -168,7 +168,21 @@ class ResearchRunManager:
                        run_uid: Optional[str] = None) -> None:
         self.broadcaster.publish("accelerator_log", "run_start",
                                  {"blueprint_id": bp.blueprint_id}, run_uid=run_uid)
-        state = await machine.run(bp)
+        try:
+            state = await machine.run(bp)
+        except Exception as exc:  # noqa: BLE001
+            if run_uid and run_uid != self.active_run_uid:
+                return
+            if self.active_state is not None:
+                self.active_state.status = "FAILED"
+                self.active_state.last_error = str(exc)
+            self.broadcaster.publish(
+                "accelerator_log",
+                "run_done",
+                {"stage": "Error", "status": "FAILED", "error": str(exc)},
+                run_uid=run_uid,
+            )
+            return
         if run_uid and run_uid != self.active_run_uid:
             return
         self.active_state = state
