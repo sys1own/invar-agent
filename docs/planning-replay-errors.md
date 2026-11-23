@@ -81,3 +81,79 @@ The previous planning identifier was a hash of the question. The two historical 
 runs used separate scratch workspace vault roots, so their repeated identifier did not
 address the same files. Within a shared workspace, repeated failures could overwrite
 one another. Planning failures now allocate a fresh UUID identifier for every invocation.
+
+## Carnot Run 4 and deterministic coordinate derivation
+
+Carnot Run 4 historical evidence attempts (the preceding response is blueprint-only):
+
+| Attempt | Historical error |
+| --- | --- |
+| 1 | `environmental_assumptions[0]: invalid syntax (<unknown>, line 1)` |
+| 2 | `IHCG_INGEST_REJECTED: CONSTRAINING; entailment_locked=False; redundant_conjuncts=(); Q1=SAT, Q2=SAT, Q3=SAT, Q4_0=SAT` |
+| 3 | `IHCG_INGEST_REJECTED: INFEASIBLE; entailment_locked=False; redundant_conjuncts=(); Q1=SAT, Q2=UNSAT, Q3=SAT, Q4_0=SAT` |
+
+New blueprints declare typed coordinates once in `typed_slots`. Indices come from
+`variable_map`; SI exponents, physical roles and optional original prompt identifiers
+are judgment inputs. Evidence-only generation supplies equations, executable predicates,
+sealed obligations and only unresolved free domains, not duplicate slot declarations.
+Legacy saved plans use their existing typed evidence slots; missing SI or bindings are
+not guessed from names.
+
+The contract retains every variable referenced by an obligation, executable environmental
+predicate or formal equation, including equation outputs and state symbols. Explicit
+mechanism and stochastic protocol coordinates remain roots so pruning cannot erase a
+non-degeneracy or RNG obligation. Unreferenced metadata is audited outside the contract.
+All formal equations remain present; no hypothesis, conjunct or equation is deleted.
+The variable cap is unchanged and applies after coordinate selection.
+
+Exact-span extraction recognizes explicit bracket ranges, between/from ranges and
+literal assignments. Formula prefixes, conditional witnesses and conflicting domains
+are not treated as fixed constants. Supported unit conversions use outward enclosures;
+unsupported units require an explicit remaining domain instead of guessed scaling.
+Blueprint fixed values are restricted to control constants. Initial-state values are
+never inferred to be domains. Missing algebraic output bounds are enclosed through the
+existing native outward-rounded interval substrate, transitively; no sampled bounds
+are used. Existing finite output boxes are preserved. Missing free or cyclic boxes
+remain precise errors. Executable environmental predicates are preserved; non-executable
+entries move to `notes` with their original text and an audit diagnostic. An entry also
+anchoring a sealed obligation is rejected rather than moved. Notes are not solver premises.
+
+### Offline replay after derivation
+
+All **24** saved provider responses from Runs 2–4 were inspected: **21 evidence-bearing
+responses** and **3 blueprint-only responses** from the split planner. Of the 21 evidence
+responses, **9 compile into structurally valid sealed IHCGs**, but **0 pass complete
+plan admission** under unchanged binding, entailment and non-vacuity checks. Structural
+sealing is not scientific verification or a claim that the plan passed admission.
+The remaining **12** fail before sealing. The three blueprint-only responses intentionally
+contain no evidence and are paired with their subsequent evidence calls, not counted as
+failed formalizations. Positive judgment-only controls pass complete admission offline.
+
+| Run | Case | Attempt | Sealed IHCG | Remaining error |
+| --- | --- | --- | --- | --- |
+| 2 | Carnot | 1 | No | `missing typed slots for referenced symbols: ['Qin', 'eta']` |
+| 2 | Carnot | 2 | No | `missing typed slots for referenced symbols: ['Qin', 'Tc', 'Th', 'eta']` |
+| 2 | SHBT | 1 | No | `equations['eta_D']: missing si_dim; no uniquely declared output/state SI dimensions` |
+| 2 | SHBT | 2 | No | `evidence.mechanism_parameters: expected symbol strings` |
+| 2 | SEIR-V | 1 | No | `equations['Reff_eq']: assignment has an ambiguous or conflicting output symbol` |
+| 2 | SEIR-V | 2 | No | `equations['Reff_below_eq']: assignment has an ambiguous or conflicting output symbol` |
+| 3 | SEIR-V | 1 | No | `obligations[1].expression: invalid syntax (<unknown>, line 1)` |
+| 3 | SEIR-V | 2 | Yes | `CONSTRAINING; entailment_locked=True; redundant_conjuncts=('4', '5')` |
+| 3 | Carnot | 1 | Yes | `compiled contract has no sealed symbolic binding: state[13]` |
+| 3 | Carnot | 2 | Yes | `compiled contract has no sealed symbolic binding: state[14]` |
+| 3 | SHBT | 1 | Yes | `CONSTRAINING; entailment_locked=True; redundant_conjuncts=('1',)` |
+| 3 | SHBT | 2 | Yes | `CONSTRAINING; entailment_locked=True; redundant_conjuncts=('1', '2')` |
+| 4 | SEIR-V | 1 | No | Missing free domains: `max_Reff_safe_sweep`, `pv_high_R0_3`, `pv_high_R0_4`, `pv_low_R0_3`, `pv_low_R0_4` |
+| 4 | SEIR-V | 2 | No | Missing free domains: `bracket_high_pv_R0_3_fraction`, `bracket_high_pv_R0_4_fraction`, `bracket_low_pv_R0_3_fraction`, `bracket_low_pv_R0_4_fraction`, `max_Reff_in_safe_R0_sweep_dimensionless` |
+| 4 | SEIR-V | 3 | Yes | `UNKNOWN; entailment_locked=False; redundant_conjuncts=()`; Q2 and all 14 Q4 queries UNKNOWN |
+| 4 | SHBT | 1 | Yes | `CONSTRAINING; entailment_locked=False; redundant_conjuncts=('1',)` |
+| 4 | SHBT | 2 | Yes | `compiled contract has no sealed symbolic binding: telemetry['finite']` |
+| 4 | SHBT | 3 | Yes | `compiled contract has no sealed symbolic binding: telemetry['finite']` |
+| 4 | Carnot | 1 | No | `prompt unit and typed SI dimensions disagree for Qin: J` |
+| 4 | Carnot | 2 | No | `prompt unit and typed SI dimensions disagree for Qin: J` |
+| 4 | Carnot | 3 | No | `prompt unit and typed SI dimensions disagree for Qin: J` |
+
+The Carnot records declare energy as `[2,1,-2,0,0,0,0]`, rather than joules'
+`[1,2,-2,0,0,0,0]`; these declarations are not silently repaired. Missing binding
+errors after pruning likewise do not authorize dropping executable guards. All replay
+counts are offline; future live convergence and verdicts remain unverified.

@@ -28,11 +28,11 @@ def test_actual_replies_are_json_but_invalid_formal_evidence(replies,scenario,in
     with pytest.raises(ValueError) as error:
         _parse_planned_blueprint(parsed['blueprint'],item['prompt'],require_evidence=True)
     if scenario == 'carnot':
-        assert 'archetype' in str(error.value)
+        assert 'missing typed slots' in str(error.value)
     elif index == 0:
         assert 'missing si_dim' in str(error.value)
     else:
-        assert 'mechanism_parameters.0' in str(error.value) and 'extra_forbidden' not in str(error.value)
+        assert 'mechanism_parameters' in str(error.value) and 'extra_forbidden' not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -57,7 +57,7 @@ async def test_raw_validation_failures_repair_once_then_persist(replies,scenario
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
     assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
     diagnostic = json.loads((directory/'metadata.json').read_text())['planning_error']
-    assert ('ALGEBRAIC_INEQUALITY' if scenario == 'carnot' else 'mechanism_parameters.4') in diagnostic
+    assert ('missing typed slots' if scenario == 'carnot' else 'mechanism_parameters') in diagnostic
     assert any(e.get('event') == 'research_completed' for e in events)
     tampered = result.meaningfulness_certificate.model_dump(mode='json')
     tampered['failure_reason'] = 'changed'

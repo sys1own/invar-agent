@@ -77,7 +77,7 @@ def compile_blueprint_ihcg(blueprint,*,stage=1):
     from .feasibility import compile_ingest_ihcg
     pack = blueprint.ihcg_evidence
     if not pack: return None
-    root = {key:value for key,value in pack.items() if key not in {"extensions","execution"}}
+    root = {key:value for key,value in pack.items() if key not in {"extensions","execution","notes"}}
     prompt = blueprint.research_prompt or blueprint.falsifiable_hypothesis
     graph = compile_ingest_ihcg(prompt, **root)
     graphs = [graph]

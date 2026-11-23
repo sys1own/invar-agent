@@ -39,7 +39,7 @@ def corrected_plan(prompt):
 @pytest.mark.parametrize('index',[0,1])
 def test_saved_undeclared_symbol_aliases_remain_precise_failures(replay,index):
     raw = _extract_json(replay['responses'][index])['blueprint']
-    expected = r"ihcg_evidence.domain\['R0'\]" if index == 0 else r"ihcg_evidence.evidence.equations\['Reff_below_eq'\]"
+    expected = r"ihcg_evidence.evidence.equations\['Reff_eq'\]" if index == 0 else r"ihcg_evidence.evidence.equations\['Reff_below_eq'\]"
     with pytest.raises(ValueError,match=expected):
         _parse_planned_blueprint(raw,replay['prompt'],require_evidence=True)
 
@@ -91,8 +91,12 @@ def test_prose_expressions_stay_invalid_and_report_path(replay,field):
     if field == 'environmental_assumptions': evidence[field] = ['Population fractions are dimensionless']
     elif field == 'equations': evidence[field]['Reff']['expression'] = 'Reff = R0*(1-e*pv)'
     else: evidence[field][0]['expression'] = 'For all R0, Reff < 1'
-    with pytest.raises(ValueError,match='ihcg_evidence.evidence.'+field):
-        _parse_planned_blueprint(plan,replay['prompt'],require_evidence=True)
+    if field == 'environmental_assumptions':
+        result = _parse_planned_blueprint(plan,replay['prompt'],require_evidence=True)
+        assert result.ihcg_evidence['notes'] == ['Population fractions are dimensionless']
+    else:
+        with pytest.raises(ValueError,match='ihcg_evidence.evidence.'+field):
+            _parse_planned_blueprint(plan,replay['prompt'],require_evidence=True)
 
 
 @pytest.mark.parametrize('bounds',[None,{},[0],['lower',1],[1,0],[0,float('inf')]])

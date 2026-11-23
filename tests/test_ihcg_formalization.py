@@ -127,7 +127,7 @@ async def test_small_formalization_call_repairs_exact_error_without_rewriting_bl
         return json.dumps(invalid if len(calls) == 1 else _FORMAL_EXAMPLE_PACK)
     result = await formalize_blueprint(_FORMAL_EXAMPLE_PROMPT,blueprint,complete)
     assert len(calls) == 2 and blueprint == before
-    assert 'slots.0.role' in calls[1] and 'DIAGNOSTIC' in calls[1]
+    assert 'typed_slots[0]' in calls[1] and 'DIAGNOSTIC' in calls[1]
     assert 'Sandbox_Execute' not in calls[0]
     assert result.code_template == blueprint['code_template'] and result.contracts[0].invariants[0].assertion == 'state[1] >= state[0]'
     assert compile_blueprint_ihcg(result) is not None
@@ -193,10 +193,10 @@ def replay_cases():
 @pytest.mark.parametrize('run,name,index,prompt,response',replay_cases(),ids=lambda v: str(v)[:30])
 def test_all_saved_raw_replies_normalize_or_fail_precisely(run,name,index,prompt,response):
     raw = _extract_json(response)['blueprint']; before = copy.deepcopy(raw)
-    expected = {(2,'seir'):r"ihcg_evidence.domain\['R0'\]" if index == 0 else r'ihcg_evidence.evidence.', (2,'carnot'):'archetype',
+    expected = {(2,'seir'):r'ihcg_evidence.evidence.', (2,'carnot'):'missing typed slots',
         (2,'shbt'):'missing si_dim' if index == 0 else 'mechanism_parameters',
-        (3,'seir'):'slots.12.role' if index == 0 else "redundant_conjuncts=\\('4', '5'\\)",
-        (3,'carnot'):'Phi_lock', (3,'shbt'):'redundant_conjuncts='}
+        (3,'seir'):'obligations' if index == 0 else "redundant_conjuncts=\\('4', '5'\\)",
+        (3,'carnot'):'sealed symbolic binding', (3,'shbt'):'redundant_conjuncts='}
     with pytest.raises(ValueError,match=expected[run,name]): _parse_planned_blueprint(raw,prompt,require_evidence=True)
     assert raw == before
 
@@ -228,10 +228,10 @@ async def test_independent_encoding_errors_are_reported_together_without_guessin
         return json.dumps(broken if len(prompts) == 1 else _FORMAL_EXAMPLE_PACK)
     result = await formalize_blueprint(_FORMAL_EXAMPLE_PROMPT,scalar_blueprint(),complete)
     assert len(prompts) == 2 and broken == before
-    assert "missing_domain=['y']" in prompts[1]
-    assert 'environmental_assumptions[0]' in prompts[1]
+    assert "missing_domain=['y']" not in prompts[1]
+    assert 'invalid syntax' not in prompts[1]
     assert "id='h'" in prompts[1] and 'original_slice=' in prompts[1]
-    assert f'at most {m.MAX_VARIABLES}' in prompts[0]
+    assert 'Do not restate slots' in prompts[0]
     assert 'x < 1 must not become x < 1 - epsilon' in prompts[0]
     assert compile_blueprint_ihcg(result) is not None
 
@@ -274,22 +274,23 @@ async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(n
     for index, (record, historical) in enumerate(zip(attempts,case['validation_errors'])):
         assert record['attempt'] == index+1
         if name == 'seir' and index == 0:
-            assert record['error'].startswith('IHCG slots and Omega must be one-to-one')
+            assert record['error'].startswith('missing finite domains for free symbols:')
             anchored = _anchor_evidence(case['prompt'],_extract_json(case['responses'][1]))
             obligation = anchored['evidence']['obligations'][9]
             start, end = obligation['prompt_span']
             assert case['prompt'][start:end] == obligation['prompt_quote'] == 'vaccination coverage pv between 0 and 1'
-        else: assert record['error'].startswith(historical)
+        elif name == 'carnot': assert record['error'].startswith('prompt unit and typed SI dimensions disagree for Qin')
+        elif name == 'seir' and index == 1: assert record['error'].startswith('missing finite domains for free symbols:')
+        elif name == 'shbt' and index > 0: assert record['error'].startswith('compiled contract has no sealed symbolic binding:')
+        else: assert record['error'].startswith('IHCG_INGEST_REJECTED:')
         assert record['error_type'] == 'ValueError'
-        assert any('environmental_assumptions[0]' in issue for issue in record['encoding_diagnostics'])
         if index < 2: assert record['error'] in prompts[index+2]
     metadata = json.loads((directory/'metadata.json').read_text())
     assert metadata['diagnostics'] == certificate.diagnostics
     terminal = next(event for event in events if event['event'] == 'research_completed')
     assert terminal['event_version'] == '2.0'
     assert terminal['meaningfulness_certificate']['diagnostics'] == certificate.diagnostics
-    assert 'missing_domain=' in prompts[2] and 'environmental_assumptions[0]' in prompts[2]
-    if name == 'shbt': assert 'declared 33 slots' in prompts[2]
+    assert attempts[0]['error'] in prompts[2]
 
 
 @pytest.mark.parametrize('suffix',['. Next sentence.','? Next sentence.','! Next sentence.'])

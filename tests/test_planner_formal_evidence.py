@@ -86,7 +86,8 @@ async def test_saved_plan_then_explicit_repair_reaches_formal_ingest(saved_plan,
 def test_normalizer_preserves_emitted_evidence(saved_plan):
     payload = repaired_plan(saved_plan)
     bp = parse_blueprint(payload)
-    assert bp.ihcg_evidence == payload["ihcg_evidence"]
+    assert {key:value for key,value in bp.ihcg_evidence.items() if key != 'execution'} == payload["ihcg_evidence"]
+    assert 'derivation' in bp.ihcg_evidence['execution']['normalization_source']
     assert compile_blueprint_ihcg(bp) is not None
 
 
@@ -129,7 +130,7 @@ def test_prose_extractor_does_not_guess_live_aliases_or_units(saved_plan):
 async def test_invalid_formal_repair_is_not_admitted(saved_plan,fault):
     corrected = copy.deepcopy(repaired_plan(saved_plan))
     if fault == "dimensions": corrected["ihcg_evidence"]["evidence"]["slots"][0]["si_dim"] = []
-    elif fault == "domain": del corrected["ihcg_evidence"]["domain"]["Qin"]
+    elif fault == "domain": del corrected["ihcg_evidence"]["domain"]["W"]
     else: corrected["contracts"][0]["invariants"][0]["assertion"] = "state[5] >= 0.64"
     calls = []
 
@@ -137,6 +138,11 @@ async def test_invalid_formal_repair_is_not_admitted(saved_plan,fault):
         calls.append(prompt)
         return json.dumps({"feasibility":saved_plan["feasibility"],"blueprint":corrected} if len(calls) == 1 else corrected['ihcg_evidence'])
 
-    with pytest.raises(ValueError):
-        await generate_plan_with_feasibility(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
-    assert len(calls) == 4
+    if fault == 'domain':
+        result = await generate_plan_with_feasibility(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
+        assert result['blueprint']['ihcg_evidence']['domain']['W'][0] <= 50 <= result['blueprint']['ihcg_evidence']['domain']['W'][1]
+        assert len(calls) == 2
+    else:
+        with pytest.raises(ValueError):
+            await generate_plan_with_feasibility(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
+        assert len(calls) == 4

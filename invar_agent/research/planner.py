@@ -858,7 +858,7 @@ _BLUEPRINT_FIELDS = {
     "contracts", "code_template", "max_feedback_rounds", "verified_layers",
     "target_research_stages", "stage_objectives", "current_stage",
     "evolution_history", "unified_module_code", "feasibility", "variable_map",
-    "slot_roles", "structured_evidence", "extracted_constants", "ihcg_evidence", "research_prompt",
+    "slot_roles", "typed_slots", "structured_evidence", "extracted_constants", "ihcg_evidence", "research_prompt",
 }
 _CONTRACT_FIELDS = {
     "contract_id", "target_backend", "timeout_seconds", "invariants",
@@ -2154,10 +2154,12 @@ def _reconcile_time_horizon(
 
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
     from .formal_evidence import attach_formal_evidence
-    from .ihcg_normalization import normalize_ihcg_evidence
-    if payload.get('ihcg_evidence') is not None:
-        payload = {**payload, 'ihcg_evidence':normalize_ihcg_evidence(payload['ihcg_evidence'])}
-    return attach_formal_evidence(ResearchBlueprint.model_validate(normalize_blueprint_payload(payload)))
+    from .ihcg_derivation import derive_ihcg_evidence
+    blueprint = ResearchBlueprint.model_validate(normalize_blueprint_payload(payload))
+    if blueprint.ihcg_evidence is not None:
+        pack = derive_ihcg_evidence(blueprint.research_prompt or blueprint.falsifiable_hypothesis,blueprint.model_dump(),blueprint.ihcg_evidence)
+        blueprint = blueprint.model_copy(update={'ihcg_evidence':pack})
+    return attach_formal_evidence(blueprint)
 
 
 def _parse_planned_blueprint(payload,question,*,require_evidence=False):
@@ -2168,7 +2170,7 @@ def _parse_planned_blueprint(payload,question,*,require_evidence=False):
         if require_evidence and re.search(r"\b[A-Za-z_]\w*\s*(?:>=|<=|==|!=|>|<|≥|≤)\s*[-+]?(?:\d|\.\d)",question):
             raise ValueError("FORMAL_EVIDENCE_MISSING: explicit quantitative claim requires ihcg_evidence with exact prompt spans, SI dimensions, domains and executable bindings")
     else:
-        graph = m.IhcgCompiler().compile_from_prompt(question,**{k:v for k,v in pack.items() if k not in {"extensions","execution"}})
+        graph = m.IhcgCompiler().compile_from_prompt(question,**{k:v for k,v in pack.items() if k not in {"extensions","execution","notes"}})
         for extension in pack.get("extensions",()):
             graph = m.IhcgCompiler().extend_stage(graph,question,extension["evidence"],extension["domain"],extension["archetype"])
         from .epistemic import compile_blueprint_ihcg
@@ -2187,7 +2189,7 @@ def _fill(template: str, **values: Any) -> str:
 def _blueprint_tools_context(fallback):
     if fallback: return TOOLS_CONTEXT
     head, rest = TOOLS_CONTEXT.split('## Formal evidence at ingest', 1)
-    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis, not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
+    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Include typed_slots: an array of {symbol, si_dim: seven integer SI exponents, role: CONTROL_PARAM|DYNAMIC_STATE|DERIVED_OBSERVABLE|CONSERVATION_AUX}, with optional semantic_tag, unit_scale and prompt_symbol (the exact original prompt identifier when renamed). Indices are derived from variable_map. Only genuinely fixed CONTROL_PARAM constants may include a literal value; never freeze a free parameter at initial_state. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis, not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
 
 
 async def _finish_planned_blueprint(payload, question, *, fallback, complete):
