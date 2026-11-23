@@ -11,7 +11,7 @@ from . import meaningfulness as m
 def _quote_tokens(text):
     operators = {"≥":">=", "≤":"<=", "≠":"!=", "−":"-"}
     return [(operators.get(match[0],match[0]),match.start(),match.end()) for match in re.finditer(
-        r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[^\W\d]\w*|>=|<=|==|!=|\*\*|\S",text)]
+        r"(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?|[^\W\d]\w*|>=|<=|==|!=|\*\*|\S",text)]
 
 
 def _anchor_evidence(prompt,pack):
@@ -19,7 +19,7 @@ def _anchor_evidence(prompt,pack):
     tokens = _quote_tokens(prompt)
     values = [token[0] for token in tokens]
     for evidence in [pack.get("evidence",{}),*(extension.get("evidence",{}) for extension in pack.get("extensions",()))]:
-        for obligation in evidence.get("obligations",()):
+        for index, obligation in enumerate(evidence.get("obligations",())):
             quote = obligation.get("prompt_quote","")
             span = obligation.get("prompt_span",())
             if not isinstance(quote,str) or not isinstance(span,(list,tuple)):
@@ -32,7 +32,9 @@ def _anchor_evidence(prompt,pack):
                 if needle and values[i:i+len(needle)] == needle]
             if len(matches) > 1 and len(span) == 2 and all(type(v) is int for v in span):
                 matches = [(start,end) for start,end in matches if start <= span[0] < end or start < span[1] <= end]
-            if len(matches) != 1: raise ValueError("obligation quote has no unique immutable prompt span")
+            if len(matches) != 1:
+                excerpt = prompt[span[0]:span[1]] if len(span) == 2 and all(type(v) is int for v in span) else None
+                raise ValueError(f"obligation quote has no unique immutable prompt span: obligations[{index}] id={obligation.get('id')!r}; quote={quote!r}; supplied_span={span!r}; original_slice={excerpt!r}; matches={len(matches)}")
             start,end = matches[0]
             obligation.update(prompt_quote=prompt[start:end],prompt_span=[start,end])
     return pack

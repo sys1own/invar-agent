@@ -221,6 +221,7 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
         summary = dict(
             scenario=scenario, verdict=state.epistemic_verdict if state else "NO_RUN",
             reason=getattr(certificate, "failure_reason", None) or (proof.mode if proof else error_type or "EIGHT_GATES_PASSED"),
+            diagnostics=getattr(certificate, "diagnostics", {}),
             rho_conv=getattr(fidelity, "convergence_reliability_ratio", None),
             enforcement_ratio=getattr(purity, "enforcement_ratio", None),
             blake3_receipt=getattr(certificate, "blake3_receipt", None),

@@ -605,7 +605,7 @@ class IhcgCompiler:
             try:
                 variables = _variables(_parse(expression))
             except (ValueError, SyntaxError) as error:
-                raise ValueError(f"ihcg_evidence.evidence.{path}: {error}") from error
+                raise ValueError(f"ihcg_evidence.evidence.{path}: {error}; expression={expression!r}") from error
             if not variables <= names:
                 raise ValueError(f"ihcg_evidence.evidence.{path}: undeclared IHCG symbol: {sorted(variables-names)}")
         controls = {s.symbol for s in graph.slots if s.role == "CONTROL_PARAM"}

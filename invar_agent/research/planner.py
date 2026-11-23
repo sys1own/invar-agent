@@ -305,7 +305,7 @@ _FORMAL_EXAMPLE_PACK = {
             {"slot_idx": 1, "symbol": "y", "si_dim": [0]*7, "role": "DERIVED_OBSERVABLE"},
         ],
         "equations": {"y": {"expression": "2*x", "si_dim": [0]*7}},
-        "environmental_assumptions": [],
+        "environmental_assumptions": ["x >= 0"],
         "obligations": [{"id": "h", "expression": "y >= x", "obligation_class": "HYPOTHESIS_TARGET",
             "prompt_quote": "y >= x", "prompt_span": [_FORMAL_EXAMPLE_PROMPT.index("y >= x"), _FORMAL_EXAMPLE_PROMPT.index("y >= x")+len("y >= x")]}],
         "quantifier_mode": "FORALL", "mechanism_parameters": ["x"],

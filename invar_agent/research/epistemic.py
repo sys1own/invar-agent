@@ -33,12 +33,13 @@ class IncompleteRunCertificate(m.StrictModel):
     epistemic_verdict: m.EpistemicVerdict = m.EpistemicVerdict.INCONCLUSIVE_UNVERIFIED
     hypothesis_quote: str
     failure_reason: str
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
     trust_boundary_version: str = "invar.tcb.v1"
     blake3_receipt: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-def incomplete_certificate(run_id, hypothesis, reason):
-    certificate = IncompleteRunCertificate(run_id=run_id, hypothesis_quote=hypothesis, failure_reason=reason, blake3_receipt="0"*64)
+def incomplete_certificate(run_id, hypothesis, reason, *, diagnostics=None):
+    certificate = IncompleteRunCertificate(run_id=run_id, hypothesis_quote=hypothesis, failure_reason=reason, diagnostics=diagnostics or {}, blake3_receipt="0"*64)
     return certificate.model_copy(update={"blake3_receipt": _native.py_compute_certificate_receipt(certificate.model_dump_json())})
 
 
@@ -49,7 +50,9 @@ def parse_run_certificate(raw):
         certificate = IncompleteRunCertificate.model_validate_json(json.dumps(raw, allow_nan=False))
         if certificate.epistemic_verdict != m.EpistemicVerdict.INCONCLUSIVE_UNVERIFIED:
             raise ValueError("incomplete evidence cannot certify a terminal discovery")
-        valid = hmac.compare_digest(certificate.blake3_receipt, _native.py_compute_certificate_receipt(certificate.model_dump_json()))
+        signed = certificate.model_dump(mode="json")
+        if "diagnostics" not in raw: signed.pop("diagnostics")
+        valid = hmac.compare_digest(certificate.blake3_receipt, _native.py_compute_certificate_receipt(json.dumps(signed, allow_nan=False)))
     else:
         certificate = m.MeaningfulnessCertificate.model_validate_json(json.dumps(raw, allow_nan=False))
         valid = m.verify_certificate_receipt(certificate)

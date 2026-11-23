@@ -46,3 +46,38 @@ new blueprint, not a fabricated evidence repair. Exhaustion persists
 `PLANNING_VALIDATION_FAILED` with all attempt diagnostics and a receipt-bearing incomplete
 certificate. Nonquantitative legacy and explicit offline/fallback planning retain their
 existing behavior.
+
+## Evidence-only replay findings
+
+The next saved runs made one blueprint call and three evidence-only calls each. The
+first-error messages below are historical; the complete original messages, including
+every missing symbol, are stored in `tests/fixtures/live_run4_raw_plans.json`.
+
+| Scenario | Evidence attempt | Historical validation error | Decision |
+|---|---|---|---|
+| SEIR-V | 1 | `obligation quote has no unique immutable prompt span` | Gate bug after off-by-one offsets: the quote exists exactly, but the lexer consumed the following sentence period as part of the number. Fix numeric-token boundaries without accepting changed numbers. The replay then reaches the missing-domain error. |
+| SEIR-V | 2 | `IHCG slots and Omega must be one-to-one; missing_domain=...` | Mis-encoding: 22 slots, only 3 domains. All slots, including derived quantities, require justified finite bounds. |
+| SEIR-V | 3 | `ihcg_evidence.evidence.environmental_assumptions[0]: invalid syntax (<unknown>, line 1)` | Mis-encoding: English prose in an executable expression field. Never discard or guess its meaning. |
+| SHBT | 1 | `IHCG slots and Omega must be one-to-one; missing_domain=...` | Mis-encoding: 33 slots, only 13 domains. Report the domain omissions, variable cap and invalid prose together in repair feedback. |
+| SHBT | 2 | `at most 32 bounded variables are supported` | Unsupported encoding: 33 symbolic variables exceed the existing deterministic cap. Do not raise the cap or silently drop scientific variables. |
+| SHBT | 3 | `ihcg_evidence.evidence.environmental_assumptions[0]: invalid syntax (<unknown>, line 1)` | Mis-encoding: prose remains after the variable/domain repair. |
+
+None of these six attempts reaches the redundancy gate. The non-vacuity requirement
+demands zero redundant primary conjuncts in an admitted sealed graph. Q4 checks
+entailment by the environment **and the other primary conjuncts**, which is stronger
+than environment-only entailment; a Q4 UNSAT result alone does not authorize pruning.
+An environment-proved equivalence is mathematically non-weakening, but would require
+audited canonicalization before sealing (or an explicitly checked resealing rule),
+not deletion of clauses from an already sealed hypothesis. The current gate is retained;
+no redundancy-policy change is needed to address these failures.
+
+Incomplete certificates now bind structured per-attempt diagnostics into their receipt;
+metadata and terminal SSE carry the same data, and the opt-in live summary prints it.
+Legacy incomplete receipts without diagnostics remain readable. Repair feedback reports
+independent encoding errors together, without changing the scientific gates or inventing
+bounds. The worked example includes an executable environmental predicate.
+
+The previous planning identifier was a hash of the question. The two historical live
+runs used separate scratch workspace vault roots, so their repeated identifier did not
+address the same files. Within a shared workspace, repeated failures could overwrite
+one another. Planning failures now allocate a fresh UUID identifier for every invocation.

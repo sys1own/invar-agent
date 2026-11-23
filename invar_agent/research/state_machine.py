@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1858,18 +1859,20 @@ class ResearchStateMachine:
             blueprint = ResearchBlueprint.model_validate(self.planner_result["blueprint"])
         except (LLMProviderError, ValueError, SyntaxError, TypeError, RuntimeError) as error:
             self._provider_failure = None
-            run_id = "planning_"+hashlib.sha256(question.encode()).hexdigest()[:20]
+            run_id = "planning_"+uuid.uuid4().hex
             if isinstance(error, LLMProviderError):
                 reason = "LLM_PROVIDER_RETRIES_EXHAUSTED" if error.retryable else "LLM_PROVIDER_ERROR"
                 detail = reason
             else:
                 reason, detail = "PLANNING_VALIDATION_FAILED", str(error)
-            certificate = incomplete_certificate(run_id,question,reason)
+            diagnostics = dict(error_type=type(error).__name__, error=detail,
+                validation_attempts=list(getattr(error,"validation_attempts",())))
+            certificate = incomplete_certificate(run_id,question,reason,diagnostics=diagnostics)
             directory = ResearchVaultManager(self.workspace_root).run_dir(run_id)
             directory.mkdir(parents=True,exist_ok=True)
             (directory/"meaningfulness_certificate.json").write_text(certificate.model_dump_json(indent=2),encoding="utf-8")
             (directory/"report.md").write_text(f"# Research planning did not complete\n\n{reason}\n\n{detail}\n",encoding="utf-8")
-            (directory/"metadata.json").write_text(json.dumps(dict(run_id=run_id,status="INCONCLUSIVE_UNVERIFIED",failure_reason=reason,planning_error=detail)),encoding="utf-8")
+            (directory/"metadata.json").write_text(json.dumps(dict(run_id=run_id,status="INCONCLUSIVE_UNVERIFIED",failure_reason=reason,planning_error=detail,diagnostics=diagnostics)),encoding="utf-8")
             await self._emit("accelerator_log","research_completed",dict(epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
                 reason=reason,meaningfulness_certificate=certificate.model_dump(mode="json")))
             return ResearchPlanningFailure(run_id,certificate)

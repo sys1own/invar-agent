@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from invar_agent import _native
 from invar_agent.research import meaningfulness as m
-from invar_agent.research.epistemic import compile_blueprint_ihcg, formal_contracts, parse_run_certificate
+from invar_agent.research.epistemic import compile_blueprint_ihcg, formal_contracts, incomplete_certificate, parse_run_certificate
+from invar_agent.research.formal_evidence import _anchor_evidence
 from invar_agent.research.formalization import evidence_json_schema, formalize_blueprint
 from invar_agent.research.ihcg_normalization import normalize_ihcg_evidence
 from invar_agent.research.planner import _FORMAL_EXAMPLE_PACK, _FORMAL_EXAMPLE_PROMPT, _extract_json, _parse_planned_blueprint, generate_plan_with_feasibility
@@ -197,3 +199,108 @@ def test_all_saved_raw_replies_normalize_or_fail_precisely(run,name,index,prompt
         (3,'carnot'):'Phi_lock', (3,'shbt'):'redundant_conjuncts='}
     with pytest.raises(ValueError,match=expected[run,name]): _parse_planned_blueprint(raw,prompt,require_evidence=True)
     assert raw == before
+
+
+@pytest.mark.parametrize('diagnostics',[{}, {'validation_attempts':[{'attempt':1,'error':'invalid expression'}]}])
+def test_incomplete_receipts_bind_diagnostics_and_accept_legacy_certificates(diagnostics):
+    certificate = incomplete_certificate('diagnostic-run','claim','PLANNING_VALIDATION_FAILED',diagnostics=diagnostics)
+    raw = certificate.model_dump(mode='json')
+    assert parse_run_certificate(raw).diagnostics == diagnostics
+    tampered = copy.deepcopy(raw)
+    tampered['diagnostics']['error'] = 'changed'
+    with pytest.raises(ValueError,match='receipt mismatch'): parse_run_certificate(tampered)
+    legacy = copy.deepcopy(raw)
+    legacy.pop('diagnostics')
+    legacy['blake3_receipt'] = _native.py_compute_certificate_receipt(json.dumps(legacy))
+    assert parse_run_certificate(legacy).diagnostics == {}
+
+
+@pytest.mark.asyncio
+async def test_independent_encoding_errors_are_reported_together_without_guessing():
+    broken = copy.deepcopy(_FORMAL_EXAMPLE_PACK)
+    broken['domain'].pop('y')
+    broken['evidence']['environmental_assumptions'] = ['All quantities are dimensionless.']
+    broken['evidence']['obligations'][0]['prompt_quote'] = 'not in the immutable request'
+    before = copy.deepcopy(broken)
+    prompts = []
+    async def complete(prompt):
+        prompts.append(prompt)
+        return json.dumps(broken if len(prompts) == 1 else _FORMAL_EXAMPLE_PACK)
+    result = await formalize_blueprint(_FORMAL_EXAMPLE_PROMPT,scalar_blueprint(),complete)
+    assert len(prompts) == 2 and broken == before
+    assert "missing_domain=['y']" in prompts[1]
+    assert 'environmental_assumptions[0]' in prompts[1]
+    assert "id='h'" in prompts[1] and 'original_slice=' in prompts[1]
+    assert f'at most {m.MAX_VARIABLES}' in prompts[0]
+    assert 'x < 1 must not become x < 1 - epsilon' in prompts[0]
+    assert compile_blueprint_ihcg(result) is not None
+
+
+@pytest.mark.asyncio
+async def test_identical_failed_requests_never_overwrite_a_previous_run(tmp_path):
+    async def planner(prompt): return json.dumps({'blueprint':scalar_blueprint()})
+    async def formalizer(prompt): return '{}'
+    machine = ResearchStateMachine(tmp_path/'research',workspace_root=tmp_path,llm_planner=planner,llm_formalizer=formalizer)
+    first = await machine.plan_and_run(_FORMAL_EXAMPLE_PROMPT)
+    directory = tmp_path/'.invar'/'research_vault'/first.run_id
+    snapshot = {p.name:p.read_bytes() for p in directory.iterdir()}
+    second = await machine.plan_and_run(_FORMAL_EXAMPLE_PROMPT)
+    assert first.run_id != second.run_id
+    assert snapshot == {p.name:p.read_bytes() for p in directory.iterdir()}
+    assert (directory.parent/second.run_id/'meaningfulness_certificate.json').exists()
+
+
+RUN4 = json.loads((Path(__file__).parent/'fixtures'/'live_run4_raw_plans.json').read_text())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('name',sorted(RUN4))
+async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(name,tmp_path):
+    case = RUN4[name]
+    replies, prompts, events = iter(case['responses']), [], []
+    async def complete(prompt):
+        prompts.append(prompt)
+        return next(replies)
+    async def progress(channel,event): events.append(event)
+    machine = ResearchStateMachine(tmp_path/'research',workspace_root=tmp_path,llm_planner=complete,progress_cb=progress)
+    state = await machine.plan_and_run(case['prompt'])
+    assert len(prompts) == 4
+    assert state.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
+    directory = tmp_path/'.invar'/'research_vault'/state.run_id
+    certificate = parse_run_certificate((directory/'meaningfulness_certificate.json').read_text())
+    assert certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
+    attempts = certificate.diagnostics['validation_attempts']
+    assert len(attempts) == 3
+    for index, (record, historical) in enumerate(zip(attempts,case['validation_errors'])):
+        assert record['attempt'] == index+1
+        if name == 'seir' and index == 0:
+            assert record['error'].startswith('IHCG slots and Omega must be one-to-one')
+            anchored = _anchor_evidence(case['prompt'],_extract_json(case['responses'][1]))
+            obligation = anchored['evidence']['obligations'][9]
+            start, end = obligation['prompt_span']
+            assert case['prompt'][start:end] == obligation['prompt_quote'] == 'vaccination coverage pv between 0 and 1'
+        else: assert record['error'].startswith(historical)
+        assert record['error_type'] == 'ValueError'
+        assert any('environmental_assumptions[0]' in issue for issue in record['encoding_diagnostics'])
+        if index < 2: assert record['error'] in prompts[index+2]
+    metadata = json.loads((directory/'metadata.json').read_text())
+    assert metadata['diagnostics'] == certificate.diagnostics
+    terminal = next(event for event in events if event['event'] == 'research_completed')
+    assert terminal['event_version'] == '2.0'
+    assert terminal['meaningfulness_certificate']['diagnostics'] == certificate.diagnostics
+    assert 'missing_domain=' in prompts[2] and 'environmental_assumptions[0]' in prompts[2]
+    if name == 'shbt': assert 'declared 33 slots' in prompts[2]
+
+
+@pytest.mark.parametrize('suffix',['. Next sentence.','? Next sentence.','! Next sentence.'])
+def test_exact_quote_reanchoring_preserves_integer_and_sentence_boundaries(suffix):
+    quote = 'x between 0 and 1'
+    prompt = 'Use '+quote+suffix
+    pack = copy.deepcopy(_FORMAL_EXAMPLE_PACK)
+    pack['evidence']['obligations'][0].update(prompt_quote=quote,prompt_span=[0,1])
+    anchored = _anchor_evidence(prompt,pack)['evidence']['obligations'][0]
+    assert anchored['prompt_quote'] == quote
+    assert prompt[slice(*anchored['prompt_span'])] == quote
+    for changed in ['x between 0 and 10','x between 0 and 1.0','x between 0 and 1e0']:
+        with pytest.raises(ValueError,match='no unique immutable prompt span'):
+            _anchor_evidence('Use '+changed+suffix,pack)
