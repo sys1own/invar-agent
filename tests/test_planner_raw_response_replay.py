@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from invar_agent.research.epistemic import parse_run_certificate
 from invar_agent.research.feasibility import compile_ingest_ihcg
@@ -26,16 +25,14 @@ def test_actual_replies_are_json_but_invalid_formal_evidence(replies,scenario,in
     parsed = _extract_json(response)
     assert parsed == json.loads(response)
     assert isinstance(parsed['blueprint']['ihcg_evidence'],dict)
-    with pytest.raises(ValidationError) as error:
+    with pytest.raises(ValueError) as error:
         _parse_planned_blueprint(parsed['blueprint'],item['prompt'],require_evidence=True)
-    paths = {'.'.join(map(str,e['loc'])) for e in error.value.errors()}
     if scenario == 'carnot':
-        assert 'archetype' in paths
-        assert any(p.startswith('equations.') for p in paths)
+        assert 'archetype' in str(error.value)
     elif index == 0:
-        assert 'equations.P_net' in paths
+        assert 'missing si_dim' in str(error.value)
     else:
-        assert 'equations.P_net.latex' in paths and 'mechanism_parameters.0' in paths
+        assert 'mechanism_parameters.0' in str(error.value) and 'extra_forbidden' not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -45,18 +42,18 @@ async def test_raw_validation_failures_repair_once_then_persist(replies,scenario
     calls = []
     async def provider(prompt):
         calls.append(prompt)
-        assert len(calls) <= 2
-        return item['responses'][len(calls)-1]
+        assert len(calls) <= 4
+        if len(calls) == 1: return item['responses'][0]
+        return json.dumps(_extract_json(item['responses'][min(len(calls)-2,1)])['blueprint']['ihcg_evidence'])
     events = []
     async def emit(channel,payload): events.append(payload)
     machine = ResearchStateMachine(tmp_path/'research',workspace_root=tmp_path,
         llm_planner=provider,progress_cb=emit)
     result = await machine.plan_and_run(item['prompt'])
-    assert len(calls) == 2 and result.blueprint is None
+    assert len(calls) == 4 and result.blueprint is None
     assert result.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
     assert result.meaningfulness_certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
-    for path in (['equations.carnot_ceiling','archetype'] if scenario == 'carnot' else ['equations.P_debt','equations.P_net']):
-        assert path in calls[1]
+    assert 'Exact formalization validation error' in calls[2]
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
     assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
     diagnostic = json.loads((directory/'metadata.json').read_text())['planning_error']

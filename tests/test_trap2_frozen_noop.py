@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from phase3b_cases import run_case,sir_model
+from trap_control_cases import run_case,sir_model
 
 
 @pytest.mark.asyncio

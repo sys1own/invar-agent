@@ -1709,11 +1709,13 @@ class ResearchStateMachine:
                  stage_synthesizer: Optional[StageSynthFn] = None,
                  abort_flag: Optional[Callable[[], bool]] = None,
                  workspace_root: Optional[Path] = None,
-                 verification_runner: Optional[Callable[..., Any]] = None):
+                 verification_runner: Optional[Callable[..., Any]] = None,
+                 llm_formalizer: Optional[LLMFn] = None):
         self.workspace = Path(workspace)
         self.progress_cb = progress_cb
         self._provider_failure = None
         self.llm_planner = self._retry_provider(llm_planner)
+        self.llm_formalizer = self._retry_provider(llm_formalizer) if llm_formalizer is not None else self.llm_planner
         self.llm_fast = self.llm_planner if llm_fast is llm_planner else self._retry_provider(llm_fast)
         if search_client is None:
             # Live network by default in production/server/CLI; offline only
@@ -1851,7 +1853,7 @@ class ResearchStateMachine:
         self._provider_failure = None
         try:
             self.planner_result = await generate_plan_with_feasibility(question,
-                llm_complete=self.llm_planner, fallback=False)
+                llm_complete=self.llm_planner, llm_formalizer=self.llm_formalizer, fallback=False)
             if self._provider_failure is not None: raise self._provider_failure
             blueprint = ResearchBlueprint.model_validate(self.planner_result["blueprint"])
         except (LLMProviderError, ValueError, SyntaxError, TypeError, RuntimeError) as error:

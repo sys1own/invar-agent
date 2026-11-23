@@ -1,7 +1,7 @@
 """Only receipt-checked, persisted prior discoveries count as duplicates."""
 import pytest
 
-from phase3b_cases import allen_eggers_model,oregonator_model,run_case
+from trap_control_cases import allen_eggers_model,oregonator_model,run_case
 
 
 @pytest.mark.asyncio

@@ -2154,6 +2154,9 @@ def _reconcile_time_horizon(
 
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
     from .formal_evidence import attach_formal_evidence
+    from .ihcg_normalization import normalize_ihcg_evidence
+    if payload.get('ihcg_evidence') is not None:
+        payload = {**payload, 'ihcg_evidence':normalize_ihcg_evidence(payload['ihcg_evidence'])}
     return attach_formal_evidence(ResearchBlueprint.model_validate(normalize_blueprint_payload(payload)))
 
 
@@ -2179,6 +2182,22 @@ def _fill(template: str, **values: Any) -> str:
     for key, val in values.items():
         out = out.replace("{" + key + "}", str(val))
     return out.replace("\x00", "{").replace("\x01", "}")
+
+
+def _blueprint_tools_context(fallback):
+    if fallback: return TOOLS_CONTEXT
+    head, rest = TOOLS_CONTEXT.split('## Formal evidence at ingest', 1)
+    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis, not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
+
+
+async def _finish_planned_blueprint(payload, question, *, fallback, complete):
+    if not fallback and (payload.get('ihcg_evidence') is not None or re.search(r'\d',question)):
+        from .formalization import formalize_blueprint
+        core = parse_blueprint({**payload, 'ihcg_evidence':None, 'research_prompt':question})
+        immutable = core.model_dump()
+        immutable['ihcg_evidence'] = payload.get('ihcg_evidence')
+        return await formalize_blueprint(question, immutable, complete)
+    return _parse_planned_blueprint(payload,question,require_evidence=not fallback)
 
 
 def compact_literature_digest(
@@ -2587,6 +2606,7 @@ async def generate_research_plan(question: str,
                                  literature: Optional[List[Dict[str, Any]]] = None,
                                  feasibility: Any = None,
                                  extra_context: str = "",
+                                 llm_formalizer: Optional[Callable[[str], Any]] = None,
                                  ) -> Dict[str, Any]:
     """Tier-2 REASONING plan synthesis; falls back to a deterministic blueprint.
 
@@ -2599,7 +2619,7 @@ async def generate_research_plan(question: str,
     evidence = _compute_structured_evidence(question, literature)
     if llm_complete is not None:
         try:
-            prompt = _fill(PLANNER_PROMPT, tools=TOOLS_CONTEXT,
+            prompt = _fill(PLANNER_PROMPT, tools=_blueprint_tools_context(fallback),
                            feasibility=_feasibility_context(feasibility),
                            literature=compact_literature_digest(literature or [], question=question),
                            question=question)
@@ -2611,19 +2631,23 @@ async def generate_research_plan(question: str,
             data = _extract_json(str(raw))
             if isinstance(data, dict):
                 try:
-                    bp = _parse_planned_blueprint(data,question,require_evidence=not fallback)
+                    bp = await _finish_planned_blueprint(data,question,fallback=fallback,complete=llm_formalizer or llm_complete)
                 except ValueError as exc:
+                    from .formalization import FormalizationError
+                    if isinstance(exc, FormalizationError): raise
                     if fallback: raise
-                    with llm_call_context("blueprint_formal_evidence_repair", attempt=2):
-                        repaired = await llm_complete(prompt+"\n\nFORMAL BLUEPRINT VALIDATION ERROR: "+str(exc)
-                            +"\nReturn the complete corrected blueprint JSON, including ihcg_evidence. Never fabricate absent domain or SI information. Previous JSON:\n"+json.dumps(data))
-                    bp = _parse_planned_blueprint(_extract_json(str(repaired)),question,require_evidence=True)
+                    with llm_call_context("blueprint_schema_repair", attempt=2):
+                        repaired = await llm_complete(prompt+"\n\nBLUEPRINT SCHEMA VALIDATION ERROR: "+str(exc)
+                            +"\nReturn the complete corrected blueprint JSON without ihcg_evidence; a separate evidence-only call follows. Never fabricate absent physical information. Previous JSON:\n"+json.dumps(data))
+                    bp = await _finish_planned_blueprint(_extract_json(str(repaired)),question,fallback=False,complete=llm_formalizer or llm_complete)
                 bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
                 bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
                 return {"blueprint": _attach_evidence(bp_dict, evidence),
                         "source": "llm", "structured_evidence": evidence.model_dump() if evidence else None}
             error = "planner returned no JSON object"
         except Exception as exc:  # noqa: BLE001 - fall through to fallback
+            from .formalization import FormalizationError
+            if isinstance(exc, FormalizationError) and not fallback: raise
             error = f"{type(exc).__name__}: {str(exc)[:300]}"
     if fallback:
         out: Dict[str, Any] = {"blueprint": _attach_evidence(dict(_FALLBACK_BLUEPRINT), evidence),
@@ -2671,8 +2695,9 @@ async def generate_plan_with_feasibility(question: str,
                                          assume_feasible: bool = False,
                                          extra_context: str = "",
                                          progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+                                         llm_formalizer: Optional[Callable[[str], Any]] = None,
                                          ) -> Dict[str, Any]:
-    """Single call: feasibility gate + blueprint with immediate progress logging and Tier-0 alignment autofix.
+    """Feasibility and blueprint synthesis, then bounded evidence-only formalization.
 
     Returns {"feasibility": FeasibilityAssessment|None, "blueprint": dict|None,
     "source": "llm"|"fallback"|"heuristic", ...}. When the verdict is a refusal,
@@ -2712,7 +2737,7 @@ async def generate_plan_with_feasibility(question: str,
         raw_sources=len(literature or []),
         compacted_chars=len(compacted_lit),
     )
-    prompt = _fill(COMBINED_PLAN_PROMPT, tools=TOOLS_CONTEXT,
+    prompt = _fill(COMBINED_PLAN_PROMPT, tools=_blueprint_tools_context(fallback),
                    literature=compacted_lit,
                    question=question)
     prompt += _evidence_prompt_block(evidence)
@@ -2811,8 +2836,10 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no blueprint object"}
         raise RuntimeError("research plan synthesis failed: no blueprint object in response")
     try:
-        bp = _parse_planned_blueprint(bp_raw,question,require_evidence=not fallback)
+        bp = await _finish_planned_blueprint(bp_raw,question,fallback=fallback,complete=llm_formalizer or llm_complete)
     except Exception as exc:
+        from .formalization import FormalizationError
+        if isinstance(exc, FormalizationError): raise
         if fallback:
             return {"feasibility": feasibility,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback",
@@ -2829,9 +2856,8 @@ async def generate_plan_with_feasibility(question: str,
             "each containing `contract_id`, `target_backend`: 'cpp', `initial_state`, `dt`, `steps`, "
             "and a non-empty `invariants` list), plus `blueprint_id`, `title`, `falsifiable_hypothesis`, "
             "`search_queries`, `variable_map`, and `code_template`."
-            " Quantitative claims require `ihcg_evidence` with slots, equations, explicit SI dimensions, "
-            "finite domains, quantifier_mode and obligations bound to exact original prompt spans. "
-            "Correct the full blueprint, including executable/contract bindings; never invent missing "
+            " Do not emit `ihcg_evidence`; a separate evidence-only call follows. "
+            "Correct the structural blueprint, including executable/contract bindings; never invent missing "
             "physical declarations or weaken a claim to make it pass. Previous blueprint JSON:\n"
             + json.dumps(bp_raw)
         )
@@ -2845,7 +2871,7 @@ async def generate_plan_with_feasibility(question: str,
                 bp_raw2 = data_retry2
         if not isinstance(bp_raw2, dict):
             raise
-        bp = _parse_planned_blueprint(bp_raw2,question,require_evidence=True)
+        bp = await _finish_planned_blueprint(bp_raw2,question,fallback=False,complete=llm_formalizer or llm_complete)
     bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
     bp_dict["research_prompt"] = question
     # Tier-0 deterministic contract alignment autofix BEFORE running validation checks (0 tokens)
@@ -2897,14 +2923,16 @@ async def generate_plan_with_feasibility(question: str,
                         if not isinstance(bp_fix, dict) and isinstance(data_fix.get("contracts"), list) and data_fix.get("title"):
                             bp_fix = data_fix
                     if isinstance(bp_fix, dict):
-                        bp2 = _parse_planned_blueprint(bp_fix,question,require_evidence=not fallback)
+                        bp2 = await _finish_planned_blueprint(bp_fix,question,fallback=fallback,complete=llm_formalizer or llm_complete)
                         bp_dict = _reconcile_time_horizon(bp2.model_dump(), question, evidence)
                         bp_dict["research_prompt"] = question
                         bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
-                except Exception:  # noqa: BLE001
-                    pass
-    except Exception:  # noqa: BLE001
-        pass
+                except Exception as error:  # noqa: BLE001
+                    from .formalization import FormalizationError
+                    if isinstance(error, FormalizationError): raise
+    except Exception as error:  # noqa: BLE001
+        from .formalization import FormalizationError
+        if isinstance(error, FormalizationError): raise
     await _emit_plan_progress(
         progress_cb,
         "blueprint_parse_validation",

@@ -10,7 +10,7 @@ from invar_agent.research.default_verification import (
 )
 from invar_agent.research import meaningfulness as m
 from invar_agent.research.epistemic import compile_blueprint_ihcg
-from phase3b_cases import sir_model, oregonator_model, allen_eggers_model
+from trap_control_cases import sir_model, oregonator_model, allen_eggers_model
 from invar_agent.research.evolution import _SymbolicKernel
 from invar_agent.research.default_verification import _prove_rk4_assignments
 from invar_agent.research.uniqueness import CanonicalSignatureEngine, si_error_budgets

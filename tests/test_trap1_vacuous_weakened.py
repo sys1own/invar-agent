@@ -5,7 +5,7 @@ import pytest
 
 from invar_agent.research import meaningfulness as m
 from invar_agent.research.epistemic import compile_blueprint_ihcg,formal_contracts
-from phase3b_cases import blueprint,oregonator_model,run_case
+from trap_control_cases import blueprint,oregonator_model,run_case
 from invar_agent.healing.deterministic_ast import assert_sealed_observables
 from invar_agent.research.scientific_integrity import validate_observables
 

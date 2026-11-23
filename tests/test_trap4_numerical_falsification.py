@@ -5,7 +5,7 @@ the user claim. Q2 and entailment feasibility remain mandatory.
 """
 import pytest
 
-from phase3b_cases import blueprint,run_case,sir_model
+from trap_control_cases import blueprint,run_case,sir_model
 
 
 @pytest.mark.asyncio

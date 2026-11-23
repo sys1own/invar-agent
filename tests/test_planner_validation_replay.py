@@ -37,9 +37,10 @@ def corrected_plan(prompt):
 
 
 @pytest.mark.parametrize('index',[0,1])
-def test_saved_raw_plans_reject_object_domains_with_field_path(replay,index):
+def test_saved_undeclared_symbol_aliases_remain_precise_failures(replay,index):
     raw = _extract_json(replay['responses'][index])['blueprint']
-    with pytest.raises(ValueError,match=r"ihcg_evidence.domain\[.+\]: expected \[lower, upper\]"):
+    expected = r"ihcg_evidence.domain\['R0'\]" if index == 0 else r"ihcg_evidence.evidence.equations\['Reff_below_eq'\]"
+    with pytest.raises(ValueError,match=expected):
         _parse_planned_blueprint(raw,replay['prompt'],require_evidence=True)
 
 
@@ -48,21 +49,21 @@ async def test_exact_raw_replay_exhausts_repair_and_persists_certificate(replay,
     calls = []
     async def provider(prompt):
         calls.append(prompt)
-        assert len(calls) <= 2
-        return replay['responses'][len(calls)-1]
+        assert len(calls) <= 4
+        if len(calls) == 1: return replay['responses'][0]
+        return json.dumps(_extract_json(replay['responses'][min(len(calls)-2,1)])['blueprint']['ihcg_evidence'])
     events = []
     async def emit(channel,payload): events.append(payload)
     machine = ResearchStateMachine(tmp_path/'research',workspace_root=tmp_path,llm_planner=provider,progress_cb=emit)
     result = await machine.plan_and_run(replay['prompt'])
     assert result.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED' and result.blueprint is None
     assert result.meaningfulness_certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
-    assert len(calls) == 2
-    assert "ihcg_evidence.domain['R0']" in calls[1]
-    assert 'expected [lower, upper]' in calls[1]
+    assert len(calls) == 4
+    assert 'Exact formalization validation error' in calls[2]
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
     assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
     metadata = json.loads((directory/'metadata.json').read_text())
-    assert 'expected [lower, upper]' in metadata['planning_error']
+    assert 'FORMALIZATION_VALIDATION_FAILED' in metadata['planning_error']
     assert any(e.get('event') == 'research_completed' for e in events)
     assert all(e['event_version'] == '2.0' for e in events)
 
@@ -74,7 +75,7 @@ async def test_precise_feedback_allows_synthetic_corrected_reply(replay):
     async def provider(prompt):
         calls.append(prompt)
         assert len(calls) <= 2
-        return replay['responses'][0] if len(calls) == 1 else json.dumps({'blueprint':corrected})
+        return json.dumps({'blueprint':dict(corrected,ihcg_evidence=None)}) if len(calls) == 1 else json.dumps(corrected['ihcg_evidence'])
     result = await generate_plan_with_feasibility(replay['prompt'],llm_complete=provider,fallback=False)
     bp = ResearchBlueprint.model_validate(result['blueprint'])
     graph = compile_blueprint_ihcg(bp)
@@ -83,7 +84,7 @@ async def test_precise_feedback_allows_synthetic_corrected_reply(replay):
     assert bp.ihcg_evidence['domain'] == corrected['ihcg_evidence']['domain']
 
 
-@pytest.mark.parametrize('field',['environmental_assumptions','equations','obligations'])
+@pytest.mark.parametrize('field',['environmental_assumptions','obligations'])
 def test_prose_expressions_stay_invalid_and_report_path(replay,field):
     plan = corrected_plan(replay['prompt'])
     evidence = plan['ihcg_evidence']['evidence']

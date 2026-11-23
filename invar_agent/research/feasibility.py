@@ -322,7 +322,7 @@ def compile_ingest_ihcg(prompt, evidence, domain, archetype):
     lock = verify_entailment_lock(graph, claims)
     vacuity = classify_contract_vacuity(graph)
     if not lock.entailment_locked or not vacuity.passed:
-        raise ValueError(f"IHCG_INGEST_REJECTED: {vacuity.classification}")
+        raise ValueError(f"IHCG_INGEST_REJECTED: {vacuity.classification}; entailment_locked={lock.entailment_locked}; redundant_conjuncts={vacuity.redundant_conjuncts}; query_statuses={dict((k,v.status) for k,v in vacuity.queries.items())}")
     return graph
 
 

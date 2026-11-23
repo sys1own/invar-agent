@@ -1,7 +1,7 @@
 """Carnot: First/Second Laws refute efficiency ≥.65 at 300K/600K."""
 import pytest
 
-from phase3b_cases import blueprint,run_case
+from trap_control_cases import blueprint,run_case
 
 
 @pytest.mark.asyncio

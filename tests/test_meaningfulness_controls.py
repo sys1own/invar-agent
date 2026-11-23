@@ -1,7 +1,7 @@
 """Offline positive controls execute actual kernels through the default runner."""
 import pytest
 
-from phase3b_cases import blueprint,run_case
+from trap_control_cases import blueprint,run_case
 from test_stochastic_equilibrium_default import sirs_model
 from invar_agent.research import meaningfulness as m
 from invar_agent.research.shbt_federation import SHBT_REPOSITORIES

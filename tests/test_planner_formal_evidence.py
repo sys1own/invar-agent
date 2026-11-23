@@ -43,7 +43,7 @@ def repaired_plan(saved):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("combined",[True,False])
-async def test_saved_missing_evidence_requires_one_bounded_repair(saved_plan,combined):
+async def test_saved_missing_evidence_requires_bounded_formalization(saved_plan,combined):
     calls = []
 
     async def provider(prompt):
@@ -51,10 +51,10 @@ async def test_saved_missing_evidence_requires_one_bounded_repair(saved_plan,com
         return json.dumps(saved_plan if combined else saved_plan["blueprint"])
 
     planner = generate_plan_with_feasibility if combined else generate_research_plan
-    with pytest.raises((ValueError,RuntimeError),match="FORMAL_EVIDENCE_MISSING"):
+    with pytest.raises((ValueError,RuntimeError),match="FORMALIZATION_VALIDATION_FAILED"):
         await planner(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
-    assert len(calls) == 2
-    assert "ihcg_evidence" in calls[1] and "FORMAL_EVIDENCE_MISSING" in calls[1]
+    assert len(calls) == 4
+    assert "ihcg_evidence" in calls[1] and "expected ONLY" in calls[2]
 
 
 @pytest.mark.asyncio
@@ -65,8 +65,10 @@ async def test_saved_plan_then_explicit_repair_reaches_formal_ingest(saved_plan,
 
     async def provider(prompt):
         calls.append(prompt)
-        if len(calls) == 1: return json.dumps(saved_plan if combined else saved_plan["blueprint"])
-        return json.dumps({"feasibility":saved_plan["feasibility"],"blueprint":corrected} if combined else corrected)
+        if len(calls) == 1:
+            core = dict(corrected, ihcg_evidence=None)
+            return json.dumps({"feasibility":saved_plan["feasibility"],"blueprint":core} if combined else core)
+        return json.dumps(corrected['ihcg_evidence'])
 
     planner = generate_plan_with_feasibility if combined else generate_research_plan
     result = await planner(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
@@ -133,8 +135,8 @@ async def test_invalid_formal_repair_is_not_admitted(saved_plan,fault):
 
     async def provider(prompt):
         calls.append(prompt)
-        return json.dumps({"feasibility":saved_plan["feasibility"],"blueprint":corrected})
+        return json.dumps({"feasibility":saved_plan["feasibility"],"blueprint":corrected} if len(calls) == 1 else corrected['ihcg_evidence'])
 
     with pytest.raises(ValueError):
         await generate_plan_with_feasibility(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
-    assert len(calls) == 2
+    assert len(calls) == 4

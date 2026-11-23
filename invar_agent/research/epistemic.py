@@ -85,19 +85,24 @@ def compile_blueprint_ihcg(blueprint,*,stage=1):
         graphs.append(graph)
     if not 1 <= stage <= len(graphs): raise ValueError("IHCG stage binding is missing")
     for index,graph in enumerate(graphs,1):
-        if not m.verify_entailment_lock(graph, formal_contracts(blueprint, graph,stage=index)).entailment_locked:
-            raise ValueError("IHCG_INGEST_REJECTED: Phi_lock")
+        compiled = formal_contracts(blueprint, graph,stage=index)
+        lock = m.verify_entailment_lock(graph, compiled)
+        if not lock.entailment_locked:
+            raise ValueError(f"IHCG_INGEST_REJECTED: Phi_lock; compiled_contracts={compiled}; query_statuses={dict((k,v.status) for k,v in lock.queries.items())}; counterexample={lock.counterexample_if_weakened}")
     return graphs[stage-1]
 
 
 def formal_contracts(blueprint, graph,*,stage=None):
     names = {s.symbol for s in graph.slots}
-    slots = {index: name for name, index in blueprint.variable_map.items() if name in names}
+    slots = {slot.slot_idx: slot.symbol for slot in graph.slots}
+    for name, index in blueprint.variable_map.items():
+        if name in names and slots.get(index) != name:
+            raise ValueError(f'compiled contract slot binding conflict: {name} at {index}')
     class Bind(ast.NodeTransformer):
         def visit_Subscript(self, node):
             if ast.unparse(node.value) in {"state", "buf.data", "data"} and isinstance(node.slice, ast.Constant) and node.slice.value in slots:
                 return ast.Name(id=slots[node.slice.value], ctx=ast.Load())
-            raise ValueError("compiled contract has no sealed symbolic binding")
+            raise ValueError(f"compiled contract has no sealed symbolic binding: {ast.unparse(node)}; variable_map={blueprint.variable_map}; sealed_symbols={sorted(names)}")
     contracts = blueprint.contracts
     if stage is not None:
         from .state_machine import _contracts_through_stage

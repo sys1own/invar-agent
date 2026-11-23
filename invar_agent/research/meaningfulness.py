@@ -589,7 +589,7 @@ class IhcgCompiler:
         graph = IhcgGraph.model_validate_json(_json(data))
         names = {s.symbol for s in graph.slots}
         if names != set(graph.omega) or len(names) != len(graph.slots) or len({s.slot_idx for s in graph.slots}) != len(names):
-            raise ValueError("IHCG slots and Omega must be one-to-one")
+            raise ValueError(f"IHCG slots and Omega must be one-to-one; missing_domain={sorted(names-set(graph.omega))}; undeclared_domain={sorted(set(graph.omega)-names)}; symbols={[s.symbol for s in graph.slots]}; indices={[s.slot_idx for s in graph.slots]}")
         if not graph.obligations or not any(o.obligation_class == "HYPOTHESIS_TARGET" for o in graph.obligations):
             raise ValueError("at least one quoted primary hypothesis is required")
         if len({o.id for o in graph.obligations}) != len(graph.obligations):
