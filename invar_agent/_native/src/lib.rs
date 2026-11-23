@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 mod adjoint;
 mod builder_uast;
+mod buckingham_pi;
 mod csel_egraph;
 mod deterministic_healer;
 mod egraph_healer;
@@ -23,8 +24,11 @@ mod hin_engine;
 mod his;
 mod holographic_hin;
 mod uast;
+#[cfg(test)]
+mod epistemic_tests;
 
 use adjoint::PyAdjointHin;
+use adjoint::evaluate_interval_f64;
 use csel_egraph::{csel_egraph_optimize, desugar_math_to_csel, resolve_symbol_fuzzy};
 use deterministic_healer::DeterministicHealerCore;
 use egraph_healer::{repair_uast_expression, align_return_type, ASTRewritePatch, PreWriteHealer};
@@ -39,6 +43,92 @@ use uast::{PyGraphPolyglotMaterializer, PyUASTGraph, PyUASTKind};
 
 fn to_set(items: Vec<String>) -> HashSet<String> {
     items.into_iter().collect()
+}
+
+fn epistemic_json<T: serde::Serialize>(value: T) -> Result<String,String> {
+    serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+#[pyfunction]
+fn py_compute_ihcg_digest(py: Python<'_>, ihcg_json: &str) -> PyResult<String> {
+    py.allow_threads(|| his::compute_ihcg_digest(ihcg_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compute_ihcg_stage_chain(py: Python<'_>, prev_hash: &str, delta_json: &str) -> PyResult<String> {
+    py.allow_threads(|| his::compute_ihcg_stage_chain(prev_hash,delta_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compute_cds_digests(py: Python<'_>, canon_model: &str, canon_claim: &str, domain_and_verdict: &str) -> PyResult<String> {
+    py.allow_threads(|| epistemic_json(his::compute_cds_digests(canon_model,canon_claim,domain_and_verdict))).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compute_certificate_receipt(py: Python<'_>, payload_json: &str) -> PyResult<String> {
+    py.allow_threads(|| his::compute_certificate_receipt(payload_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_verify_observational_purity(py: Python<'_>, wires_json: &str, writes_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String,String> {
+        let wires = serde_json::from_str(wires_json).map_err(|e| e.to_string())?;
+        let writes: Vec<holographic_hin::SlotWriteOp> = serde_json::from_str(writes_json).map_err(|e| e.to_string())?;
+        match holographic_hin::verify_observational_purity(&wires,&writes) {
+            Ok(report) => epistemic_json(report),
+            Err(violations) => epistemic_json(serde_json::json!({"valid":false,"violations":violations})),
+        }
+    }).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (lhs, rhs, iter_limit=30, node_limit=20000, time_limit_ms=1500))]
+fn py_check_algebraic_equivalence(py: Python<'_>, lhs: &str, rhs: &str, iter_limit: usize, node_limit: usize, time_limit_ms: u64) -> PyResult<String> {
+    py.allow_threads(|| csel_egraph::check_algebraic_equivalence(lhs,rhs,iter_limit,node_limit,time_limit_ms).and_then(epistemic_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_canonicalize_csel_expr(py: Python<'_>, expr: &str) -> PyResult<String> {
+    py.allow_threads(|| csel_egraph::canonicalize_csel_expr(expr)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (eqs_json, max_aut_branches=64))]
+fn py_compute_alpha_canonical_system(py: Python<'_>, eqs_json: &str, max_aut_branches: usize) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String,String> {
+        let eqs: Vec<csel_egraph::TaggedCselEq> = serde_json::from_str(eqs_json).map_err(|e| e.to_string())?;
+        csel_egraph::compute_alpha_canonical_system(&eqs,max_aut_branches).and_then(epistemic_json)
+    }).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (s_stack, dead_tol=1e-10, svd_tol=1e-10))]
+fn py_compute_sensitivity_svd(py: Python<'_>, s_stack: Vec<Vec<f64>>, dead_tol: f64, svd_tol: f64) -> PyResult<String> {
+    py.allow_threads(|| adjoint::compute_sensitivity_svd(&s_stack,dead_tol,svd_tol).and_then(epistemic_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compute_ift_equilibrium_sensitivity(py: Python<'_>, jx: Vec<Vec<f64>>, jth: Vec<Vec<f64>>, dy_dx: Vec<Vec<f64>>, dy_dth: Vec<Vec<f64>>) -> PyResult<String> {
+    py.allow_threads(|| adjoint::compute_ift_equilibrium_sensitivity(&jx,&jth,&dy_dx,&dy_dth).and_then(epistemic_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_certify_krawczyk_fixed_point(py: Python<'_>, exprs: Vec<String>, z_center: Vec<f64>, rad: f64) -> PyResult<String> {
+    py.allow_threads(|| adjoint::certify_krawczyk_fixed_point(&exprs,&z_center,rad).and_then(epistemic_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_certify_interval_stability(py: Python<'_>, j_iv_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String,String> {
+        let matrix: Vec<Vec<adjoint::IntervalF64>> = serde_json::from_str(j_iv_json).map_err(|e| e.to_string())?;
+        adjoint::certify_interval_stability(&matrix).and_then(epistemic_json)
+    }).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (margin_expr, box_lo, box_hi, eps_total, max_boxes=32768))]
+fn py_branch_and_bound_refute(py: Python<'_>, margin_expr: &str, box_lo: Vec<f64>, box_hi: Vec<f64>, eps_total: f64, max_boxes: usize) -> PyResult<String> {
+    py.allow_threads(|| adjoint::branch_and_bound_refute(margin_expr,&box_lo,&box_hi,eps_total,max_boxes).and_then(epistemic_json)).map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -280,6 +370,20 @@ impl PyHisRegister {
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(py_compute_ihcg_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_ihcg_stage_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_cds_digests, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_certificate_receipt, m)?)?;
+    m.add_function(wrap_pyfunction!(py_verify_observational_purity, m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_algebraic_equivalence, m)?)?;
+    m.add_function(wrap_pyfunction!(py_canonicalize_csel_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_alpha_canonical_system, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_sensitivity_svd, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_ift_equilibrium_sensitivity, m)?)?;
+    m.add_function(wrap_pyfunction!(py_certify_krawczyk_fixed_point, m)?)?;
+    m.add_function(wrap_pyfunction!(py_certify_interval_stability, m)?)?;
+    m.add_function(wrap_pyfunction!(py_branch_and_bound_refute, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_interval_f64, m)?)?;
     m.add_function(wrap_pyfunction!(validate_builder_uast, m)?)?;
     m.add_function(wrap_pyfunction!(schedule_builder_wavefronts, m)?)?;
     m.add_function(wrap_pyfunction!(compute_builder_smw_delta, m)?)?;

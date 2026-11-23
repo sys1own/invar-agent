@@ -22,6 +22,53 @@ from .scientific_integrity import SCIENTIFIC_CONTRACT
 # -- shared tool-mastery context ----------------------------------------------
 
 TOOLS_CONTEXT = SCIENTIFIC_CONTRACT + "\n\n" + """## Your execution tools (know them exactly)
+## Formal evidence at ingest
+For quantitative requests with explicit formal claims, `ihcg_evidence` is a
+REQUIRED blueprint field, not narrative text or `structured_evidence`:
+`{"evidence":{"slots":[{"slot_idx":0,"symbol":"<symbol>","si_dim":[0,0,0,0,0,0,0],"role":"DYNAMIC_STATE"}],"equations":{},"environmental_assumptions":[],"obligations":[{"id":"h","expression":"<formal claim>","obligation_class":"HYPOTHESIS_TARGET","prompt_quote":"<verbatim user text>","prompt_span":[0,1]}],"quantifier_mode":"FORALL","mechanism_parameters":[]},"domain":{},"archetype":"ODE_PDE"}`.
+Populate every slot and governing equation, use audited SI dimensions, and bind
+each obligation to an exact character span in the original user research_prompt.
+Copy research_prompt verbatim from the original request. Offsets are zero-based
+Python character offsets [start,end), not byte offsets. A quote must be a literal
+substring, not a paraphrase. Keep physical symbols, variable_map indices, domains,
+code and contracts consistent. A claimed bound must apply to the computed physical
+observable, not an input containing the desired answer. Retain strictness and
+quantifiers exactly; an execution tolerance must not weaken a sealed inequality.
+For a single bounded study use one stage. Later stages require explicit sealed
+IHCG extensions; do not manufacture stages just to rephrase a refutation.
+Formal JSON shapes are strict:
+- domain maps EVERY slot symbol (and no undeclared symbol) to a numeric
+  [lower, upper] array, including outputs and controls. Fixed values use [v,v].
+  Never use {"lower":...,"upper":...}, {"value":...}, or dimensionless flags here.
+- Every equation has expression and si_dim (seven integer SI exponents).
+  ALGEBRAIC is the default kind: name the equation by its derived output symbol
+  and put only its RHS in expression. Do not use assignment syntax `x = ...`.
+  ODE_RHS and FIXED_POINT_MAP/RESIDUAL require state_symbol bound to a DYNAMIC_STATE;
+  FIXED_POINT_MAP is not the kind for a simple algebraic readout.
+- Equation objects allow expression, si_dim, semantic_tag, kind and state_symbol;
+  never add latex or other display metadata. mechanism_parameters is a list of
+  declared CONTROL_PARAM symbol strings, not objects containing values or units.
+- archetype is ODE_PDE, MONTE_CARLO, FIXED_POINT or PARAM_SWEEP. ALGEBRAIC is an
+  equation kind, not an archetype; pure algebraic readouts can use ODE_PDE.
+- environmental_assumptions are formal Boolean expressions, not English prose.
+  obligations[].expression is also a formal expression, e.g. `Reff < 1`;
+  quantification belongs in quantifier_mode (FORALL, EXISTS, BOUNDARY), not
+  strings such as 'For all ... Therefore ...'. Boundary requests use BOUNDARY.
+  Keep prose in prompt_quote; it must quote the original claim exactly.
+Use CONTROL_PARAM for held inputs and DERIVED_OBSERVABLE for pure readouts.
+An evolution equation must include `kind:"ODE_RHS"` and `state_symbol` naming
+the evolving state; its SI dimensions are state dimensions minus time.
+For equilibrium equations use kind FIXED_POINT_RESIDUAL (g(z)=0) or
+FIXED_POINT_MAP (z=F(z)), with state_symbol naming the corresponding state.
+For bounded Monte Carlo samplers use kind MC_SAMPLE and state_symbol naming
+the population-mean observable. Mark immutable stochastic input slots with
+stochastic_role UNIFORM, SEED, COUNTER, or CHANNEL; uniform inputs require
+domain [0,1]. Bind invar_rand_u01(seed,counter,channel) to those exact inputs.
+Do not invent a narrower domain, change a quantifier, or assign dimensionless
+units to an ambiguous quantity merely to obtain a certificate. Leave evidence
+absent when an honest binding cannot be established. The deterministic literal
+extractor accepts Claim:/Model:/Evolution:/Assume: lines and explicit `x in [a,b]`
+domains, with explicit SI vectors or an all-quantities-dimensionless declaration.
 - Sandbox_Execute is AIR-GAPPED: no network, no disk, no imports. Your Python is
   transpiled to C++20 (-O3 -std=c++20 -fPIC -shared), compiled, and executed in an
   isolated subprocess with CPU/memory limits. Nothing else runs your code.
@@ -249,6 +296,27 @@ stages/contracts (or an explicit sweep kernel) rather than copying identical
   `1 uM = 1e-3 mol/m^3` (when a threshold is stated in `uM`, keep the observable in `uM`
   scale, e.g. `peak_ros_uM < 2.0`, matching its `variable_map` name);
   `1 uF/cm^2 = 0.01 F/m^2`."""
+
+_FORMAL_EXAMPLE_PROMPT = "All quantities are dimensionless. x in [0,1]; y in [0,2]. Model: y = 2*x. Claim: y >= x."
+_FORMAL_EXAMPLE_PACK = {
+    "evidence": {
+        "slots": [
+            {"slot_idx": 0, "symbol": "x", "si_dim": [0]*7, "role": "CONTROL_PARAM"},
+            {"slot_idx": 1, "symbol": "y", "si_dim": [0]*7, "role": "DERIVED_OBSERVABLE"},
+        ],
+        "equations": {"y": {"expression": "2*x", "si_dim": [0]*7}},
+        "environmental_assumptions": [],
+        "obligations": [{"id": "h", "expression": "y >= x", "obligation_class": "HYPOTHESIS_TARGET",
+            "prompt_quote": "y >= x", "prompt_span": [_FORMAL_EXAMPLE_PROMPT.index("y >= x"), _FORMAL_EXAMPLE_PROMPT.index("y >= x")+len("y >= x")]}],
+        "quantifier_mode": "FORALL", "mechanism_parameters": ["x"],
+    },
+    "domain": {"x": [0, 1], "y": [0, 2]}, "archetype": "ODE_PDE",
+}
+TOOLS_CONTEXT += ("\n\n## Worked formal-evidence example (schema only)\n"
+    "This unrelated scalar example illustrates encoding, not a certified discovery. "
+    "Use its schema, never its symbols, numbers or claim in place of the user's task.\n"
+    "Example original research_prompt: " + json.dumps(_FORMAL_EXAMPLE_PROMPT) + "\n"
+    "Example ihcg_evidence:\n```json\n" + json.dumps(_FORMAL_EXAMPLE_PACK, separators=(",", ":")) + "\n```\n")
 
 PLANNER_PROMPT = """{tools}
 
@@ -721,7 +789,7 @@ def _iter_balanced(text: str, open_c: str, close_c: str, limit: int = 12):
                         yielded += 1
                         break
             j += 1
-        i = start + 1
+        i = j + 1 if depth == 0 else start + 1
 
 
 def _extract_json(text: str) -> Optional[Any]:
@@ -729,6 +797,14 @@ def _extract_json(text: str) -> Optional[Any]:
     string-aware balanced-brace matcher so trailing prose after the JSON
     object does not break parsing."""
     text = (text or "").strip()
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(document, (dict, list)) and document != {}:
+            from ..latex_normalizer import repair_json_strings
+            return repair_json_strings(document)
     # Reasoning models may leak chain-of-thought wrappers; strip them first.
     text = _THINK_BLOCK.sub("", text).strip()
     if not text:
@@ -737,6 +813,7 @@ def _extract_json(text: str) -> Optional[Any]:
     candidates = [c for c in candidates if c] + [text]
     first_valid: Optional[Any] = None
     best_dict: Optional[Dict[str, Any]] = None
+    best_rank = 0
     for candidate in candidates:
         for open_c, close_c in (("{", "}"), ("[", "]")):
             for chunk in _iter_balanced(candidate, open_c, close_c):
@@ -750,11 +827,13 @@ def _extract_json(text: str) -> Optional[Any]:
                 if first_valid is None and parsed != {}:
                     first_valid = parsed
                 if isinstance(parsed, dict) and parsed:
-                    if any(k in parsed for k in ("blueprint_id", "contracts", "code", "directives", "feasibility")):
-                        from ..latex_normalizer import repair_json_strings
-                        return repair_json_strings(parsed)
-                    if best_dict is None or len(parsed) > len(best_dict):
+                    blueprint = parsed.get("blueprint")
+                    rank = (4 if isinstance(blueprint, dict) and (blueprint.get("blueprint_id") or blueprint.get("contracts")) else
+                            3 if any(k in parsed for k in ("blueprint_id", "contracts", "code", "directives")) else
+                            2 if "feasibility" in parsed else 1)
+                    if rank > best_rank or (rank == best_rank == 1 and len(parsed) > len(best_dict)):
                         best_dict = parsed
+                        best_rank = rank
     chosen = best_dict if best_dict is not None else first_valid
     if chosen is not None:
         from ..latex_normalizer import repair_json_strings
@@ -779,7 +858,7 @@ _BLUEPRINT_FIELDS = {
     "contracts", "code_template", "max_feedback_rounds", "verified_layers",
     "target_research_stages", "stage_objectives", "current_stage",
     "evolution_history", "unified_module_code", "feasibility", "variable_map",
-    "slot_roles", "structured_evidence", "extracted_constants",
+    "slot_roles", "structured_evidence", "extracted_constants", "ihcg_evidence", "research_prompt",
 }
 _CONTRACT_FIELDS = {
     "contract_id", "target_backend", "timeout_seconds", "invariants",
@@ -2074,7 +2153,24 @@ def _reconcile_time_horizon(
 
 
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
-    return ResearchBlueprint.model_validate(normalize_blueprint_payload(payload))
+    from .formal_evidence import attach_formal_evidence
+    return attach_formal_evidence(ResearchBlueprint.model_validate(normalize_blueprint_payload(payload)))
+
+
+def _parse_planned_blueprint(payload,question,*,require_evidence=False):
+    from . import meaningfulness as m
+    blueprint = parse_blueprint({**payload,"research_prompt":question})
+    pack = blueprint.ihcg_evidence
+    if pack is None:
+        if require_evidence and re.search(r"\b[A-Za-z_]\w*\s*(?:>=|<=|==|!=|>|<|≥|≤)\s*[-+]?(?:\d|\.\d)",question):
+            raise ValueError("FORMAL_EVIDENCE_MISSING: explicit quantitative claim requires ihcg_evidence with exact prompt spans, SI dimensions, domains and executable bindings")
+    else:
+        graph = m.IhcgCompiler().compile_from_prompt(question,**{k:v for k,v in pack.items() if k not in {"extensions","execution"}})
+        for extension in pack.get("extensions",()):
+            graph = m.IhcgCompiler().extend_stage(graph,question,extension["evidence"],extension["domain"],extension["archetype"])
+        from .epistemic import compile_blueprint_ihcg
+        compile_blueprint_ihcg(blueprint)
+    return blueprint
 
 
 def _fill(template: str, **values: Any) -> str:
@@ -2514,7 +2610,14 @@ async def generate_research_plan(question: str,
                 raw = await llm_complete(prompt)
             data = _extract_json(str(raw))
             if isinstance(data, dict):
-                bp = parse_blueprint(data)
+                try:
+                    bp = _parse_planned_blueprint(data,question,require_evidence=not fallback)
+                except ValueError as exc:
+                    if fallback: raise
+                    with llm_call_context("blueprint_formal_evidence_repair", attempt=2):
+                        repaired = await llm_complete(prompt+"\n\nFORMAL BLUEPRINT VALIDATION ERROR: "+str(exc)
+                            +"\nReturn the complete corrected blueprint JSON, including ihcg_evidence. Never fabricate absent domain or SI information. Previous JSON:\n"+json.dumps(data))
+                    bp = _parse_planned_blueprint(_extract_json(str(repaired)),question,require_evidence=True)
                 bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
                 bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
                 return {"blueprint": _attach_evidence(bp_dict, evidence),
@@ -2708,7 +2811,7 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no blueprint object"}
         raise RuntimeError("research plan synthesis failed: no blueprint object in response")
     try:
-        bp = parse_blueprint(bp_raw)
+        bp = _parse_planned_blueprint(bp_raw,question,require_evidence=not fallback)
     except Exception as exc:
         if fallback:
             return {"feasibility": feasibility,
@@ -2720,12 +2823,17 @@ async def generate_plan_with_feasibility(question: str,
         seen_error_fingerprints.add(fp)
         repair_prompt = (
             prompt
-            + "\n\nCRITICAL SCHEMA VALIDATION ERROR on your previous JSON output: "
-            f"{str(exc)[:400]}. "
+            + "\n\nCRITICAL BLUEPRINT VALIDATION ERROR on your previous JSON output: "
+            f"{str(exc)}. "
             "You MUST include a non-empty `contracts` list (with `c1_`, `c2_`, `c3_` contracts, "
             "each containing `contract_id`, `target_backend`: 'cpp', `initial_state`, `dt`, `steps`, "
             "and a non-empty `invariants` list), plus `blueprint_id`, `title`, `falsifiable_hypothesis`, "
             "`search_queries`, `variable_map`, and `code_template`."
+            " Quantitative claims require `ihcg_evidence` with slots, equations, explicit SI dimensions, "
+            "finite domains, quantifier_mode and obligations bound to exact original prompt spans. "
+            "Correct the full blueprint, including executable/contract bindings; never invent missing "
+            "physical declarations or weaken a claim to make it pass. Previous blueprint JSON:\n"
+            + json.dumps(bp_raw)
         )
         with llm_call_context("blueprint_schema_repair", attempt=2):
             raw_retry2 = await llm_complete(repair_prompt)
@@ -2737,7 +2845,7 @@ async def generate_plan_with_feasibility(question: str,
                 bp_raw2 = data_retry2
         if not isinstance(bp_raw2, dict):
             raise
-        bp = parse_blueprint(bp_raw2)
+        bp = _parse_planned_blueprint(bp_raw2,question,require_evidence=True)
     bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
     bp_dict["research_prompt"] = question
     # Tier-0 deterministic contract alignment autofix BEFORE running validation checks (0 tokens)
@@ -2789,7 +2897,7 @@ async def generate_plan_with_feasibility(question: str,
                         if not isinstance(bp_fix, dict) and isinstance(data_fix.get("contracts"), list) and data_fix.get("title"):
                             bp_fix = data_fix
                     if isinstance(bp_fix, dict):
-                        bp2 = parse_blueprint(bp_fix)
+                        bp2 = _parse_planned_blueprint(bp_fix,question,require_evidence=not fallback)
                         bp_dict = _reconcile_time_horizon(bp2.model_dump(), question, evidence)
                         bp_dict["research_prompt"] = question
                         bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)

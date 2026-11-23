@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import importlib
+import hmac
 import math
 import os
 import re
@@ -55,6 +56,7 @@ async def build_research_instrument(workspace_dir, *, vault_ids=(), uploaded_fil
     if ir is None:
         ir = pipeline.CanonicalResearchIngestionPipeline(workspace_dir, llm_client=llm_client).ingest(
             schemas.IngestionRequest(vault_run_ids=list(vault_ids), upload_paths=[str(path) for path in uploaded_files]))
+    if ir is not None: validate_research_ir(ir)
     options = dict(ir=ir, explicit_profiles=profiles, leaf_slots=list(leaf_slots), build_goal=build_goal,
                    auto_approve_clean_ir=auto_approve_clean_ir)
     if build_id is not None:
@@ -383,6 +385,7 @@ class ResearchToBuildPacket(BaseModel):
     metric_rel_tolerance: float = 1e-6
     metric_abs_tolerance: float = 1e-9
     prompt_block: str = ""
+    negative_constraints: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     @property
     def primary_run_id(self) -> str:
@@ -464,6 +467,36 @@ def _load_detail(vault: Optional[ResearchVaultManager], run: Dict[str, Any]) -> 
             "blueprint": run.get("blueprint"), "report_md": run.get("report_md", "")}
 
 
+def validate_research_ir(ir, *, positive_import=True):
+    from invar_agent import _native
+    from ..research.epistemic import parse_run_certificate
+    if ir.blake3_receipt:
+        expected = _native.py_compute_certificate_receipt(ir.model_dump_json())
+        if not hmac.compare_digest(ir.blake3_receipt, expected): raise ValueError("CanonicalResearchIR receipt mismatch")
+    elif ir.meaningfulness_certificates or ir.meaningfulness_certificate is not None: raise ValueError("CanonicalResearchIR receipt is missing")
+    negative_ids = {entry.get("run_id") for entry in ir.negative_constraints}
+    certificates = dict(ir.meaningfulness_certificates)
+    if ir.epistemic_verdict is not None and not certificates and ir.meaningfulness_certificate is None:
+        raise ValueError("CanonicalResearchIR verdict requires a certificate")
+    if ir.meaningfulness_certificate is not None:
+        single = parse_run_certificate(ir.meaningfulness_certificate)
+        if ir.epistemic_verdict != single.epistemic_verdict.value: raise ValueError("CanonicalResearchIR verdict differs from certificate")
+        if single.run_id in certificates and certificates[single.run_id] != ir.meaningfulness_certificate: raise ValueError("CanonicalResearchIR certificate copies differ")
+        certificates[single.run_id] = ir.meaningfulness_certificate
+    for run_id, raw in certificates.items():
+        certificate = parse_run_certificate(raw)
+        if certificate.run_id != run_id: raise ValueError("certificate run identity mismatch")
+        if hasattr(certificate, "ihcg_anchor") and certificate.epistemic_verdict.value == "INCONCLUSIVE_UNVERIFIED":
+            raise ValueError("INCONCLUSIVE_UNVERIFIED cannot be imported as scientific evidence")
+        if certificate.epistemic_verdict.value == "VERIFIED_FALSIFICATION" and run_id not in negative_ids:
+            raise ValueError("NEGATIVE_CONSTRAINT_ONLY: falsification cannot become a positive law")
+    if ir.research_import_role == "NEGATIVE_CONSTRAINT_ONLY":
+        if ir.equations or ir.constants or ir.pinned_kernel_code or ir.runtime_predicates:
+            raise ValueError("NEGATIVE_CONSTRAINT_ONLY: positive evidence is forbidden")
+        if positive_import: raise ValueError("NEGATIVE_CONSTRAINT_ONLY: import as scoped constraints, not an executable instrument")
+    return ir
+
+
 def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any]],
                                   workspace_dir: Optional[str | Path] = None,
                                   archetype: Optional[SoftwareArchetypeSpec] = None
@@ -498,6 +531,7 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
     contracts: List[ResearchContractSpec] = []
     metrics: List[ResearchMetric] = []
     metric_contract_id = ""
+    negative_constraints = {}
 
     for run in research_runs:
         detail = _load_detail(vault, run)
@@ -509,6 +543,16 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
         run_ids.append(run_id)
         titles[run_id] = str(meta.get("title") or run_id)
         origins[run_id] = str(meta.get("origin") or "research_agent")
+        raw_certificate = detail.get("meaningfulness_certificate") or meta.get("meaningfulness_certificate")
+        if raw_certificate is not None:
+            from ..research.epistemic import validate_certificate_artifacts
+            certificate = validate_certificate_artifacts(raw_certificate, detail.get("unified_module_code") or "", detail.get("blueprint") or {})
+            if certificate.run_id != run_id: raise ValueError("certificate run identity mismatch")
+            if hasattr(certificate, "ihcg_anchor") and certificate.epistemic_verdict.value == "INCONCLUSIVE_UNVERIFIED":
+                raise ValueError("INCONCLUSIVE_UNVERIFIED cannot be imported as scientific evidence")
+            if certificate.epistemic_verdict.value == "VERIFIED_FALSIFICATION":
+                negative_constraints[run_id] = certificate.model_dump(mode="json")
+                continue
 
         evidence = meta.get("structured_evidence") or {}
         ev_params = evidence.get("parameters") or {}
@@ -573,6 +617,7 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
                 name=str(name), value=f, unit=str(entry.get("unit") or ""),
                 slot=variable_map.get(str(name)), run_id=run_id))
 
+    run_ids = [r for r in run_ids if r not in negative_constraints] + [r for r in run_ids if r in negative_constraints]
     primary = run_ids[0] if run_ids else ""
     packet = ResearchToBuildPacket(
         run_ids=run_ids, titles=titles, origins=origins, archetype=archetype,
@@ -582,6 +627,7 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
         classification_result=classification_result,
         variable_map=variable_map, contracts=contracts, key_metrics=metrics,
         metric_contract_id=metric_contract_id)
+    packet.negative_constraints = negative_constraints
     return packet.model_copy(update={"prompt_block": render_packet_prompt_block(packet)})
 
 
@@ -602,6 +648,9 @@ def render_packet_prompt_block(packet: ResearchToBuildPacket,
     lines.append("")
     lines.append("## Architecture Guidelines")
     lines.extend(f"- {g}" for g in arch.architecture_guidelines)
+    if packet.negative_constraints:
+        lines += ["", "## NEGATIVE_CONSTRAINT_ONLY", "The following hypotheses were refuted only in their recorded scope. Do not promote their models, claims, kernels, or metrics to positive evidence; do not turn a counterexample into a universal negation."]
+        lines.extend(f"- `@research:{run_id}` receipt `{certificate['blake3_receipt']}`" for run_id, certificate in packet.negative_constraints.items())
     lines.append("")
     lines.append("## Archetype Scaffold")
     lines.append(archetype_scaffold_text(SoftwareArchetype(arch.archetype_id)))

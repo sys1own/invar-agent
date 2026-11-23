@@ -8,6 +8,44 @@
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CdsTriplet { pub model_hash: String, pub claim_hash: String, pub full_hash: String }
+
+fn epistemic_digest(context: &str, payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(context.as_bytes());
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
+}
+
+pub fn compute_ihcg_digest(ihcg_json: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(ihcg_json).map_err(|e| e.to_string())?;
+    value.as_object_mut().ok_or("IHCG must be an object")?.remove("h_ihcg");
+    Ok(epistemic_digest("invar.ihcg.v1", &crate::uast::epistemic_canonical_bytes(&value.to_string())?))
+}
+
+pub fn compute_ihcg_stage_chain(prev_hash: &str, delta_json: &str) -> Result<String, String> {
+    let mut bytes = hex::decode(prev_hash).map_err(|_| "invalid previous digest")?;
+    if bytes.len() != 32 { return Err("previous digest must contain 32 bytes".into()); }
+    bytes.extend(crate::uast::epistemic_canonical_bytes(delta_json)?);
+    Ok(epistemic_digest("invar.ihcg.stage.v1", &bytes))
+}
+
+pub fn compute_cds_digests(canon_model: &str, canon_claim: &str, domain_and_verdict: &str) -> CdsTriplet {
+    let model_hash = epistemic_digest("invar.cds.model.v1", canon_model.as_bytes());
+    let mut claim = model_hash.as_bytes().to_vec(); claim.extend_from_slice(canon_claim.as_bytes());
+    let claim_hash = epistemic_digest("invar.cds.claim.v1", &claim);
+    let mut full = claim_hash.as_bytes().to_vec(); full.extend_from_slice(domain_and_verdict.as_bytes());
+    let full_hash = epistemic_digest("invar.cds.full.v1", &full);
+    CdsTriplet { model_hash, claim_hash, full_hash }
+}
+
+pub fn compute_certificate_receipt(payload_json: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| e.to_string())?;
+    value.as_object_mut().ok_or("certificate must be an object")?.remove("blake3_receipt");
+    Ok(epistemic_digest("invar.cert.v1", &crate::uast::epistemic_canonical_bytes(&value.to_string())?))
+}
+
 pub fn domain_separated_blake3_hex(context: &str, payload: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new_derive_key(context);
     hasher.update(payload);

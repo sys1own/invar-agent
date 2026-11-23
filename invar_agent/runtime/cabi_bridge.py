@@ -37,6 +37,7 @@ class SimulationBuffer(ctypes.Structure):
         ("dt", ctypes.c_double),
         ("steps", ctypes.c_uint32),
         ("data", ctypes.POINTER(ctypes.c_double)),
+        ("diag", ctypes.POINTER(ctypes.c_double)),
     ]
 
 
@@ -69,25 +70,35 @@ so_path, entry, initial_json, dt, steps = (
 
 class SimulationBuffer(ctypes.Structure):
     _fields_ = [("size", ctypes.c_size_t), ("dt", ctypes.c_double),
-                ("steps", ctypes.c_uint32), ("data", ctypes.POINTER(ctypes.c_double))]
+                ("steps", ctypes.c_uint32), ("data", ctypes.POINTER(ctypes.c_double)),
+                ("diag", ctypes.POINTER(ctypes.c_double))]
 
 initial = json.loads(initial_json)
 n = len(initial)
 alloc_n = max(n, 64)
 padded = list(initial) + [0.0] * (alloc_n - n)
 data = (ctypes.c_double * alloc_n)(*padded)
+diag = (ctypes.c_double * 8)()
 buf = SimulationBuffer(size=n, dt=dt, steps=0,
-                       data=ctypes.cast(data, ctypes.POINTER(ctypes.c_double)))
+                       data=ctypes.cast(data, ctypes.POINTER(ctypes.c_double)), diag=diag)
 lib = ctypes.CDLL(so_path)
 fn = getattr(lib, entry)
 fn.argtypes = [ctypes.POINTER(SimulationBuffer)]
 fn.restype = None
 trace_min = list(initial)
 trace_max = list(initial)
+trace_slots = json.loads(sys.argv[6]) if len(sys.argv) > 6 else []
+trace_values = []
 first_nonfinite = -1
 t0 = time.perf_counter()
 for step in range(steps):
+    diag[6] = diag[7] = 0.0
     fn(ctypes.byref(buf))
+    if trace_slots:
+        trace_values.append([data[i] for i in trace_slots])
+    diag[0] += 1
+    diag[3 if diag[7] else 2 if diag[6] > 1e-12 else 1] += 1
+    diag[5] = max(diag[5], diag[6])
     for i in range(n):
         v = data[i]
         if v < trace_min[i]:
@@ -101,8 +112,10 @@ for step in range(steps):
 state = list(data)[:n]
 finite = all(math.isfinite(v) for v in state)
 print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
+                  "diag": list(diag),
                   "execution_time_ms": (time.perf_counter() - t0) * 1000.0,
                   "trace_min": trace_min, "trace_max": trace_max,
+                  "trace_values": trace_values,
                   "first_nonfinite_step": first_nonfinite}))
 '''
 
@@ -356,6 +369,7 @@ class SimulationBuffer:
         self.size = len(self.data)
         self.dt = dt
         self.steps = 0
+        self.diag = [0.0] * 8
 
     def __getitem__(self, index):
         return self.data[index]
@@ -389,11 +403,19 @@ if "[62]" in src and len(initial) < 64:
 buf = SimulationBuffer(initial, dt)
 trace_min = list(initial[:orig_n])
 trace_max = list(initial[:orig_n])
+trace_slots = json.loads(sys.argv[6]) if len(sys.argv) > 6 else []
+trace_values = []
 first_nonfinite = -1
 start = time.perf_counter()
 for step in range(steps):
     prev_steps = buf.steps
+    buf.diag[6] = buf.diag[7] = 0.0
     fn(buf, dt)
+    if trace_slots:
+        trace_values.append([buf.data[i] for i in trace_slots])
+    buf.diag[0] += 1
+    buf.diag[3 if buf.diag[7] else 2 if buf.diag[6] > 1e-12 else 1] += 1
+    buf.diag[5] = max(buf.diag[5], buf.diag[6])
     if buf.steps == prev_steps:
         buf.steps += 1
     for i in range(orig_n):
@@ -410,6 +432,8 @@ run_ms = (time.perf_counter() - start) * 1000.0
 state = [float(v) for v in buf.data[:orig_n]]
 finite = all(math.isfinite(v) for v in state)
 print(json.dumps({"state": state, "steps": int(buf.steps), "finite": finite,
+                  "diag": buf.diag,
+                  "trace_values": trace_values,
                   "trace_min": trace_min, "trace_max": trace_max,
                   "first_nonfinite_step": first_nonfinite,
                   "execution_time_ms": run_ms}))
@@ -537,7 +561,8 @@ class DynamicCABIBridge:
             timeout_seconds: float = 30.0,
             max_memory_mb: int = 1024,
             isolated: bool = True,
-            kernel_mode: str = RK4_ODE) -> Dict[str, object]:
+            kernel_mode: str = RK4_ODE,
+            trace_slots: tuple[int, ...] = ()) -> Dict[str, object]:
         """Compile (cached) and run ``steps`` iterations of ``entry``.
 
         Returns ``state``, ``steps``, ``execution_time_ms`` (kernel wall time
@@ -552,6 +577,10 @@ class DynamicCABIBridge:
         no RK4 wrapper is ever injected around a custom map.
         """
         entry = self.resolve_entry(entry, kernel_mode)
+        if any(type(i) is not int or not 0 <= i < len(initial_state) for i in trace_slots):
+            raise ValueError("trace slots must address the initial state")
+        if trace_slots and not isolated:
+            raise ValueError("trajectory capture requires isolated execution")
         start = time.perf_counter()
         so_path = self.compile(cpp_code)
         compile_ms = (time.perf_counter() - start) * 1000.0
@@ -560,7 +589,7 @@ class DynamicCABIBridge:
                                        compile_ms, self.cache_key(cpp_code))
         return self._run_subprocess(so_path, entry, initial_state, dt, steps,
                                     timeout_seconds, max_memory_mb, compile_ms,
-                                    self.cache_key(cpp_code))
+                                    self.cache_key(cpp_code), trace_slots)
 
     # -- in-process (tests / trusted callers) ------------------------------
     def _run_inprocess(self, so_path: Path, entry: str, initial_state,
@@ -587,15 +616,21 @@ class DynamicCABIBridge:
             alloc_n = max(n, 64)
             padded = list(initial_state) + [0.0] * (alloc_n - n)
             data = (ctypes.c_double * alloc_n)(*padded)
-            buf = SimulationBuffer(size=n, dt=dt, steps=0, data=data)
+            diag = (ctypes.c_double * 8)()
+            buf = SimulationBuffer(size=n, dt=dt, steps=0, data=data, diag=diag)
             run_start = time.perf_counter()
             for _ in range(steps):
+                diag[6] = diag[7] = 0.0
                 fn(ctypes.byref(buf))
+                diag[0] += 1
+                diag[3 if diag[7] else 2 if diag[6] > 1e-12 else 1] += 1
+                diag[5] = max(diag[5], diag[6])
             run_ms = (time.perf_counter() - run_start) * 1000.0
             state = list(data)[:n]
             finite = all(math.isfinite(v) for v in state)
             return {
                 "state": state,
+                "diag": list(diag),
                 "steps": int(buf.steps),
                 "finite": finite,
                 "execution_time_ms": run_ms,
@@ -631,7 +666,7 @@ class DynamicCABIBridge:
     # -- isolated subprocess (Sandbox_Execute) ------------------------------
     def _run_subprocess(self, so_path: Path, entry: str, initial_state,
                         dt, steps, timeout_seconds, max_memory_mb,
-                        compile_ms, key) -> Dict[str, object]:
+                        compile_ms, key, trace_slots=()) -> Dict[str, object]:
         so_path = Path(so_path).resolve()
         if not so_path.is_file():
             raise KernelExecutionError(f"compiled kernel missing: {so_path}")
@@ -661,7 +696,7 @@ class DynamicCABIBridge:
             try:
                 proc = subprocess.run(
                     [sys.executable, str(runner), str(so_path), entry,
-                     json.dumps([float(v) for v in initial_state]), str(float(dt)), str(int(steps))],
+                     json.dumps([float(v) for v in initial_state]), str(float(dt)), str(int(steps)), json.dumps(trace_slots)],
                     capture_output=True, text=True, timeout=timeout_seconds + 10,
                     preexec_fn=preexec, cwd=str(run_dir))
             except subprocess.TimeoutExpired as exc:
@@ -693,7 +728,9 @@ class DynamicCABIBridge:
         exec_ms = max(0.0, float(payload.get("execution_time_ms", wall_ms)))
         return {
             "state": state,
+            "trace_values": payload.get("trace_values", []),
             "steps": int(payload.get("steps", steps)),
+            "diag": [float(v) for v in payload["diag"]],
             "finite": finite,
             "trace_min": [float(v) for v in payload.get("trace_min", state)],
             "trace_max": [float(v) for v in payload.get("trace_max", state)],
@@ -718,7 +755,8 @@ class DynamicCABIBridge:
                    steps: int, entry: str = "execute_step",
                    timeout_seconds: float = 30.0,
                    max_memory_mb: int = 1024,
-                   kernel_mode: str = RK4_ODE) -> Dict[str, object]:
+                   kernel_mode: str = RK4_ODE,
+                   trace_slots: tuple[int, ...] = ()) -> Dict[str, object]:
         """Execute the guard-passed Python kernel in an isolated subprocess.
 
         Deterministic fallback for C-ABI compilation failures: runs
@@ -727,6 +765,8 @@ class DynamicCABIBridge:
         returns the same result shape as :meth:`run`.
         """
         start = time.perf_counter()
+        if any(type(i) is not int or not 0 <= i < len(initial_state) for i in trace_slots):
+            raise ValueError("trace slots must address the initial state")
         entry = self.resolve_entry(entry, kernel_mode)
         func_name = self.python_entry_name(entry)
         key = hashlib.blake2b(python_code.encode(), digest_size=16).hexdigest()
@@ -750,7 +790,7 @@ class DynamicCABIBridge:
                 proc = subprocess.run(
                     [sys.executable, str(runner), str(kernel_path), func_name,
                      json.dumps([float(v) for v in initial_state]),
-                     str(float(dt)), str(int(steps))],
+                     str(float(dt)), str(int(steps)), json.dumps(trace_slots)],
                     capture_output=True, text=True, timeout=timeout_seconds + 10,
                     preexec_fn=preexec, cwd=str(run_dir))
             except subprocess.TimeoutExpired as exc:
@@ -782,7 +822,9 @@ class DynamicCABIBridge:
         run_ms = max(0.0, float(payload.get("execution_time_ms", 0.0)))
         return {
             "state": state,
+            "trace_values": payload.get("trace_values", []),
             "steps": int(payload.get("steps", steps)),
+            "diag": [float(v) for v in payload["diag"]],
             "finite": finite,
             "trace_min": [float(v) for v in payload.get("trace_min", state)],
             "trace_max": [float(v) for v in payload.get("trace_max", state)],

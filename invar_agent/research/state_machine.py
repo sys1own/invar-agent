@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..runtime.build_utils import rollback_overlay
+from ..llm.errors import LLMProviderError, backoff_delay
 from ..healing.buffer_api import BUFFER_API
 from ..healing.structural import is_structural_failure, unresolved_symbol
 from ..runtime.research_reference import ReferenceError
@@ -161,6 +163,15 @@ _INSIGHT_RE = re.compile(
 
 class PreWriteGuardError(ValueError):
     pass
+
+
+@dataclass
+class ResearchPlanningFailure:
+    run_id: str
+    meaningfulness_certificate: Any
+    status: str = "INCONCLUSIVE_UNVERIFIED"
+    epistemic_verdict: str = "INCONCLUSIVE_UNVERIFIED"
+    blueprint: None = None
 
 
 def shacl_chiasmus_firewall(code: str) -> List[str]:
@@ -301,6 +312,11 @@ def _lower_kernel(code_template: str):
     uast = python_source_to_uast(code_template)
     cpp = CppEmitter().emit_module(uast)
     return uast, cpp
+
+
+def instrumented_fallback(code):
+    from ..healing.deterministic_ast import instrument_purity
+    return instrument_purity(code)
 
 
 # -- kernel archetype detection ------------------------------------------------
@@ -558,68 +574,6 @@ def _reconcile_hallucinated_bounds(expression: str, state: List[float],
                                    telemetry: Dict[str, float],
                                    extra: Optional[Dict[str, Any]] = None
                                    ) -> Optional[str]:
-    """Tier-0 Reflex_Heal: recalibrate guessed numeric LOWER bounds.
-
-    When the sandbox executed cleanly and all state is finite, an invariant
-    that fails ONLY because the planner guessed a narrow lower interval
-    (e.g. ``state[3] >= 15.0`` when the integrated ODE gives 12.34 g) is
-    reconciled deterministically: the lower constant is relaxed to just below
-    the verified trajectory value and the assertion re-checked. Upper bounds,
-    positivity bounds (``>= 0``) and non-bound clauses are NEVER relaxed —
-    violating those remains a genuine falsification.
-
-    Returns the revised assertion string when it passes, else ``None``.
-    """
-    try:
-        tree = ast.parse(expression, mode="eval")
-    except SyntaxError:
-        return None
-    env = _invariant_env(state, telemetry, extra)
-    changed = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare) or len(node.ops) != 1 \
-                or len(node.comparators) != 1:
-            continue
-        op = node.ops[0]
-        left, right = node.left, node.comparators[0]
-        # Pattern A: state[i] >= const  (or > )
-        # Pattern B: const <= state[i]  (or < )
-        if isinstance(op, (ast.GtE, ast.Gt)) and isinstance(left, ast.Subscript) \
-                and isinstance(right, ast.Constant) and isinstance(right.value, (int, float)):
-            base = ast.unparse(left.value)
-            if base not in _STATE_SLOT_BASES:
-                continue
-            const = float(right.value)
-            if const <= 0.0:
-                continue  # positivity bounds are physical, never relax
-            observed = _eval_subscript(left, env)
-            if observed is None or const <= observed:
-                continue
-            relaxed = observed - max(abs(observed) * 0.05, 1e-9)
-            right.value = round(relaxed, 10)
-            changed = True
-        elif isinstance(op, (ast.LtE, ast.Lt)) and isinstance(right, ast.Subscript) \
-                and isinstance(left, ast.Constant) and isinstance(left.value, (int, float)):
-            base = ast.unparse(right.value)
-            if base not in _STATE_SLOT_BASES:
-                continue
-            const = float(left.value)
-            if const <= 0.0:
-                continue
-            observed = _eval_subscript(right, env)
-            if observed is None or const <= observed:
-                continue
-            relaxed = observed - max(abs(observed) * 0.05, 1e-9)
-            left.value = round(relaxed, 10)
-            changed = True
-    if not changed:
-        return None
-    revised = ast.unparse(tree)
-    try:
-        if _eval_invariant(revised, state, telemetry, extra):
-            return revised
-    except PreWriteGuardError:
-        return None
     return None
 
 
@@ -1696,6 +1650,13 @@ class ResearchRunState:
     checkpoint_path: Optional[str] = None
     refusal: Optional[Dict[str, Any]] = None
     report: Optional[str] = None  # Final Quantitative Research Report (markdown)
+    ihcg: Any = None
+    meaningfulness_certificate: Any = None
+    canonical_signature: Any = None
+    epistemic_verdict: str = "INCONCLUSIVE_UNVERIFIED"
+    preserved_vs_enforced: Dict[str, Any] = field(default_factory=dict)
+    heal_count: int = 0
+    precision_refined: bool = False
 
     def snapshot(self) -> Dict[str, Any]:
         bp = self.blueprint
@@ -1713,6 +1674,9 @@ class ResearchRunState:
             "checkpoint_path": self.checkpoint_path,
             "refusal": self.refusal,
             "report": self.report,
+            "epistemic_verdict": self.epistemic_verdict,
+            "heal_count": self.heal_count,
+            "meaningfulness_certificate": self.meaningfulness_certificate.model_dump(mode="json") if self.meaningfulness_certificate else None,
             "results": [r.model_dump() for r in self.results],
         }
 
@@ -1744,11 +1708,13 @@ class ResearchStateMachine:
                  search_client: Optional[LiteratureSearchClient] = None,
                  stage_synthesizer: Optional[StageSynthFn] = None,
                  abort_flag: Optional[Callable[[], bool]] = None,
-                 workspace_root: Optional[Path] = None):
+                 workspace_root: Optional[Path] = None,
+                 verification_runner: Optional[Callable[..., Any]] = None):
         self.workspace = Path(workspace)
         self.progress_cb = progress_cb
-        self.llm_planner = llm_planner
-        self.llm_fast = llm_fast
+        self._provider_failure = None
+        self.llm_planner = self._retry_provider(llm_planner)
+        self.llm_fast = self.llm_planner if llm_fast is llm_planner else self._retry_provider(llm_fast)
         if search_client is None:
             # Live network by default in production/server/CLI; offline only
             # when explicitly requested (INVAR_OFFLINE=1) or under pytest
@@ -1775,6 +1741,10 @@ class ResearchStateMachine:
         self.retrieved_sources: List[Dict[str, Any]] = []
         self._retrieved_source_keys: set = set()
         self.blueprint: Optional[ResearchBlueprint] = None
+        if verification_runner is None:
+            from .default_verification import DefaultVerificationRunner
+            verification_runner = DefaultVerificationRunner(self)
+        self.verification_runner = verification_runner
 
     def _record_literature(self, items: Iterable[Dict[str, Any]]) -> int:
         """Merge newly retrieved sources (deduped) into the run ledger."""
@@ -1793,8 +1763,49 @@ class ResearchStateMachine:
         return len(self.retrieved_sources)
 
     async def _emit(self, channel: str, event: str, data: Dict[str, Any]) -> None:
+        if self._provider_failure is not None: raise self._provider_failure
         if self.progress_cb is not None:
-            await self.progress_cb(channel, {"event": event, **data})
+            await self.progress_cb(channel, {"event": event, **data, "event_version": "2.0"})
+
+    async def _evaluate_epistemic(self, state, *, phase, code, uast=None, contracts=None):
+        if state.ihcg is None or self.verification_runner is None: return None
+        from .epistemic import evaluate_execution, incomplete_certificate
+        from .vault import ResearchVaultManager
+        try:
+            evidence = self.verification_runner(phase=phase, state=state, code=code, uast=uast, results=state.results)
+            if inspect.isawaitable(evidence): evidence = await evidence
+            if evidence is None: return None
+            from dataclasses import replace
+            for domain, audit in getattr(self, "_runtime_purity", {}).items():
+                enforced = audit.projected_steps > 0 or audit.stabilized_steps > 0
+                violations = (*evidence.purity.violations, "RUNTIME_ENFORCEMENT") if enforced else evidence.purity.violations
+                state.preserved_vs_enforced[domain] = audit.model_copy(update={
+                    "static_purity_passed": evidence.purity.static_purity_passed and not enforced, "violations": violations})
+                if enforced:
+                    evidence = replace(evidence, purity=evidence.purity.model_copy(update={
+                        "static_purity_passed": False, "violations": violations}))
+            state.preserved_vs_enforced[evidence.purity.domain_tag] = evidence.purity
+            blueprint = state.blueprint if contracts is None else state.blueprint.model_copy(update={"contracts": contracts})
+            certificate, signature, decision = evaluate_execution(blueprint, state.ihcg, evidence,
+                executable_digest=code_hash(code), vault=ResearchVaultManager(self.workspace_root), attempt=state.heal_count,
+                precision_refined=state.precision_refined, preserved=state.preserved_vs_enforced)
+            state.meaningfulness_certificate, state.canonical_signature = certificate, signature
+            state.blueprint = state.blueprint.model_copy(update={"unified_module_code":code})
+            state.epistemic_verdict = certificate.epistemic_verdict.value
+            if state.epistemic_verdict == "VERIFIED_DISCOVERY":
+                if not hasattr(self,"_verified_foundations"): self._verified_foundations = {}
+                self._verified_foundations[state.research_stage] = (state.ihcg,state.blueprint,code)
+            await self._emit("accelerator_log", "purity_audit", {"audit": evidence.purity.model_dump(mode="json"), "research_stage": state.research_stage})
+            certified = state.epistemic_verdict == "VERIFIED_FALSIFICATION"
+            await self._emit("accelerator_log", "epistemic_route", {"action": decision.action, "halt_healing": certified,
+                "epistemic_verdict": state.epistemic_verdict, "heal_count": state.heal_count})
+            return decision
+        except (ValueError, KeyError, TypeError) as error:
+            state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
+                state.blueprint.falsifiable_hypothesis, f"FORMAL_EVIDENCE_UNVERIFIED: {error}")
+            state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+            await self._emit("accelerator_log", "epistemic_unverified", {"reason": str(error)})
+            return None
 
     async def emit_activity(self, stage: str, step: str, message: str,
                             level: str = "info",
@@ -1817,11 +1828,80 @@ class ResearchStateMachine:
         return state.aborted
 
     # -- top-level loop ----------------------------------------------------
+    def _retry_provider(self, callback):
+        if callback is None: return None
+
+        async def complete(prompt):
+            if self._provider_failure is not None: raise self._provider_failure
+            for attempt in range(3):
+                try:
+                    result = callback(prompt)
+                    return await result if inspect.isawaitable(result) else result
+                except LLMProviderError as error:
+                    if not error.retryable or attempt == 2:
+                        self._provider_failure = error
+                        raise
+                    await asyncio.sleep(backoff_delay(attempt))
+        return complete
+
+    async def plan_and_run(self, question: str):
+        from .planner import generate_plan_with_feasibility
+        from .epistemic import incomplete_certificate
+        from .vault import ResearchVaultManager
+        self._provider_failure = None
+        try:
+            self.planner_result = await generate_plan_with_feasibility(question,
+                llm_complete=self.llm_planner, fallback=False)
+            if self._provider_failure is not None: raise self._provider_failure
+            blueprint = ResearchBlueprint.model_validate(self.planner_result["blueprint"])
+        except (LLMProviderError, ValueError, SyntaxError, TypeError, RuntimeError) as error:
+            self._provider_failure = None
+            run_id = "planning_"+hashlib.sha256(question.encode()).hexdigest()[:20]
+            if isinstance(error, LLMProviderError):
+                reason = "LLM_PROVIDER_RETRIES_EXHAUSTED" if error.retryable else "LLM_PROVIDER_ERROR"
+                detail = reason
+            else:
+                reason, detail = "PLANNING_VALIDATION_FAILED", str(error)
+            certificate = incomplete_certificate(run_id,question,reason)
+            directory = ResearchVaultManager(self.workspace_root).run_dir(run_id)
+            directory.mkdir(parents=True,exist_ok=True)
+            (directory/"meaningfulness_certificate.json").write_text(certificate.model_dump_json(indent=2),encoding="utf-8")
+            (directory/"report.md").write_text(f"# Research planning did not complete\n\n{reason}\n\n{detail}\n",encoding="utf-8")
+            (directory/"metadata.json").write_text(json.dumps(dict(run_id=run_id,status="INCONCLUSIVE_UNVERIFIED",failure_reason=reason,planning_error=detail)),encoding="utf-8")
+            await self._emit("accelerator_log","research_completed",dict(epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                reason=reason,meaningfulness_certificate=certificate.model_dump(mode="json")))
+            return ResearchPlanningFailure(run_id,certificate)
+        return await self.run(blueprint)
+
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
+        self._provider_failure = None
+        from .formal_evidence import attach_formal_evidence
+        ingest_error = None
+        try: blueprint = attach_formal_evidence(blueprint)
+        except (ValueError,SyntaxError) as error: ingest_error = str(error)
         _canonicalize_blueprint_slots(blueprint)
         _auto_populate_variable_map(blueprint)
         self.blueprint = blueprint
         state = ResearchRunState(blueprint=blueprint)
+        self._runtime_purity = {}
+        from .epistemic import compile_blueprint_ihcg, incomplete_certificate
+        if ingest_error:
+            state.meaningfulness_certificate = incomplete_certificate(blueprint.blueprint_id,blueprint.falsifiable_hypothesis,f"FORMAL_INGEST_REJECTED: {ingest_error}")
+            state.status = "INCONCLUSIVE_UNVERIFIED"
+            await self._emit_report(state)
+            return state
+        try: state.ihcg = compile_blueprint_ihcg(blueprint)
+        except ValueError as error:
+            state.meaningfulness_certificate = incomplete_certificate(blueprint.blueprint_id, blueprint.falsifiable_hypothesis, str(error))
+            state.status = "INCONCLUSIVE_UNVERIFIED"
+            await self._emit_report(state)
+            return state
+        if state.ihcg is not None:
+            await self._evaluate_epistemic(state, phase="deductive", code=blueprint.code_template)
+            if state.epistemic_verdict == "VERIFIED_FALSIFICATION":
+                state.status = state.epistemic_verdict
+                await self._emit_report(state)
+                return state
         # Defense-in-depth epistemic gate. A blueprint that already carries a
         # PASSING feasibility verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE)
         # was approved upstream (Plan Mode / combined planner call) and must
@@ -1861,6 +1941,7 @@ class ResearchStateMachine:
                     state.status = "REFUSED"
                     state.refusal = blueprint.feasibility.model_dump()
                     await self._emit("search_log", "refused", {"feasibility": state.refusal})
+                    await self._emit_report(state)
                     return state
         else:
             gate = _heuristic_verdict(f"{blueprint.title}. {blueprint.falsifiable_hypothesis}")
@@ -1868,6 +1949,7 @@ class ResearchStateMachine:
                 state.status = "REFUSED"
                 state.refusal = gate.model_dump()
                 await self._emit("search_log", "refused", {"feasibility": gate.model_dump()})
+                await self._emit_report(state)
                 return state
 
         await self.emit_activity(
@@ -1875,7 +1957,9 @@ class ResearchStateMachine:
             f"Feasibility gate passed ({bp_verdict or 'HEURISTIC_PASS'}); "
             "starting the verified research loop.")
         try:
-            return await self._run_stages(state)
+            result = await self._run_stages(state)
+            if not getattr(result, "_report_emitted", False): await self._emit_report(result)
+            return result
         except Exception as exc:  # noqa: BLE001 - bulletproof exception shield
             return await self._handle_loop_exception(state, exc)
         finally:
@@ -1902,6 +1986,12 @@ class ResearchStateMachine:
 
         while stage <= total and not self._aborted(state):
             state.research_stage = stage
+            if stage > 1 and state.ihcg is not None:
+                from .epistemic import compile_blueprint_ihcg, incomplete_certificate
+                state.ihcg = compile_blueprint_ihcg(state.blueprint,stage=stage)
+                state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+                state.canonical_signature = None
+                state.meaningfulness_certificate = incomplete_certificate(blueprint.blueprint_id,blueprint.falsifiable_hypothesis,"ACCRETIVE_STAGE_UNVERIFIED")
             objective = (blueprint.stage_objectives[stage - 1]
                          if len(blueprint.stage_objectives) >= stage
                          else blueprint.falsifiable_hypothesis)
@@ -1916,6 +2006,8 @@ class ResearchStateMachine:
                     f"module ({len(pinned_layers)} pinned layer(s))...")
             failures: List[str] = []
             candidate_code: Optional[str] = blueprint.code_template if stage == 1 else None
+            if stage > 1:
+                candidate_code = (blueprint.ihcg_evidence or {}).get("execution",{}).get("stage_code_templates",{}).get(str(stage))
             if stage == 1:
                 bp_contracts = list(blueprint.contracts)
                 if blueprint.target_research_stages > 1:
@@ -1975,6 +2067,13 @@ class ResearchStateMachine:
                     stabilize_diverged=had_divergence)
                 candidate_code = outcome.get("candidate_code", candidate_code)
                 contracts = outcome.get("contracts", contracts)
+                if outcome.get("epistemic_terminal"):
+                    state.status = state.epistemic_verdict
+                    await self._emit_report(state)
+                    return state
+                if outcome.get("refine_precision"):
+                    state.precision_refined = True
+                    continue
                 if outcome["status"] == "commit":
                     pinned_code = outcome["pinned_code"]
                     pinned_layers.append(outcome["layer"])
@@ -2108,6 +2207,7 @@ class ResearchStateMachine:
                                      if (degraded_attempt and best_attempt)
                                      else failure)
                 pre_heal_hash = code_hash(base_heal_code or "")
+                state.heal_count += 1
                 raw_heal = await self._heal_and_refine(
                     stage=stage, round_idx=round_idx, objective=objective,
                     candidate_code=base_heal_code,
@@ -2124,6 +2224,18 @@ class ResearchStateMachine:
                     healing_terminated = True
                     break
                 healed_code = heal_outcome.get("code") or candidate_code
+                if state.ihcg is not None:
+                    from ..healing.deterministic_ast import assert_sealed_observables
+                    protected = {state.blueprint.variable_map[s.symbol] for s in state.ihcg.slots
+                        if s.role in {"CONTROL_PARAM", "DERIVED_OBSERVABLE"} and s.symbol in state.blueprint.variable_map}
+                    try: assert_sealed_observables(base_heal_code or "", healed_code or "", protected)
+                    except ValueError as error:
+                        from .epistemic import incomplete_certificate
+                        state.meaningfulness_certificate = incomplete_certificate(blueprint.blueprint_id, blueprint.falsifiable_hypothesis, str(error))
+                        state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+                        state.status = state.epistemic_verdict
+                        await self._emit_report(state)
+                        return state
                 post_heal_hash = code_hash(healed_code or "")
                 if post_heal_hash == pre_heal_hash:
                     healing_stall += 1
@@ -2226,6 +2338,17 @@ class ResearchStateMachine:
         if getattr(state, "_report_emitted", False):
             return
         state._report_emitted = True
+        state.preserved_vs_enforced.update(getattr(self, "_runtime_purity", {}))
+        from .epistemic import incomplete_certificate
+        if (state.meaningfulness_certificate is not None and state.epistemic_verdict in {"VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY"}
+                and state.status not in {"VERIFIED", "VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY"}):
+            state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+            state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
+                state.blueprint.falsifiable_hypothesis, "RUN_DID_NOT_COMPLETE")
+        if state.meaningfulness_certificate is None:
+            state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
+                state.blueprint.falsifiable_hypothesis, "FORMAL_IHCG_OR_EXECUTION_EVIDENCE_MISSING")
+        if state.ihcg is not None and state.status == "VERIFIED": state.status = state.epistemic_verdict
         await self._emit("accelerator_log", "synthesizing_report", {
             "research_stage": state.research_stage, "status": state.status})
         try:
@@ -2244,6 +2367,8 @@ class ResearchStateMachine:
                 checkpoint_path=state.checkpoint_path)
         except Exception as exc:  # noqa: BLE001 - report is best-effort
             state.report = f"(report synthesis failed: {str(exc)[:200]})"
+        from .report import render_meaningfulness_certificate
+        state.report += "\n\n" + render_meaningfulness_certificate(state.meaningfulness_certificate, state.preserved_vs_enforced)
         await self.emit_activity(
             "REPORT", "report_generated",
             f"Synthesized comprehensive research report "
@@ -2283,7 +2408,9 @@ class ResearchStateMachine:
                 telemetry=telemetry_all,
                 target_backend=backend,
                 literature_count=(self._literature_count()
-                                  or len(state.literature)))
+                                  or len(state.literature)),
+                meaningfulness_certificate=state.meaningfulness_certificate,
+                canonical_signature=state.canonical_signature)
             report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
             await self._emit("accelerator_log", "vault_archived", {
                 "run_id": meta.get("run_id"), "status": state.status})
@@ -2302,6 +2429,8 @@ class ResearchStateMachine:
             # A halted run with a verified baseline is PARTIALLY_VERIFIED.
             terminal_status = "PARTIALLY_VERIFIED"
         payload: Dict[str, Any] = {
+            "epistemic_verdict": state.epistemic_verdict,
+            "meaningfulness_certificate": state.meaningfulness_certificate.model_dump(mode="json"),
             "status": terminal_status,
             "report": state.report,
             "run_id": state.blueprint.blueprint_id,
@@ -2359,6 +2488,17 @@ class ResearchStateMachine:
     async def _handle_loop_exception(self, state: ResearchRunState,
                                      exc: Exception) -> ResearchRunState:
         """Bulletproof shield: never lose verified work to an unhandled error."""
+        provider_error = self._provider_failure or (exc if isinstance(exc,LLMProviderError) else None)
+        if provider_error is not None:
+            from .epistemic import incomplete_certificate
+            self._provider_failure = None
+            reason = "LLM_PROVIDER_RETRIES_EXHAUSTED" if provider_error.retryable else "LLM_PROVIDER_ERROR"
+            state.status = state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+            state._report_emitted = False
+            state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
+                state.blueprint.research_prompt or state.blueprint.falsifiable_hypothesis,reason)
+            await self._emit_report(state)
+            return state
         error_trace = traceback.format_exc()
         logger.error("Research loop error in stage %s: %s",
                      state.research_stage, error_trace)
@@ -2609,7 +2749,7 @@ class ResearchStateMachine:
             variable_map=getattr(bp, "variable_map", None),
             slot_roles=bp.slot_roles,
             stabilize_diverged=stabilize_diverged,
-            preserve_dynamics=bool(declared),
+            preserve_dynamics=bool(declared) or state.ihcg is not None,
             pinned_functions=pinned_fn_names or None,
         )
         _apply_backup_slots_to_vmap(bp, getattr(san, "backup_slot_map", {}), san.code)
@@ -2663,7 +2803,7 @@ class ResearchStateMachine:
                 variable_map=getattr(bp, "variable_map", None),
                 slot_roles=bp.slot_roles,
                 stabilize_diverged=stabilize_diverged,
-                preserve_dynamics=bool(declared),
+                preserve_dynamics=bool(declared) or state.ihcg is not None,
                 pinned_functions=unified_pinned or None,
             )
             _apply_backup_slots_to_vmap(bp, getattr(san_u, "backup_slot_map", {}), san_u.code)
@@ -2788,8 +2928,9 @@ class ResearchStateMachine:
                     "failure": f"PreWrite_Guard python_smoke: {type(exc).__name__}: {exc}",
                     "candidate_code": candidate_code, "contracts": contracts}
         try:
-            uast, cpp_code = _lower_kernel(unified)
-        except (UnsupportedError, EmitterError, SyntaxError) as exc:
+            from ..healing.deterministic_ast import instrument_purity
+            uast, cpp_code = _lower_kernel(instrument_purity(unified))
+        except (UnsupportedError, EmitterError, SyntaxError, ValueError) as exc:
             await emit("accelerator_log", "guard_reject", {**tag, "violations": [str(exc)]})
             self._rollback_overlay(scratch)
             return {"status": "error", "result_status": "ERROR",
@@ -2843,6 +2984,21 @@ class ResearchStateMachine:
             bp, uast, cpp_code, unified, contracts, pinned_layers, stage, tag,
             **km_kw)
         state.results = results
+        if state.ihcg is not None:
+            bound_contracts = list({c.contract_id: c for layer in pinned_layers for c in layer.contracts}.values())
+            bound_contracts = list({c.contract_id: c for c in [*bound_contracts, *contracts]}.values())
+            decision = await self._evaluate_epistemic(state, phase="post_execution", code=unified, uast=uast, contracts=bound_contracts)
+            if (state.epistemic_verdict in {"VERIFIED_FALSIFICATION", "VERIFIED_BOUNDARY_DISCOVERY", "VERIFIED_DISCOVERY"}
+                    and not (state.epistemic_verdict == "VERIFIED_DISCOVERY" and stage < bp.target_research_stages)):
+                state.blueprint = state.blueprint.model_copy(update={"unified_module_code": unified})
+                return {"status": "epistemic_terminal", "epistemic_terminal": True, "candidate_code": unified, "contracts": contracts}
+            if decision is not None and decision.action == "REFINE_PRECISION_ONCE" and not state.precision_refined:
+                return {"status": "refine_precision", "refine_precision": True, "candidate_code": unified, "contracts": contracts}
+            if decision is not None and decision.action == "REFLEX_HEAL":
+                return {"status": "error", "result_status": "ERROR", "failure": decision.reason,
+                        "candidate_code": unified, "contracts": contracts}
+            if state.epistemic_verdict == "INCONCLUSIVE_UNVERIFIED":
+                return {"status": "epistemic_terminal", "epistemic_terminal": True, "candidate_code": unified, "contracts": contracts}
         for r in results:
             await emit("accelerator_log", "result", {
                 **tag, "contract_id": r.contract_id, "status": r.status,
@@ -3058,7 +3214,7 @@ class ResearchStateMachine:
                 verified_contracts=verified_contracts, telemetry=kw["telemetry"],
                 literature=concise_lit, failures=kw["failures"],
                 pinned_functions=pinned_fn_list,
-                stage_contracts=stage_contracts), timeout=75.0)
+                stage_contracts=stage_contracts), timeout=None)
         except (asyncio.TimeoutError, TimeoutError, ValueError):
             fb = _deterministic_accretion_candidate(pinned_code, kw["stage"])
             if fb is not None:
@@ -3135,14 +3291,14 @@ class ResearchStateMachine:
             try:
                 repaired = await asyncio.wait_for(refine_stage_code(
                     llm, objective=_repair_obj, code=candidate_code, contracts=_repair_contracts,
-                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=120.0)
+                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=None)
             except (asyncio.TimeoutError, TimeoutError):
                 repaired = None
             if (not repaired or repaired.strip() == candidate_code.strip()) and _is_noop_err and self.llm_planner and self.llm_planner is not llm:
                 try:
                     repaired = await asyncio.wait_for(refine_stage_code(
                         self.llm_planner, objective=_repair_obj, code=candidate_code, contracts=_repair_contracts,
-                        failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=120.0)
+                        failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=None)
                 except (asyncio.TimeoutError, TimeoutError):
                     repaired = None
             if not repaired or repaired.strip() == candidate_code.strip():
@@ -3170,7 +3326,7 @@ class ResearchStateMachine:
                 refined = await asyncio.wait_for(refine_stage_code(
                     llm, objective=reference_objective, code=candidate_code,
                     contracts=[c.model_dump() if hasattr(c, 'model_dump') else c for c in contracts],
-                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=90.0)
+                    failure=str(failure), **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {})), timeout=None)
             except (asyncio.TimeoutError, TimeoutError):
                 refined = None
             return {"code": refined or candidate_code, "terminated": False,
@@ -3284,7 +3440,7 @@ class ResearchStateMachine:
                         failure=str(failure),
                         **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                     ),
-                    timeout=120.0,
+                    timeout=None,
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 refined = None
@@ -3457,7 +3613,7 @@ class ResearchStateMachine:
                             failure=str(failure),
                             **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                         ),
-                        timeout=120.0,
+                        timeout=None,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
@@ -3519,7 +3675,7 @@ class ResearchStateMachine:
                             failure=str(failure),
                             **({"pinned_functions": pinned_fn_list} if pinned_fn_list else {}),
                         ),
-                        timeout=120.0,
+                        timeout=None,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
                     refined = None
@@ -3681,7 +3837,7 @@ class ResearchStateMachine:
     async def _run_kernel_guarded(self, cpp_code: str, py_code: str,
                                   initial: List[float], contract: VerificationContract,
                                   entry: str, stage: int,
-                                  kernel_mode: str = "rk4_ode") -> Dict[str, Any]:
+                                  kernel_mode: str = "rk4_ode", trace_slots: tuple[int, ...] = ()) -> Dict[str, Any]:
         """C-ABI execution with deterministic Python fallback on compile failure.
 
         Kernels here have already passed PreWrite_Guard AST validation, so a
@@ -3694,7 +3850,8 @@ class ResearchStateMachine:
                 self.bridge.run, cpp_code, initial, contract.dt, contract.steps,
                 entry, contract.timeout_seconds, contract.max_memory_mb,
                 True,
-                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
+                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()),
+                **({"trace_slots":trace_slots} if trace_slots else {}))
         except KernelExecutionError as exc:
             compile_failed = bool(getattr(exc, "compile_error", False))
             # Runtime loader/ctypes failures (rc != 0, e.g. dlopen ENOMEM)
@@ -3709,10 +3866,11 @@ class ResearchStateMachine:
             logger.warning("C-ABI %s failed; falling back to the "
                            "deterministic Python kernel sandbox", reason)
             run = await asyncio.to_thread(
-                self.bridge.run_python, py_code, initial, contract.dt,
+                self.bridge.run_python, instrumented_fallback(py_code), initial, contract.dt,
                 contract.steps, entry, contract.timeout_seconds,
                 contract.max_memory_mb,
-                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()))
+                *((kernel_mode,) if kernel_mode != "rk4_ode" else ()),
+                **({"trace_slots":trace_slots} if trace_slots else {}))
             await self.emit_activity(
                 f"STAGE_{stage}_BUILD", "cabi_fallback",
                 "C-ABI compiler/runtime fallback -> executed verified "
@@ -3743,9 +3901,40 @@ class ResearchStateMachine:
         status = "ERROR"
         try:
             km_kw = {} if kernel_mode == "rk4_ode" else {"kernel_mode": kernel_mode}
+            pack = bp.ihcg_evidence or {}
+            effective_stage = regression_of or stage
+            if effective_stage > 1 and pack:
+                pack = pack.get("extensions",[])[effective_stage-2]
+            reductions = {name:e for name,e in pack.get("evidence",{}).get("equations",{}).items()
+                if e.get("kind") in {"TRAJECTORY_MAX","TRAJECTORY_MIN"}}
+            if reductions:
+                km_kw["trace_slots"] = tuple(bp.variable_map[e["state_symbol"]] for e in reductions.values())
             run = await self._run_kernel_guarded(cpp_code, py_code, initial, contract, entry,
                                                  stage, **km_kw)
+            if reductions:
+                from .meaningfulness import quadratic_peak
+                run["state"] = list(run["state"])
+                for column,(name,equation) in enumerate(reductions.items()):
+                    source = bp.variable_map[equation["state_symbol"]]
+                    samples = [initial[source],*[row[column] for row in run["trace_values"]]]
+                    times = [i*contract.dt for i in range(len(samples))]
+                    value = quadratic_peak(times,samples,minimum=equation["kind"] == "TRAJECTORY_MIN")[0]
+                    target = bp.variable_map[name]
+                    run["state"][target] = value
+                    run["trace_min"][target] = min(initial[target],value)
+                    run["trace_max"][target] = max(initial[target],value)
             telemetry = _telemetry(run, initial)
+            if "diag" in run:
+                from ..healing.deterministic_ast import purity_audit_from_diag
+                domain_tag = f"stage{stage}/{kernel_mode}/{contract.contract_id}"
+                audit = purity_audit_from_diag(run["diag"], domain_tag=domain_tag, static_purity_passed=False,
+                    violations=("ARENA_PURITY_NOT_CERTIFIED",))
+                state_audits = getattr(self, "_runtime_purity", {})
+                state_audits[domain_tag] = audit
+                self._runtime_purity = state_audits
+                for key in ("total_steps", "preserved_steps", "projected_steps", "stabilized_steps", "enforcement_ratio"):
+                    telemetry[f"purity_{key}"] = float(getattr(audit, key))
+                await self._emit("accelerator_log", "purity_audit", {"research_stage": stage, "audit": audit.model_dump(mode="json")})
             telemetry.setdefault("dt", float(contract.dt))
             if run.get("fallback"):
                 telemetry["cabi_fallback"] = 1.0

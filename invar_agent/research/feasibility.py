@@ -91,8 +91,11 @@ _UNSUITABLE_PATTERNS = [
     (r"\bmoral\s+(?:superiority|philosophy|debate|dilemma)\b", "moral philosophy"),
     (r"causal effect on|effect on .*legislation|influence on .*policy", "non-quantifiable causal claim"),
     (r"\bbeaut(y|iful)\b|\bmeaning of life\b|\bmorality\b|\bethics\b", "subjective value judgement"),
-    (r"\bclinical\b(?!.*(trial|endpoint|biomarker|dose|pk|pd|pharmac|seir|sir|model|simulat|hill|ec50))", "clinical/wet-lab task without a model"),
     (r"\bprove\b.*\b(poetry|art|music|culture|society)\b", "unfalsifiable cultural claim"),
+]
+
+_TASKS_REQUIRING_MODEL = [
+    (r"\bclinical\b", "clinical/wet-lab task without a model"),
 ]
 
 _SURROGATE_PATTERNS = [
@@ -153,7 +156,8 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
                            "conservation/invariant bounds, (2) maximise efficiency "
                            "subject to those bounds."),
             assessed_by="heuristic")
-    for pattern, what in _UNSUITABLE_PATTERNS:
+    unsuitable = _UNSUITABLE_PATTERNS + ([] if _QUANTITATIVE_HINTS.search(q) else _TASKS_REQUIRING_MODEL)
+    for pattern, what in unsuitable:
         if re.search(pattern, q):
             return FeasibilityAssessment(
                 verdict="REFUSED_UNSUITABLE",
@@ -311,16 +315,31 @@ def override_refusal_for_computational_benchmark(
     return assessment
 
 
+def compile_ingest_ihcg(prompt, evidence, domain, archetype):
+    from .meaningfulness import IhcgCompiler, classify_contract_vacuity, verify_entailment_lock
+    graph = IhcgCompiler().compile_from_prompt(prompt, evidence, domain, archetype)
+    claims = [o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
+    lock = verify_entailment_lock(graph, claims)
+    vacuity = classify_contract_vacuity(graph)
+    if not lock.entailment_locked or not vacuity.passed:
+        raise ValueError(f"IHCG_INGEST_REJECTED: {vacuity.classification}")
+    return graph
+
+
 async def evaluate_research_feasibility(
         question: str,
         llm_complete: Optional[Callable[[str], Any]] = None,
-        use_llm: bool = True) -> FeasibilityAssessment:
+        use_llm: bool = True, *, ihcg_input: Optional[Dict[str, Any]] = None) -> FeasibilityAssessment:
     """Classify a research request; heuristic first, optional Tier-2 refinement.
 
     The deterministic heuristic is authoritative for clear-cut refusals; the LLM
     refinement can override OPTIMAL_DIRECT / SURROGATE verdicts and sharpen
     rationales, but can never *downgrade* a heuristic REFUSAL into a run.
     """
+    if ihcg_input is not None:
+        try: compile_ingest_ihcg(question, **ihcg_input)
+        except ValueError as error:
+            return FeasibilityAssessment(verdict="REFUSED_UNSUITABLE", rationale=str(error), violated_boundary="Phi_lock/Phi_nonvac")
     heuristic = _heuristic_verdict(question)
     if heuristic.verdict in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
         return heuristic

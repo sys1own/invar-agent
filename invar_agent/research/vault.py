@@ -190,11 +190,22 @@ class ResearchVaultManager:
     def register_run(self, *, run_id: str, title: str, blueprint: ResearchBlueprint,
                      report_md: str, status: str, telemetry: Optional[Dict[str, Any]] = None,
                      target_backend: str = "",
-                     literature_count: Optional[int] = None) -> Dict[str, Any]:
+                     literature_count: Optional[int] = None,
+                     meaningfulness_certificate=None, canonical_signature=None) -> Dict[str, Any]:
         """Archive one completed research run into the vault."""
         telemetry = dict(telemetry or {})
         directory = self.run_dir(run_id)
         directory.mkdir(parents=True, exist_ok=True)
+        certificate_data = None
+        if meaningfulness_certificate is None:
+            from .epistemic import incomplete_certificate
+            meaningfulness_certificate = incomplete_certificate(_safe_run_id(run_id), blueprint.falsifiable_hypothesis, "RUN_NOT_CERTIFIED_AT_ARCHIVE")
+        if meaningfulness_certificate is not None:
+            from .epistemic import parse_run_certificate
+            certificate = parse_run_certificate(meaningfulness_certificate)
+            if certificate.run_id != _safe_run_id(run_id): raise ValueError("certificate run identity mismatch")
+            certificate_data = certificate.model_dump(mode="json")
+            (directory/"meaningfulness_certificate.json").write_text(certificate.model_dump_json(indent=2), encoding="utf-8")
         module_code = blueprint.unified_module_code or blueprint.code_template or ""
         evidence_section = _evidence_report_section(blueprint)
         (directory / "unified_module.py").write_text(module_code, encoding="utf-8")
@@ -207,6 +218,9 @@ class ResearchVaultManager:
                           getattr(feasibility, "verdict", "")) if feasibility else ""
         stages = len(getattr(blueprint, "verified_layers", []) or [])
         metadata = {
+            "meaningfulness_certificate": certificate_data,
+            "epistemic_verdict": certificate_data["epistemic_verdict"] if certificate_data else "INCONCLUSIVE_UNVERIFIED",
+            "canonical_signature": canonical_signature.model_dump(mode="json") if canonical_signature else None,
             "run_id": _safe_run_id(run_id),
             "title": title or blueprint.title,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -320,7 +334,20 @@ class ResearchVaultManager:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict): return None
+        raw_certificate = data.get("meaningfulness_certificate")
+        certificate_path = directory/"meaningfulness_certificate.json"
+        if certificate_path.is_file():
+            stored = json.loads(certificate_path.read_text(encoding="utf-8"))
+            if raw_certificate is not None and raw_certificate != stored: raise ValueError("Vault certificate copies differ")
+            raw_certificate = stored
+        if raw_certificate is not None:
+            from .epistemic import parse_run_certificate
+            certificate = parse_run_certificate(raw_certificate)
+            if certificate.run_id != directory.name: raise ValueError("Vault run identity mismatch")
+            data["meaningfulness_certificate"] = certificate.model_dump(mode="json")
+            data["epistemic_verdict"] = certificate.epistemic_verdict.value
+        return data
 
     def list_runs(self) -> List[Dict[str, Any]]:
         """All vault entries, newest first, with a search snippet."""
@@ -379,9 +406,13 @@ class ResearchVaultManager:
                 blueprint = json.loads(raw_bp)
             except json.JSONDecodeError:
                 blueprint = None
+        if meta.get("meaningfulness_certificate") is not None:
+            from .epistemic import validate_certificate_artifacts
+            validate_certificate_artifacts(meta["meaningfulness_certificate"], _read("unified_module.py"), blueprint or {})
         stage_files = sorted(p.name for p in directory.glob("stage_*.py"))
         return {
             "metadata": meta,
+            "meaningfulness_certificate": json.loads(_read("meaningfulness_certificate.json")) if _read("meaningfulness_certificate.json") else meta.get("meaningfulness_certificate"),
             "report_md": _read("report.md"),
             "unified_module_code": _read("unified_module.py"),
             "blueprint": blueprint,

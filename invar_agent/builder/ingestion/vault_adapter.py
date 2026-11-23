@@ -130,6 +130,24 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
         metadata, blueprint = json.loads(texts['metadata.json']), json.loads(texts['blueprint.json'])
     except (OSError, ValueError) as error:
         raise IngestionError('VAULT_BUNDLE_INVALID', str(error)) from error
+    raw_certificate = metadata.get('meaningfulness_certificate')
+    certificate_path = root/'meaningfulness_certificate.json'
+    if certificate_path.exists(): raw_certificate = json.loads(certificate_path.read_text())
+    certificates = {}
+    certified_valid_domain = None
+    if raw_certificate is not None:
+        from ...research.epistemic import validate_certificate_artifacts
+        certificate = validate_certificate_artifacts(raw_certificate, texts['unified_module.py'], blueprint)
+        certified_valid_domain = getattr(certificate,'certified_valid_domain',None)
+        if certificate.run_id != run_id: raise IngestionError('VAULT_CERTIFICATE_MISMATCH', run_id)
+        certificates[run_id] = certificate.model_dump(mode='json')
+        if certificate.epistemic_verdict.value == 'VERIFIED_FALSIFICATION':
+            return CanonicalResearchIR(ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
+                title=metadata.get('title') or run_id, meaningfulness_certificates=certificates,
+                meaningfulness_certificate=certificates[run_id], epistemic_verdict='VERIFIED_FALSIFICATION', certified_valid_domain=certified_valid_domain,
+                research_import_role='NEGATIVE_CONSTRAINT_ONLY', negative_constraints=[{'run_id': run_id, 'certificate': certificates[run_id]}])
+        if hasattr(certificate, 'ihcg_anchor') and certificate.epistemic_verdict.value == 'INCONCLUSIVE_UNVERIFIED':
+            raise IngestionError('INCONCLUSIVE_UNVERIFIED', run_id)
 
     def provenance(filename, location, needle=''):
         text = texts[filename]
@@ -149,6 +167,28 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
             for invariant in contract.get('invariants') or []:
                 validate_predicate(invariant['assertion'])
     except ReferenceError as error:
+        if error.code == "VAULT_INTEGRATOR_UNSUPPORTED" and certificates:
+            from types import SimpleNamespace
+            from ...schemas.research import ResearchBlueprint
+            from ...research.epistemic import compile_blueprint_ihcg
+            from ...research.default_verification import _Kernel
+            parsed = ResearchBlueprint.model_validate(blueprint)
+            graph = compile_blueprint_ihcg(parsed)
+            if (graph is not None and all(e.kind == "ALGEBRAIC" for e in graph.equations.values())
+                    and all(not any(s.si_dim) for s in graph.slots)):
+                _Kernel(None,SimpleNamespace(ihcg=graph,blueprint=parsed,research_stage=1),texts['unified_module.py'])
+                span = provenance('blueprint.json','sealed-algebraic-model','"ihcg_evidence"')
+                raw_equations = [RawEquation(text=f'{name} = {equation.expression}',provenance=span)
+                                 for name,equation in graph.equations.items()]
+                constants = [RawConstant(symbol=s.symbol,value=str(parsed.contracts[0].initial_state[s.slot_idx]),unit='1',provenance=span)
+                             for s in graph.slots if s.role == 'CONTROL_PARAM']
+                equations,constants,flags = lower_and_verify_equations(raw_equations,constants,
+                    {'symbol_dimensions':{s.symbol:SIDimensionVectorModel().model_dump() for s in graph.slots}})
+                return CanonicalResearchIR(ir_id=f'vault:{run_id}',source_mode='vault',vault_run_ids=[run_id],
+                    title=metadata.get('title') or run_id,summary=texts['report.md'][:2000],
+                    equations=equations,constants=constants,disambiguation_flags=flags,
+                    meaningfulness_certificates=certificates,meaningfulness_certificate=certificates[run_id],
+                    epistemic_verdict=certificate.epistemic_verdict.value,certified_valid_domain=certified_valid_domain)
         raise IngestionError(error.code, str(error), details=error.details) from error
     laws, parameters, slots = recovered['laws'], recovered['parameters'], recovered['slots']
     quantities = ((blueprint.get('uast_spec') or {}).get('ontology') or {}).get('quantities') or {}
@@ -231,6 +271,8 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
     for equation in equations:
         equation.supporting_provenance = sources.get(equation.lhs_symbol, [])
     ir = CanonicalResearchIR(ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
+        meaningfulness_certificates=certificates,
+        certified_valid_domain=certified_valid_domain,
         title=metadata.get('title') or blueprint.get('title') or run_id, summary=texts['report.md'][:2000],
         equations=equations, constants=constants, pinned_kernel_code=texts['unified_module.py'],
         runtime_predicates=runtime, research_reference=ResearchReference(state_slots=state_slots, variable_map=blueprint.get('variable_map') or {},

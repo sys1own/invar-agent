@@ -1,0 +1,323 @@
+{
+  "feasibility": "verdict=<FeasibilityVerdict.OPTIMAL_DIRECT: 'OPTIMAL_DIRECT'> rationale='The request supplies exact thermodynamic equations and sealed bounds. A direct algebraic/sampling computational study can audit the eta>=0.65 claim against the first law and Clausius inequality, with Carnot efficiency as the ceiling benchmark. No reduced-order surrogate is needed.' violated_boundary=None reformulation=None assessed_by='llm'",
+  "blueprint": {
+    "blueprint_id": "cyclic_heat_engine_audit",
+    "title": "Audit of claimed 65% efficiency cyclic heat engine between 600 K and 300 K",
+    "falsifiable_hypothesis": "A cyclic heat engine operating between a hot reservoir at 600 K and a cold reservoir at 300 K can attain efficiency eta >= 0.65 while obeying Qin=W+Qout, eta=W/Qin, Qin in [1,200] J, W and Qout nonnegative and at most 200 J, and the Clausius inequality Qout/300 >= Qin/600.",
+    "research_prompt": "Audit, rather than repair, the following falsifiable research claim in a single computational study: a cyclic heat engine operating between a hot reservoir at 600 K and a cold reservoir at 300 K can have efficiency eta >= 0.65 while obeying both thermodynamic laws. Take positive heat input Qin between 1 and 200 J per cycle, work W and rejected heat Qout nonnegative and at most 200 J, and eta in [0,1]. Use Qin=W+Qout, eta=W/Qin and the Clausius inequality Qout/300 >= Qin/600; the reversible Carnot engine provides the ceiling benchmark. Retain eta >= 0.65 as the claim being tested, even if false. Seek a justified refutation with a checkable proof, not a redesigned engine, a weakened target, or a failed-search claim. State SI units explicitly and keep all original bounds sealed.",
+    "search_queries": [
+      "Carnot efficiency limit",
+      "Clausius inequality cyclic engine",
+      "thermodynamic efficiency upper bound",
+      "entropy production heat engine"
+    ],
+    "contracts": [
+      {
+        "contract_id": "c1_carnot_clausius_ceiling",
+        "target_backend": "rust_hin",
+        "timeout_seconds": 20.0,
+        "invariants": [
+          {
+            "variable_name": "carnot_efficiency_ceiling",
+            "assertion": "abs(state[6] - 0.5) <= 1e-9",
+            "tolerance": 1e-09
+          },
+          {
+            "variable_name": "clausius_efficiency_ceiling",
+            "assertion": "abs(state[7] - 0.5) <= 1e-9",
+            "tolerance": 1e-09
+          },
+          {
+            "variable_name": "claimed_efficiency_eta",
+            "assertion": "state[5] >= 0.65 - 1e-9",
+            "tolerance": 1e-09
+          }
+        ],
+        "max_memory_mb": 512,
+        "initial_state": [
+          0.0,
+          600.0,
+          300.0,
+          1.0,
+          200.0,
+          0.65,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "initial_values": {
+          "time_s": 0.0,
+          "hot_reservoir_temperature_K": 600.0,
+          "cold_reservoir_temperature_K": 300.0,
+          "input_qin_min_J": 1.0,
+          "input_qin_max_J": 200.0,
+          "claimed_efficiency_eta": 0.65,
+          "carnot_efficiency_ceiling": 0.0,
+          "clausius_efficiency_ceiling": 0.0,
+          "max_eta_feasible_over_Qin_range": 0.0,
+          "refutation_margin": 0.0,
+          "feasible_count_eta_at_least_0p65": 0.0,
+          "sampled_qin_J": 0.0,
+          "sampled_work_W_J": 0.0,
+          "sampled_rejected_heat_Qout_J": 0.0,
+          "sampled_efficiency": 0.0,
+          "clausius_residual_J_per_K": 0.0
+        },
+        "dt": 1.0,
+        "steps": 1
+      },
+      {
+        "contract_id": "c2_clausius_sweep_refutation",
+        "target_backend": "rust_hin",
+        "timeout_seconds": 20.0,
+        "invariants": [
+          {
+            "variable_name": "feasible_count_eta_at_least_0p65",
+            "assertion": "state[10] == 0.0",
+            "tolerance": 1e-09
+          },
+          {
+            "variable_name": "clausius_residual_J_per_K",
+            "assertion": "state[15] <= -1e-6",
+            "tolerance": 1e-06
+          },
+          {
+            "variable_name": "refutation_margin",
+            "assertion": "state[9] >= 0.15 - 1e-9",
+            "tolerance": 1e-09
+          }
+        ],
+        "max_memory_mb": 512,
+        "initial_state": [
+          0.0,
+          600.0,
+          300.0,
+          1.0,
+          200.0,
+          0.65,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "initial_values": {
+          "time_s": 0.0,
+          "hot_reservoir_temperature_K": 600.0,
+          "cold_reservoir_temperature_K": 300.0,
+          "input_qin_min_J": 1.0,
+          "input_qin_max_J": 200.0,
+          "claimed_efficiency_eta": 0.65,
+          "carnot_efficiency_ceiling": 0.0,
+          "clausius_efficiency_ceiling": 0.0,
+          "max_eta_feasible_over_Qin_range": 0.0,
+          "refutation_margin": 0.0,
+          "feasible_count_eta_at_least_0p65": 0.0,
+          "sampled_qin_J": 0.0,
+          "sampled_work_W_J": 0.0,
+          "sampled_rejected_heat_Qout_J": 0.0,
+          "sampled_efficiency": 0.0,
+          "clausius_residual_J_per_K": 0.0
+        },
+        "dt": 1.0,
+        "steps": 1
+      },
+      {
+        "contract_id": "c3_no_solution_proof",
+        "target_backend": "rust_hin",
+        "timeout_seconds": 20.0,
+        "invariants": [
+          {
+            "variable_name": "max_eta_feasible_over_Qin_check",
+            "assertion": "state[8] <= 0.5 + 1e-9",
+            "tolerance": 1e-09
+          },
+          {
+            "variable_name": "refutation_margin",
+            "assertion": "state[9] > 0.0",
+            "tolerance": 1e-09
+          },
+          {
+            "variable_name": "feasible_count_eta_at_least_0p65",
+            "assertion": "state[10] == 0.0",
+            "tolerance": 1e-09
+          }
+        ],
+        "max_memory_mb": 512,
+        "initial_state": [
+          0.0,
+          600.0,
+          300.0,
+          1.0,
+          200.0,
+          0.65,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "initial_values": {
+          "time_s": 0.0,
+          "hot_reservoir_temperature_K": 600.0,
+          "cold_reservoir_temperature_K": 300.0,
+          "input_qin_min_J": 1.0,
+          "input_qin_max_J": 200.0,
+          "claimed_efficiency_eta": 0.65,
+          "carnot_efficiency_ceiling": 0.0,
+          "clausius_efficiency_ceiling": 0.0,
+          "max_eta_feasible_over_Qin_range": 0.0,
+          "refutation_margin": 0.0,
+          "feasible_count_eta_at_least_0p65": 0.0,
+          "sampled_qin_J": 0.0,
+          "sampled_work_W_J": 0.0,
+          "sampled_rejected_heat_Qout_J": 0.0,
+          "sampled_efficiency": 0.0,
+          "clausius_residual_J_per_K": 0.0
+        },
+        "dt": 1.0,
+        "steps": 1
+      }
+    ],
+    "code_template": "import math\n\ndef simulation_step(buf, dt):\n    t = buf.data[0]\n    th = buf.data[1]\n    tc = buf.data[2]\n    qmin = buf.data[3]\n    qmax = buf.data[4]\n    eta_claim = buf.data[5]\n\n    carnot = 1.0 - tc / th\n    clausius_limit = 1.0 - tc / th\n    buf.data[6] = carnot\n    buf.data[7] = clausius_limit\n\n    max_feasible = clausius_limit\n    feasible_count = 0.0\n    n_samples = 100\n    last_q = qmin\n    last_w = 0.0\n    last_qout = 0.0\n    last_eta = 0.0\n    residual = 0.0\n\n    for k in range(n_samples):\n        q = qmin + (qmax - qmin) * k / (n_samples - 1)\n        w = eta_claim * q\n        qout = q - w\n        eta = w / q\n        if eta <= clausius_limit + 1e-12:\n            feasible_count = feasible_count + 1.0\n        last_q = q\n        last_w = w\n        last_qout = qout\n        last_eta = eta\n        residual = qout / tc - q / th\n\n    buf.data[8] = max_feasible\n    buf.data[9] = eta_claim - max_feasible\n    buf.data[10] = feasible_count\n    buf.data[11] = last_q\n    buf.data[12] = last_w\n    buf.data[13] = last_qout\n    buf.data[14] = last_eta\n    buf.data[15] = residual\n    buf.data[0] = t + dt\n",
+    "max_feedback_rounds": 3,
+    "verified_layers": [],
+    "target_research_stages": 3,
+    "stage_objectives": [
+      "Establish the Carnot and Clausius efficiency ceiling for reservoirs at 600 K and 300 K.",
+      "Sweep the sealed Qin range 1-200 J to test the retained eta>=0.65 claim against first-law and second-law constraints.",
+      "Consolidate the refutation proof by confirming zero feasible samples and a positive violation margin."
+    ],
+    "current_stage": 1,
+    "evolution_history": [],
+    "unified_module_code": null,
+    "feasibility": null,
+    "variable_map": {
+      "time_s": 0,
+      "hot_reservoir_temperature_K": 1,
+      "cold_reservoir_temperature_K": 2,
+      "input_qin_min_J": 3,
+      "input_qin_max_J": 4,
+      "claimed_efficiency_eta": 5,
+      "carnot_efficiency_ceiling": 6,
+      "clausius_efficiency_ceiling": 7,
+      "max_eta_feasible_over_Qin_range": 8,
+      "refutation_margin": 9,
+      "feasible_count_eta_at_least_0p65": 10,
+      "sampled_qin_J": 11,
+      "sampled_work_W_J": 12,
+      "sampled_rejected_heat_Qout_J": 13,
+      "sampled_efficiency": 14,
+      "clausius_residual_J_per_K": 15
+    },
+    "slot_roles": {
+      "time_s": "evolving_state",
+      "hot_reservoir_temperature_K": "read_only_parameter",
+      "cold_reservoir_temperature_K": "read_only_parameter",
+      "input_qin_min_J": "read_only_parameter",
+      "input_qin_max_J": "read_only_parameter",
+      "claimed_efficiency_eta": "read_only_parameter",
+      "carnot_efficiency_ceiling": "diagnostic",
+      "clausius_efficiency_ceiling": "diagnostic",
+      "max_eta_feasible_over_Qin_range": "diagnostic",
+      "refutation_margin": "diagnostic",
+      "feasible_count_eta_at_least_0p65": "diagnostic",
+      "sampled_qin_J": "diagnostic",
+      "sampled_work_W_J": "diagnostic",
+      "sampled_rejected_heat_Qout_J": "diagnostic",
+      "sampled_efficiency": "diagnostic",
+      "clausius_residual_J_per_K": "diagnostic"
+    },
+    "structured_evidence": {
+      "domains": [
+        "PHYSICAL_SCIENCES_AND_ENG",
+        "EARTH_CLIMATE_AND_ENVIRONMENT"
+      ],
+      "equations": [
+        {
+          "lhs": "Qin",
+          "rhs_latex": "W+Qout, eta",
+          "rhs_python_hint": "",
+          "variables": [],
+          "description": "",
+          "source": "user_prompt"
+        }
+      ],
+      "parameters": {
+        "input_qin": {
+          "name": "input_qin",
+          "symbol": "Qin",
+          "raw_value": 200.0,
+          "raw_unit": "J",
+          "si_value": 200.0,
+          "si_unit": "J",
+          "uncertainty": null,
+          "source": "user_prompt",
+          "confidence": 1.0
+        }
+      },
+      "benchmarks": [],
+      "recommended_backend": "cpp",
+      "recommended_stepper": "rk4",
+      "suggested_invariants": [],
+      "summary_markdown_table": "**Domains:** PHYSICAL_SCIENCES_AND_ENG, EARTH_CLIMATE_AND_ENVIRONMENT  \n**Recommended backend / stepper:** `cpp` / `rk4`\n\n| Parameter | Symbol | Raw | SI value | SI unit | Source |\n|---|---|---|---|---|---|\n| input_qin | Qin | 200 J | 200 | J | user_prompt |\n\n| Equation | LaTeX | Python hint (v9) | Source |\n|---|---|---|---|\n| Qin | $W+Qout, eta$ | \u2014 | user_prompt |"
+    },
+    "extracted_constants": {
+      "input_qin": 200.0
+    },
+    "uast_spec": null,
+    "ihcg_evidence": null
+  },
+  "source": "llm",
+  "structured_evidence": {
+    "domains": [
+      "PHYSICAL_SCIENCES_AND_ENG",
+      "EARTH_CLIMATE_AND_ENVIRONMENT"
+    ],
+    "equations": [
+      {
+        "lhs": "Qin",
+        "rhs_latex": "W+Qout, eta",
+        "rhs_python_hint": "",
+        "variables": [],
+        "description": "",
+        "source": "user_prompt"
+      }
+    ],
+    "parameters": {
+      "input_qin": {
+        "name": "input_qin",
+        "symbol": "Qin",
+        "raw_value": 200.0,
+        "raw_unit": "J",
+        "si_value": 200.0,
+        "si_unit": "J",
+        "uncertainty": null,
+        "source": "user_prompt",
+        "confidence": 1.0
+      }
+    },
+    "benchmarks": [],
+    "recommended_backend": "cpp",
+    "recommended_stepper": "rk4",
+    "suggested_invariants": [],
+    "summary_markdown_table": "**Domains:** PHYSICAL_SCIENCES_AND_ENG, EARTH_CLIMATE_AND_ENVIRONMENT  \n**Recommended backend / stepper:** `cpp` / `rk4`\n\n| Parameter | Symbol | Raw | SI value | SI unit | Source |\n|---|---|---|---|---|---|\n| input_qin | Qin | 200 J | 200 | J | user_prompt |\n\n| Equation | LaTeX | Python hint (v9) | Source |\n|---|---|---|---|\n| Qin | $W+Qout, eta$ | \u2014 | user_prompt |"
+  }
+}

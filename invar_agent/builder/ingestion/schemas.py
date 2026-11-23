@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -207,6 +207,13 @@ class CanonicalResearchIR(StrictModel):
     llm_disambiguation_tokens_used: int = 0
     user_approved: bool = False
     ir_blake3_digest: str = ""
+    blake3_receipt: str = ""
+    meaningfulness_certificates: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    meaningfulness_certificate: dict[str, Any] | None = None
+    epistemic_verdict: Literal["VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY", "VERIFIED_FALSIFICATION", "INCONCLUSIVE_UNVERIFIED"] | None = None
+    certified_valid_domain: dict[str, Any] | None = None
+    negative_constraints: list[dict[str, Any]] = Field(default_factory=list)
+    research_import_role: Literal["POSITIVE_EVIDENCE", "NEGATIVE_CONSTRAINT_ONLY", "LEGACY_UNVERIFIED"] = "LEGACY_UNVERIFIED"
 
 
 class RawEquation(StrictModel):

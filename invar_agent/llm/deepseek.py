@@ -144,7 +144,8 @@ class DeepSeekChatClient:
             # calls disable it explicitly; the API accepts this on flash.
             extra["extra_body"] = {"thinking": {"type": "disabled"}}
 
-        wall_timeout = float(os.environ.get("INVAR_DEEPSEEK_WALL_TIMEOUT", "180.0"))
+        idle_timeout = float(os.environ.get("INVAR_DEEPSEEK_IDLE_TIMEOUT",
+            os.environ.get("INVAR_DEEPSEEK_WALL_TIMEOUT", "180.0")))
         ctx = current_llm_context()
         tier_val = self.tier.value if isinstance(self.tier, Tier) else str(self.tier)
         est_input_chars = sum(len(str(m.get("content") or "")) for m in (messages or []))
@@ -154,6 +155,8 @@ class DeepSeekChatClient:
             req_extra = extra_override if extra_override is not None else extra
             try:
                 client = self._openai_client()
+                if not self._injected_client:
+                    client = client.with_options(timeout=httpx.Timeout(idle_timeout, connect=20.0), max_retries=0)
                 if builder_transport_active() and callable(getattr(client, "with_options", None)):
                     client = client.with_options(max_retries=0)
                 if not self._injected_client:
@@ -168,7 +171,7 @@ class DeepSeekChatClient:
                         _sys.stderr.flush()
                     except Exception:
                         pass
-                    req_t0 = time.monotonic()
+                    last_chunk_at = time.monotonic()
                     stream = client.chat.completions.create(
                         model=self.model,
                         messages=messages,
@@ -183,6 +186,12 @@ class DeepSeekChatClient:
                     usage_obj: Any = None
                     try:
                         for chunk in stream:
+                            now = time.monotonic()
+                            if now - last_chunk_at > idle_timeout:
+                                raise LLMProviderError(DEEPSEEK_PROVIDER, self.model,
+                                    upstream_message=f"Streaming idle timeout after {idle_timeout:.0f}s without a chunk",
+                                    retryable=True, api_key=self.api_key)
+                            last_chunk_at = now
                             if getattr(chunk, "usage", None) is not None:
                                 usage_obj = chunk.usage
                             choices = getattr(chunk, "choices", None) or ()
@@ -197,15 +206,6 @@ class DeepSeekChatClient:
                                 reason_delta = getattr(delta, "reasoning_content", None) if delta is not None else None
                                 if reason_delta:
                                     reasoning_parts.append(reason_delta)
-                            if (time.monotonic() - req_t0) > wall_timeout:
-                                raise LLMProviderError(
-                                    DEEPSEEK_PROVIDER,
-                                    self.model,
-                                    status_code=None,
-                                    upstream_message=f"Streaming wall timeout after {wall_timeout:.0f}s",
-                                    retryable=True,
-                                    api_key=self.api_key,
-                                )
                     finally:
                         closer = getattr(stream, "close", None)
                         if callable(closer):

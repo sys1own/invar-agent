@@ -1447,7 +1447,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                         continue
                     terminal = (payload.get("event") in terminal_events
                                 and payload.get("seq", 0) > initial_seq)
-                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                    yield f"data: {json.dumps({**payload, 'event_version': '2.0'}, default=str)}\n\n"
                     if terminal:
                         # Graceful close after the final event; EventSource
                         # reconnects and replays history without re-closing.

@@ -74,6 +74,7 @@ typedef struct SimulationBuffer {
     double dt;
     uint32_t steps;
     double* data;
+    double* diag;
 } SimulationBuffer;
 }
 
@@ -498,7 +499,7 @@ class CppEmitter:
                 return self._aliases[name]
             if name.startswith("buf."):
                 attr = name.split(".", 1)[1]
-                if attr not in ("data", "size", "dt", "steps"):
+                if attr not in ("data", "diag", "size", "dt", "steps"):
                     raise EmitterError(f"unsupported buffer attribute buf.{attr}")
                 return f"buf->{attr}" if attr != "size" else "static_cast<long>(buf->size)"
             if "." in name:
@@ -506,7 +507,7 @@ class CppEmitter:
             return name
         if t == "attribute":
             value = node.get("value") or {}
-            if _ref_name(value) == "buf" and node.get("attr") in ("data", "dt", "steps"):
+            if _ref_name(value) == "buf" and node.get("attr") in ("data", "diag", "dt", "steps"):
                 return f"buf->{node.get('attr')}"
             if _ref_name(value) == "buf" and node.get("attr") == "size":
                 return "static_cast<long>(buf->size)"
