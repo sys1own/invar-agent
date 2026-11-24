@@ -70,6 +70,12 @@ def model(context):
             seen_params.add(item.symbol)
             parameters.append(item.symbol)
     equations = {item.lhs_symbol: item for item in ir.equations if item.role == EquationRole.EVOLUTION_LAW}
+    if not equations:
+        alg_eqs = {item.lhs_symbol: item for item in ir.equations if item.role == EquationRole.ALGEBRAIC_CLOSURE and item.lhs_symbol}
+        if alg_eqs and set(alg_eqs) <= set(names):
+            equations = alg_eqs
+            states = [s for s in states if s.symbol in equations]
+            names = [s.symbol for s in states]
     if not names or set(names) != set(equations):
         raise ValueError("Every state must have exactly one evolution equation")
     if len(set(names + parameters)) != len(names + parameters):

@@ -8,6 +8,103 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WireRole { ControlParam, #[default] DynamicState, DerivedObservable, ConservationAux }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[repr(u8)]
+pub enum PurityTag { #[default] Pure = 0, Projected = 1, Stabilized = 2, Recalibrated = 3 }
+
+impl PurityTag {
+    pub fn join(self, other: Self) -> Self { self.max(other) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObligationClass { HypothesisTarget, ConservationGuard, StageCoupling }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QuantifierMode { ForAll, Exists, Boundary }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IhcgSlot {
+    pub slot_idx: usize,
+    pub symbol: String,
+    pub si_dim: [i8; 7],
+    pub semantic_tag: u8,
+    pub role: WireRole,
+    #[serde(default)]
+    pub is_falsification_target: bool,
+    pub domain_interval: crate::holographic_hin::IntervalBound,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IhcgObligation {
+    pub id: String,
+    pub class: ObligationClass,
+    pub predicate: crate::holographic_hin::CselExpr,
+    pub prompt_quote: String,
+    pub prompt_span: [usize; 2],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IhcgGraph {
+    pub slots: Vec<IhcgSlot>,
+    pub equations: Vec<crate::holographic_hin::CselExpr>,
+    pub environmental_assumptions: Vec<crate::holographic_hin::CselExpr>,
+    pub obligations: Vec<IhcgObligation>,
+    pub omega: std::collections::BTreeMap<String, crate::holographic_hin::IntervalBound>,
+    pub quantifier_mode: QuantifierMode,
+    pub archetype: String,
+    #[serde(default)]
+    pub h_ihcg: String,
+}
+
+/// Typed binary canonical encoding; legacy JSON receipts retain their old encoding.
+pub fn epistemic_canonical_bytes(json: &str) -> Result<Vec<u8>, String> {
+    fn encode(v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+        fn bytes(b: &[u8], out: &mut Vec<u8>) {
+            out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        match v {
+            Value::Null => out.push(b'n'),
+            Value::Bool(b) => { out.push(b'b'); out.push(u8::from(*b)); }
+            Value::Number(n) if n.is_f64() => {
+                out.push(b'f');
+                let x = n.as_f64().ok_or("invalid float")?;
+                out.extend_from_slice(&(if x == 0.0 { 0.0 } else { x }).to_bits().to_le_bytes());
+            }
+            Value::Number(n) => { out.push(b'i'); bytes(n.to_string().as_bytes(), out); }
+            Value::String(s) => { out.push(b's'); bytes(s.as_bytes(), out); }
+            Value::Array(a) => {
+                out.push(b'a'); out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                for x in a { encode(x, out)?; }
+            }
+            Value::Object(m) if m.len() == 2 && m.contains_key("numerator") && m.contains_key("denominator") => {
+                let mut p = m["numerator"].as_i64().ok_or("rational numerator must be i64")? as i128;
+                let mut q = m["denominator"].as_i64().ok_or("rational denominator must be i64")? as i128;
+                if q == 0 { return Err("zero rational denominator".into()); }
+                if q < 0 { p = -p; q = -q; }
+                let (mut a, mut b) = (p.abs(), q);
+                while b != 0 { (a, b) = (b, a % b); }
+                out.push(b'r'); out.extend_from_slice(&(p / a).to_le_bytes()); out.extend_from_slice(&(q / a).to_le_bytes());
+            }
+            Value::Object(m) => {
+                out.push(b'o'); out.extend_from_slice(&(m.len() as u64).to_le_bytes());
+                let mut keys: Vec<_> = m.keys().collect(); keys.sort();
+                for k in keys { bytes(k.as_bytes(), out); encode(&m[k], out)?; }
+            }
+        }
+        Ok(())
+    }
+    let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut out = Vec::new(); encode(&v, &mut out)?; Ok(out)
+}
+
 pub fn canonical_json_bytes(json: &str) -> Result<Vec<u8>, String> {
     fn compact(value: &Value) -> Result<String, String> {
         Ok(match value {

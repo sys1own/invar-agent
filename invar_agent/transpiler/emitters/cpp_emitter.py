@@ -74,6 +74,7 @@ typedef struct SimulationBuffer {
     double dt;
     uint32_t steps;
     double* data;
+    double* diag;
 } SimulationBuffer;
 }
 
@@ -228,8 +229,8 @@ inline double betainc_reg(double a, double b, double x) noexcept {
 
 namespace invar {
 static inline uint64_t _to_u64(double x) noexcept { return static_cast<uint64_t>(static_cast<int64_t>(x)); }
-static inline long pymod_i(long a, long b) { long r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
-static inline long floordiv_i(long a, long b) { long q = a / b; return ((a % b != 0) && ((a < 0) != (b < 0))) ? q - 1 : q; }
+static inline int64_t pymod_i(int64_t a, int64_t b) { int64_t r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
+static inline int64_t floordiv_i(int64_t a, int64_t b) { int64_t q = a / b; return ((a % b != 0) && ((a < 0) != (b < 0))) ? q - 1 : q; }
 static inline double pymod_f(double a, double b) { double r = std::fmod(a, b); return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r; }
 static inline double clamp(double x, double lo, double hi) { return std::max((double)(lo), std::min((double)(hi), (double)(x))); }
 static inline double clip(double x, double lo, double hi) { return clamp(x, lo, hi); }
@@ -415,10 +416,72 @@ class CppEmitter:
             return _ref_name(node.get("value")) == "buf" and node.get("attr") == "data"
         return False
 
+    def _int_params(self, fn: Dict[str, Any]) -> Set[str]:
+        """Identify non-buf parameters used in integer bitwise ops so they stay exact int64_t."""
+        params = {p for p in (fn.get("params") or []) if p != "buf"}
+        if not params:
+            return set()
+        tainted: Set[str] = set()
+        aliases: Dict[str, Set[str]] = {}
+        def scan_expr(e, in_bit=False):
+            if not isinstance(e, dict):
+                return
+            t = e.get("type")
+            if t == "reference" and in_bit:
+                n = e.get("name")
+                if n in params:
+                    tainted.add(n)
+                elif n in aliases:
+                    tainted.update(aliases[n])
+            elif t == "binop":
+                bit = in_bit or e.get("op") in ("&", "|", "^", "<<", ">>")
+                scan_expr(e.get("left"), bit)
+                scan_expr(e.get("right"), bit)
+            else:
+                for v in e.values():
+                    if isinstance(v, dict):
+                        scan_expr(v, in_bit)
+                    elif isinstance(v, list):
+                        for item in v:
+                            scan_expr(item, in_bit)
+        def refs_in(e) -> Set[str]:
+            out: Set[str] = set()
+            if not isinstance(e, dict):
+                return out
+            if e.get("type") == "reference":
+                n = e.get("name")
+                if n in params:
+                    out.add(n)
+                elif n in aliases:
+                    out.update(aliases[n])
+            for v in e.values():
+                if isinstance(v, dict):
+                    out.update(refs_in(v))
+                elif isinstance(v, list):
+                    for item in v:
+                        out.update(refs_in(item))
+            return out
+        def walk(stmts):
+            for s in stmts or []:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("type") == "binding" and isinstance(s.get("name"), str) and s.get("target") is None:
+                    r = refs_in(s.get("value"))
+                    if r:
+                        aliases.setdefault(s["name"], set()).update(r)
+                scan_expr(s.get("value"), False)
+                scan_expr(s.get("condition"), False)
+                for key in ("body", "then", "else"):
+                    if isinstance(s.get(key), list):
+                        walk(s[key])
+        walk(fn.get("body"))
+        return tainted
+
     def _collect_locals(self, fn: Dict[str, Any]) -> Dict[str, str]:
         """Fixed-point type inference over every local bound in the function."""
         params = fn.get("params") or []
-        self.types = {p: (BUF if p == "buf" else FLOAT) for p in params}
+        int_params = self._int_params(fn)
+        self.types = {p: (BUF if p == "buf" else (INT if p in int_params else FLOAT)) for p in params}
         self._aliases = {}
         loop_vars: Set[str] = set()
         float_loop_vars: Set[str] = set()
@@ -491,6 +554,8 @@ class CppEmitter:
             v = node.get("value")
             if isinstance(v, str) or v is None:
                 raise EmitterError(f"unsupported literal {v!r} in kernel")
+            if type(v) is int and v >= (1 << 63):
+                return f"static_cast<int64_t>({v}ULL)"
             return render_literal(v, "cpp")
         if t == "reference":
             name = str(node.get("name", ""))
@@ -498,7 +563,7 @@ class CppEmitter:
                 return self._aliases[name]
             if name.startswith("buf."):
                 attr = name.split(".", 1)[1]
-                if attr not in ("data", "size", "dt", "steps"):
+                if attr not in ("data", "diag", "size", "dt", "steps"):
                     raise EmitterError(f"unsupported buffer attribute buf.{attr}")
                 return f"buf->{attr}" if attr != "size" else "static_cast<long>(buf->size)"
             if "." in name:
@@ -506,7 +571,7 @@ class CppEmitter:
             return name
         if t == "attribute":
             value = node.get("value") or {}
-            if _ref_name(value) == "buf" and node.get("attr") in ("data", "dt", "steps"):
+            if _ref_name(value) == "buf" and node.get("attr") in ("data", "diag", "dt", "steps"):
                 return f"buf->{node.get('attr')}"
             if _ref_name(value) == "buf" and node.get("attr") == "size":
                 return "static_cast<long>(buf->size)"
@@ -642,11 +707,11 @@ class CppEmitter:
             raise EmitterError("len() is only supported on buf.data and local lists")
         if name == "abs" and len(args) == 1:
             if self._type_of(args[0]) == INT:
-                return f"std::labs({self.emit_expr(args[0])})"
+                return f"std::llabs({self.emit_expr(args[0])})"
             return f"std::fabs({self._num(args[0])})"
         if name in ("min", "max") and len(args) >= 2:
             if all(self._type_of(a) == INT for a in args):
-                fn = "std::min<long>" if name == "min" else "std::max<long>"
+                fn = "std::min<int64_t>" if name == "min" else "std::max<int64_t>"
                 expr = self.emit_expr(args[0])
                 for a in args[1:]:
                     expr = f"({expr} {'<' if name == 'min' else '>'} {self.emit_expr(a)} ? {expr} : {self.emit_expr(a)})"
@@ -657,7 +722,7 @@ class CppEmitter:
                 expr = f"{fn}({expr}, {self._num(a)})"
             return expr
         if name == "int" and len(args) == 1:
-            return f"static_cast<long>({self.emit_expr(args[0])})"
+            return f"static_cast<int64_t>({self.emit_expr(args[0])})"
         if name == "float" and len(args) == 1:
             return self._num(args[0])
         if name in ("math.radians", "math.degrees"):
@@ -709,7 +774,9 @@ class CppEmitter:
                 raise EmitterError(f"{name}() expects {_INTRINSICS[name]} arguments")
             return f"invar::{name}(" + ", ".join(self._num(a) for a in args) + ")"
         if name in self.functions:
-            params = self.functions[name].get("params") or []
+            fn_node = self.functions[name]
+            params = fn_node.get("params") or []
+            int_params = self._int_params(fn_node)
             if len(params) != len(args):
                 raise EmitterError(f"{name}() expects {len(params)} arguments, got {len(args)}")
             rendered = []
@@ -718,6 +785,9 @@ class CppEmitter:
                     if _ref_name(a) != "buf":
                         raise EmitterError(f"{name}(): the buf parameter must receive buf")
                     rendered.append("buf")
+                elif p in int_params:
+                    expr = self.emit_expr(a)
+                    rendered.append(expr if self._type_of(a) in (INT, BOOL) else f"static_cast<int64_t>({expr})")
                 else:
                     rendered.append(self._num(a))
             return f"{name}(" + ", ".join(rendered) + ")"
@@ -751,7 +821,7 @@ class CppEmitter:
             out = [pad + "{\n"]
             for i, (n, v) in enumerate(zip(names, values)):
                 ty = self.types.get(n, FLOAT)
-                cty = {INT: "long", VEC: "std::vector<double>",
+                cty = {INT: "int64_t", VEC: "std::vector<double>",
                        VEC2: "std::vector<std::vector<double>>"}.get(ty, "double")
                 rendered = self._num(v) if ty == FLOAT else self.emit_expr(v)
                 out.append(f"{pad}    {cty} __tmp{i} = {rendered};\n")
@@ -852,7 +922,7 @@ class CppEmitter:
         if ret.startswith("__tuple"):
             arity = int(ret[len("__tuple"):])
             return "std::tuple<" + ", ".join(["double"] * arity) + ">"
-        return {"void": "void", INT: "long", FLOAT: "double"}[ret]
+        return {"void": "void", INT: "int64_t", FLOAT: "double"}[ret]
 
     # -- functions -------------------------------------------------------
     def _return_type(self, fn: Dict[str, Any]) -> str:
@@ -890,11 +960,14 @@ class CppEmitter:
         self._declared_locals = set(local_types) | set(params)
         ret = self.returns.get(name, "void")
         cret = self._cret(ret)
-        plist = ", ".join(f"{self.buffer_struct}* buf" if p == "buf" else f"double {p}"
-                          for p in params)
+        int_params = self._int_params(fn)
+        plist = ", ".join(
+            f"{self.buffer_struct}* buf" if p == "buf" else (f"int64_t {p}" if p in int_params else f"double {p}")
+            for p in params
+        )
         lines = [f"static {cret} {name}({plist}) {{"]
         for local, ty in sorted(local_types.items()):
-            cty = {INT: "long", VEC: "std::vector<double>",
+            cty = {INT: "int64_t", VEC: "std::vector<double>",
                    VEC2: "std::vector<std::vector<double>>"}.get(ty, "double")
             init = "{}" if ty in (VEC, VEC2) else ("0" if ty == INT else "0.0")
             lines.append(f"    {cty} {local} = {init}; (void){local};")
@@ -927,7 +1000,7 @@ class CppEmitter:
                 ty = self._type_of(g.get("value"))
                 if ty not in (INT, FLOAT, BOOL):
                     raise EmitterError("module-level constants must be scalars")
-                cty = "long" if ty in (INT, BOOL) else "double"
+                cty = "int64_t" if ty in (INT, BOOL) else "double"
                 val = self.emit_expr(g.get("value"))
                 out.append(f"static const {cty} {g['name']} = {val};")
                 self.globals[g["name"]] = INT if ty in (INT, BOOL) else FLOAT
@@ -940,8 +1013,11 @@ class CppEmitter:
         for f in funcs:
             if f["name"] in _NATIVE_PRELUDE_INTRINSICS:
                 continue
-            plist = ", ".join(f"{self.buffer_struct}* buf" if p == "buf" else "double"
-                              for p in (f.get("params") or []))
+            f_int_params = self._int_params(f)
+            plist = ", ".join(
+                f"{self.buffer_struct}* buf" if p == "buf" else ("int64_t" if p in f_int_params else "double")
+                for p in (f.get("params") or [])
+            )
             out.append(f"static {self._cret(self.returns[f['name']])} {f['name']}({plist});")
         out.append("")
         for f in funcs:

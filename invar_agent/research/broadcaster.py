@@ -86,12 +86,13 @@ class ResearchRunManager:
     """Owns the active research run; supports approve/edit/abort."""
 
     def __init__(self, workspace_root, broadcaster: ResearchEventBroadcaster,
-                 llm_planner=None, llm_fast=None, search_client=None):
+                 llm_planner=None, llm_fast=None, search_client=None, verification_runner=None):
         self.workspace_root = workspace_root
         self.broadcaster = broadcaster
         self.llm_planner = llm_planner
         self.llm_fast = llm_fast
         self.search_client = search_client
+        self.verification_runner = verification_runner
         self.pending_blueprint: Optional[ResearchBlueprint] = None
         self.active_state: Optional[ResearchRunState] = None
         self.active_run_uid: Optional[str] = None
@@ -148,7 +149,8 @@ class ResearchRunManager:
             llm_planner=self.llm_planner, llm_fast=self.llm_fast,
             search_client=self.search_client,
             abort_flag=self._abort.is_set,
-            workspace_root=self.workspace_root)
+            workspace_root=self.workspace_root,
+            **({"verification_runner": self.verification_runner} if self.verification_runner is not None else {}))
         self.active_state = ResearchRunState(blueprint=fresh_bp)
         seeded = list(getattr(self, "seeded_upload_ids", None) or [])
 

@@ -16,9 +16,16 @@ from .vault_adapter import load_vault_bundle
 
 
 def seal_ir(ir: CanonicalResearchIR) -> CanonicalResearchIR:
-    payload = ir.model_dump(mode="json", exclude={"ir_blake3_digest"})
+    payload = ir.model_dump(mode="json", exclude={"ir_blake3_digest", "blake3_receipt"})
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     ir.ir_blake3_digest = _native().compute_his_digest_v2("invar.ir.canonical.v1", canonical)
+    native = _native()
+    if hasattr(native, "py_compute_certificate_receipt"):
+        ir.blake3_receipt = native.py_compute_certificate_receipt(ir.model_dump_json())
+    elif ir.meaningfulness_certificates or ir.meaningfulness_certificate is not None or ir.epistemic_verdict is not None:
+        raise FormalGateError("NATIVE_CERTIFICATE_RECEIPT_REQUIRED", "Certified research requires the native BLAKE3 receipt binding")
+    else:
+        ir.blake3_receipt = ""
     return ir
 
 
@@ -40,7 +47,7 @@ def reverify_ir(ir: CanonicalResearchIR) -> CanonicalResearchIR:
         checked.is_tunable_parameter = old.is_tunable_parameter
         checked.disambiguated_by_llm = old.disambiguated_by_llm
         checked.verification_status = old.verification_status
-        checked.dimension.semantic_tag = old.dimension.semantic_tag
+        checked.dimension = old.dimension.model_copy(deep=True)
     for old, checked in zip(ir.equations, equations):
         checked.equation_id = old.equation_id
         checked.raw_latex = old.raw_latex
@@ -129,6 +136,8 @@ class CanonicalResearchIngestionPipeline:
         for run_id in request.vault_run_ids:
             bundle = load_vault_bundle(self.workspace_root, run_id)
             ir.vault_run_ids.append(run_id)
+            ir.meaningfulness_certificates.update(bundle.meaningfulness_certificates)
+            ir.negative_constraints.extend(bundle.negative_constraints)
             ir.equations.extend(bundle.equations)
             ir.constants.extend(bundle.constants)
             ir.state_variables.extend(bundle.state_variables)
@@ -143,6 +152,18 @@ class CanonicalResearchIngestionPipeline:
             for name in ("time_horizon_si_s", "default_dt_si_s", "default_steps"):
                 if getattr(ir, name) is None:
                     setattr(ir, name, getattr(bundle, name))
+        if ir.negative_constraints and not ir.equations and not request.upload_paths:
+            ir.research_import_role = "NEGATIVE_CONSTRAINT_ONLY"
+            return seal_ir(ir)
+        if ir.meaningfulness_certificates:
+            from ...research.epistemic import parse_run_certificate
+            certificates = [parse_run_certificate(raw) for raw in ir.meaningfulness_certificates.values()]
+            if all(c.epistemic_verdict.value in {"VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY"} for c in certificates):
+                ir.research_import_role = "POSITIVE_EVIDENCE"
+                if len(certificates) == 1:
+                    ir.meaningfulness_certificate = certificates[0].model_dump(mode="json")
+                    ir.epistemic_verdict = certificates[0].epistemic_verdict.value
+                    ir.certified_valid_domain = getattr(certificates[0],"certified_valid_domain",None)
         raw_eqs, raw_constants, source_text = [], [], []
         for index, upload in enumerate(request.upload_paths):
             paths = validate_and_unpack_upload(Path(upload), self.workspace_root / ".invar" / "builder_ingestion" / ir.ir_id / str(index))

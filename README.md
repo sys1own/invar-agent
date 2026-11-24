@@ -1,280 +1,369 @@
 # invar-agent
 
-Formally Grounded Autonomous Software Engineering Kernel and Universal Pan-Scientific Hypothesis Verification Engine.
+An **8-Gate Formal Epistemic Meaningfulness, Uniqueness & Justified Falsification Engine**, paired with a software Builder and an interactive research workspace.
 
-`invar-agent` combines a Rust/PyO3 native verification and algebraic-rewriting core (`invar_agent._native`), a deterministic Python/C++20/Z3 verification substrate (`invar_agent/`), and an interactive FastAPI + SSE web console (`invar_agent/server.py`, `invar_agent/static/index.html`) to synthesize, formally verify, and execute numerical simulation kernels, multi-domain scientific hypotheses across all 8 macro-scientific domains, and software modules with zero unverified claims.
+The Rust/PyO3 core, Python/Z3 substrate, restricted-Python-to-C++20 compiler and isolated execution bridge connect declared scientific hypotheses to executable evidence. Results carry BLAKE3 commitments and auditable certificates. **Verification is conditional on the sealed model, domain, numerical reliability and trust boundary—not a guarantee of physical truth or universal implementation correctness.** Missing evidence and unsupported obligations fail closed.
 
----
+## Scientific contract and eight gates
 
-## 1. Architectural Overview
+Ingest seals the IHCG: original prompt, quoted obligations and character spans, quantifier, finite domain Ω, typed symbols, governing equations, immutable controls and stage commitments. Formal evidence must bind to the executable slots and contracts, not to an input containing the desired answer.
 
-`invar-agent` is structured into three tightly coupled layers:
+Literal extraction requires unambiguous formula/domain/unit declarations; it does not invent units or ambiguous prose aliases. Quote re-anchoring tolerates whitespace and equivalent Unicode comparison/minus tokens, then stores the exact original substring. Paraphrases, changed numbers/strictness and ambiguous matches are rejected. Strict quantitative planning requests bounded repair for absent or invalid evidence. Healing cannot recalibrate sealed observables or silently weaken a hypothesis.
 
-1. **Native Acceleration Core (`invar_agent/_native`)**:
-   Rust crate (`invar_agent_native`) compiled via `maturin` and exposed to Python through PyO3:
-   - **Girard GoI Wavefront Solver (`goi_wavefront.rs`, `goi_solver.rs`, `goi_matrix.rs`)**: Computes execution matrices `EX(M, U) = (I - U * M)^(-1) * U`, checks nilpotency (`rho(U * M) < 1`), partitions acyclic DAGs into parallelizable wavefronts, and performs Sherman-Morrison-Woodbury rank-k incremental updates.
-   - **Holographic Interaction Net (HIN) Arena (`hin_arena.rs`, `hin_engine.rs`, `holographic_hin.rs`)**: Flat arena graph reducer supporting MELL linear typing (`tau_wire = (MELLType, SIDimensionVector, IntervalBound)`), automatic promotion/dereliction, and causal fault slicing.
-   - **Reverse-Mode Adjoint HIN (`adjoint.rs`)**: Symbolic Jacobian differentiation `J_ij = df_i / dx_j` and spectrum/stiffness analysis.
-   - **`egg` E-Graph Reflex Healer (`csel_egraph.rs`, `deterministic_healer.rs`)**: Sub-2 ms Tier-0 algebraic canonicalization, CSEL desugaring, and syntax/import reflex repair.
-   - **Holographic Interface Signatures (`his.rs`)**: BLAKE3 structural digests that track public signature boundaries independently of private body edits.
-   - **Declarative UAST (`uast.rs`)**: Typed representation for `ResearchComputeUAST` and Closed Symbolic Expression Language (CSEL).
+| Gate | Requirement |
+|---|---|
+| Φ<sub>lock</sub> | Compiled contracts entail the original hypothesis; bounds, strictness and quantifiers remain sealed. |
+| Φ<sub>nonvac</sub> | Reject tautologies, unreachable antecedents and redundant/vacuous constraints; distinguish a consistent model/environment from a model-incompatible hypothesis. |
+| Φ<sub>pure</sub> | Observational purity and immutable controls; projection/stabilization is enforcement, not preservation. |
+| Φ<sub>fid</sub> | Formal/executable equivalence, SI/semantic consistency, convergence, physical checks and applicable statistical reliability. |
+| Φ<sub>active</sub> | Mechanism-to-observable coupling via derivative/FD/native-SVD and archetype-specific sensitivity/restoring-force checks. |
+| Φ<sub>epistemic</sub> | Certified falsification, boundary evidence or significance against a baseline—not a convenient sample. |
+| Φ<sub>novel</sub> | Canonical/reference/vault comparison rejects duplicates and validates scoped extensions or sharpenings. |
+| Φ<sub>nontrivial</sub> | The environment and domain alone must not already imply the claim without the proposed model. |
 
-2. **Kernel and Verification Substrate (`invar_agent/`)**:
-   - **9-Stage Verification State Machine (`invar_agent/research/state_machine.py`)**: Orchestrates literature ingestion, GoI scheduling, copy-on-write overlay mutation, PreWrite guards, Z3 SMT/concolic verification, C++20 C-ABI sandbox execution, Tier-0/1/2 healing, and adjoint commit/rollback.
-   - **Tier-0 Deterministic AST Sanitizer (`invar_agent/healing/deterministic_ast.py`)**: Rewrites domains, signatures, comprehensions, tuple unpacking, relational contracts, and manifold projections before compilation or execution.
-   - **Polyglot Transpiler & C-ABI Bridge (`invar_agent/transpiler/`, `invar_agent/runtime/cabi_bridge.py`)**: Lowers restricted Python (`v9_transpiler_friendly`) to UAST and C++20 shared libraries (`-O3 -std=c++20`), with isolated subprocess execution and deterministic Python fallback.
-   - **Deterministic LaTeX Canonicalizer (`invar_agent/latex_normalizer.py`)**: Repairs JSON control-character escapes, wraps bare equations, canonicalizes ASCII-math hybrids, and balances delimiters/braces.
+Deductive refutation has an explicit activity shortcut after certified model-relative infeasibility; fidelity, purity and reliability still apply. Certified zero-dissipation cancellations can be excluded from activity checks, but hardcoded zero/no-op implementations are not discoveries.
 
-3. **Interactive Web Platform (`invar_agent/server.py`, `invar_agent/static/index.html`)**:
-   - FastAPI backend with 3-channel SSE streaming (`search_log`, `goi_stream`, `accelerator_log`), Research Vault persistence, zip export/import, Markdown-protected KaTeX rendering, and an integrated `xterm.js` workspace terminal.
+### Four terminal epistemic states
 
----
+| Verdict | Meaning |
+|---|---|
+| `VERIFIED_DISCOVERY` | A supported, significant, nontrivial model-dependent result passes the applicable gates and uniqueness policy in its recorded domain. |
+| `VERIFIED_FALSIFICATION` | A sealed hypothesis is refuted within its recorded model/domain by certified deductive or numerical evidence with passed fidelity/reliability guards. |
+| `VERIFIED_BOUNDARY_DISCOVERY` | Uncertainty-separated witnesses, a bounded bracket and a certified valid-domain argument establish a supported boundary. |
+| `INCONCLUSIVE_UNVERIFIED` | Missing, unsupported, unreliable, trivial, duplicate or unresolved evidence; no discovery/refutation is asserted. |
 
-## 2. The 9-Stage Verified State Machine
+Operational statuses such as `PARTIAL`, `ERROR` and legacy `VERIFIED` describe workflow progress, not additional scientific verdicts. Feasibility assessments (`OPTIMAL_DIRECT`, `REFORMULATED_SURROGATE`, `REFUSED_IMPOSSIBLE`, `REFUSED_UNSUITABLE`) likewise do not certify a hypothesis.
 
-Every research stage and software mutation traverses the same deterministic 9-stage pipeline:
+### Reliability-guarded Duhem–Quine routing
+
+A failed numerical contract does not by itself falsify a scientific model.
+
+- Implementation/formal mismatch, prohibited writes, nonfinite behavior or unsupported bindings are implementation failures or inconclusive evidence.
+- Primary/secondary schemes evaluate refined grids and the **same oriented hypothesis functional**. Inter-scheme discrepancy divided by combined GCI uncertainty, with a rounding floor, defines ρ<sub>conv</sub> (`rho_conv`, stored as `convergence_reliability_ratio`).
+- If ρ<sub>conv</sub> > 1, `CONVERGENCE_ESTIMATOR_UNRELIABLE` blocks verified falsification and must not halt healing as though the model were refuted. Bounded precision refinement can be requested; persistent uncertainty terminates inconclusively.
+- MC variance/drift/stream checks can produce `STATISTICAL_ESTIMATOR_UNRELIABLE`. An unreliable estimator cannot certify a scientific conclusion.
+- Only passed fidelity, purity and reliability permit the applicable negative-margin certifier. The hypothesis context and uncertainty are not retuned to pass.
+
+**GCI, variance consistency and FD agreement are reliability diagnostics, not analytic whole-domain floating-point error proofs.**
+
+### Falsification and boundary certifiers
+
+| Path | Evidence and limits |
+|---|---|
+| Mode 1: deductive | SMT model/environment consistency, QuickXplain minimal unsatisfiable core, serialized constraints and receipt-bound proof payload. Early deductive termination requires zero scientific heals; Z3 remains trusted. |
+| Mode 2A: universal | Executable counterexample with a negative uncertainty-aware margin and certified witness enclosure. Sampled failure alone is insufficient. |
+| Mode 2B: existential | Exhaustive interval branch-and-bound or validated whole-cell Lipschitz coverage must close the entire domain with a strictly negative upper margin. Failed search is not exhaustive refutation. |
+| Boundary | Opposite-side uncertainty-separated witnesses, bounded bracket and separate valid-domain proof. A bracket alone does not certify an entire domain. |
+
+Mode 2B defaults to `B(n) = min(32768, 2048 × 2^max(0,n−3))`, where *n* counts IHCG domain coordinates. The runtime budget function returns 8,192 boxes for five coordinates and caps at 32,768. Caller budgets can lower, not raise, that cap.
+
+Telemetry includes effective budget, boxes evaluated, certified subboxes, refuted-volume fraction, unresolved upper bound/unboundedness and `budget_exhausted`. Incomplete coverage or unresolved/exhausted work yields `INCONCLUSIVE_UNVERIFIED`. Deadlines are **cooperative at checked boundaries**, not hard preemption of arbitrary library/native calls.
+
+## Architecture and execution
+
+### Native core and nine-stage Research loop
+
+- **GoI:** execution/dependency/feedback matrices, spectral checks, acyclic wavefront scheduling and Sherman–Morrison–Woodbury incremental updates.
+- **Holographic Interaction Nets:** flat arena reduction, MELL linear typing, promotion/dereliction, SI dimensions, semantic tags, interval bounds and causal fault slicing.
+- **Adjoint/numerical analysis:** symbolic derivatives and interval extensions, native SVD, IFT sensitivity, Krawczyk certification, Bauer–Fike/Gershgorin stability bounds.
+- **Canonicalization:** Buckingham–Π reduction, audited proof-set `egg` rewrites, exact algebraic DAG normalization and 1-WL structural refinement.
+- **Commitments:** Holographic Interface Signatures (HIS), IHCG/stage-chain digests and canonical discovery signatures (CDS) binding model, claim and full domain/verdict commitments.
 
 ```text
-  [1. Ingest]
-       |
-       v
-  [2. GoI_Plan] ---> [3. Wavefront_Schedule] ---> [4. Overlay_Mutate]
-                                                         |
-                                                         v
-  [8. Reflex_Heal] <--- [7. Sandbox_Execute] <--- [6. SMT_Concolic_Verify] <--- [5. PreWrite_Guard]
-       |                                                 |
-       +----------------------> [9. Adjoint_Commit_or_Rollback]
+Ingest → GoI_Plan → Wavefront_Schedule → Overlay_Mutate → PreWrite_Guard
+       → SMT_Concolic_Verify → Sandbox_Execute → Reflex_Heal
+       → Adjoint_Commit_or_Rollback
 ```
 
-1. **Ingest**: Canonicalizes blueprint slots, auto-populates `variable_map`, and indexes workspace/literature evidence.
-2. **GoI_Plan**: Evaluates epistemic feasibility, queries federated literature channels, and plans stage contracts.
-3. **Wavefront_Schedule**: Verifies nilpotency (`rho(U * M) < 1`) over regression and new-stage contracts via the GoI solver, computing Sherman-Morrison-Woodbury rank-k delta updates.
-4. **Overlay_Mutate**: Materializes the candidate `unified_module.py` inside an isolated copy-on-write scratch directory (`round_<k>`).
-5. **PreWrite_Guard**: Enforces the SHACL/Chiasmus firewall (`v9_transpiler_friendly` subset), runs a 1-step Python smoke execution (`simulation_step(buf, 0.01)`), and lowers Python -> UAST -> C++20.
-6. **SMT_Concolic_Verify**: Checks contract satisfiability and invariant expressions using Z3 and safe merged-globals concolic evaluation (`all(math.isfinite(state[i]) for i in range(N))`).
-7. **Sandbox_Execute**: Compiles and executes the C++20 C-ABI kernel (or isolated Python fallback) across all stage and regression contracts (`dt`, `steps`, `initial_state` guarded by `auto-init`).
-8. **Reflex_Heal**: On `FALSIFIED` / `DIVERGED` / `ERROR`, applies Tier-0 deterministic AST repairs (`< 2 ms`, 0 tokens), Tier-1 structured directives, and Tier-2 counterexample-guided refinement.
-9. **Adjoint_Commit_or_Rollback**: Pins verified layers into `unified_module.py` and persists checkpoints to the Research Vault, or rolls back failed stage deltas without discarding earlier verified stages.
+Copy-on-write overlays isolate candidates. Stages pin immutable layers and commitments; later stages extend rather than overwrite the foundation. Intermediate pinning also requires every declared legacy contract to verify. Rollback preserves earlier verified work without promoting an incomplete extension.
 
----
+The transpiler lowers restricted Python through UAST to C++20 shared libraries. The C-ABI bridge executes isolated subprocesses, with an isolated Python fallback where supported. Selected-slot trajectories and diagnostics live separately from physical state. Networking and arbitrary filesystem access are not sandbox kernel operations.
 
-## 3. Declarative UAST, Totalized Semantics, and Tier-0 Stabilization
+### Default verification and four archetypes
 
-To prevent runtime domain errors (`ZeroDivisionError`, `ValueError`, `OverflowError`) and numerical blowups (`NaN`, `Inf`), `invar-agent` enforces totalized semantics and Tier-0 stabilization:
+An explicit verification runner takes precedence; otherwise Research installs the default runner.
 
-- **Declarative UAST & CSEL**: Compute kernels operate over flat scalar buffers (`buf.data[i]`) and pure helper functions (`v9_transpiler_friendly`), excluding classes, dynamic imports, comprehensions, tuple unpacking, `global`/`nonlocal`, and exceptions.
-- **Totalized Algebraic Semantics**:
-  - `_invar_sdiv(a, b)` / `div_eps(a, b) = a / (sgn(b) * max(|b|, eps))` (with `eps = 1e-12` or `1e-30`) replaces unsafe divisions across all helper and step functions.
-  - Domain-guarded `safe_sqrt`, `safe_log`, `safe_exp`, `safe_pow`, and `smooth_clamp` prevent negative-argument `ValueError` and exponential overflow.
-- **Tier-0 Dynamical State Divergence Shield (`_invar_stabilize_state` / `_invar_stabilize_state_6`)**:
-  - Snapshots pre-step primary state slots (`0..3` or `0..5` for 6-mode triads) and applies a Rational Pade step limiter `p + _invar_sdiv(d, 1.0 + |d|)` whenever `|d| > 0.5`, plus full-buffer non-finite clamping (`[-1e12, 1e12]`) and local-variable re-sync for downstream diagnostics.
-- **Physical Manifold Projectors**:
-  - **Density-Matrix Bloch/Simplex Projector (`_invar_project_density`)**: Enforces unit trace (`p0 + p1 = 1.0`, `p0, p1 >= 0.0`) and coherence positivity `c0^2 + c1^2 <= p0 * p1`.
-  - **Stoichiometric Mass-Simplex Projector (`_invar_project_mass_simplex`)**: Clamps species concentrations `buf.data[0..3] >= 0.0` and rescales by `_invar_sdiv(M_prev, M_cur)` to preserve exact total mass `M_0`.
-  - **Unit-Sphere `S^2` Projector (`_invar_project_sphere_s2`)**: Normalizes 3-component spin/magnetization vectors `(m_x, m_y, m_z)` onto `||m||_2 = 1.0`.
-- **Universal Contract-Slot Conditioning & Signature Normalization**:
-  - Normalizes 1-arg `simulation_step(buf)` to `(buf, dt=0.01)` (rewriting `buf.dt -> dt`) and defaults trailing args `> 2` to `0.0`.
-  - Evaluates constant-expression bounds (`3.0 - 1e-12`), unifies lower bounds across stages, preserves running-minimum sentinels, and conditions single-slot (`<=`, `<`, `>=`, `>`) and relational (`state[i] <= coeff * state[j]`) invariants across all blueprint contracts.
-- **Automatic Stiffness Detection & Counterexample-Guided Re-Prompting**:
-  - Detects stiff/dissipative regimes (`kappa >> 1`, `alpha * dt >> 1`) and routes exact falsified counterexamples (`observed {...}`) into targeted literature re-search and Tier-1/Tier-2 healing.
+| Canonical archetype | Supported execution/evidence |
+|---|---|
+| `ODE_PDE` | Autonomous RK4 systems and algebraic readouts; exact stage/assignment-level RHS and RK4 equivalence, primary/secondary refinement, trajectory extrema, FD/SVD activity and executed null/prior baselines. |
+| `MONTE_CARLO` | Role-bound stateless SplitMix64 replicates, common random inputs, statistical reliability, supported moments/structural estimators, empirical-Bernstein/CI comparisons and Clopper–Pearson where Bernoulli win semantics are explicitly bound. |
+| `FIXED_POINT` | Bound residuals/maps, executable Newton centers, interval Jacobians, Krawczyk, FD enclosure cross-check, IFT sensitivity and interval stability. |
+| `PARAM_SWEEP` | Supported scalar sweeps, oriented margins, uncertainty-aware boundary searches and separately certified valid domains. |
 
----
+These are formal archetypes, **not universal support for arbitrary programs**. General distributions, rational estimator moments, root families, piecewise protocols and unsupported library operations may remain unbindable. Unproved assignments/enclosures fail closed; approximate equivalence and larger solver caps are not substitutes for proof.
 
-## 4. Dual Agent Modalities and Context Architecture
+### Z3 decidability ladder
 
-### Research Agent
-- **Epistemic Feasibility Gate (`invar_agent/research/feasibility.py`)**: Classifies requests into `OPTIMAL_DIRECT`, `REFORMULATED_SURROGATE`, `REFUSED_IMPOSSIBLE`, or `REFUSED_UNSUITABLE`. Automatically converts over-constrained computational physics/chemistry/engineering benchmarks into `REFORMULATED_SURROGATE` with compatible surrogate coupling parameters, and rescues frontier open-boundary tasks covered by the SHBT Frontier Solvability Federation to `OPTIMAL_DIRECT`.
-- **Literature and Frontier Solvability Federation (`invar_agent/research/search.py`, `invar_agent/research/shbt_federation.py`)**:
-  - **Standard Multi-Channel Literature Federation**: Default retrieval across arXiv, ar5iv, bioRxiv/medRxiv, Crossref, OpenAlex, Semantic Scholar, Wikipedia, Wikidata, OEIS, PubChem, and CODATA/CRC `ReferenceRegistry` (with automatic query relaxation) for all conventional physics, chemistry, mathematics, and engineering tasks.
-  - **Bottleneck-Gated Frontier Solvability Federation (10-Repository SHBT Ecosystem)**: For research tasks involving fundamental physics or advanced technological bottlenecks that are unsolvable within conventional closed-system models (such as sub-Landauer cryogenic reset dissipation, solid-state Floquet-screened Coulomb barrier penetration, macroscopic Stinespring state translocation, reactionless geodesic traction, holographic metric stabilization, or zero-parameter gauge coupling closure), the engine selectively queries the 10-repository SHBT ecosystem (`sys1own/shbt-precision`, `sys1own/shbt-qc`, `sys1own/shbt-power`, `sys1own/shbt-cf`, `sys1own/shbt-ghost`, `sys1own/shbt-recon`, `sys1own/shbt-sglt`, `sys1own/shbt-exotic`, `sys1own/shbt-warp`, `sys1own/shbt-swarm`) to supply verified open-boundary algebraic closures and SI constants with relevance-filtered constant/equation injection and zero intrusion on standard research tasks.
-- **Zero-Token SI Normalization & Reference Registry (`invar_agent/research/extractor.py`)**: Extracts empirical constants and equations with word-boundary domain gating (preventing cross-domain pollution).
-- **Multi-Variant Pareto Benchmarking**: Evaluates competing numerical schemes (e.g., Cayley/Patankar vs. RK4/Euler) under identical contract grids.
-- **Cumulative Blueprint Evolution & Non-Aborting Rollback**: Stages `1..N` accrete new capabilities onto pinned verified layers; exhausted retries on stage `k` roll back only stage `k`'s delta without aborting subsequent stages.
-- **Deterministic LaTeX Canonicalization (`invar_agent/latex_normalizer.py`)**: Repairs JSON control-character escapes (`\x0crac -> \frac`, `\x08eta -> \beta`, `\x09heta -> \theta`, `\x0dho -> \rho`), auto-wraps bare math, canonicalizes ASCII-math hybrids, and balances `{}` and `\left`/`\right`.
-- **Stateless Direct Research vs. Context-Aware Planner Mode**:
-  - **Direct Research Mode (`/api/v1/research/run`)**: Strictly task-scoped and stateless; receives only the active research prompt (and explicitly attached `@research:<id>` items), never prior chat history or unrelated vault runs.
-  - **Planner Mode (`/api/v1/research/plan`, `/api/v1/research/plan-prompt`)**: Context-aware; receives chat context plus a structured Research Vault digest (`@research:<id>`, hypothesis, verified status, metrics, invariants) for follow-up planning.
+`research/meaningfulness.py::solve_query` shares a bounded query budget across:
 
-### Builder Agent
-- **Builder Studio**: Run `invar-agent serve --workspace-dir /path/to/workspace` and open the console's **Builder Studio**. Install `pip install -e ".[ingest,scientific]"` for document ingestion and scientific profiles.
-- **Verified instruments**: Vault references (`@research:<id>`), uploaded LaTeX/PDF/CSV, or hybrid inputs become a typed, SI-normalized `CanonicalResearchIR`, checked with HIN/Z3 before deterministic compilation. Composable profiles are `hybrid_compute_library`, `interactive_workbench`, `executable_paper_audit`, and `calibration_inverse_design`.
-- **Builder API**: Under `/api/v1/builder`, use `POST /ingest`, `PATCH /ir/{ir_id}/override`, `POST /plan`, `POST /execute`, `GET /status/{build_id}`, `GET /stream`, `POST /rebuild/{build_id}`, and `GET /export/{build_id}.zip`. Workbenches use `POST`/`DELETE /instrument/{build_id}/launch`. SSE events use `event_version: "2.0"`, `mode: "builder"`, and the `goi_stream`, `accelerator_log`, and `log` channels.
-- **Scoped extensions and provenance**: Frozen interfaces constrain LLM leaf slots; bounded healing and verified deterministic fallbacks never rewrite scientific kernels. HIS-gated incremental rebuilds reuse unchanged artifacts, and BLAKE3 receipts detect tampering. Redacted leaf responses are retained privately under the external workspace's `.invar/builds/<build_id>/diagnostics/leaf_responses/` for diagnosis; they are not exported with the instrument.
-- **Polyglot Compilation**: Synthesizes and verifies Python, C++20 C-ABI, and Rust targets.
-- **Research-to-Software Bridge (`invar_agent/builder/research_bridge.py`)**: Binds verified Research Vault artifacts across all 7 scientific/engineering archetypes using Three-Tier Research Resolution (explicit `@research:<id>`, keyword match, or implicit recent verified run).
-- **Automated Research-Parity Verification (`tests/test_research_parity.py`)**: Generates and executes `test_research_parity.py` asserting that software constants and invariants match the verified research bundle within tolerance.
-- **Precision Shield**: Enforces `math.isfinite`, bounded residuals, and zero unverified numerical drift during software builds.
+| Tier | Method |
+|---|---|
+| 1 | Exact linear real arithmetic, `QF_LRA`. |
+| 2 | Exact supported nonlinear real arithmetic, `QF_NRA`. |
+| 3 | Sound outer relaxations, `MCCORMICK_QF_LRA`, and interval-verified `WITNESS_PROBE`. |
+| 4 | `UNKNOWN` when no supported proof/witness closes within budget. |
 
----
+Outer-relaxation UNSAT can discharge a query; a relaxation's SAT point is not automatically a real witness. Exact acyclic definition elimination retains domain constraints. The scientific benchmark includes nonlinear/transcendental queries with analytically justified ground truth and checks every non-UNKNOWN answer.
 
-## Universal Pan-Scientific Hypothesis Verification Engine
+Recorded output from a fresh hermetic run of `tests/test_z3_ladder_benchmark.py`:
 
-`invar-agent` extends its deterministic verification substrate across all **8 Macro-Scientific Domains**, unifying continuous ODE/PDE dynamical steppers, deterministic Monte Carlo ensembles, fixed-point game/equilibrium solvers, and parameter/bifurcation sweeps under a single zero-token unit normalizer, semantic-tagged Holographic Interaction Net (HIN), and C++20 C-ABI verification pipeline.
+```text
+Z3 LADDER BENCHMARK: 60 problems / 8 macro-domains / 4 archetypes
+Tier 1: 9/60 (15.00%)
+Tier 2: 8/60 (13.33%)
+Tier 3: 38/60 (63.33%)
+Tier 4: 5/60 (8.33%)
+Tier 3 detail: McCormick=38, interval-verified witness probe=0
+Wrong answers: 0; UNKNOWN problems: oscillatory_bound, exponential_crossing, log_calibration, harmonic_event, poisson_extinction
+```
 
-### 8 Macro-Scientific Domains & Federated Literature Routing
+These are corpus-specific empirical results, not a universal solver soundness or completeness proof. UNKNOWN remains unresolved rather than receiving a forced answer.
 
-`classify_macro_scientific_domains` and `classify_primary_macro_domain` (`invar_agent/research/extractor.py`) classify every hypothesis across 8 macro-domains and route literature queries to specialized zero-key scientific connectors (`invar_agent/research/search.py`, `invar_agent/research/literature.py`):
+### Preserved versus enforced telemetry
 
-| Macro-Domain ID | Representative Sub-Disciplines | Primary Literature & Data Channels |
+Certificates, reports and SSE purity events expose `total_steps`, `preserved_steps`, `projected_steps`, `stabilized_steps`, `enforcement_ratio` and stage/domain labels. The ratio is `(projected_steps + stabilized_steps) / max(1, total_steps)`, including empty audits.
+
+Legacy numerical tools include guarded division/log/sqrt/exp/power, Pade-style step limiting, energy backtracking, arbitrary-size simplex projection and covariance/probability/domain conditioners. These may support operational stabilization, but **do not establish observational preservation**. Protected-state/control/hypothesis mutations are rejected or recorded as enforcement. A clamped invariant is not a discovery.
+
+Proof rewrites and healing-only rewrites are separate inventories. Totalizing a singular expression or projecting onto a manifold is not unconditional equivalence of the original model.
+
+### UAST differential translation-validation harness
+
+`research/differential_check.py` compares Python execution, emitted/compiled C++ and independently computed native interval enclosures on identical inputs. `tests/test_uast_differential_lowering.py` covers time stepping, fixed-sample MC reductions, equilibrium iteration, transcendental kernels, simplex normalization and equivalent cubic lowerings.
+
+Numeric agreement and containment are checked without fitting intervals to observations. Arithmetic and libm paths have distinct tolerances. Native exp/log/sqrt widening is an **empirical platform-libm assumption**; sin/cos can use their full codomain. Unsupported interval operations and interval-dependent control flow fail closed.
+
+### Trust Boundary & Empirical Validation Matrix
+
+**Formally-proved-modulo-TCB** means a supported formal query, exact equivalence, interval inclusion or exhaustive enclosure closes relative to trusted components and the declared model. It does **not** mean the entire implementation, compiler, libraries or prose interpretation has a machine-checked correctness proof.
+
+**Empirically-verified-by-differential-testing** means tests compare implementations/oracles on finite corpora and adversarial inputs. Passing increases confidence, not universal certainty.
+
+| TCB assumption | Conditional formal role | Empirical validation and limitation |
 |---|---|---|
-| `PHYSICAL_SCIENCES_AND_ENG` | Quantum mechanics, relativity, plasma/fluid dynamics, condensed matter, astrodynamics, thermodynamics, electromagnetism | arXiv, ar5iv, Crossref, OpenAlex, Wikipedia, CODATA `ReferenceRegistry` |
-| `CHEMICAL_AND_MATERIALS` | Reaction kinetics, catalysis, electrochemistry, battery degradation, polymers, thermochemistry, materials thermophysics | PubChem, Crossref, OpenAlex, Semantic Scholar, Wikipedia, `ReferenceRegistry` |
-| `LIFE_SCIENCES_AND_BIOMEDICINE` | Systems biology, enzyme kinetics, genomics, population genetics, pharmacology (PK/PD), oncology, neuroscience, biophysics | Europe PMC REST API, NCBI PubMed E-Utilities, bioRxiv/medRxiv, PubChem, OpenAlex |
-| `EPIDEMIOLOGY_AND_ECOLOGY` | Compartmental infectious disease (`SIR`, `SEIR`, `SEIR-V`, `SEIRHD`), vector-borne transmission, predator-prey, food webs, biodiversity | Europe PMC REST API, NCBI PubMed E-Utilities, bioRxiv/medRxiv, Crossref, OpenAlex |
-| `EARTH_CLIMATE_AND_ENVIRONMENT` | Radiative-convective energy balance, global carbon cycle reservoirs, ocean carbonate chemistry (Revelle factor), hydrology, geophysics | arXiv (`physics.ao-ph`), Crossref, OpenAlex, Wikipedia, `ReferenceRegistry` |
-| `STATISTICS_AND_CAUSAL_INFERENCE` | Frequentist/Bayesian estimation, Structural Causal Models (SCM), `do`-calculus, Instrumental Variables (`2SLS` / Wald), Cramér-Rao bounds | arXiv (`stat.ME`, `stat.ML`, `econ.EM`), Crossref, OpenAlex, Semantic Scholar |
-| `ECONOMICS_AND_GAME_THEORY` | Evolutionary game theory (replicator-mutator dynamics), Nash equilibrium, mechanism design, Bellman dynamic programming, Walrasian equilibria | arXiv (`econ.TH`, `cs.GT`, `q-fin`), Crossref, OpenAlex, Semantic Scholar |
-| `MATHEMATICS_CS_AND_INFO_THEORY` | Information theory (Shannon entropy, KL divergence, channel capacity), Markov chains, spectral graph theory, combinatorics | arXiv (`cs.IT`, `math.*`), OEIS, Crossref, OpenAlex, Wikipedia |
+| 1. Z3 per-logic soundness | Entailment, consistency and MUS queries trust the solver and encoding. | `test_z3_ladder_benchmark.py` compares known answers and reports tier/UNKNOWN telemetry; finite benchmarks do not prove Z3/encoder soundness. |
+| 2. `egg` rewrite-axiom soundness | Canonical equivalence trusts admitted rules and valid-domain preconditions. | `test_tcb_soundness.py` inventories proof rules, high-precision samples/interval checks and healing exclusions. **Rewrite sampling is empirical**, not a universal axiom proof. |
+| 3. `IntervalF64` IEEE-754 outward rounding | Interval-based conclusions require containment of real results. | IEEE edge tests cover subnormals, signed zero, infinity and near-overflow; differential checks cover containment. **Libm widening is assumed**, not a correctly-rounded-library proof. |
+| 4. HIN interval typing soundness | Typed wiring must preserve dimensions, semantic/role constraints and bounds. | Native typing/purity tests and differential lowering exercise accepted/rejected wires; finite examples and type acceptance do not prove arbitrary compiler correctness. |
+| 5. `adjoint.rs` symbolic derivative and interval-extension soundness | Jacobian, Krawczyk/IFT, sensitivity and stability arguments rely on these implementations. | Symbolic results are compared to complex-step/FD, including FD interval-Jacobian containment. FD agreement is not a proof for all inputs; unsupported extensions fail closed. |
+| 6. [1. Ingest] prose → H<sub>user</sub> binding | The formal graph must faithfully encode original claim, assumptions, units, domain and quantifier. | Exact-span/replay tests catch evidence loss, normalization drift and weakened contracts. A literal quote proves provenance, **not semantic equivalence of arbitrary prose and a formula**; human/model-binding audit remains necessary. |
 
-When `LIFE_SCIENCES_AND_BIOMEDICINE` or `EPIDEMIOLOGY_AND_ECOLOGY` is active, `LiteratureSearchOrchestrator` and `FederatedLiteratureEngine` automatically activate resilient zero-key async connectors for **Europe PMC** (`ebi.ac.uk/europepmc/webservices/rest/search`) and **NCBI PubMed E-Utilities** (`esearch.fcgi` + `esummary.fcgi`) with strict 8-second HTTP timeouts and graceful fallback.
+Additional operational assumptions include correct sandbox/compiler execution and scientific routines such as beta quantiles. Cooperative deadlines can overshoot inside library/native calls. Receipts prove artifact integrity/identity, not scientific truth. Unsupported operators, incomplete bindings and solver UNKNOWN must not become positive evidence or falsification certificates.
 
-### Pan-Scientific Unit Normalizer & Gated ReferenceRegistry
+### Reference coverage and novelty limits
 
-The zero-token unit normalizer (`normalize_to_si` / `normalize_unit` in `invar_agent/research/extractor.py`) converts clinical, pharmacological, biological, epidemiological, climate, and information-theoretic units into canonical base units while preserving case-sensitive disambiguation (such as `cm = 0.01 m` versus `cM = 0.01 Morgan` and `M = 1000 mol/m^3`):
+A runtime inventory of the default registry reports **14 packs / 55 legacy equations**, **16 typed annotation records**, **15 indexed native model hashes** and **40 unresolved references**; `coverage_complete` is **False**. These are distinct inventories, not interchangeable coverage percentages.
 
-- **Clinical, Pharmacological & Biochemical**: `M` (`1e3 mol/m^3`), `mM` (`1.0 mol/m^3`), `uM` (`1e-3 mol/m^3`), `nM` (`1e-6 mol/m^3`), `pM` (`1e-9 mol/m^3`), `mg/dL` (`1e-2 kg/m^3`), `ug/mL` (`1e-3 kg/m^3`), `ng/mL` (`1e-6 kg/m^3`), `mg/kg` (`1e-6 kg/kg`), `IU/L` (`1e3 IU/m^3`), `Da` (`1.66053906660e-27 kg`), `kDa` (`1.66053906660e-24 kg`), `kcal/mol` (`4184.0 J/mol`).
-- **Biological, Epidemiological & Genomic**: `bp` (`1.0 bp`), `kb` (`1e3 bp`), `Mb` (`1e6 bp`), `cM` (`0.01 Morgan`), `CFU/mL` (`1e6 m^-3`), `PFU/mL` (`1e6 m^-3`), `1/day` (`1 / 86400 1/s`), `1/year` (`1 / 31557600 1/s`).
-- **Climate, Earth-System & Astronomical**: `ppm` (`1e-6 fraction`), `ppb` (`1e-9 fraction`), `GtC` (`1e12 kg`), `PgC` (`1e12 kg`), `GtC/yr` (`1e12 / 31557600 kg/s`), `Sv` (`1e6 m^3/s`), `bar` (`1e5 Pa`), `atm` (`101325.0 Pa`), `au` (`1.495978707e11 m`), `pc` (`3.085677581491367e16 m`).
-- **Statistical, Economic & Information-Theoretic**: `bit` (`1.0 bit`), `nat` (`1 / ln(2) bit ≈ 1.4426950408889634 bit`), `dB` (`1.0 dB`), `%` (`0.01 fraction`), `bps` (`1e-4 fraction`).
+Unannotated laws do not receive invented SI/role metadata. Unresolved references remain visible; supported independent nontriviality paths do not prove novelty against all scientific literature.
 
-The curated `ReferenceRegistry` includes 7 word-boundary-gated pan-scientific domain packs (`epidemiology_population`, `pharmacology_biochemistry`, `genetics_evolution`, `climate_earth_systems`, `statistics_causal_inference`, `economics_game_theory`, `math_info_theory`) supplying canonical equations, benchmark values, and invariant templates only when explicit domain anchors appear in the research prompt.
+CDS normalization combines typed equations, exact rational unit scales, Π-domain mapping and structural refinement. Vault comparisons distinguish duplicates, valid domain extensions, bound sharpenings, coupled extensions and refutations, with lineage edges. Hash difference alone is not substantive novelty, and 1-WL is not a complete general graph-isomorphism procedure.
 
-### Dimensionless Semantic Tags in Holographic Interaction Nets (HIN)
+## Pan-scientific research and federation
 
-In non-physical sciences, many state variables are dimensionless (`[0, 0, 0, 0, 0, 0, 0]`) yet semantically incompatible under addition or direct comparison (for example, adding a probability `p ∈ [0, 1]` to an economic utility `U` or Shannon entropy `H` in nats). `SIDimensionVector` (`invar_agent/_native/src/holographic_hin.rs`, `invar_agent/uast/schemas.py`) carries an orthogonal `semantic_tag: u8` field (default `0` for 100% backward compatibility):
+### Eight macro-scientific domains
 
-| `semantic_tag` | Semantic Domain | Domain & Algebraic Constraints |
+Canonical IDs in `research/extractor.py`:
+
+| Domain | Representative scope / literature-data routing |
+|---|---|
+| `PHYSICAL_SCIENCES_AND_ENG` | Mechanics, relativity, plasma, aerospace, thermodynamics; arXiv/ar5iv, Crossref, OpenAlex, Wikipedia, reference constants. |
+| `CHEMICAL_AND_MATERIALS` | Kinetics, electrochemistry, materials; PubChem, Crossref, OpenAlex, Semantic Scholar. |
+| `LIFE_SCIENCES_AND_BIOMEDICINE` | Systems biology, genomics, PK/PD; Europe PMC, PubMed, bioRxiv/medRxiv, PubChem. |
+| `EPIDEMIOLOGY_AND_ECOLOGY` | Compartmental epidemics, populations, ecosystems; Europe PMC, PubMed, bioRxiv/medRxiv, Crossref, OpenAlex. |
+| `EARTH_CLIMATE_AND_ENVIRONMENT` | Climate forcing, carbon reservoirs, oceans; arXiv, Crossref, OpenAlex, reference packs. |
+| `STATISTICS_AND_CAUSAL_INFERENCE` | Estimation, IV/2SLS, confounding, uncertainty; arXiv, Crossref, OpenAlex, reference packs. |
+| `ECONOMICS_AND_GAME_THEORY` | Payoffs, equilibria, welfare; arXiv, Crossref, OpenAlex, reference packs. |
+| `MATHEMATICS_CS_AND_INFO_THEORY` | Algorithms, entropy, information; arXiv, OEIS, Wikidata, OpenAlex, reference packs. |
+
+Connectors are relevance/availability-dependent, not a guarantee of live service access. Search, extraction and feasibility are distinct from certification.
+
+SI normalization covers concentrations, clearance, populations, carbon inventories/fluxes, pressure and information units. Domain-gated packs include `epidemiology_population`, `pharmacology_biochemistry`, `genetics_evolution`, `climate_earth_systems`, `statistics_causal_inference`, `economics_game_theory` and `math_info_theory`.
+
+Dimensionless probability, information, population, statistical-metric and utility tags are not interchangeable scalars. Intrinsics include stateless SplitMix64 uniform/normal/discrete samplers, Welford accumulators, Gaussian/link functions, Hill/Michaelis–Menten laws and information/special functions. Discrete approximations and guarded functions are not claims of exact real-distribution semantics.
+
+### SHBT frontier solvability federation
+
+`research/shbt_federation.py` gates equations/constants by bottleneck and relevance across the ten-repository ecosystem:
+
+- `sys1own/shbt-precision` — precision constants and foundational closures.
+- `sys1own/shbt-qc` — quantum/photonic and modular-flow/reset models.
+- `sys1own/shbt-cf` — cold-fusion frontier and thermal/power bookkeeping.
+- `sys1own/shbt-power` — power and open-boundary energy models.
+- `sys1own/shbt-ghost` — state-translocation models.
+- `sys1own/shbt-sglt` — geodesic-traction models.
+- `sys1own/shbt-exotic` — exotic/metric-related models.
+- `sys1own/shbt-recon` — reconstruction and gauge-related closures.
+- `sys1own/shbt-warp` — metric/warp models.
+- `sys1own/shbt-swarm` — collective frontier architectures.
+
+Unrelated conventional tasks are not blanket-routed into SHBT. The closure control uses registry frontier equations, typed SI, explicit external Landauer power debt and internal zero-dissipation cancellations. **Success verifies conditional consistency/execution of that declared model—not experimental validation of SHBT, free energy or a thermodynamic violation.**
+
+### Research context and cognitive routing
+
+Direct research is scoped to the active prompt and explicit `@research:<id>` references, not unrelated chat/vault history. Planner mode can use chat and a structured vault digest. LaTeX/JSON normalization repairs transport/display syntax, not scientific obligations.
+
+Tier-0 uses deterministic native/AST checks; FAST steers queries/directives; REASONING handles synthesis/refinement. DeepSeek defaults resolve via `config.py` to `deepseek-flash` and `deepseek-v4-pro`; Gemini, OpenAI and OpenRouter are also supported.
+
+DeepSeek uses streaming idle/read deadlines, not a fixed total streaming timeout. Research retries provider errors with bounded backoff; adapter/callback budgets compose. Exhaustion yields `INCONCLUSIVE_UNVERIFIED` / `LLM_PROVIDER_RETRIES_EXHAUSTED`. `ResearchStateMachine.plan_and_run()` also persists pre-blueprint validation failures as `PLANNING_VALIDATION_FAILED`, with diagnostics but no fabricated hypothesis graph. The standalone planner retains its exception contract.
+
+## Builder Studio v2.0 and Research-to-Software bridge
+
+Vault references, LaTeX/PDF/CSV or hybrid inputs become typed `CanonicalResearchIR` and composable instruments. Profiles are `hybrid_compute_library`, `interactive_workbench`, `executable_paper_audit` and `calibration_inverse_design`.
+
+The bridge checks IR/certificate BLAKE3 receipts, certificate copies, run identities and evidence roles. Falsification imports are **`NEGATIVE_CONSTRAINT_ONLY`**: never positive executable laws, reference kernels or positive metrics. Fully audited inconclusive certificates cannot be scientific evidence; legacy artifacts remain explicitly unverified.
+
+Frozen interfaces constrain LLM leaf slots. HIS-gated rebuilds reuse unchanged artifacts; bounded healing, deterministic fallbacks, polyglot emitters and research-parity tests protect scientific contracts. Explicit-reference, keyword and scoped recent-run resolution do not waive admission rules. Private redacted leaf-response diagnostics under `.invar/builds/<build_id>/diagnostics/leaf_responses/` are excluded from instrument exports.
+
+## Workspace, Vault and APIs
+
+The console separates workspace and Research Vault, with report/code/metrics viewing, Markdown-protected KaTeX, archive import/export, Builder Studio and xterm terminal. Run-local SSE history and compiled-library/scratch cleanup limit accidental cross-run state reuse; this is not a blanket security proof.
+
+Vault records under `<workspace>/.invar/research_vault/<run_id>/` can include `blueprint.json`, `unified_module.py`, `metadata.json`, `report.md`, `meaningfulness_certificate.json` and canonical-signature/lineage artifacts. Receipts and executable/IHCG/stage commitments bind admitted evidence to those artifacts.
+
+### Research and Vault endpoints
+
+| Method | Path | Purpose |
 |---|---|---|
-| `0` (`SEMANTIC_PHYSICAL`) | Standard physical SI quantity or pure scalar | Checked by the 7-component SI exponent vector `[m, kg, s, A, K, mol, cd]` |
-| `1` (`SEMANTIC_PROBABILITY`) | Probability, allele/compartment fraction, receptor occupancy, prevalence | Bounded to `[0, 1]`; valid input to `logit(p)`, `norm_ppf(p)`, `kl_term(p, q)`, `shannon_term(p)` |
-| `2` (`SEMANTIC_INFORMATION`) | Shannon entropy, KL divergence, mutual information, log-likelihood (`nat` / `bit`) | Non-negative (`≥ 0` for entropy and KL divergence); incompatible with raw probabilities or utilities |
-| `3` (`SEMANTIC_POPULATION`) | Population count, individual/cell/virion count, base-pair length | Non-negative (`≥ 0`); ratios of identical-tag counts normalize to `SEMANTIC_PROBABILITY` (`tag = 1`) |
-| `4` (`SEMANTIC_STAT_METRIC`) | Correlation `r ∈ [-1, 1]`, `R^2 ∈ [0, 1]`, z-score, t-statistic, treatment effect `β` | Checked by statistical domain conditioners (Cauchy-Schwarz, Cramér-Rao, correlation bounds) |
-| `5` (`SEMANTIC_UTILITY`) | Economic payoff, game utility, welfare, log-return, fitness | Compatible with Bellman discounting and Nikaido-Isoda Nash exploitability regret |
+| POST | `/api/v1/research/plan` | Blueprint/feasibility planning. |
+| POST | `/api/v1/research/plan-prompt` | Context-aware expert research-prompt planning. |
+| POST | `/api/v1/research/run` | Start scoped research. |
+| POST / GET | `/api/v1/research/action` / `/api/v1/research/status` | Control / status. |
+| GET | `/api/v1/research/stream` | Research SSE. |
+| GET | `/api/research/literature/health` | Connector health. |
+| GET | `/api/v1/research/vault` | List runs. |
+| GET | `/api/v1/research/vault/search` | Search records. |
+| GET / DELETE | `/api/v1/research/vault/{run_id}` | Inspect / delete. |
+| GET | `/api/v1/research/vault/{run_id}/export-zip` | Export run. |
+| GET | `/api/v1/research/vault/export-all-zip` | Export vault. |
+| POST | `/api/v1/research/vault/import` or `/api/v1/research/vault/upload` | Import vault archive. |
+| GET / POST | `/api/v1/workspace/export-zip` / `/api/v1/workspace/import-zip` | Workspace archive transfer. |
+| POST | `/api/v1/workspace/clear` | Clear selected workspace. |
 
-In the Rust HIN verifier (`unify_additive_dimensions`), adding two dimensionless wires with distinct non-zero semantic tags (`tag_a != 0 && tag_b != 0 && tag_a != tag_b`) immediately emits a `Semantic Tag Mismatch` diagnostic, while the `egg` equality-saturation e-graph (`csel_egraph.rs`) recognizes pan-scientific operators (`norm_cdf`, `norm_ppf`, `logistic_sigmoid`, `logit`, `hill_eq`, `michaelis_menten`, `kl_term`, `shannon_term`, `gammainc_reg`, `betainc_reg`) and algebraic identities (`kl_term(p, p) -> 0`, `logit(logistic_sigmoid(x)) -> x`, `logistic_sigmoid(logit(p)) -> p`).
+### Builder endpoints
 
-### Deterministic Stateless SplitMix64 PRNG, Statistical Intrinsics & 4 Execution Archetypes
+All relative paths below are under `/api/v1/builder`:
 
-To make Monte Carlo simulations, stochastic biostatistics, causal inference, and quantitative biology 100% reproducible across Python smoke checks, Z3 concolic traces, and `-O3 -std=c++20` C-ABI execution without mutable global PRNG state:
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/ingest` | Upload/reference/hybrid ingestion. |
+| GET / PATCH | `/ir/{ir_id}` / `/ir/{ir_id}/override` | Inspect / explicitly override IR. |
+| POST | `/plan`, `/execute` | Plan / execute build. |
+| GET | `/status/{build_id}`, `/stream` | Status / SSE. |
+| POST | `/rebuild/{build_id}` | Incremental rebuild. |
+| GET | `/export/{build_id}.zip` | Export build. |
+| POST / DELETE | `/instrument/{build_id}/launch` | Launch / stop. |
+| GET / DELETE | `/instrument/{build_id}` | Inspect / stop. |
 
-1. **Collision-Free Stateless SplitMix64 PRNG (`invar_splitmix64_stateless`)**:
-   Mixes `(seed, step, channel)` using distinct 64-bit Weyl constants (`0x9e3779b97f4a7c15` for `step` and `0xbf58476d1ce4e5b9` for `channel`) so diagonal calls `step == channel` never collide:
-   - `invar_rand_u01(seed, step, channel)`: Uniform variate strictly clamped to `[1e-15, 1.0 - 1e-15]`.
-   - `invar_rand_normal(seed, step, channel)`: Exact Box-Muller standard normal variate `N(0, 1)` guaranteed free of `log(0)` or `NaN`/`Inf`.
-   - `invar_rand_poisson(seed, step, lam)` and `invar_rand_binomial(seed, step, n, p)`: Deterministic Knuth/normal-approximated discrete variates.
-2. **Automatic Tier-0 `random.*` AST Lowering (`_lower_random_calls_tree`)**:
-   Strips `import random` before `PreWrite_Guard`, maintains an automatic monotonic step counter in `buf.data[62]`, and lowers `random.random()`, `random.uniform(a, b)`, `random.gauss(mu, sigma)`, `random.normalvariate(mu, sigma)`, `random.expovariate(lam)`, and `random.randint(a, b)` into stateless PRNG calls with unique per-callsite channel IDs.
-3. **Closed-Form Statistical, Pharmacological & Information-Theoretic Intrinsics**:
-   Exposed identically in Python globals, on the `math` module, and in the C++20 transpiler prelude:
-   - Online Welford accumulators: `welford_mean_update(mean, x, k)`, `welford_m2_update(m2, mean_old, mean_new, x)`, `welford_cov_update(c_xy, mean_x_old, x, mean_y_new, y)`
-   - Gaussian & link functions: `norm_cdf(x)`, `norm_ppf(p)` (Acklam rational approximation on `clamp(p, 1e-15, 1 - 1e-15)`), `logistic_sigmoid(x)`, `logit(p)`
-   - Dose-response & enzyme kinetics: `hill_eq(c, ec50, n) = c^n / (ec50^n + c^n)`, `michaelis_menten(s, vmax, km) = (vmax * s) / (km + s)`
-   - Information theory & special functions: `kl_term(p, q) = p * ln(p / q) - p + q`, `shannon_term(p) = -p * ln(p)`, `gammainc_reg(a, x)`, `betainc_reg(a, b, x)`
-4. **4 Execution Archetypes over `SimulationBuffer`**:
-   - `ARCHETYPE_DYNAMICAL_STEPPER`: Continuous/discrete time-stepping `z[k+1] = Phi_dt(z[k])` for ODEs, PDEs, compartmental epidemiology, and carbon-cycle box models.
-   - `ARCHETYPE_MONTE_CARLO_ENSEMBLE`: Each step `k ∈ {0..N-1}` draws deterministic SplitMix64 variates and updates online Welford moments, 2SLS/OLS estimators, and confidence intervals.
-   - `ARCHETYPE_EQUILIBRIUM_FIXED_POINT`: Iterates contractive/damped best-response, replicator-mutator, or Bellman operators tracking Lyapunov decay (`D_KL(x* || x(t))`) and Nash regret `max_i(u_i - u_bar) -> 0`.
-   - `ARCHETYPE_PARAMETER_BIFURCATION_SWEEP`: Sweeps a control parameter (dose, reproduction number, coupling) across `steps` grid points to verify monotonicity, EC50 thresholds, and bifurcation invariants.
+**SSE v2.0:** `event_version: "2.0"`. Research channels are `search_log`, `goi_stream` and `accelerator_log`. Builder events include `mode: "builder"` and `goi_stream`, `accelerator_log` and `log`. Consumers should retain purity, uncertainty, receipt and reason-code telemetry and distinguish workflow status from epistemic verdicts.
 
-### Generalized Arbitrary-K Simplex Projection & Statistical Domain Conditioners
+## Build, run and test
 
-The Tier-0 deterministic AST normalizer (`invar_agent/healing/deterministic_ast.py`) inspects all blueprint contract invariants and automatically synthesizes domain-specific manifold projectors and statistical conditioners:
+Use a Python supported by `pyproject.toml`, Rust and a C++20 compiler on `PATH`:
 
-- **Generalized Arbitrary-`K` Simplex Projector (`_invar_project_k_simplex`)**:
-  Automatically detects any `K`-slot sum conservation law (`K ≥ 2`), including `K = 2` biallelic frequencies (`p + q = 1`), `K = 3` `SIR` or 3-strategy Rock-Paper-Scissors replicator simplices (`x_1 + x_2 + x_3 = 1`), `K = 4` `SEIR` or 4-reservoir global carbon cycle inventories (`M_atm + M_surf + M_deep + M_bio = 41000 GtC`), `K = 5` `SEIR-V` vaccine models, and `K = 6` `SEIRHD` clinical cohorts. At the end of every step function, it clamps non-negative slots `buf.data[i_m] = max(0.0, buf.data[i_m])`, computes the current sum `_s_cur`, rescales each participating slot by `_invar_sdiv(_target_sum, _s_cur)` (or distributes `_target_sum / K` uniformly on underflow), and re-synchronizes local variable aliases.
-- **Statistical & Causal Inference Domain Conditioners**:
-  Enforces Cauchy-Schwarz covariance bounds (`|Cov(X, Y)| ≤ √(Var(X) * Var(Y))`), Cramér-Rao / Fisher information variance lower bounds (`Var(θ_hat) ≥ 1 / I_F(θ)`), Pearson correlation bounds (`-1.0 ≤ r ≤ 1.0`), probability/AUC/`R^2`/p-value unit-interval bounds (`0.0 ≤ p ≤ 1.0`), and Instrumental Variable (`2SLS` / Wald) versus confounded OLS estimation error ordering.
-
----
-
-## 5. Workspace Platform and Web Console
-
-- **Partitioned File Explorers**: Separate `[Codebase]` workspace tree and `[Research Vault]` archive browser.
-- **Center-Stage Research Viewer**: Displays verified numerical metrics tables, extracted constants, governing equations, unified kernel code, and full reports with Markdown-protected KaTeX rendering (`katex.renderToString` after masking code spans and math delimiters).
-- **One-Click Software & Vault Archive Management**: Zip export/import for both software workspaces and `.invar/research_vault/` bundles.
-- **Zero-Leak Multi-Run Lifecycle**: Every run instantiates an isolated `ResearchStateMachine`, clears SSE replay history (`clear_history()`) on start so prior commit banners never bleed across runs, unloads compiled C-ABI shared library handles (`FreeLibrary`/`dlclose`), removes temporary `.cpp`/`.so`/`.dll` build artifacts in `finally:`, and runs `gc.collect()`.
-- **Integrated Workspace Terminal**: Embedded `xterm.js` terminal with fit addon for direct shell inspection.
-
----
-
-## 6. Native Core Implementation Details
-
-- **Girard GoI Wavefront Solver**: Constructs dependency adjacency matrix `M` and feedback/control matrix `U`, verifies `rho(U * M) < 1`, and executes rank-k Sherman-Morrison-Woodbury updates `(A + P * Q^T)^(-1) = A^(-1) - A^(-1) * P * (I + Q^T * A^(-1) * P)^(-1) * Q^T * A^(-1)` when adding stage contracts.
-- **Holographic Interaction Net (HIN) Arena**: Fixed-index arena nodes with active-pair interaction rules (annihilation, commutation), MELL exponential promotion/dereliction, and 3-hop causal fault slicing.
-- **Reverse-Mode Adjoint HIN**: Computes exact symbolic partial derivatives `J_ij = df_i / dx_j` and eigenvalue/stiffness bounds for ODE/PDE systems.
-- **MELL Linear Typing & `egg` E-Graph Reflex Healer**: Enforces linear resource usage and dimensional consistency (`SIDimensionVector`) alongside `egg` equality saturation for algebraic simplification (`log1p`, stiff IMEX forms) and sub-2 ms syntax/import healing.
-
----
-
-## 7. Cognitive Router
-
-| Tier | Role | Default Model Routing | Typical Latency / Cost |
-|---|---|---|---|
-| **Tier-2 Pro** | Blueprint synthesis, Stage `2..N` accretion, final healing | Reasoning model (e.g., `deepseek-v4-pro`, `gemini-2.5-pro`) | Complex synthesis |
-| **Tier-1 Flash** | Planning, feasibility gate, literature queries, fast healing directives | Fast model (e.g., `deepseek-flash`, `gemini-2.5-flash`) | Low latency |
-| **Tier-0 Reflex** | `egg` e-graph, AST sanitizer, manifold projectors, contract conditioning | Deterministic Rust + Python AST | `< 2 ms` \| `0 Tokens` |
-
-Supported LLM providers (`invar_agent/llm/`): **DeepSeek**, **Gemini**, **OpenAI**, and **OpenRouter**.
-
----
-
-## 8. Quickstart and Verification Suites
-
-### Prerequisites
-- Python 3.12+
-- Rust toolchain (`cargo`, `rustc`) and `maturin`
-- C++20 compiler (`clang++` or `g++`) on `PATH` for native C-ABI kernel execution
-
-### Installation
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate  |  Linux/macOS: source .venv/bin/activate
-pip install maturin
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+python -m pip install maturin
+python -m pip install -e ".[dev,ingest,scientific]"
 maturin develop --release
-pip install -e .
-```
 
-### Environment Variables
-Set one or more provider keys (or configure them in the Web Console settings modal):
-- `DEEPSEEK_API_KEY`
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
-- `OPENROUTER_API_KEY`
-
-### Launch the Web Console
-```bash
+invar-agent serve --workspace-dir /path/to/workspace
+# Alternative:
 uvicorn invar_agent.server:app --host 127.0.0.1 --port 8000
 ```
 
-### Run Verification Suites
-```bash
-# Rust native core tests
-cargo test --lib
+Configure an existing `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the environment/console. Never commit credentials. Offline verification does not require provider access.
 
-# Python unit and integration tests (offline/deterministic suite)
-pytest -q
+```bash
+# Native workspace, from repository root
+cargo test
+
+# Offline Python
+pytest -v -m "not live"
+
+# Hermetic environment
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY -u OPENAI_API_KEY \
+    -u DEEPSEEK_API_KEY -u DEEPSEEK_API \
+    INVAR_OFFLINE=1 INVAR_RESEARCH_SEARCH_LIVE=0 \
+    pytest -v -m "not live"
+
+# TCB checks and current Z3 tier breakdown
+pytest -v -s -m "not live" tests/test_tcb_soundness.py tests/test_z3_ladder_benchmark.py
+
+# Translation validation
+pytest -v -m "not live" tests/test_uast_differential_lowering.py
+
+# Opt-in live acceptance, with an existing provider key
+pytest -v -m live
 ```
 
-### Repository Directory Tree
+Offline traps cover weakening/vacuity, frozen/uncoupled dynamics, deductive Carnot refutation, universal/existential numerical refutation and algebraic/unit-rescaled duplicates. Positive controls cover SEIR-V boundaries, structural IV/2SLS versus OLS, SIRS equilibrium and conditional SHBT closure. Pipeline tests exercise persisted receipts, purity, lineage and Builder admission.
+
+These commands are reproducible checks, not claims that a particular machine ran them. Do not copy old test totals, benchmark percentages or timings into a new report without fresh applicable measurements. Offline controls do not establish live success.
+
+### Live E2E results (`deepseek-v4-pro` / `deepseek-flash`)
+
+Verified across all live computational archetypes, terminal epistemic verdicts, SHBT/non-SHBT routing, and Builder Studio v2.0 admission controls (`R7b` and `B1`–`B4` executed end-to-end fresh; live DeepSeek-synthesized artifacts for `R1`–`R7a` were finalized and certified unchanged through `ResearchStateMachine` + Vault persistence after locking universal compiler/formalizer fixes surfaced during live verification with offline regression tests in `tests/test_release_hardening_regressions.py`):
+
+| Scenario | Expected verdict | Observed verdict / mode | ρ<sub>conv</sub> | Enforcement ratio | BLAKE3 receipt | Key metrics & tokens |
+|---|---|---|---|---|---|---|
+| **R1** SEIR-V boundary (`seirv_vaccine_threshold`, Non-SHBT) | `VERIFIED_BOUNDARY_DISCOVERY` | `VERIFIED_BOUNDARY_DISCOVERY` (`ODE_GCI_SEPARATION`) | `0.0` | `0.0` | `c5ab7ae0cc6b5969345aab0fc4267a2518ea14c5904cd66e3258ea6c229e3781` | `domain_compression_bits=3.0875`, bracket `0.78431320..0.78431416`, 0 SHBT, 4 calls (`54,732` in / `151,517` out) |
+| **R2** IV/2SLS vs OLS MC (`iv_mse_separation_mc`, Non-SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`MC_CLOPPER_PEARSON`) | — | `0.0` | `57cb725443da27d0eda1e21b7a87859d15d798b2ecb6e94e707d970c239498b6` | `conf=0.9967`, `margin=+0.9013`, `256` CRN replicates, 0 SHBT, 2 calls (`17,506` in / `84,977` out) |
+| **R3** RPS replicator-mutator (`rps_replicator_mutator`, Non-SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`FIXED_POINT_KRAWCZYK_HURWITZ`) | — | `0.0` | `0f2d18404956def383a6add3b9b3a1278c87d4a0b071ca23aad040584d3718b1` | `margin=+0.0505`, `dead_parameters=[]`, `epsilon_total=2.23e-5`, 0 SHBT |
+| **R4** SHBT open-boundary closure (`open_landauer_lanr_ledger`, SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`PARETO_EPS_DOMINANCE`) | `0.0` | `0.0` | `0da82a63b6bd6a5631d4687ae86b4cf745b8d2acba5e5e997e3cd1ff8a23dbf6` | `margin=9.99e-9`, `effect=1,047,054`, 565 SHBT refs, 2 calls (`22,082` in / `76,851` out) |
+| **R5** Carnot ceiling (`thermo_cycle_eta_feasibility`) | `VERIFIED_FALSIFICATION` | `VERIFIED_FALSIFICATION` (`MODE1_DEDUCTIVE_MUS`) | `0.0` | `0.0` | `74da474644c89034182b749a81b854d9616a7821b109b376714e8f64e680d205` | `heal_count=0`, deductive MUS refutation, 3 calls (`25,447` in / `70,081` out) |
+| **R6** SIR `R_max` universal bound (`sir_peak_rmax_bound`) | `VERIFIED_FALSIFICATION` | `VERIFIED_FALSIFICATION` (`MODE2A_COUNTEREXAMPLE`) | `0.7957` | `0.0` | `a750e16098ad71f7f4fddd505bc6b18bc4e0fcd8763f5c33505f71143fc3eef8` | Counterexample witness certified, 2 calls (`15,019` in / `50,363` out) |
+| **R7a** Duplicate vs R6 (`sir_peak_universal_bound_test`) | `INCONCLUSIVE_UNVERIFIED` | `INCONCLUSIVE_UNVERIFIED` (`uniqueness_audit.passed=False`) | `0.7956` | `0.0` | `fd4de850101d4381a2ca70cc606f62d9c70b09ab206eccf5567aa579a0388196` | Caught Vault duplicate against R6, 4 calls (`43,894` in / `118,973` out) |
+| **R7b** Contradictory impossibility (`T>=500 and T<=300`) | `REFUSED_IMPOSSIBLE` | `REFUSED_IMPOSSIBLE` | — | — | `480b130ba07303ed6593225cca98574e9c34269763b9a88bc9366517e56d9c7f` | Fast precheck refusal in `11.38s`, 1 call (`7,119` in / `607` out) |
+
+**Builder Studio v2.0 E2E (`B1`–`B4`):**
+- **B1** (`seirv_boundary_workbench` from **R1**): `POSITIVE_EVIDENCE`, `ir_blake3_digest=0120b2e5...`, `parity_rc=0`, live launch health `200`, clean stop `200`, export `81,908 bytes` (30 files) (`41.66s`).
+- **B2** (`shbt_frontier_calibration_lib` from **R4**): `COMPLETED` build + `PATCH /override` (`ir_digest` `1e162f80...` → `68054338...`) + `COMPLETED` incremental rebuild, export `41,662 bytes` (19 files) (`17.68s`).
+- **B3** (**R5** & **R6** falsifications): both admitted as `NEGATIVE_CONSTRAINT_ONLY` with `equations_count=0` and empty pinned kernel (`0.41s`).
+- **B4** (Anti-laundering & tamper rejection): HTTP `422` rejecting **R7a** (`INCONCLUSIVE_UNVERIFIED`) and HTTP `422` rejecting 1-byte tampered **R1** certificate (`meaningfulness certificate receipt mismatch`) (`0.51s`).
+
+## Repository map
+
 ```text
 invar-agent/
-├── Cargo.toml
-├── pyproject.toml
+├── Cargo.toml                       # Rust workspace
+├── pyproject.toml                   # Dependencies, CLI, maturin configuration
 ├── README.md
 ├── invar_agent/
-│   ├── _native/                  # Rust PyO3 crate (GoI, HIN, Adjoint, CSEL egg, HIS, Healer)
-│   ├── builder/                  # Research-to-Software Bridge & parity test generator
-│   ├── guards/                   # PreWrite_Guard, SHACL/Chiasmus, import pruner
-│   ├── healing/                  # Tier-0 deterministic AST sanitizer & reflex healer
-│   ├── llm/                      # Provider clients (DeepSeek, Gemini, OpenAI, OpenRouter)
-│   ├── research/                 # State machine, feasibility, planner, extractor, report, vault
-│   ├── runtime/                  # C-ABI bridge & isolated sandbox runner
-│   ├── schemas/                  # Pydantic v2 models for blueprints, contracts, and telemetry
-│   ├── static/                   # Web UI (index.html, marked, KaTeX, xterm.js)
-│   ├── transpiler/               # Python -> UAST -> C++20 / HIN emitters
-│   ├── verification/             # Z3 SMT & concolic verification
-│   ├── latex_normalizer.py       # Deterministic JSON escape repair & LaTeX canonicalizer
-│   └── server.py                 # FastAPI + SSE server
-└── tests/                        # Unit, regression, parity, and live integration tests
+│   ├── _native/
+│   │   ├── Cargo.toml
+│   │   └── src/                     # GoI, HIN, adjoint, egg, HIS, Π, intervals
+│   ├── research/
+│   │   ├── state_machine.py         # Research loop and provider handling
+│   │   ├── planner.py               # Synthesis and formal validation
+│   │   ├── formal_evidence.py       # Literal extraction and quote anchoring
+│   │   ├── meaningfulness.py        # IHCG, gates, SMT, reliability, certificates
+│   │   ├── falsification.py         # Deductive, numerical, boundary certifiers
+│   │   ├── default_verification.py  # Executable binding and baseline evidence
+│   │   ├── stochastic_equilibrium.py
+│   │   ├── differential_check.py
+│   │   ├── uniqueness.py            # CDS, references, vault comparison, lineage
+│   │   ├── reference_annotations.py
+│   │   ├── epistemic.py             # Receipts and execution/certificate bridge
+│   │   ├── shbt_federation.py
+│   │   └── ...                      # Feasibility, search/extraction, reports, vault, SSE
+│   ├── builder/                     # Studio API, ingestion/IR, guards, emitters
+│   ├── uast/                        # Schemas, compiler, totalized math, native bridge
+│   ├── transpiler/                  # Restricted Python frontend and C++/HIN
+│   ├── runtime/                     # C-ABI and isolated Python execution
+│   ├── verification/                # SMT, concolic checks, precision shield
+│   ├── guards/                      # Firewall and prewrite checks
+│   ├── healing/                     # AST repair, purity instrumentation
+│   ├── llm/                         # Providers, errors, retries, telemetry
+│   ├── schemas/                     # Blueprint/contract/shared models
+│   ├── static/                      # Workspace, Research, Builder UI
+│   ├── latex_normalizer.py
+│   └── server.py                    # FastAPI and SSE
+├── scripts/
+└── tests/                           # Unit, differential, traps/controls, opt-in live
 ```
+
+## Roadmap
+
+**Full Bayesian/KL prior-relative informativeness is a next-phase capability.** Current model dependence, significance and canonical/reference-relative nontriviality are not a full Bayesian update; having a KL intrinsic does not implement that gate. Broader certified sampler/residual bindings, analytic floating-point error arguments and expanded typed reference coverage remain distinct work.

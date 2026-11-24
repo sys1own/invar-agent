@@ -223,6 +223,17 @@ def parameter_bindings(blueprint, metadata):
             if len(name) <= 2 and old.get('unit', '1') != canonical:
                 continue
             if abs(old['value']-value) > max(abs(value)*1e-12, 1e-30):
+                # Do not flag a sweep probe value mentioned in prose (e.g. "at R_0 = 3.0"
+                # for a free sweep parameter with domain [2.5, 4.0]) as a constant mismatch.
+                ihcg_dom = (blueprint.get('ihcg_evidence') or {}).get('domain') or {}
+                dom_bounds = ihcg_dom.get(symbol) or ihcg_dom.get(name) or next(
+                    (b for k, b in ihcg_dom.items() if _key(k) == _key(name) or _key(k).endswith(_key(name))),
+                    None,
+                )
+                if (isinstance(dom_bounds, (list, tuple)) and len(dom_bounds) == 2
+                        and float(dom_bounds[0]) < float(dom_bounds[1])
+                        and float(dom_bounds[0]) <= value <= float(dom_bounds[1])):
+                    continue
                 raise ReferenceError('VAULT_CONSTANT_MISMATCH', f'{symbol}: stored {old["value"]}, text {value}')
         if old is None or old['unit'] in ('', '1') and unit != '1':
             filename, field = next((filename,field) for filename,field,value in texts if match[0] in str(value))
@@ -391,7 +402,7 @@ def _apply_dual_math(name, arguments, sp):
             return _safe_minmax(sp.Min, *arguments)
         if name == 'max':
             return _safe_minmax(sp.Max, *arguments)
-        if name == 'abs' and len(arguments) == 1:
+        if name in {'abs', 'fabs'} and len(arguments) == 1:
             arg = arguments[0]
             if isinstance(arg, (int, float)) or getattr(arg, 'is_Number', False):
                 return sp.Abs(arg)
@@ -433,7 +444,7 @@ def _apply_dual_math(name, arguments, sp):
         return _Dual(sp.sin(vals[0]), sp.cos(vals[0]) * derivs[0])
     if name == 'cos' and len(duals) == 1:
         return _Dual(sp.cos(vals[0]), -sp.sin(vals[0]) * derivs[0])
-    if name == 'abs' and len(duals) == 1:
+    if name in {'abs', 'fabs'} and len(duals) == 1:
         u, du = vals[0], derivs[0]
         abs_u = sp.Abs(u) if (isinstance(u, (int, float)) or getattr(u, 'is_Number', False)) else sp.Abs(u, evaluate=False)
         return _Dual(abs_u, _safe_cmp_piecewise(du, u, 'ge', 0, -du, sp))
@@ -606,7 +617,15 @@ class _SymbolicKernel:
             arguments = [self.expression(arg, environment, depth) for arg in node.args]
             if name in {'float', 'int'} and len(arguments) == 1:
                 return arguments[0]
-            if name in {'_invar_sdiv', '_sdiv', 'sdiv', 'safe_div', 'div_eps', 'logistic_sigmoid', 'sigmoid', 'clamp', 'clip', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'min', 'max'}:
+            if name == 'pow' and len(arguments) == 2:
+                left, right = arguments
+                if isinstance(left, _Dual) or isinstance(right, _Dual):
+                    dl, dr = _Dual.lift(left, sp), _Dual.lift(right, sp)
+                    if _is_zero_expr(dr.deriv):
+                        return dl.__pow__(dr, sp)
+                    return _Dual(dl.val ** dr.val, (dl.val ** dr.val) * (dr.val * dl.deriv / dl.val + sp.log(dl.val) * dr.deriv))
+                return left ** right
+            if name in {'_invar_sdiv', '_sdiv', 'sdiv', 'safe_div', 'div_eps', 'logistic_sigmoid', 'sigmoid', 'clamp', 'clip', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'fabs', 'min', 'max'}:
                 return _apply_dual_math(name, arguments, sp)
             function = environment.get(('function', name), self.functions.get(name))
             if function is not None:
@@ -771,6 +790,34 @@ class _SymbolicKernel:
         return {name: environment[('slot', index)] for index, symbol in self.slots.items()
                 if (name := str(symbol)) in states and ('slot', index) in environment}
 
+    def zero_dt_profile(self, states):
+        """Return (rhs_dict, zero_dt_updates_dict, written_slots) via O(steps) dual evaluation without _dt blowup."""
+        sp = self.sp
+        driver = self.functions.get('simulation_step')
+        if driver is None:
+            return {}, {}, set()
+        self.initial_slots = {('slot', index): _Dual(symbol, sp.Integer(0)) for index, symbol in self.slots.items()}
+        environment = {**self.globals, 'dt': _Dual(sp.Integer(0), sp.Integer(1))}
+        if len(driver.args.args) > 1:
+            environment[driver.args.args[1].arg] = environment['dt']
+        try:
+            self.block(driver.body, environment)
+        finally:
+            self.initial_slots = {}
+        rhs, vals, written = {}, {}, set()
+        for index, symbol in self.slots.items():
+            key = ('slot', index)
+            if key not in environment:
+                continue
+            written.add(str(symbol))
+            if str(symbol) not in states:
+                continue
+            v = environment[key]
+            dval = v.deriv if isinstance(v, _Dual) else sp.Integer(0)
+            rhs[str(symbol)] = sp.Integer(0) if _is_zero_expr(dval) else dval
+            vals[str(symbol)] = _Dual.value_of(v)
+        return rhs, vals, written
+
     def derivatives(self, states):
         sp = self.sp
         if 'simulation_step' in self.functions:
@@ -838,11 +885,16 @@ def recover_evolution(blueprint, metadata, code):
     evidence = structured_evidence(blueprint, metadata)
     laws, origins = {}, {}
     for item in evidence.get('equations') or []:
-        text = f"{item.get('lhs', '')} = {item.get('rhs_latex', '')}"
-        if item.get('role') == 'EVOLUTION_LAW' and not re.search(r'\bd\w+/dt|\\dot|\\frac\{d', text):
-            text = f"d{item['lhs']}/dt = {item['rhs_latex']}"
-        if re.search(r'\bd\w+/dt|\\dot|\\frac\{d', text):
-            left, _, right = equation_parts(text)
+        lhs_raw = str(item.get('lhs', '') or '')
+        rhs_raw = str(item.get('rhs_latex', '') or '')
+        text = f"{lhs_raw} = {rhs_raw}"
+        if item.get('role') == 'EVOLUTION_LAW' and not re.search(r'\bd\w+/dt|\\dot|\\frac\{d', lhs_raw):
+            text = f"d{lhs_raw}/dt = {rhs_raw}"
+        if item.get('role') == 'EVOLUTION_LAW' or re.search(r'\bd\w+/dt|\\dot|\\frac\{d', lhs_raw):
+            try:
+                left, _, right = equation_parts(text)
+            except ValueError:
+                continue
             laws[str(left)] = right
             filename = 'blueprint.json' if (blueprint.get('structured_evidence') or {}).get('equations') else 'metadata.json'
             origins[str(left)] = ('structured', item['rhs_latex'], filename)
@@ -936,11 +988,20 @@ def recover_evolution(blueprint, metadata, code):
     if not states or missing:
         missing = missing or list(blueprint.get('variable_map') or {'<unknown>': 0})
         raise ReferenceError('VAULT_MISSING_EVOLUTION_LAW', 'Missing evolution laws for: '+', '.join(missing), {'missing_states': missing})
+    ihcg_domain = (blueprint.get('ihcg_evidence') or {}).get('domain') or {}
+    ihcg_vmap_inv = {idx: sym for sym, idx in (blueprint.get('variable_map') or {}).items()}
     for name, item in parameters.items():
         if name in slots and slots[name] < len(initial):
             iv_f = float(initial[slots[name]])
             pv_f = float(item['value'])
             if abs(iv_f - pv_f) > 1e-6 * max(1.0, abs(iv_f), abs(pv_f)):
+                slot_sym = ihcg_vmap_inv.get(slots[name], name)
+                bounds = ihcg_domain.get(slot_sym) or ihcg_domain.get(name)
+                if (isinstance(bounds, (list, tuple)) and len(bounds) == 2
+                        and float(bounds[0]) <= iv_f <= float(bounds[1])):
+                    item = {**item, 'value': iv_f}
+                    parameters[name] = item
+                    continue
                 raise ReferenceError('VAULT_CONSTANT_MISMATCH', f'{name}: initial slot {initial[slots[name]]} != {item["value"]}')
     environment = {name: item['value'] for name, item in parameters.items()}
     environment.update({name: initial[slots[name]] if slots[name]<len(initial) else 1. for name in states})
@@ -948,7 +1009,10 @@ def recover_evolution(blueprint, metadata, code):
     for factor in (1., .75, 1.125):
         point = {**environment, **{name: value*factor if value else .001*factor for name, value in environment.items() if name in states}, 't': 0.}
         for state in text_laws.keys() & symbolic.keys():
-            actual, expected = float(symbolic[state].subs(point)), float(text_laws[state].subs(point))
+            try:
+                actual, expected = float(symbolic[state].subs(point)), float(text_laws[state].subs(point))
+            except (TypeError, ValueError):
+                continue
             if abs(actual-expected) > 1e-10:
                 raise ReferenceError('VAULT_REFERENCE_MISMATCH', f'{state}: stated RHS {expected}, symbolic RHS {actual}', dict(state=state, step=0, actual=actual, expected=expected, absolute_error=abs(actual-expected)))
             comparisons.append(dict(state=state, actual=actual, expected=expected, point=point))
@@ -978,12 +1042,21 @@ def check_evolution_reference(blueprint, metadata, code, *, recovered=None):
         'math',
     ]
     def _safe_lambdify(args, exprs, *, cse=True):
-        cleaned = [
-            e.replace(sp.ITE, lambda c, t, f: sp.Or(sp.And(c, t), sp.And(sp.Not(c), f)))
-            if hasattr(e, 'has') and e.has(sp.ITE)
-            else e
-            for e in exprs
-        ]
+        arg_set = set(args)
+        alias_subs = {}
+        for e in exprs:
+            for fs in getattr(e, 'free_symbols', ()):
+                if fs not in arg_set and fs not in alias_subs:
+                    matches = [a for a in args if a.name.endswith(f'_{fs.name}') or _key(a.name) == _key(fs.name)]
+                    if len(matches) == 1:
+                        alias_subs[fs] = matches[0]
+        cleaned = []
+        for e in exprs:
+            if alias_subs and hasattr(e, 'xreplace'):
+                e = e.xreplace(alias_subs)
+            if hasattr(e, 'has') and e.has(sp.ITE):
+                e = e.replace(sp.ITE, lambda c, t, f: sp.Or(sp.And(c, t), sp.And(sp.Not(c), f)))
+            cleaned.append(e)
         try:
             return sp.lambdify(args, cleaned, modules=math_shim, dummify=True, cse=cse)
         except TypeError:

@@ -157,6 +157,26 @@ def _fallback_variable_map(bp: ResearchBlueprint) -> Dict[str, int]:
     return dict(list(mapping.items())[:64])
 
 
+def render_meaningfulness_certificate(certificate, preserved=None) -> str:
+    from .epistemic import TRUST_BOUNDARY, parse_run_certificate
+    certificate = parse_run_certificate(certificate)
+    lines = ["## Epistemic Meaningfulness Certificate", "", f"**Epistemic verdict:** `{certificate.epistemic_verdict.value}`",
+             f"**BLAKE3 receipt:** `{certificate.blake3_receipt}`", ""]
+    if hasattr(certificate, "ihcg_anchor"):
+        from .meaningfulness import meaningfulness_gates
+        lines += ["| Gate | Passed |", "|---|---|"]
+        lines += [f"| `{gate}` | {passed} |" for gate, passed in meaningfulness_gates(certificate).items()]
+    else: lines += [f"Unverified: {certificate.failure_reason}. No formal hypothesis was fabricated for this legacy run."]
+    audits = preserved or getattr(certificate, "preserved_vs_enforced", {})
+    if audits:
+        lines += ["", "| Stage/domain | Total | Preserved | Projected | Stabilized | Enforcement ratio |", "|---|---:|---:|---:|---:|---:|"]
+        for domain, audit in sorted(audits.items()):
+            lines.append(f"| {domain} | {audit.total_steps} | {audit.preserved_steps} | {audit.projected_steps} | {audit.stabilized_steps} | {audit.enforcement_ratio:.6g} |")
+    lines += ["", "**Trust Boundary (TCB):** " + "; ".join(TRUST_BOUNDARY) + "."]
+    lines += ["", "_Formal conclusions are conditional on the TCB. Rewrite sampling and differential/FD checks are empirical; libm bounds are assumed, and cooperative deadlines are not hard preemption. Unsupported interval operations fail closed._"]
+    return "\n".join(lines)
+
+
 def build_research_report(state) -> str:
     """Markdown Verified Quantitative Research Report for a finished run."""
     bp: ResearchBlueprint = state.blueprint
@@ -276,4 +296,6 @@ def build_research_report(state) -> str:
     lines.append("---")
     lines.append("_Generated deterministically from verified sandbox telemetry; "
                  "no values are extrapolated._")
+    certificate = getattr(state, "meaningfulness_certificate", None)
+    if certificate is not None: lines += ["", render_meaningfulness_certificate(certificate, getattr(state, "preserved_vs_enforced", {}))]
     return normalize_report_latex("\n".join(lines))

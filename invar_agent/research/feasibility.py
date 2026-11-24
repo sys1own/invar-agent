@@ -91,8 +91,11 @@ _UNSUITABLE_PATTERNS = [
     (r"\bmoral\s+(?:superiority|philosophy|debate|dilemma)\b", "moral philosophy"),
     (r"causal effect on|effect on .*legislation|influence on .*policy", "non-quantifiable causal claim"),
     (r"\bbeaut(y|iful)\b|\bmeaning of life\b|\bmorality\b|\bethics\b", "subjective value judgement"),
-    (r"\bclinical\b(?!.*(trial|endpoint|biomarker|dose|pk|pd|pharmac|seir|sir|model|simulat|hill|ec50))", "clinical/wet-lab task without a model"),
     (r"\bprove\b.*\b(poetry|art|music|culture|society)\b", "unfalsifiable cultural claim"),
+]
+
+_TASKS_REQUIRING_MODEL = [
+    (r"\bclinical\b", "clinical/wet-lab task without a model"),
 ]
 
 _SURROGATE_PATTERNS = [
@@ -153,7 +156,8 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
                            "conservation/invariant bounds, (2) maximise efficiency "
                            "subject to those bounds."),
             assessed_by="heuristic")
-    for pattern, what in _UNSUITABLE_PATTERNS:
+    unsuitable = _UNSUITABLE_PATTERNS + ([] if _QUANTITATIVE_HINTS.search(q) else _TASKS_REQUIRING_MODEL)
+    for pattern, what in unsuitable:
         if re.search(pattern, q):
             return FeasibilityAssessment(
                 verdict="REFUSED_UNSUITABLE",
@@ -271,6 +275,20 @@ def is_computational_dynamical_benchmark(question: str) -> bool:
     return bool(_COMPUTATIONAL_BENCHMARK_HINTS.search(q))
 
 
+_DIRECT_CONTRADICTION_RE = re.compile(
+    r"\b(contradict\w*|mutually\s+exclusive|empty\s+(?:feasible\s+)?set|"
+    r"disjoint\s+intervals?|intersection\s+is\s+empty|infeasible\s+domain|"
+    r"unsatisfiable|inconsistent\s+bounds|cannot\s+(?:both|simultaneously)|"
+    r"logically\s+impossible|no\s+(?:real\s+|scalar\s+)?solution\s+exists|"
+    r"simultaneously\s+satisfy)\b",
+    re.I,
+)
+_SURROGATE_BENCHMARK_RESCUE_RE = re.compile(
+    r"\b(hasegawa|wakatani|drift[- ]wave|triad|patankar|oregonator|stiff\w*|lindblad)\b",
+    re.I,
+)
+
+
 def override_refusal_for_computational_benchmark(
     question: str,
     assessment: FeasibilityAssessment,
@@ -292,6 +310,10 @@ def override_refusal_for_computational_benchmark(
                 ),
                 assessed_by=assessment.assessed_by,
             )
+    if verdict_str == "REFUSED_IMPOSSIBLE" and not _SURROGATE_BENCHMARK_RESCUE_RE.search(str(question or "")):
+        refusal_text = f"{assessment.violated_boundary or ''} {assessment.rationale or ''}"
+        if _DIRECT_CONTRADICTION_RE.search(refusal_text):
+            return assessment
     if verdict_str in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE") and is_computational_dynamical_benchmark(question):
         return FeasibilityAssessment(
             verdict=FeasibilityVerdict.REFORMULATED_SURROGATE,
@@ -311,16 +333,35 @@ def override_refusal_for_computational_benchmark(
     return assessment
 
 
+def compile_ingest_ihcg(prompt, evidence, domain, archetype):
+    from .meaningfulness import IhcgCompiler, classify_contract_vacuity, verify_entailment_lock
+    graph = IhcgCompiler().compile_from_prompt(prompt, evidence, domain, archetype)
+    obligations = [o.expression for o in graph.obligations]
+    lock = verify_entailment_lock(graph, obligations)
+    vacuity = classify_contract_vacuity(graph)
+    if not lock.entailment_locked or not vacuity.passed:
+        extra = ""
+        if vacuity.redundant_conjuncts:
+            hyp_exprs = [o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
+            extra = f"; redundant_hint=remove or move to environmental_assumptions/CONSERVATION_GUARD any HYPOTHESIS_TARGET already implied by domain/environment; hypothesis_targets={hyp_exprs}"
+        raise ValueError(f"IHCG_INGEST_REJECTED: {vacuity.classification}; entailment_locked={lock.entailment_locked}; redundant_conjuncts={vacuity.redundant_conjuncts}; query_statuses={dict((k,v.status) for k,v in vacuity.queries.items())}{extra}")
+    return graph
+
+
 async def evaluate_research_feasibility(
         question: str,
         llm_complete: Optional[Callable[[str], Any]] = None,
-        use_llm: bool = True) -> FeasibilityAssessment:
+        use_llm: bool = True, *, ihcg_input: Optional[Dict[str, Any]] = None) -> FeasibilityAssessment:
     """Classify a research request; heuristic first, optional Tier-2 refinement.
 
     The deterministic heuristic is authoritative for clear-cut refusals; the LLM
     refinement can override OPTIMAL_DIRECT / SURROGATE verdicts and sharpen
     rationales, but can never *downgrade* a heuristic REFUSAL into a run.
     """
+    if ihcg_input is not None:
+        try: compile_ingest_ihcg(question, **ihcg_input)
+        except ValueError as error:
+            return FeasibilityAssessment(verdict="REFUSED_UNSUITABLE", rationale=str(error), violated_boundary="Phi_lock/Phi_nonvac")
     heuristic = _heuristic_verdict(question)
     if heuristic.verdict in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
         return heuristic

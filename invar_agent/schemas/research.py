@@ -143,6 +143,28 @@ class FeasibilityAssessment(BaseModel):
         return data
 
 
+class TypedResearchSlot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1)
+    slot_idx: Optional[int] = Field(default=None, ge=0, strict=True)
+    si_dim: List[int] = Field(min_length=7, max_length=7)
+    role: Literal["CONTROL_PARAM", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "CONSERVATION_AUX"]
+    semantic_tag: int = Field(default=0, ge=0, le=255)
+    unit_scale: tuple[int, int] = (1, 1)
+    is_falsification_target: bool = False
+    stochastic_role: Optional[Literal["UNIFORM", "SEED", "COUNTER", "CHANNEL"]] = None
+    value: Optional[float] = Field(default=None, allow_inf_nan=False)
+    prompt_symbol: Optional[str] = None
+
+    @field_validator("si_dim", mode="before")
+    @classmethod
+    def integer_dimensions(cls, value):
+        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
+            raise ValueError("SI dimensions must be seven integer exponents")
+        return value
+
+
 class ResearchBlueprint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -182,6 +204,7 @@ class ResearchBlueprint(BaseModel):
     # "magnetic_field_B_tesla") -> index into the final buf.data state vector.
     # Sandbox_Execute publishes each mapping as telemetry["obs_<name>"].
     variable_map: Dict[str, int] = Field(default_factory=dict, max_length=4096)
+    typed_slots: List[TypedResearchSlot] = Field(default_factory=list, max_length=4096)
     slot_roles: Dict[str, Literal['read_only_parameter', 'evolving_state', 'diagnostic']] = Field(default_factory=dict, max_length=4096)
     # Zero-LLM deterministic extraction of quantitative literature evidence
     # (SI-normalized constants, LaTeX equations, benchmarks) attached by the
@@ -192,6 +215,7 @@ class ResearchBlueprint(BaseModel):
     extracted_constants: Dict[str, float] = Field(default_factory=dict, max_length=128)
     # Declarative ResearchComputeUAST specification (when synthesized via UAST/HIN pipeline).
     uast_spec: Optional[Dict[str, Any]] = None
+    ihcg_evidence: Optional[Dict[str, Any]] = None
 
 
 class ExtractedParameter(BaseModel):

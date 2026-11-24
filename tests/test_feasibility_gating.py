@@ -50,6 +50,58 @@ def test_refusal_verdicts_keep_boundary_and_reformulation():
     assert a.reformulation == "drop the claim"
 
 
+_BOUNDARY_REQUEST = (
+    "Carry out one bounded computational study of the herd-immunity boundary "
+    "in a standard SEIR model with imperfect vaccination. Use population "
+    "fractions, a basic reproduction number R0 between 2.5 and 4, vaccine "
+    "efficacy e=0.85, and vaccination coverage pv between 0 and 1. The "
+    "effective reproduction number is Reff=R0*(1-e*pv). Find and bracket "
+    "the coverage boundary for the strict criterion Reff < 1 at R0=3, "
+    "and certify a safe coverage interval across the stated R0 uncertainty. "
+    "Keep the strict criterion unchanged, report both sides of the boundary, "
+    "and distinguish the threshold calculation from clinical evidence. "
+    "Use dimensionless quantities and explicit finite parameter domains."
+)
+
+
+@pytest.mark.parametrize("prompt", [
+    _BOUNDARY_REQUEST,
+    "Integrate the equation dx/dt=-k*x for k in [0.1,1]. Distinguish this from clinical evidence.",
+    "Distinguish clinical evidence from this calculation. Integrate the equation dx/dt=-k*x for k in [0.1,1].",
+    "Clinical evidence is not established here.\nUse a mathematical model dx/dt=-k*x for k in [0.1,1].",
+    "Use a mathematical model dx/dt=-k*x for k in [0.1,1].\nClinical evidence is not established here.",
+])
+def test_quantitative_model_context_is_request_wide(prompt):
+    from invar_agent.research.feasibility import _heuristic_verdict
+    assessment = _heuristic_verdict(prompt)
+    assert assessment.verdict == "OPTIMAL_DIRECT", assessment.model_dump()
+
+
+@pytest.mark.parametrize("prompt", ["Review clinical evidence for a treatment.", "Arrange a clinical appointment."])
+def test_unmodeled_clinical_task_still_refused(prompt):
+    from invar_agent.research.feasibility import _heuristic_verdict
+    assert _heuristic_verdict(prompt).verdict == "REFUSED_UNSUITABLE"
+
+
+@pytest.mark.asyncio
+async def test_quantitative_boundary_request_reaches_planner_dispatch():
+    from invar_agent.research.planner import generate_plan_with_feasibility
+
+    class PlannerReached(Exception):
+        pass
+
+    calls = []
+
+    async def llm(prompt):
+        calls.append(prompt)
+        raise PlannerReached()
+
+    with pytest.raises(PlannerReached):
+        await generate_plan_with_feasibility(_BOUNDARY_REQUEST, llm_complete=llm, fallback=False)
+    assert len(calls) == 1
+    assert _BOUNDARY_REQUEST in calls[0]
+
+
 def test_run_success_response_has_started_true(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "0")
     import invar_agent.server as server

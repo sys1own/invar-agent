@@ -1,6 +1,7 @@
 """Native core tests: PyGoiSolver, PyHinEngine, PyDeterministicHealer, PyHisRegister."""
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -131,3 +132,57 @@ def test_his_register_public_boundary_sensitivity():
     verifier.encode_bulk_ast_to_boundary(files_v3)
     assert not verifier.register.verify_boundary_parity(d1)
     assert len(digest_before) == 64
+
+
+def test_arena_derived_purity_and_default_compatible_constructor():
+    quantities = [
+        dict(symbol=s, si_dimension=[0] * 7, interval=[0, 1], is_state_variable=s == "x")
+        for s in ("x", "y")
+    ]
+    equations = json.dumps({"y": {"kind": "symbol", "name": "x"}})
+    arena = invar_agent_native.PyHolographicHin(json.dumps(quantities))
+    assert json.loads(arena.verify_observational_purity(equations))["valid"]
+    assert json.loads(arena.verify_observational_purity("{}"))["checked_writes"] == 0
+    metadata = {
+        "x": dict(purity="PROJECTED", instrumented=True, has_conservation_guard=True),
+        "y": dict(role="DERIVED_OBSERVABLE", is_falsification_target=True),
+    }
+    arena = invar_agent_native.PyHolographicHin(json.dumps(quantities), json.dumps(metadata))
+    report = json.loads(arena.verify_observational_purity(equations))
+    assert not report["valid"]
+    assert {v["rule"] for v in report["violations"]} == {"T-OBSERVABLE-PURE"}
+    with pytest.raises(ValueError, match="undeclared"):
+        invar_agent_native.PyHolographicHin(json.dumps(quantities), '{"unknown": {}}')
+    with pytest.raises(ValueError, match="unbound"):
+        arena.verify_observational_purity('{"y": {"kind": "symbol", "name": "missing"}}')
+
+
+def test_dimensional_signature_unit_conversion_and_error_paths():
+    def signature(x, reference, scale, cubic=False):
+        symbols = {
+            x: dict(role="DYNAMIC_STATE", si_dim=[0, 1, 0, 0, 0, 0, 0], semantic_tag=0, unit_scale=[scale, 1]),
+            reference: dict(role="CONTROL_PARAM", si_dim=[0, 1, 0, 0, 0, 0, 0], semantic_tag=0,
+                            unit_scale=[scale, 1], positive=True),
+        }
+        expression = f"(- {x} {reference})"
+        if cubic:
+            expression = f"(- (/ (* {x} (* {x} {x})) (* {reference} {reference})) {reference})"
+        return json.loads(invar_agent_native.py_compute_alpha_canonical_system(
+            json.dumps([dict(expr=expression, symbols=symbols)])))["canonical_system"]
+
+    assert signature("x", "L", 1) == signature("distance", "scale", 1000)
+    assert signature("x", "L", 1) != signature("x", "L", 1, cubic=True)
+    assert json.loads(invar_agent_native.py_compute_alpha_canonical_system("[]"))["saturated"]
+    with pytest.raises(ValueError, match="budget"):
+        invar_agent_native.py_compute_alpha_canonical_system("[]", max_aut_branches=0)
+
+
+def test_bauer_fike_binding_certifies_non_gershgorin_matrix():
+    matrix = [[dict(lo=-i - 1.0 if i == j else 0.0, hi=-i - 1.0 if i == j else 0.0)
+               for j in range(5)] for i in range(5)]
+    matrix[0][1] = dict(lo=1.19999, hi=1.20001)
+    report = json.loads(invar_agent_native.py_certify_interval_stability(json.dumps(matrix)))
+    assert report["certified"] and report["method"] == "INTERVAL_BAUER_FIKE"
+    assert report["bauer_fike"]["spectral_abscissa_upper"] < 0
+    with pytest.raises(ValueError, match="matrix"):
+        invar_agent_native.py_certify_interval_stability("[]")

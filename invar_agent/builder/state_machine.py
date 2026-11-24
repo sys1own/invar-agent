@@ -188,6 +188,9 @@ class BuilderStateMachine:
                 await pending
 
     async def run(self, request: BuildRequest) -> BuildRunState:
+        if request.ir is not None:
+            from .research_bridge import validate_research_ir
+            validate_research_ir(request.ir)
         if self._running:
             raise RuntimeError("A BuilderStateMachine executes one build at a time")
         self._running = True

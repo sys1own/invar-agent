@@ -116,8 +116,12 @@ def test_deepseek_client_records_cache_hit_and_reasoning_tokens():
 
 
 @pytest.mark.asyncio
-async def test_cognitive_router_tier_selection_and_blueprint_progress_logging():
+async def test_cognitive_router_tier_selection_and_blueprint_progress_logging(monkeypatch):
     """Verify immediate progress events during blueprint generation and Tier-1 query routing."""
+    from invar_agent.research.planner import parse_blueprint
+    async def formalization_boundary(question, blueprint, complete):
+        return parse_blueprint(blueprint)
+    monkeypatch.setattr('invar_agent.research.formalization.formalize_blueprint',formalization_boundary)
     progress_events: List[Dict[str, Any]] = []
 
     def on_progress(channel: str, payload: Dict[str, Any]) -> None:

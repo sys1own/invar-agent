@@ -408,15 +408,17 @@ def test_heuristic_still_refuses_true_impossibles():
 
 @pytest.mark.asyncio
 async def test_assume_feasible_bypasses_heuristic_refusal():
-    """An approved Plan Mode prompt must not be rejected by substring heuristics."""
+    """Approval bypasses heuristics, not subsequent formal-evidence validation."""
+    calls = []
     async def llm(prompt: str):
+        calls.append(prompt)
         return _COMBINED_JSON
 
-    out = await generate_plan_with_feasibility(
-        "perpetual motion COP = 1.25 approved expert prompt",
-        llm_complete=llm, fallback=False, assume_feasible=True)
-    assert out["source"] == "llm"
-    assert out["blueprint"]["blueprint_id"] == "bp_combined"
+    with pytest.raises(ValueError,match='FORMALIZATION_VALIDATION_FAILED'):
+        await generate_plan_with_feasibility(
+            "perpetual motion COP = 1.25 approved expert prompt",
+            llm_complete=llm, fallback=False, assume_feasible=True)
+    assert len(calls) == 4
 
 
 @pytest.mark.asyncio

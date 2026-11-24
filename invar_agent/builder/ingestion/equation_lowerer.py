@@ -144,7 +144,12 @@ def parse_expression(text: str):
     latex_text = text
 
     def latex_expression(source):
-        result = parse_latex(source, backend="lark")
+        try:
+            result = parse_latex(source, backend="lark")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Unparseable LaTeX expression: {exc}") from exc
         if not isinstance(result, sp.Basic):
             raise ValueError("Ambiguous LaTeX expression")
         return result.xreplace({symbol:sp.Symbol(re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}',r'\1_\2',str(symbol)))

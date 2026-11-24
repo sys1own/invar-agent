@@ -109,6 +109,11 @@ def client(tmp_path, monkeypatch):
 def test_research_run_endpoint_payload_with_oversized_title(client, monkeypatch):
     """POST /api/v1/research/run must survive an oversized LLM title (no 502)."""
     import invar_agent.server as server
+    from invar_agent.research.planner import parse_blueprint
+
+    async def formalization_boundary(question, blueprint, complete):
+        return parse_blueprint(blueprint)
+    monkeypatch.setattr('invar_agent.research.formalization.formalize_blueprint',formalization_boundary)
 
     state = server._STATE
     assert state is not None

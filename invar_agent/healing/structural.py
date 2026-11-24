@@ -8,7 +8,7 @@ def is_structural_failure(failure: str) -> bool:
         return False
     return any(marker in failure for marker in (
         'PreWrite_Guard', 'SCIENTIFIC_INTEGRITY', 'CONTRACT_FAITHFULNESS_ERROR',
-        'SLOT_ALIGNMENT_ERROR', 'transpiler:', 'AttributeError', 'NameError',
+        'EXECUTABLE_IHCG_MISMATCH', 'SLOT_ALIGNMENT_ERROR', 'transpiler:', 'AttributeError', 'NameError',
         'TypeError', 'SyntaxError', 'IndexError', 'AST firewall', 'SLOT_SCHEMA_ERROR'))
 
 

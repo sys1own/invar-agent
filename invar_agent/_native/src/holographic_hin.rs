@@ -6,6 +6,101 @@ use std::collections::HashMap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
+use crate::uast::{PurityTag, WireRole};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireType {
+    pub mell_type: MELLType,
+    pub dimensions: SIDimensionVector,
+    pub bound: IntervalBound,
+    #[serde(default)]
+    pub role: WireRole,
+    #[serde(default)]
+    pub purity: PurityTag,
+    #[serde(default)]
+    pub is_falsification_target: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WireMetadata {
+    pub role: WireRole,
+    pub purity: PurityTag,
+    pub is_falsification_target: bool,
+    pub has_conservation_guard: bool,
+    pub instrumented: bool,
+    pub recalibrates_obligation: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SlotWriteOp {
+    pub slot_idx: usize,
+    #[serde(default)]
+    pub source_slots: Vec<usize>,
+    #[serde(default)]
+    pub purity: PurityTag,
+    #[serde(default)]
+    pub has_conservation_guard: bool,
+    #[serde(default)]
+    pub instrumented: bool,
+    #[serde(default)]
+    pub recalibrates_obligation: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PurityViolation { pub slot_idx: usize, pub rule: String, pub reason: String }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PurityAuditReport {
+    pub valid: bool,
+    pub checked_writes: usize,
+    pub slot_purity: std::collections::BTreeMap<usize, PurityTag>,
+}
+
+pub fn verify_observational_purity(wires: &std::collections::BTreeMap<usize, WireType>, writes: &[SlotWriteOp])
+    -> Result<PurityAuditReport, Vec<PurityViolation>> {
+    let mut purity: std::collections::BTreeMap<_, _> = wires.iter().map(|(i, w)| (*i, w.purity)).collect();
+    let mut violations = Vec::new();
+    // Fixed point covers loop-carried dependencies and arbitrary write ordering.
+    for _ in 0..=wires.len() * 3 {
+        let previous = purity.clone();
+        for write in writes {
+            let mut tag = write.purity;
+            for source in &write.source_slots {
+                tag = tag.join(*purity.get(source).unwrap_or(&PurityTag::Recalibrated));
+            }
+            if let Some(current) = purity.get_mut(&write.slot_idx) { *current = current.join(tag); }
+        }
+        if purity == previous { break; }
+    }
+    for write in writes {
+        let mut reject = |rule: &str, reason: &str| violations.push(PurityViolation {
+            slot_idx: write.slot_idx, rule: rule.into(), reason: reason.into() });
+        let Some(wire) = wires.get(&write.slot_idx) else {
+            reject("T-UNKNOWN-SLOT", "write references an undeclared slot"); continue;
+        };
+        if write.source_slots.iter().any(|s| !wires.contains_key(s)) {
+            reject("T-UNKNOWN-SLOT", "read references an undeclared slot");
+        }
+        if wire.role == WireRole::ControlParam { reject("T-CONST-PARAM", "control parameters are immutable"); }
+        if (wire.role == WireRole::DerivedObservable || wire.is_falsification_target)
+            && purity[&write.slot_idx] != PurityTag::Pure {
+            reject("T-OBSERVABLE-PURE", "ForbiddenObservableClamp: observable depends on enforcement");
+        }
+        if write.purity == PurityTag::Projected && (wire.role != WireRole::DynamicState
+            || !write.has_conservation_guard || !write.instrumented) {
+            reject("T-STATE-INSTRUMENTED", "projection requires dynamic state, conservation guard and drift instrumentation");
+        }
+        if write.purity == PurityTag::Stabilized && (wire.role != WireRole::DynamicState || !write.instrumented) {
+            reject("T-STATE-INSTRUMENTED", "stabilization requires dynamic state and hit instrumentation");
+        }
+        if write.recalibrates_obligation || write.purity == PurityTag::Recalibrated {
+            reject("T-FORBID-RECALIBRATION", "IHCG bounds cannot be recalibrated");
+        }
+    }
+    if violations.is_empty() { Ok(PurityAuditReport { valid: true, checked_writes: writes.len(), slot_purity: purity }) }
+    else { Err(violations) }
+}
 
 pub const SAFE_MAX_VAL: f64 = 1e300;
 pub const SAFE_DIV_EPS: f64 = 1e-12;
@@ -457,6 +552,15 @@ pub struct HolographicPort {
     /// True for numeric literals or unspecified dimensionless constants that can
     /// unify their SI dimension from a peer operand in +/-/comparison nodes.
     pub inferable_dimension: bool,
+    #[serde(flatten)]
+    pub metadata: WireMetadata,
+}
+
+impl HolographicPort {
+    fn wire_type(&self) -> WireType {
+        WireType { mell_type:self.mell_type.clone(), dimensions:self.dimensions, bound:self.bound,
+            role:self.metadata.role, purity:self.metadata.purity, is_falsification_target:self.metadata.is_falsification_target }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -633,12 +737,15 @@ struct HinNode {
     #[allow(dead_code)]
     kind: HinAgentKind,
     out_port: HolographicPort,
+    source_slots: Vec<usize>,
+    enforcement: WireMetadata,
 }
 
 pub struct HolographicHinArena {
     ontology: HashMap<String, QuantitySpec>,
     nodes: Vec<HinNode>,
     active_pairs_reduced: usize,
+    wire_metadata: std::collections::BTreeMap<String,WireMetadata>,
 }
 
 impl HolographicHinArena {
@@ -651,13 +758,44 @@ impl HolographicHinArena {
             ontology,
             nodes: Vec::new(),
             active_pairs_reduced: 0,
+            wire_metadata: std::collections::BTreeMap::new(),
         }
     }
 
     fn alloc_node(&mut self, kind: HinAgentKind, out_port: HolographicPort) -> usize {
         let id = self.nodes.len();
-        self.nodes.push(HinNode { id, kind, out_port });
+        let enforcement=if matches!(kind,HinAgentKind::StateSource { .. } | HinAgentKind::LiteralSource { .. }) { out_port.metadata.clone() } else { WireMetadata::default() };
+        self.nodes.push(HinNode { id, kind, out_port, source_slots:Vec::new(), enforcement });
         id
+    }
+
+    pub fn set_wire_metadata(&mut self, metadata: std::collections::BTreeMap<String,WireMetadata>) -> Result<(),String> {
+        if !self.nodes.is_empty() { return Err("wire metadata must be assigned before lowering".into()); }
+        if metadata.keys().any(|s| !self.ontology.contains_key(s)) { return Err("wire metadata references an undeclared quantity".into()); }
+        self.wire_metadata=metadata; Ok(())
+    }
+
+    fn alloc_derived_node(&mut self, kind: HinAgentKind, port: HolographicPort, sources: Vec<usize>) -> usize {
+        let id=self.alloc_node(kind,port); self.nodes[id].source_slots=sources; id
+    }
+
+    pub fn wire_types(&self) -> std::collections::BTreeMap<usize,WireType> {
+        self.nodes.iter().map(|n| (n.id,n.out_port.wire_type())).collect()
+    }
+
+    pub fn audit_observational_purity(&self) -> Result<PurityAuditReport,Vec<PurityViolation>> {
+        let mut definitions=std::collections::BTreeMap::<String,Vec<usize>>::new();
+        for n in &self.nodes {if let HinAgentKind::StateDerivativeSink {equation}=&n.kind {definitions.entry(equation.clone()).or_default().push(n.id);}}
+        let writes: Vec<_>=self.nodes.iter().filter_map(|n| {
+            let mut sources=n.source_slots.clone();
+            if let HinAgentKind::StateSource {symbol}=&n.kind {if let Some(defs)=definitions.get(symbol) {sources.extend(defs);}}
+            let computation=matches!(n.kind,HinAgentKind::Operator { .. } | HinAgentKind::StateDerivativeSink { .. });
+            let source=matches!(n.kind,HinAgentKind::StateSource { .. } | HinAgentKind::LiteralSource { .. });
+            if !computation && !(source && (!sources.is_empty() || n.enforcement.purity!=PurityTag::Pure || n.enforcement.recalibrates_obligation)) {return None;}
+            Some(SlotWriteOp { slot_idx:n.id, source_slots:sources, purity:n.enforcement.purity,
+                has_conservation_guard:n.enforcement.has_conservation_guard, instrumented:n.enforcement.instrumented,
+                recalibrates_obligation:n.enforcement.recalibrates_obligation })}).collect();
+        verify_observational_purity(&self.wire_types(),&writes)
     }
 
     /// Lower an equation RHS CselExpr into the Holographic HIN Arena,
@@ -677,7 +815,8 @@ impl HolographicHinArena {
         let mut dimensional_warnings = Vec::new();
 
         // Check every referenced symbol against the ontology (strictly catch unbound wires)
-        for (sym, &count) in &counts {
+        let mut ordered_counts:Vec<_>=counts.iter().collect(); ordered_counts.sort_by(|(a,_),(b,_)| a.cmp(b));
+        for (sym, &count) in ordered_counts {
             if !self.ontology.contains_key(sym) && sym != "t" && sym != "pi" && sym != "e" {
                 unbound_symbols.push(sym.clone());
             } else if count > 1 {
@@ -695,6 +834,7 @@ impl HolographicHinArena {
                         dimensions: dim,
                         bound: IntervalBound::new(spec.interval[0], spec.interval[1]),
                         inferable_dimension: spec.dimension_unspecified,
+                        metadata:self.wire_metadata.get(sym).cloned().unwrap_or_default(),
                     };
                     self.alloc_node(
                         HinAgentKind::Promotion {
@@ -710,12 +850,13 @@ impl HolographicHinArena {
 
         // Automatically insert ? (dereliction/weakening) agents for declared symbols
         // not referenced in this particular equation f_i.
-        let unused_specs: Vec<(String, QuantitySpec)> = self
+        let mut unused_specs: Vec<(String, QuantitySpec)> = self
             .ontology
             .iter()
             .filter(|(sym, _)| !counts.contains_key(*sym))
             .map(|(sym, spec)| (sym.clone(), spec.clone()))
             .collect();
+        unused_specs.sort_by(|a,b| a.0.cmp(&b.0));
         for (sym, spec) in unused_specs {
             dereliction_agents.push(format!("?{}", sym));
             let dim = SIDimensionVector::from_vec_with_tag(&spec.si_dimension, spec.semantic_tag)
@@ -729,6 +870,7 @@ impl HolographicHinArena {
                 dimensions: dim,
                 bound: IntervalBound::new(spec.interval[0], spec.interval[1]),
                 inferable_dimension: spec.dimension_unspecified,
+                metadata:self.wire_metadata.get(&sym).cloned().unwrap_or_default(),
             };
             self.alloc_node(
                 HinAgentKind::Dereliction { symbol: sym },
@@ -758,15 +900,21 @@ impl HolographicHinArena {
         }
 
         // Lower AST recursively into HIN ports
-        let out_port = self.lower_expr(expr, equation_name, &mut dimensional_warnings);
+        let mut out_port = self.lower_expr(expr, equation_name, &mut dimensional_warnings);
+        let source=self.nodes.len()-1;
+        let sink_metadata=self.wire_metadata.get(equation_name).cloned().unwrap_or_default();
+        out_port.metadata=sink_metadata.clone();
+        out_port.metadata.purity=out_port.metadata.purity.join(self.nodes[source].out_port.metadata.purity);
 
         // Connect to state-derivative sink port
-        self.alloc_node(
+        let sink=self.alloc_derived_node(
             HinAgentKind::StateDerivativeSink {
                 equation: equation_name.to_string(),
             },
             out_port.clone(),
+            vec![source],
         );
+        self.nodes[sink].enforcement=sink_metadata;
         self.active_pairs_reduced += 1;
 
         let dim_vec = out_port.dimensions.to_vec();
@@ -800,6 +948,7 @@ impl HolographicHinArena {
                     dimensions: SIDimensionVector::dimensionless(),
                     bound: IntervalBound::point(*value),
                     inferable_dimension: true,
+                    metadata:WireMetadata::default(),
                 };
                 self.alloc_node(HinAgentKind::LiteralSource { value: *value }, port.clone());
                 port
@@ -820,6 +969,7 @@ impl HolographicHinArena {
                         },
                         bound: IntervalBound::new(0.0, f64::INFINITY),
                         inferable_dimension: false,
+                        metadata:self.wire_metadata.get(name).cloned().unwrap_or_default(),
                     };
                     self.alloc_node(HinAgentKind::StateSource { symbol: "t".into() }, port.clone());
                     return port;
@@ -831,6 +981,7 @@ impl HolographicHinArena {
                         dimensions: SIDimensionVector::dimensionless(),
                         bound: IntervalBound::point(v),
                         inferable_dimension: true,
+                        metadata:self.wire_metadata.get(name).cloned().unwrap_or_default(),
                     };
                     self.alloc_node(HinAgentKind::LiteralSource { value: v }, port.clone());
                     return port;
@@ -843,12 +994,14 @@ impl HolographicHinArena {
                     dimensions: dim,
                     bound: IntervalBound::new(spec.interval[0], spec.interval[1]),
                     inferable_dimension: spec.dimension_unspecified,
+                    metadata:self.wire_metadata.get(name).cloned().unwrap_or_default(),
                 };
                 self.alloc_node(HinAgentKind::StateSource { symbol: name.clone() }, port.clone());
                 port
             }
             CselExpr::Unary { op, arg } => {
                 let inner = self.lower_expr(arg, eq_name, warnings);
+                let source=self.nodes.len()-1;
                 let bound = match op.as_str() {
                     "-" | "neg" => inner.bound.neg(),
                     _ => inner.bound,
@@ -858,14 +1011,17 @@ impl HolographicHinArena {
                     dimensions: inner.dimensions,
                     bound,
                     inferable_dimension: inner.inferable_dimension,
+                    metadata:WireMetadata { purity:inner.metadata.purity,..WireMetadata::default() },
                 };
-                self.alloc_node(HinAgentKind::Operator { name: op.clone() }, port.clone());
+                self.alloc_derived_node(HinAgentKind::Operator { name: op.clone() }, port.clone(),vec![source]);
                 self.active_pairs_reduced += 1;
                 port
             }
             CselExpr::Binary { op, left, right } => {
                 let lp = self.lower_expr(left, eq_name, warnings);
+                let left_slot=self.nodes.len()-1;
                 let rp = self.lower_expr(right, eq_name, warnings);
+                let right_slot=self.nodes.len()-1;
                 let (dim, inferable, bound) = match op.as_str() {
                     "+" | "-" => {
                         let (d, inf) = unify_additive_dimensions(
@@ -907,21 +1063,24 @@ impl HolographicHinArena {
                     dimensions: dim,
                     bound,
                     inferable_dimension: inferable,
+                    metadata:WireMetadata { purity:lp.metadata.purity.join(rp.metadata.purity),..WireMetadata::default() },
                 };
-                self.alloc_node(HinAgentKind::Operator { name: op.clone() }, port.clone());
+                self.alloc_derived_node(HinAgentKind::Operator { name: op.clone() }, port.clone(),vec![left_slot,right_slot]);
                 self.active_pairs_reduced += 1;
                 port
             }
             CselExpr::Call { func, args } => {
+                let mut sources=Vec::new();
                 let ports: Vec<HolographicPort> = args
                     .iter()
-                    .map(|a| self.lower_expr(a, eq_name, warnings))
+                    .map(|a| { let p=self.lower_expr(a, eq_name, warnings); sources.push(self.nodes.len()-1); p })
                     .collect();
                 let p0 = ports.first().cloned().unwrap_or(HolographicPort {
                     mell_type: MELLType::Linear,
                     dimensions: SIDimensionVector::dimensionless(),
                     bound: IntervalBound::point(0.0),
                     inferable_dimension: true,
+                    metadata:WireMetadata::default(),
                 });
                 let p1 = ports.get(1).cloned().unwrap_or_else(|| p0.clone());
                 let p2 = ports.get(2).cloned().unwrap_or_else(|| p1.clone());
@@ -1032,8 +1191,9 @@ impl HolographicHinArena {
                     dimensions: dim,
                     bound,
                     inferable_dimension: inferable,
+                    metadata:WireMetadata { purity:ports.iter().fold(PurityTag::Pure,|p,w| p.join(w.metadata.purity)),..WireMetadata::default() },
                 };
-                self.alloc_node(HinAgentKind::Operator { name: func.clone() }, port.clone());
+                self.alloc_derived_node(HinAgentKind::Operator { name: func.clone() }, port.clone(),sources);
                 self.active_pairs_reduced += 1;
                 port
             }
@@ -1098,15 +1258,34 @@ fn unify_additive_dimensions(
 #[pyclass(module = "invar_agent._native", name = "PyHolographicHin")]
 pub struct PyHolographicHin {
     quantities: Vec<QuantitySpec>,
+    wire_metadata: std::collections::BTreeMap<String,WireMetadata>,
 }
 
 #[pymethods]
 impl PyHolographicHin {
     #[new]
-    pub fn new(quantities_json: &str) -> PyResult<Self> {
+    #[pyo3(signature=(quantities_json, wire_metadata_json=None))]
+    pub fn new(quantities_json: &str, wire_metadata_json: Option<&str>) -> PyResult<Self> {
         let quantities: Vec<QuantitySpec> = serde_json::from_str(quantities_json)
             .map_err(|e| PyValueError::new_err(format!("Invalid quantities JSON: {}", e)))?;
-        Ok(Self { quantities })
+        let wire_metadata:std::collections::BTreeMap<String,WireMetadata>=serde_json::from_str(wire_metadata_json.unwrap_or("{}")).map_err(|e| PyValueError::new_err(format!("Invalid wire metadata JSON: {e}")))?;
+        let mut arena=HolographicHinArena::new(quantities.clone());
+        arena.set_wire_metadata(wire_metadata.clone()).map_err(PyValueError::new_err)?;
+        Ok(Self { quantities, wire_metadata })
+    }
+
+    pub fn verify_observational_purity(&self, py: Python<'_>, equations_json: &str) -> PyResult<String> {
+        let eqs: std::collections::BTreeMap<String,CselExpr>=serde_json::from_str(equations_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result=py.allow_threads(|| -> Result<serde_json::Value,String> {
+            let mut arena=HolographicHinArena::new(self.quantities.clone());
+            arena.set_wire_metadata(self.wire_metadata.clone())?;
+            for (name,expr) in eqs { let report=arena.verify_equation(&name,&expr); if !report.valid { return Err(report.error_message.unwrap_or_else(|| "arena lowering failed".into())); } }
+            match arena.audit_observational_purity() {
+                Ok(audit)=>serde_json::to_value(audit).map_err(|e| e.to_string()),
+                Err(violations)=>Ok(serde_json::json!({"valid":false,"violations":violations})),
+            }
+        }).map_err(PyValueError::new_err)?;
+        serde_json::to_string(&result).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Verify a map of `{equation_name: CselExpr JSON}` against the ontology.
@@ -1115,9 +1294,11 @@ impl PyHolographicHin {
         let eqs: HashMap<String, CselExpr> = serde_json::from_str(equations_json)
             .map_err(|e| PyValueError::new_err(format!("Invalid equations JSON: {}", e)))?;
         let quantities = self.quantities.clone();
+        let wire_metadata=self.wire_metadata.clone();
 
         let result = py.allow_threads(move || {
             let mut arena = HolographicHinArena::new(quantities);
+            arena.set_wire_metadata(wire_metadata).expect("constructor validates wire metadata");
             let mut keys: Vec<String> = eqs.keys().cloned().collect();
             keys.sort();
             let mut reports = Vec::with_capacity(keys.len());

@@ -28,6 +28,148 @@ from ..research.scientific_integrity import output_dataflow, physical_projection
 
 logger = logging.getLogger(__name__)
 
+DIAG_TOTAL_STEPS = 0
+DIAG_PRESERVED_STEPS = 1
+DIAG_PROJECTED_STEPS = 2
+DIAG_STABILIZED_STEPS = 3
+DIAG_STAB_HITS = 4
+DIAG_MAX_PROJ_DRIFT = 5
+DIAG_STEP_PROJ_DRIFT = 6
+DIAG_STEP_STAB_HITS = 7
+DIAG_SIZE = 8
+
+
+def assert_sealed_observables(before: str, after: str, slots: Collection[int]) -> None:
+    def writes(source):
+        tree = ast.parse(source)
+        aliases = {"buf.data", "state", "data"}
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and ast.unparse(node.value) in aliases:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id not in aliases:
+                            aliases.add(target.id); changed = True
+        result = []
+        dependencies = set()
+        for node in ast.walk(tree):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+            for target in targets:
+                if isinstance(target, ast.Subscript) and ast.unparse(target.value) in aliases:
+                    if not isinstance(target.slice, ast.Constant) or target.slice.value in slots:
+                        result.append(ast.dump(node, include_attributes=False))
+                        dependencies.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+        captured = set()
+        while dependencies - captured:
+            name = (dependencies - captured).pop(); captured.add(name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == name:
+                    result.append(ast.dump(node, include_attributes=False))
+                    dependencies.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+                elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                    result.append(ast.dump(node, include_attributes=False))
+                    dependencies.update(n.id for n in ast.walk(node.value) if isinstance(n, ast.Name))
+        return sorted(result)
+    if slots and writes(before) != writes(after): raise ValueError("T-FORBID-RECALIBRATION: sealed observable or parameter write changed")
+
+
+def instrument_purity(code: str) -> str:
+    tree = ast.parse(code)
+    marker = "_invar_purity_mark"
+    tree.body = [node for node in tree.body if not isinstance(node, ast.FunctionDef) or node.name not in {marker, "_invar_purity_value"}]
+    if any(isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "buf" and node.attr == "diag" for node in ast.walk(tree)):
+        raise ValueError("purity diagnostics are runtime-owned")
+    if not any(isinstance(n, ast.FunctionDef) and n.name == marker for n in tree.body):
+        helper = '''
+def _invar_purity_mark(buf, before, after, stabilizer):
+    drift = abs(after-before)
+    if not math.isfinite(before) or not math.isfinite(after):
+        drift = 1e300
+    if stabilizer and before != after:
+        buf.diag[4] = buf.diag[4]+1.0
+        buf.diag[7] = 1.0
+    if not stabilizer:
+        buf.diag[6] = max(buf.diag[6], drift)
+'''
+        tree.body[0:0] = ast.parse(helper).body
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("_invar_purity_"): continue
+        if not fn.args.args or fn.args.args[0].arg != "buf": continue
+        stabilizer = fn.name.startswith("_invar_stabilize")
+        projection = fn.name.startswith(("_invar_project", "_invar_enforce"))
+        class Instrument(ast.NodeTransformer):
+            def visit_FunctionDef(self, node): return node
+            def visit_AugAssign(self, node):
+                old = copy.deepcopy(node.target); old.ctx = ast.Load()
+                return self.visit_Assign(ast.copy_location(ast.Assign(targets=[node.target], value=ast.BinOp(left=old, op=node.op, right=node.value)), node))
+            def visit_Assign(self, node):
+                if len(node.targets) != 1: return node
+                target = node.targets[0]
+                if not isinstance(target, ast.Subscript) or ast.unparse(target.value) not in {"buf.data", "state"}: return node
+                if isinstance(node.value, ast.Call) and _call_name(node.value.func) == "_invar_purity_value": return node
+                if stabilizer or projection:
+                    old = copy.deepcopy(target); old.ctx = ast.Load()
+                    value = ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                        args=[ast.Name(id="buf", ctx=ast.Load()), old, node.value, ast.Constant(float(stabilizer))], keywords=[])
+                    return ast.copy_location(ast.Assign(targets=node.targets, value=value), node)
+                target_src = ast.unparse(target)
+                clamps = [c for c in ast.walk(node.value) if isinstance(c, ast.Call) and _call_name(c.func) in {"min", "max", "clamp", "clip"}]
+                if not clamps: return node
+                if any(target_src in ast.unparse(c) for c in clamps):
+                    old = copy.deepcopy(target); old.ctx = ast.Load()
+                    value = ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                        args=[ast.Name(id="buf", ctx=ast.Load()), old, node.value, ast.Constant(0.0)], keywords=[])
+                    return ast.copy_location(ast.Assign(targets=node.targets, value=value), node)
+                # Guarded domain clamp inside a derived expression (e.g. math.log(max(x, 1e-300))):
+                # instrument the clamp itself against its non-constant argument rather than the
+                # previous step's slot value.
+                class _InstrumentClamp(ast.NodeTransformer):
+                    def visit_Call(self, cnode):
+                        if _call_name(cnode.func) == "_invar_purity_value":
+                            return cnode
+                        self.generic_visit(cnode)
+                        if _call_name(cnode.func) in {"min", "max", "clamp", "clip"} and len(cnode.args) >= 2:
+                            non_const = [a for a in cnode.args if not isinstance(a, ast.Constant)]
+                            if len(non_const) == 1:
+                                raw_arg = copy.deepcopy(non_const[0])
+                                return ast.copy_location(
+                                    ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                                        args=[ast.Name(id="buf", ctx=ast.Load()), raw_arg, cnode, ast.Constant(0.0)], keywords=[]),
+                                    cnode,
+                                )
+                        return cnode
+                new_val = _InstrumentClamp().visit(copy.deepcopy(node.value))
+                return ast.copy_location(ast.Assign(targets=node.targets, value=new_val), node)
+        transform = Instrument()
+        fn.body = [transform.visit(statement) for statement in fn.body]
+    if not any(isinstance(n, ast.FunctionDef) and n.name == "_invar_purity_value" for n in tree.body):
+        tree.body[0:0] = ast.parse('''
+def _invar_purity_value(buf, before, after, stabilizer):
+    _invar_purity_mark(buf, before, after, stabilizer)
+    return after
+''').body
+    if not any(isinstance(n, ast.Import) and any(a.name == "math" and a.asname in {None, "math"} for a in n.names) for n in tree.body):
+        tree.body.insert(0, ast.Import(names=[ast.alias(name="math")]))
+    helpers = [next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name) for name in (marker, "_invar_purity_value")]
+    tree.body = [n for n in tree.body if n not in helpers]
+    position = next((i for i,n in enumerate(tree.body) if isinstance(n, ast.FunctionDef)), len(tree.body))
+    tree.body[position:position] = helpers
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+def purity_audit_from_diag(diag, *, domain_tag, static_purity_passed, violations=()):
+    from ..research.meaningfulness import PurityAudit
+    if len(diag) != DIAG_SIZE or any(not math.isfinite(v) or v < 0 for v in diag):
+        raise ValueError("invalid per-step purity diagnostics")
+    counts = [int(v) for v in diag[:5]]
+    if any(a != b for a, b in zip(counts, diag[:5])): raise ValueError("purity counters must be integral")
+    total, preserved, projected, stabilized, hits = counts
+    return PurityAudit(static_purity_passed=static_purity_passed, violations=tuple(violations),
+        runtime_stabilizer_hits=hits, runtime_max_proj_residual=diag[DIAG_MAX_PROJ_DRIFT],
+        total_steps=total, preserved_steps=preserved, projected_steps=projected, stabilized_steps=stabilized,
+        enforcement_ratio=(projected+stabilized)/max(1,total), domain_tag=domain_tag)
+
 MATH_FUNCS = {
     "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
     "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
@@ -1466,18 +1608,19 @@ def _domain_guarded_call(node: ast.Call, eps: float) -> Optional[ast.Call]:
     if name not in {"math.log", "math.sqrt", "math.asin", "math.acos"} or not node.args:
         return None
     arg = node.args[0]
+    const_val = float(arg.value) if isinstance(arg, ast.Constant) and type(arg.value) in (int, float) else None
     if name == "math.log":
-        if _is_guarded_log(arg):
+        if (const_val is not None and const_val > 0.0) or _is_guarded_log(arg):
             return None
         guarded = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                            args=[arg, _num(eps)], keywords=[])
     elif name == "math.sqrt":
-        if _is_guarded_sqrt(arg):
+        if (const_val is not None and const_val >= 0.0) or _is_guarded_sqrt(arg):
             return None
         guarded = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                            args=[arg, _num(0.0)], keywords=[])
     else:
-        if _is_guarded_unit_interval(arg):
+        if (const_val is not None and -1.0 <= const_val <= 1.0) or _is_guarded_unit_interval(arg):
             return None
         inner = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                          args=[arg, _num(-1.0)], keywords=[])
@@ -9744,6 +9887,9 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
         if not isinstance(raw, dict):
             continue
         op = str(raw.get("op") or "")
+        if op in {"RECALIBRATE_BOUND", "RELAX_HYPOTHESIS", "REWRITE_OBSERVABLE"}:
+            notes.append("T-FORBID-RECALIBRATION")
+            continue
         snap_op_tree = copy.deepcopy(tree)
         try:
             if op == "INLINE_INTRINSIC":
