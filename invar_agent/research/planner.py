@@ -355,6 +355,7 @@ Each variable/invariant has a dedicated global `buf.data[idx]` slot. Write every
 computed quantity to its exact assigned `buf.data[idx]` slot on every step. NEVER
 branch on `buf.size` or `len(buf.data)` (e.g. `if buf.size > 10:`), and NEVER
 overwrite input parameter slots (`N_cells`, `P_cell`, etc.) with output observables.
+Implement exact mathematical formulas cleanly without ad-hoc smoothing epsilons (e.g. NEVER write `math.log(x + 1e-12)` or `math.sqrt(x + 1e-12)` for `log(x)`/`sqrt(x)`) and use closed-form analytic derivatives/Jacobians instead of finite-difference steps (`h = 1e-5`).
 No markdown fences, no <think> blocks. Output JSON only.
 
 ## Feasibility context (authoritative)
@@ -523,11 +524,17 @@ ONE strict JSON object with two keys: "feasibility" and "blueprint".
 ## Part 1 — feasibility (gate)
 Classify the request into EXACTLY ONE verdict:
 - OPTIMAL_DIRECT: quantitative, mathematical, physical, dynamical or algorithmic
-  research falsifiable by simulation.
+  research falsifiable by simulation, INCLUDING requests that ask to formally
+  test, analyze, or audit a falsifiable hypothesis against governing laws (even
+  if you expect the hypothesis to be refuted/falsified — NEVER refuse a
+  consistent testable hypothesis; emit OPTIMAL_DIRECT and keep the hypothesis
+  intact so the formal falsification certifier can prove VERIFIED_FALSIFICATION).
 - REFORMULATED_SURROGATE: too large for full-scale local execution but admits a
   rigorous reduced-order / 0D-1D asymptotic / scaling-law surrogate.
-- REFUSED_IMPOSSIBLE: mathematically, physically or logically impossible
-  (conservation-law violations, undecidable, contradictory invariants).
+- REFUSED_IMPOSSIBLE: ONLY when the request's own environmental assumptions are
+  mutually contradictory (e.g. requiring a single parameter to satisfy T >= 500 K
+  and T <= 300 K simultaneously), or asks to build/fabricate a perpetual-motion
+  device rather than formally test a hypothesis.
 - REFUSED_UNSUITABLE: subjective/qualitative/historical/clinical/literary tasks
   without falsifiable governing equations, or requiring forbidden sandbox ops.
 For REFORMULATED_SURROGATE, the "reformulation" field MUST name the exact
@@ -559,6 +566,7 @@ max 64) and steps <= 20000. initial_state must encode the physical state of the
 surrogate model, never a repeating dummy vector. Keep code_template concise
 (<= 80 lines of scalar Python implementing the primary reference integrator in
 simulation_step; do not embed duplicate Euler/RK4 state copies inside simulation_step).
+Implement exact mathematical formulas cleanly without ad-hoc smoothing epsilons (NEVER write `math.log(x + 1e-12)` or `math.sqrt(x + 1e-12)` for `log(x)`/`sqrt(x)`) and use closed-form analytic derivatives/Jacobians instead of finite-difference steps (`h = 1e-5`).
 If the verdict is REFORMULATED_SURROGATE, implement exactly the surrogate equations named in the
 reformulation.
 
@@ -1260,7 +1268,9 @@ def _materialize_initial_state_bounds(contracts: List[Dict[str, Any]]) -> None:
 def canonicalize_contract_dicts(
         contracts: List[Dict[str, Any]],
         variable_map: Optional[Dict[str, int]] = None,
-        prior_contracts: Optional[List[Dict[str, Any]]] = None
+        prior_contracts: Optional[List[Dict[str, Any]]] = None,
+        *,
+        preserve_mapped_slots: bool = False,
         ) -> tuple[List[Dict[str, Any]], Dict[str, int], List[str]]:
     """Deterministically give every named observable one unique state slot.
 
@@ -1500,6 +1510,8 @@ def canonicalize_contract_dicts(
                 # under compatible equality/sum targets (even if testing different initial states
                 # or sub-intervals). Never clone it to an uncomputed phantom slot outside `variable_map`.
                 return False
+        if preserve_mapped_slots and slot_idx in set(vm.values()):
+            return False
         prev_t = slot_eq_target.get(slot_idx)
         prev_sum = slot_sum_target.get(slot_idx)
         prev_lo = slot_lower.get(slot_idx)
@@ -2023,7 +2035,7 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             out["code_template"] = new_code
             out["contracts"] = new_contracts
         out["contracts"], out["variable_map"], _ = canonicalize_contract_dicts(
-            out["contracts"], out.get("variable_map"))
+            out["contracts"], out.get("variable_map"), preserve_mapped_slots=bool(out.get("typed_slots")))
         # If the LLM emitted >= 3 contracts all tagged stage 1 (e.g. stage1_...
         # or c1_...) while requesting multi-stage verification, partition them
         # across c1_, c2_, c3_ so each research stage has dedicated contracts.
@@ -2153,9 +2165,39 @@ def _reconcile_time_horizon(
 
 
 def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
+    from . import meaningfulness as m
     from .formal_evidence import attach_formal_evidence
     from .ihcg_derivation import derive_ihcg_evidence
     blueprint = ResearchBlueprint.model_validate(normalize_blueprint_payload(payload))
+    if blueprint.typed_slots:
+        for idx, raw_slot in enumerate(blueprint.typed_slots):
+            slot_dict = raw_slot.model_dump(exclude_none=True) if hasattr(raw_slot, "model_dump") else dict(raw_slot)
+            check = {k: v for k, v in slot_dict.items() if k not in {"value", "prompt_symbol"}}
+            if check.get("slot_idx") is None:
+                sym = check.get("symbol")
+                resolved_idx = blueprint.variable_map.get(sym)
+                if resolved_idx is None:
+                    raise ValueError(
+                        f"typed_slots[{idx}] symbol {sym!r} has no slot_idx and is missing from "
+                        f"variable_map (keys={sorted(blueprint.variable_map)})"
+                    )
+                check["slot_idx"] = resolved_idx
+            spec_obj = m.SlotSpec.model_validate_json(json.dumps(check, allow_nan=False))
+            if spec_obj.stochastic_role and spec_obj.role != "CONTROL_PARAM":
+                raise ValueError(
+                    f"typed_slots[{idx}] ({spec_obj.symbol!r}): stochastic_role={spec_obj.stochastic_role!r} "
+                    f"requires role='CONTROL_PARAM' (got role={spec_obj.role!r})"
+                )
+        mapped_indices = {v for v in blueprint.variable_map.values() if isinstance(v, int)}
+        if mapped_indices:
+            for contract in blueprint.contracts:
+                for inv in contract.invariants:
+                    for idx_str in re.findall(r"(?:state|buf\.data|data)\[(\d+)\]", str(inv.assertion or "")):
+                        if int(idx_str) not in mapped_indices:
+                            raise ValueError(
+                                f"contract {contract.contract_id} invariant references state[{idx_str}] "
+                                f"which is not in variable_map (mapped_indices={sorted(mapped_indices)})"
+                            )
     if blueprint.ihcg_evidence is not None:
         pack = derive_ihcg_evidence(blueprint.research_prompt or blueprint.falsifiable_hypothesis,blueprint.model_dump(),blueprint.ihcg_evidence)
         blueprint = blueprint.model_copy(update={'ihcg_evidence':pack})
@@ -2189,7 +2231,7 @@ def _fill(template: str, **values: Any) -> str:
 def _blueprint_tools_context(fallback):
     if fallback: return TOOLS_CONTEXT
     head, rest = TOOLS_CONTEXT.split('## Formal evidence at ingest', 1)
-    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Include typed_slots: an array of {symbol, si_dim: seven integer SI exponents, role: CONTROL_PARAM|DYNAMIC_STATE|DERIVED_OBSERVABLE|CONSERVATION_AUX}, with optional semantic_tag, unit_scale and prompt_symbol (the exact original prompt identifier when renamed). Indices are derived from variable_map. Only genuinely fixed CONTROL_PARAM constants may include a literal value; never freeze a free parameter at initial_state. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis, not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
+    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Include typed_slots: an array of {symbol, si_dim: seven integer SI exponents, role: CONTROL_PARAM|DYNAMIC_STATE|DERIVED_OBSERVABLE|CONSERVATION_AUX}, with optional semantic_tag, stochastic_role (UNIFORM|SEED|COUNTER|CHANNEL for MONTE_CARLO slots), unit_scale ([positive_int_num, positive_int_den], default [1, 1], never 0) and prompt_symbol (the exact original prompt identifier when renamed). Keep variable_map and typed_slots compact (at most 24 slots; the formal verifier enforces a hard cap of 32 bounded variables). NEVER write to any CONTROL_PARAM slot inside simulation_step (any computed parameter such as beta = R0 * gamma must have role="DERIVED_OBSERVABLE"). Declare every dimensional physical constant (e.g. k_B in J/K, eV_to_J, c, h, G) as a typed CONTROL_PARAM slot with its exact si_dim rather than hardcoding a bare numeric literal in formulas. Indices are derived from variable_map. Only genuinely fixed CONTROL_PARAM constants may include a literal value; never freeze a free parameter at initial_state. Contract invariants MUST reference only state[i] / buf.data[i] bound in variable_map (never telemetry["finite"], which Sandbox_Execute already enforces unconditionally). For ODE/dynamical kernels, write pure branch-free smooth RK4 updates with ZERO defensive clamping (`if x < 0: x = 0`, `max(0.0, ...)`) and ZERO `if t == 0:` guards (running peak `if x > buf.data[k]: buf.data[k] = x` on a TRAJECTORY_MAX slot is allowed). For fixed-point equilibrium problems (`FIXED_POINT`), write a pure branch-free `simulation_step` that evaluates the equilibrium residual vector `g(x)` (and any algebraic readouts) directly at `buf.data` — the engine automatically runs Newton, Krawczyk existence/uniqueness, Hurwitz interval stability, and IFT sensitivity. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis expressed directly on the governing physical/mathematical observable slot (e.g. `state[eta_idx] >= 0.65`, NEVER a proxy counter like `feasible_count >= 1.0`), not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
 
 
 async def _finish_planned_blueprint(payload, question, *, fallback, complete):
@@ -2813,6 +2855,8 @@ async def generate_plan_with_feasibility(question: str,
                     data = data2
         elif is_computational_dynamical_benchmark(question):
             feasibility = override_refusal_for_computational_benchmark(question, feasibility)
+            if feasibility.verdict in (FeasibilityVerdict.REFUSED_IMPOSSIBLE, FeasibilityVerdict.REFUSED_UNSUITABLE):
+                return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
             if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
                 surrogate_prompt = (
                     prompt

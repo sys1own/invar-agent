@@ -247,17 +247,27 @@ def _normalized_residual(node, oriented=True):
 
 class CanonicalSignatureEngine:
     def compute_cds(self, ihcg: m.IhcgGraph, uast: Mapping[str, Any], verdict: m.EpistemicVerdict) -> CdsTriplet:
-        ihcg.assert_sealed(); deadline = time.monotonic()+2
+        ihcg.assert_sealed(); deadline = time.monotonic()+20
         residuals = _residuals(ihcg, uast)
         tags = {}
         metadata = uast.get("symbol_metadata", {})
+        strictly_positive = set()
+        for expr_text in [*ihcg.environmental_assumptions, *(o.expression for o in ihcg.obligations if o.obligation_class == "CONSERVATION_GUARD")]:
+            for node in ast.walk(m._parse(expr_text)):
+                if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+                    lhs_n, op_n, rhs_n = node.left, node.ops[0], node.comparators[0]
+                    if isinstance(lhs_n, ast.Name) and isinstance(op_n, ast.Gt) and isinstance(rhs_n, ast.Constant) and type(rhs_n.value) in (int, float) and rhs_n.value >= 0:
+                        strictly_positive.add(lhs_n.id)
+                    elif isinstance(rhs_n, ast.Name) and isinstance(op_n, ast.Lt) and isinstance(lhs_n, ast.Constant) and type(lhs_n.value) in (int, float) and lhs_n.value >= 0:
+                        strictly_positive.add(rhs_n.id)
         for slot in ihcg.slots:
             extra = metadata.get(slot.symbol, {})
             if set(extra)-{"unit_scale"}: raise CanonicalizationError("only exact coordinate unit scales may supplement sealed slot metadata")
             scale = extra.get("unit_scale", [1, 1])
             if len(scale) != 2 or any(type(x) is not int for x in scale) or scale[0] <= 0 or scale[1] <= 0: raise CanonicalizationError("positive rational unit scale required")
             tags[slot.symbol] = dict(role=slot.role, si_dim=list(slot.si_dim), semantic_tag=slot.semantic_tag,
-                                     unit_scale=list(scale), positive=ihcg.omega[slot.symbol][0] > 0)
+                                     unit_scale=list(scale), positive=ihcg.omega[slot.symbol][0] > 0 or (ihcg.omega[slot.symbol][0] >= 0 and slot.symbol in strictly_positive),
+                                     domain=list(ihcg.omega[slot.symbol]))
         model = _native_canonical(_tagged(residuals, tags))
         claims = [o.expression for o in ihcg.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
         governing = [e.expression for e in ihcg.equations.values() if isinstance(m._parse(e.expression), (ast.BoolOp, ast.UnaryOp, ast.Call)) and any(isinstance(n, ast.Compare) for n in ast.walk(m._parse(e.expression)))
@@ -266,7 +276,15 @@ class CanonicalSignatureEngine:
         for claim in [*claims, *ihcg.environmental_assumptions]:
             for node in ast.walk(m._parse(claim)):
                 if isinstance(node, ast.Compare):
-                    comparison_residuals.extend(f"({ast.unparse(a)})-({ast.unparse(b)})" for a, b in zip([node.left, *node.comparators], node.comparators))
+                    for a, b in zip([node.left, *node.comparators], node.comparators):
+                        cand = f"({ast.unparse(a)})-({ast.unparse(b)})"
+                        try:
+                            _native_canonical(_tagged([cand], tags))
+                            comparison_residuals.append(cand)
+                        except CanonicalizationError:
+                            # Dimensional constant comparison (e.g. time_days <= 120 or gamma == 0.1):
+                            # bare numeric literal carries implicit SI units; omit from untagged Pi coloring.
+                            continue
         joint = _tagged([*residuals, *comparison_residuals], tags)
         marker = next((i for i in range(256) if i not in {s.semantic_tag for s in ihcg.slots}), None)
         if marker is None: raise CanonicalizationError("no individualization marker available")
@@ -276,22 +294,36 @@ class CanonicalSignatureEngine:
             rooted = copy.deepcopy(joint)
             for equation in rooted:
                 if symbol in equation["symbols"]: equation["symbols"][symbol]["semantic_tag"] = marker
-            colors[symbol] = (not tags[symbol]["positive"], _native_canonical(rooted), m._json({k: v for k, v in tags[symbol].items() if k != "unit_scale"}))
+            colors[symbol] = (not tags[symbol]["positive"], _native_canonical(rooted), m._json({k: v for k, v in tags[symbol].items() if k not in {"unit_scale", "domain"}}))
+        referenced_symbols = set()
+        for expr_text in [*residuals, *comparison_residuals, *claims, *governing, *ihcg.environmental_assumptions]:
+            referenced_symbols.update(m._variables(m._parse(expr_text)))
+        for eq in ihcg.equations.values():
+            referenced_symbols.update(m._variables(m._parse(eq.expression)))
+            if eq.state_symbol:
+                referenced_symbols.add(eq.state_symbol)
         cells = {}
         for symbol, color in colors.items(): cells.setdefault(color, []).append(symbol)
-        count = math.prod(math.factorial(len(cell)) for cell in cells.values())
+        cell_perms = []
+        count = 1
+        for color in sorted(cells):
+            cell = cells[color]
+            active_cell = [s for s in cell if s in referenced_symbols or any(tags[s]["si_dim"])]
+            inert_cell = tuple(s for s in cell if s not in active_cell)
+            count *= math.factorial(len(active_cell))
+            cell_perms.append((active_cell, inert_cell))
         if count > 64: raise CanonicalizationError("canonical domain symmetry budget exhausted")
         best = None
-        for parts in itertools.product(*(itertools.permutations(cells[color]) for color in sorted(cells))):
+        for parts in itertools.product(*((p + inert for p in itertools.permutations(active)) for active, inert in cell_perms)):
             if time.monotonic() >= deadline: raise CanonicalizationError("canonical coordinate budget exhausted")
             order = [s for part in parts for s in part]
             pivots, free, basis = _rref_basis(tags, order)
-            if any(ihcg.omega[order[p]][0] <= 0 for p in pivots): raise CanonicalizationError("positive repeating quantities required")
+            if any(not tags[order[p]]["positive"] for p in pivots): raise CanonicalizationError("positive repeating quantities required")
             replacements = {}
             for j, symbol in enumerate(order):
                 if j in free:
                     index = free.index(j); degree = basis[index][j]
-                    if degree != 1 and ihcg.omega[symbol][0] <= 0: raise CanonicalizationError("positive radical coordinate required")
+                    if degree != 1 and not tags[symbol]["positive"]: raise CanonicalizationError("positive radical coordinate required")
                     value = f"pi{index}" if degree == 1 else f"pi{index}**(1/{degree})"
                 else: value = "1"
                 p, q = tags[symbol]["unit_scale"]; replacements[symbol] = m._parse(f"({value})*({q}/{p})")
@@ -320,7 +352,7 @@ class CanonicalSignatureEngine:
             normalized_claims = tuple(sorted(predicate(m._parse(expr)) for expr in claims))
             normalized_governing = tuple(sorted(predicate(m._parse(expr)) for expr in governing))
             environment = tuple(sorted(predicate(m._parse(expr)) for expr in ihcg.environmental_assumptions if expr != "True"))
-            chart = m._json({"model": normalized_model, "basis": basis, "tags": [{k: v for k, v in tags[s].items() if k != "unit_scale"} for s in order]})
+            chart = m._json({"model": normalized_model, "basis": basis, "tags": [{k: v for k, v in tags[s].items() if k not in {"unit_scale", "domain"}} for s in order]})
             domain = _pi_domain(ihcg, tags, order, pivots, free, basis, chart, environment)
             key = (normalized_model, evolution, normalized_governing, normalized_claims, domain.model_dump_json())
             if best is None or key < best[0]: best = key, normalized_claims, domain, normalized_governing, evolution

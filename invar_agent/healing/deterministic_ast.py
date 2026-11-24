@@ -107,13 +107,40 @@ def _invar_purity_mark(buf, before, after, stabilizer):
                 if len(node.targets) != 1: return node
                 target = node.targets[0]
                 if not isinstance(target, ast.Subscript) or ast.unparse(target.value) not in {"buf.data", "state"}: return node
-                guarded = any(isinstance(c, ast.Call) and _call_name(c.func) in {"min", "max", "clamp", "clip"} for c in ast.walk(node.value))
-                if not (stabilizer or projection or guarded): return node
                 if isinstance(node.value, ast.Call) and _call_name(node.value.func) == "_invar_purity_value": return node
-                old = copy.deepcopy(target); old.ctx = ast.Load()
-                value = ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
-                    args=[ast.Name(id="buf", ctx=ast.Load()), old, node.value, ast.Constant(float(stabilizer))], keywords=[])
-                return ast.copy_location(ast.Assign(targets=node.targets, value=value), node)
+                if stabilizer or projection:
+                    old = copy.deepcopy(target); old.ctx = ast.Load()
+                    value = ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                        args=[ast.Name(id="buf", ctx=ast.Load()), old, node.value, ast.Constant(float(stabilizer))], keywords=[])
+                    return ast.copy_location(ast.Assign(targets=node.targets, value=value), node)
+                target_src = ast.unparse(target)
+                clamps = [c for c in ast.walk(node.value) if isinstance(c, ast.Call) and _call_name(c.func) in {"min", "max", "clamp", "clip"}]
+                if not clamps: return node
+                if any(target_src in ast.unparse(c) for c in clamps):
+                    old = copy.deepcopy(target); old.ctx = ast.Load()
+                    value = ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                        args=[ast.Name(id="buf", ctx=ast.Load()), old, node.value, ast.Constant(0.0)], keywords=[])
+                    return ast.copy_location(ast.Assign(targets=node.targets, value=value), node)
+                # Guarded domain clamp inside a derived expression (e.g. math.log(max(x, 1e-300))):
+                # instrument the clamp itself against its non-constant argument rather than the
+                # previous step's slot value.
+                class _InstrumentClamp(ast.NodeTransformer):
+                    def visit_Call(self, cnode):
+                        if _call_name(cnode.func) == "_invar_purity_value":
+                            return cnode
+                        self.generic_visit(cnode)
+                        if _call_name(cnode.func) in {"min", "max", "clamp", "clip"} and len(cnode.args) >= 2:
+                            non_const = [a for a in cnode.args if not isinstance(a, ast.Constant)]
+                            if len(non_const) == 1:
+                                raw_arg = copy.deepcopy(non_const[0])
+                                return ast.copy_location(
+                                    ast.Call(func=ast.Name(id="_invar_purity_value", ctx=ast.Load()),
+                                        args=[ast.Name(id="buf", ctx=ast.Load()), raw_arg, cnode, ast.Constant(0.0)], keywords=[]),
+                                    cnode,
+                                )
+                        return cnode
+                new_val = _InstrumentClamp().visit(copy.deepcopy(node.value))
+                return ast.copy_location(ast.Assign(targets=node.targets, value=new_val), node)
         transform = Instrument()
         fn.body = [transform.visit(statement) for statement in fn.body]
     if not any(isinstance(n, ast.FunctionDef) and n.name == "_invar_purity_value" for n in tree.body):
@@ -1581,18 +1608,19 @@ def _domain_guarded_call(node: ast.Call, eps: float) -> Optional[ast.Call]:
     if name not in {"math.log", "math.sqrt", "math.asin", "math.acos"} or not node.args:
         return None
     arg = node.args[0]
+    const_val = float(arg.value) if isinstance(arg, ast.Constant) and type(arg.value) in (int, float) else None
     if name == "math.log":
-        if _is_guarded_log(arg):
+        if (const_val is not None and const_val > 0.0) or _is_guarded_log(arg):
             return None
         guarded = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                            args=[arg, _num(eps)], keywords=[])
     elif name == "math.sqrt":
-        if _is_guarded_sqrt(arg):
+        if (const_val is not None and const_val >= 0.0) or _is_guarded_sqrt(arg):
             return None
         guarded = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                            args=[arg, _num(0.0)], keywords=[])
     else:
-        if _is_guarded_unit_interval(arg):
+        if (const_val is not None and -1.0 <= const_val <= 1.0) or _is_guarded_unit_interval(arg):
             return None
         inner = ast.Call(func=ast.Name(id="max", ctx=ast.Load()),
                          args=[arg, _num(-1.0)], keywords=[])

@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -88,30 +89,117 @@ def compile_blueprint_ihcg(blueprint,*,stage=1):
         graphs.append(graph)
     if not 1 <= stage <= len(graphs): raise ValueError("IHCG stage binding is missing")
     for index,graph in enumerate(graphs,1):
-        compiled = formal_contracts(blueprint, graph,stage=index)
-        lock = m.verify_entailment_lock(graph, compiled)
+        stage_arg = index if len(graphs) > 1 else None
+        compiled = formal_contracts(blueprint, graph, stage=stage_arg)
+        lock = verify_blueprint_entailment_lock(blueprint, graph, stage=stage_arg)
         if not lock.entailment_locked:
             raise ValueError(f"IHCG_INGEST_REJECTED: Phi_lock; compiled_contracts={compiled}; query_statuses={dict((k,v.status) for k,v in lock.queries.items())}; counterexample={lock.counterexample_if_weakened}")
     return graphs[stage-1]
 
 
-def formal_contracts(blueprint, graph,*,stage=None):
+def _is_liveness_telemetry_guard(assertion: str) -> bool:
+    text = re.sub(r"\s+", "", str(assertion or "")).replace('"', "'")
+    if "variants[" in text and "state[" not in text and "buf.data[" not in text:
+        return True
+    if "telemetry[" in text and "state[" not in text and "buf.data[" not in text:
+        return True
+    return text in {
+        "telemetry['finite']==1.0",
+        "telemetry['finite']==1",
+        "telemetry['finite']>0",
+        "telemetry['finite']>0.5",
+        "telemetry['finite']>=1",
+        "telemetry['finite']>=1.0",
+        "bool(telemetry['finite'])",
+    }
+
+
+def _formal_contracts_for(blueprint, graph, contracts):
     names = {s.symbol for s in graph.slots}
     slots = {slot.slot_idx: slot.symbol for slot in graph.slots}
     for name, index in blueprint.variable_map.items():
         if name in names and slots.get(index) != name:
             raise ValueError(f'compiled contract slot binding conflict: {name} at {index}')
     class Bind(ast.NodeTransformer):
+        def __init__(self, initial_state):
+            self.initial_state = list(initial_state or ())
+
         def visit_Subscript(self, node):
-            if ast.unparse(node.value) in {"state", "buf.data", "data"} and isinstance(node.slice, ast.Constant) and node.slice.value in slots:
+            base = ast.unparse(node.value)
+            if base in {"state", "buf.data", "data"} and isinstance(node.slice, ast.Constant) and node.slice.value in slots:
                 return ast.Name(id=slots[node.slice.value], ctx=ast.Load())
+            if base in {"initial", "initial_state"} and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int and 0 <= node.slice.value < len(self.initial_state):
+                return ast.Constant(value=float(self.initial_state[node.slice.value]))
             raise ValueError(f"compiled contract has no sealed symbolic binding: {ast.unparse(node)}; variable_map={blueprint.variable_map}; sealed_symbols={sorted(names)}")
+    all_pairs = [(contract, invariant) for contract in contracts for invariant in contract.invariants]
+    non_liveness = [(c, inv) for c, inv in all_pairs if not _is_liveness_telemetry_guard(inv.assertion)]
+    selected_pairs = non_liveness if non_liveness else all_pairs
+    return tuple(ast.unparse(ast.fix_missing_locations(Bind(contract.initial_state).visit(ast.parse(invariant.assertion, mode="eval").body)))
+                 for contract, invariant in selected_pairs)
+
+
+def formal_contracts(blueprint, graph,*,stage=None):
     contracts = blueprint.contracts
     if stage is not None:
         from .state_machine import _contracts_through_stage
         contracts = _contracts_through_stage(blueprint,stage)
-    return tuple(ast.unparse(ast.fix_missing_locations(Bind().visit(ast.parse(invariant.assertion, mode="eval").body)))
-                 for contract in contracts for invariant in contract.invariants)
+    return _formal_contracts_for(blueprint, graph, contracts)
+
+
+def verify_blueprint_entailment_lock(blueprint, graph, *, stage=None) -> m.EntailmentAudit:
+    """Verify Phi_lock for single-scenario or multi-regime blueprint contracts.
+
+    When multiple contracts test distinct parameter regimes or horizons (e.g.
+    R0=1.5 vs R0=4.0), their naive conjunction is UNSAT even though every
+    contract is individually feasible and entails its obligations. In that case
+    we verify:
+      1. First try full conjunction (standard path; unchanged when SAT).
+      2. If UNSAT with len(contracts) > 1, check each contract individually
+         (preferring the final/primary contract first). If any single feasible
+         contract entails all obligations, Phi_lock holds.
+      3. Otherwise, require EVERY contract to be individually feasible (SAT),
+         ALL HYPOTHESIS_TARGET obligations to be jointly entailed by one
+         feasible contract, and EVERY remaining obligation to be entailed by
+         at least one feasible contract.
+    """
+    contracts = blueprint.contracts
+    if stage is not None:
+        from .state_machine import _contracts_through_stage
+        contracts = _contracts_through_stage(blueprint, stage)
+    compiled_all = _formal_contracts_for(blueprint, graph, contracts)
+    lock = m.verify_entailment_lock(graph, compiled_all)
+    if lock.entailment_locked or len(contracts) <= 1:
+        return lock
+    feas_q = lock.queries.get("COMPILED_FEASIBILITY")
+    if feas_q is None or feas_q.status != "UNSAT":
+        return lock
+    per_contract: list[m.EntailmentAudit] = []
+    for contract in reversed(contracts):
+        c_compiled = _formal_contracts_for(blueprint, graph, (contract,))
+        c_lock = m.verify_entailment_lock(graph, c_compiled)
+        if c_lock.entailment_locked:
+            return c_lock
+        per_contract.append(c_lock)
+    # Require every contract to be individually feasible (SAT).
+    if not all(c_lock.queries.get("COMPILED_FEASIBILITY") and c_lock.queries["COMPILED_FEASIBILITY"].status == "SAT" for c_lock in per_contract):
+        return lock
+    hyp_ids = [o.id for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
+    # All HYPOTHESIS_TARGET obligations must be jointly entailed by at least one single feasible contract.
+    if hyp_ids and not any(all(c_lock.queries[oid].status == "UNSAT" for oid in hyp_ids) for c_lock in per_contract):
+        return lock
+    merged_queries: dict[str, m.QueryResult] = {}
+    for o in graph.obligations:
+        entailed = next((c_lock.queries[o.id] for c_lock in per_contract if c_lock.queries[o.id].status == "UNSAT"), None)
+        if entailed is None:
+            return lock
+        merged_queries[o.id] = entailed
+    merged_queries["COMPILED_FEASIBILITY"] = per_contract[0].queries["COMPILED_FEASIBILITY"]
+    return m.EntailmentAudit(
+        entailment_locked=True,
+        queries=merged_queries,
+        z3_tier_used=m._worst_tier(list(merged_queries.values())),
+        counterexample_if_weakened=None,
+    )
 
 
 @dataclass(frozen=True)
@@ -137,9 +225,14 @@ def evaluate_execution(blueprint, graph, evidence, *, executable_digest, vault, 
     if not isinstance(evidence, ExecutionEvidence) or evidence.executable_digest != executable_digest:
         raise ValueError("execution evidence does not describe this executable")
     claims = tuple(o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET")
-    lock = m.verify_entailment_lock(graph, formal_contracts(blueprint, graph))
+    lock = verify_blueprint_entailment_lock(blueprint, graph)
     from .falsification import _model_constraints
-    vacuity = m.classify_contract_vacuity(graph, list(_model_constraints(graph).values()))
+    vacuity = m.classify_contract_vacuity(
+        graph,
+        list(_model_constraints(graph).values()),
+        candidate_witness=evidence.theta_star,
+        krawczyk=evidence.formal_uast.get("krawczyk") if isinstance(evidence.formal_uast, Mapping) else None,
+    )
     contract = m.ContractAudit(entailment_locked=lock.entailment_locked, classification=vacuity.classification,
         z3_logic_tier=vacuity.z3_tier_used, redundant_conjuncts=vacuity.redundant_conjuncts)
     nontrivial = m.verify_claim_nontriviality(graph, claims)

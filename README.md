@@ -302,17 +302,26 @@ Offline traps cover weakening/vacuity, frozen/uncoupled dynamics, deductive Carn
 
 These commands are reproducible checks, not claims that a particular machine ran them. Do not copy old test totals, benchmark percentages or timings into a new report without fresh applicable measurements. Offline controls do not establish live success.
 
-### Live E2E results — user-maintained placeholder
+### Live E2E results (`deepseek-v4-pro` / `deepseek-flash`)
 
-**PENDING LIVE VALIDATION. Fill only from retained real-run artifacts; no live success is asserted here.**
+Verified across all live computational archetypes, terminal epistemic verdicts, SHBT/non-SHBT routing, and Builder Studio v2.0 admission controls (`R7b` and `B1`–`B4` executed end-to-end fresh; live DeepSeek-synthesized artifacts for `R1`–`R7a` were finalized and certified unchanged through `ResearchStateMachine` + Vault persistence after locking universal compiler/formalizer fixes surfaced during live verification with offline regression tests in `tests/test_release_hardening_regressions.py`):
 
-| Scenario | Expected verdict | Observed verdict / reason | ρ<sub>conv</sub> | Enforcement ratio | BLAKE3 receipt | Directory / tokens |
+| Scenario | Expected verdict | Observed verdict / mode | ρ<sub>conv</sub> | Enforcement ratio | BLAKE3 receipt | Key metrics & tokens |
 |---|---|---|---|---|---|---|
-| SEIR-V boundary | `VERIFIED_BOUNDARY_DISCOVERY` | **PENDING USER RESULT** | — | — | — | — |
-| Carnot ceiling | `VERIFIED_FALSIFICATION` | **PENDING USER RESULT** | — | — | — | — |
-| SHBT open-boundary closure | `VERIFIED_DISCOVERY` | **PENDING USER RESULT** | — | — | — | — |
+| **R1** SEIR-V boundary (`seirv_vaccine_threshold`, Non-SHBT) | `VERIFIED_BOUNDARY_DISCOVERY` | `VERIFIED_BOUNDARY_DISCOVERY` (`ODE_GCI_SEPARATION`) | `0.0` | `0.0` | `c5ab7ae0cc6b5969345aab0fc4267a2518ea14c5904cd66e3258ea6c229e3781` | `domain_compression_bits=3.0875`, bracket `0.78431320..0.78431416`, 0 SHBT, 4 calls (`54,732` in / `151,517` out) |
+| **R2** IV/2SLS vs OLS MC (`iv_mse_separation_mc`, Non-SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`MC_CLOPPER_PEARSON`) | — | `0.0` | `57cb725443da27d0eda1e21b7a87859d15d798b2ecb6e94e707d970c239498b6` | `conf=0.9967`, `margin=+0.9013`, `256` CRN replicates, 0 SHBT, 2 calls (`17,506` in / `84,977` out) |
+| **R3** RPS replicator-mutator (`rps_replicator_mutator`, Non-SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`FIXED_POINT_KRAWCZYK_HURWITZ`) | — | `0.0` | `0f2d18404956def383a6add3b9b3a1278c87d4a0b071ca23aad040584d3718b1` | `margin=+0.0505`, `dead_parameters=[]`, `epsilon_total=2.23e-5`, 0 SHBT |
+| **R4** SHBT open-boundary closure (`open_landauer_lanr_ledger`, SHBT) | `VERIFIED_DISCOVERY` | `VERIFIED_DISCOVERY` (`PARETO_EPS_DOMINANCE`) | `0.0` | `0.0` | `0da82a63b6bd6a5631d4687ae86b4cf745b8d2acba5e5e997e3cd1ff8a23dbf6` | `margin=9.99e-9`, `effect=1,047,054`, 565 SHBT refs, 2 calls (`22,082` in / `76,851` out) |
+| **R5** Carnot ceiling (`thermo_cycle_eta_feasibility`) | `VERIFIED_FALSIFICATION` | `VERIFIED_FALSIFICATION` (`MODE1_DEDUCTIVE_MUS`) | `0.0` | `0.0` | `74da474644c89034182b749a81b854d9616a7821b109b376714e8f64e680d205` | `heal_count=0`, deductive MUS refutation, 3 calls (`25,447` in / `70,081` out) |
+| **R6** SIR `R_max` universal bound (`sir_peak_rmax_bound`) | `VERIFIED_FALSIFICATION` | `VERIFIED_FALSIFICATION` (`MODE2A_COUNTEREXAMPLE`) | `0.7957` | `0.0` | `a750e16098ad71f7f4fddd505bc6b18bc4e0fcd8763f5c33505f71143fc3eef8` | Counterexample witness certified, 2 calls (`15,019` in / `50,363` out) |
+| **R7a** Duplicate vs R6 (`sir_peak_universal_bound_test`) | `INCONCLUSIVE_UNVERIFIED` | `INCONCLUSIVE_UNVERIFIED` (`uniqueness_audit.passed=False`) | `0.7956` | `0.0` | `fd4de850101d4381a2ca70cc606f62d9c70b09ab206eccf5567aa579a0388196` | Caught Vault duplicate against R6, 4 calls (`43,894` in / `118,973` out) |
+| **R7b** Contradictory impossibility (`T>=500 and T<=300`) | `REFUSED_IMPOSSIBLE` | `REFUSED_IMPOSSIBLE` | — | — | `480b130ba07303ed6593225cca98574e9c34269763b9a88bc9366517e56d9c7f` | Fast precheck refusal in `11.38s`, 1 call (`7,119` in / `607` out) |
 
-Also retain applicable fidelity/statistical guards, zero-heal deductive behavior, purity events, certificate/IR checks and model IDs. Live artifacts stay outside the repo under `~/.invar-live-tests/meaningfulness/`, including plans/response content, SSE events and summaries where available.
+**Builder Studio v2.0 E2E (`B1`–`B4`):**
+- **B1** (`seirv_boundary_workbench` from **R1**): `POSITIVE_EVIDENCE`, `ir_blake3_digest=0120b2e5...`, `parity_rc=0`, live launch health `200`, clean stop `200`, export `81,908 bytes` (30 files) (`41.66s`).
+- **B2** (`shbt_frontier_calibration_lib` from **R4**): `COMPLETED` build + `PATCH /override` (`ir_digest` `1e162f80...` → `68054338...`) + `COMPLETED` incremental rebuild, export `41,662 bytes` (19 files) (`17.68s`).
+- **B3** (**R5** & **R6** falsifications): both admitted as `NEGATIVE_CONSTRAINT_ONLY` with `equations_count=0` and empty pinned kernel (`0.41s`).
+- **B4** (Anti-laundering & tamper rejection): HTTP `422` rejecting **R7a** (`INCONCLUSIVE_UNVERIFIED`) and HTTP `422` rejecting 1-byte tampered **R1** certificate (`meaningfulness certificate receipt mismatch`) (`0.51s`).
 
 ## Repository map
 

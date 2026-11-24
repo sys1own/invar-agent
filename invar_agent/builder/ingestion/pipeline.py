@@ -47,7 +47,7 @@ def reverify_ir(ir: CanonicalResearchIR) -> CanonicalResearchIR:
         checked.is_tunable_parameter = old.is_tunable_parameter
         checked.disambiguated_by_llm = old.disambiguated_by_llm
         checked.verification_status = old.verification_status
-        checked.dimension.semantic_tag = old.dimension.semantic_tag
+        checked.dimension = old.dimension.model_copy(deep=True)
     for old, checked in zip(ir.equations, equations):
         checked.equation_id = old.equation_id
         checked.raw_latex = old.raw_latex
@@ -155,7 +155,7 @@ class CanonicalResearchIngestionPipeline:
         if ir.negative_constraints and not ir.equations and not request.upload_paths:
             ir.research_import_role = "NEGATIVE_CONSTRAINT_ONLY"
             return seal_ir(ir)
-        if ir.meaningfulness_certificates and not request.upload_paths:
+        if ir.meaningfulness_certificates:
             from ...research.epistemic import parse_run_certificate
             certificates = [parse_run_certificate(raw) for raw in ir.meaningfulness_certificates.values()]
             if all(c.epistemic_verdict.value in {"VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY"} for c in certificates):

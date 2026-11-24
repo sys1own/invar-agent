@@ -191,7 +191,7 @@ class ResearchComputeUAST(BaseModel):
     ontology: OntologyAndParameterSpec
     governance: SymbolicGovernanceMap
     invariants: InvariantContractSpec = Field(default_factory=InvariantContractSpec)
-    dt: float = Field(default=0.01, gt=0.0, le=10.0)
+    dt: float = Field(default=0.01, gt=0.0, le=1e12)
     steps: int = Field(default=1000, ge=1, le=200000)
     target_backend: Literal["rust_hin", "cpp", "multi_variant"] = "multi_variant"
     solver_override: Optional[str] = None

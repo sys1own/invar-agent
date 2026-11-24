@@ -173,6 +173,8 @@ class ResearchPlanningFailure:
     status: str = "INCONCLUSIVE_UNVERIFIED"
     epistemic_verdict: str = "INCONCLUSIVE_UNVERIFIED"
     blueprint: None = None
+    feasibility: Any = None
+    report: str = ""
 
 
 def shacl_chiasmus_firewall(code: str) -> List[str]:
@@ -900,6 +902,9 @@ def _format_accretion_exception(exc: BaseException) -> str:
 
 def _contracts_through_stage(bp: ResearchBlueprint, stage: int) -> List[VerificationContract]:
     """Cumulative contracts for stages 1..k (unprefixed contracts are stage 1)."""
+    ev = getattr(bp, "ihcg_evidence", None)
+    if isinstance(ev, dict) and not ev.get("extensions"):
+        return list(bp.contracts or [])
     total = int(getattr(bp, "target_research_stages", 1) or 1)
     if total <= 1 or stage >= total:
         return list(bp.contracts or [])
@@ -1402,7 +1407,8 @@ def _canonicalize_blueprint_slots(bp: ResearchBlueprint) -> None:
     if not contracts:
         return
     new_contracts, vm, notes = canonicalize_contract_dicts(
-        contracts, dict(getattr(bp, "variable_map", None) or {}))
+        contracts, dict(getattr(bp, "variable_map", None) or {}),
+        preserve_mapped_slots=bool(getattr(bp, "ihcg_evidence", None) or getattr(bp, "typed_slots", None)))
     if not notes and vm == dict(getattr(bp, "variable_map", None) or {}):
         return
     bp.contracts = [VerificationContract.model_validate(c) for c in new_contracts]
@@ -1413,7 +1419,13 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
     """Infer missing ``variable_map`` entries from contract constraints and AST
     buffer bindings so report Section 1 and telemetry ``obs_*`` never leave
     contract metrics null."""
-    mapping: Dict[str, int] = dict(getattr(bp, "variable_map", None) or {})
+    mapping: Dict[str, int] = {}
+    ihcg_slots = ((getattr(bp, "ihcg_evidence", None) or {}).get("evidence") or {}).get("slots") or []
+    for s in ihcg_slots:
+        if isinstance(s, dict) and s.get("symbol") and isinstance(s.get("slot_idx"), int):
+            mapping[str(s["symbol"])] = int(s["slot_idx"])
+    for k, v in dict(getattr(bp, "variable_map", None) or {}).items():
+        mapping.setdefault(k, v)
     contracts = getattr(bp, "contracts", None) or []
     for contract in contracts:
         for inv in (getattr(contract, "invariants", None) or []):
@@ -1499,6 +1511,20 @@ def _auto_populate_variable_map(bp: ResearchBlueprint, code_text: str = "") -> N
                         _ias,
                     )
         bp.variable_map = canonical_variable_map(contracts, mapping)
+    ihcg_owned = {
+        int(s["slot_idx"]): str(s["symbol"])
+        for s in ihcg_slots
+        if isinstance(s, dict) and s.get("symbol") and isinstance(s.get("slot_idx"), int)
+    }
+    if ihcg_owned:
+        # Preserve exact IHCG slot symbols against observable_label() suffix stripping (_bound, _window, etc.).
+        preserved_vm: Dict[str, int] = {}
+        for k, v in (bp.variable_map or {}).items():
+            si = int(v)
+            preserved_vm[ihcg_owned.get(si, k)] = si
+        for si, sym in ihcg_owned.items():
+            preserved_vm.setdefault(sym, si)
+        bp.variable_map = preserved_vm
     phys_slots: List[int] = []
     written_slots: set[int] = set()
     try:
@@ -1807,6 +1833,23 @@ class ResearchStateMachine:
             state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
                 state.blueprint.falsifiable_hypothesis, f"FORMAL_EVIDENCE_UNVERIFIED: {error}")
             state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+            err_code = str(error).split(":", 1)[0].strip()
+            recoverable = {
+                "ALGEBRAIC_EXECUTABLE_MISMATCH", "ORACLE_EXECUTABLE_MISMATCH",
+                "ORACLE_OUTPUT_UNBOUND", "ORACLE_INPUT_WRITE", "T_CONST_PARAM_WRITE",
+                "PIECEWISE_ORACLE_UNBINDABLE", "ORACLE_DIMENSION_MISMATCH",
+                "ORACLE_STABILIZER_HIT", "ROUNDING_PROGRAM_UNBOUND",
+                "ROUNDING_DENOMINATOR_NOT_SEPARATED", "RIGOROUS_ROUNDING_BOUND_UNAVAILABLE",
+            }
+            if phase == "post_execution" and err_code in recoverable and state.heal_count < 2:
+                from .meaningfulness import RouteDecision
+                heal_reason = f"EXECUTABLE_IHCG_MISMATCH: {error}"
+                await self._emit("accelerator_log", "epistemic_route", {
+                    "action": "REFLEX_HEAL", "halt_healing": False,
+                    "epistemic_verdict": state.epistemic_verdict,
+                    "heal_count": state.heal_count, "reason": heal_reason,
+                })
+                return RouteDecision(action="REFLEX_HEAL", reason=heal_reason)
             await self._emit("accelerator_log", "epistemic_unverified", {"reason": str(error)})
             return None
 
@@ -1856,6 +1899,27 @@ class ResearchStateMachine:
             self.planner_result = await generate_plan_with_feasibility(question,
                 llm_complete=self.llm_planner, llm_formalizer=self.llm_formalizer, fallback=False)
             if self._provider_failure is not None: raise self._provider_failure
+            feas = self.planner_result.get("feasibility")
+            feas_verdict = getattr(getattr(feas, "verdict", None), "value", getattr(feas, "verdict", None))
+            if self.planner_result.get("blueprint") is None and str(feas_verdict or "").upper() in {"REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"}:
+                verdict_str = str(feas_verdict).upper()
+                run_id = "refused_" + uuid.uuid4().hex
+                rationale = getattr(feas, "rationale", "") or ""
+                violated = getattr(feas, "violated_boundary", "") or ""
+                report_md = f"# Research Request Refused ({verdict_str})\n\n**Violated Boundary:** {violated}\n\n{rationale}\n"
+                certificate = incomplete_certificate(run_id, question, verdict_str, diagnostics={"feasibility": feas.model_dump(mode="json") if hasattr(feas, "model_dump") else str(feas)})
+                await self._emit("accelerator_log", "research_completed", dict(
+                    epistemic_verdict=verdict_str, reason=verdict_str,
+                    meaningfulness_certificate=certificate.model_dump(mode="json")))
+                return ResearchPlanningFailure(
+                    run_id=run_id,
+                    meaningfulness_certificate=certificate,
+                    status=verdict_str,
+                    epistemic_verdict=verdict_str,
+                    blueprint=None,
+                    feasibility=feas,
+                    report=report_md,
+                )
             blueprint = ResearchBlueprint.model_validate(self.planner_result["blueprint"])
         except (LLMProviderError, ValueError, SyntaxError, TypeError, RuntimeError) as error:
             self._provider_failure = None
@@ -1979,6 +2043,9 @@ class ResearchStateMachine:
     async def _run_stages(self, state: ResearchRunState) -> ResearchRunState:
         """Drive the accretive stage loop (wrapped by run()'s shield)."""
         blueprint = state.blueprint
+        if isinstance(blueprint.ihcg_evidence, dict) and not blueprint.ihcg_evidence.get("extensions") and blueprint.target_research_stages > 1:
+            blueprint = blueprint.model_copy(update={"target_research_stages": 1})
+            state.blueprint = blueprint
         self.blueprint = blueprint
         total = blueprint.target_research_stages
         pinned_code = ""          # verified layers only (drivers renamed)
@@ -2073,6 +2140,7 @@ class ResearchStateMachine:
                 candidate_code = outcome.get("candidate_code", candidate_code)
                 contracts = outcome.get("contracts", contracts)
                 if outcome.get("epistemic_terminal"):
+                    self.blueprint = state.blueprint
                     state.status = state.epistemic_verdict
                     await self._emit_report(state)
                     return state
@@ -2231,8 +2299,13 @@ class ResearchStateMachine:
                 healed_code = heal_outcome.get("code") or candidate_code
                 if state.ihcg is not None:
                     from ..healing.deterministic_ast import assert_sealed_observables
-                    protected = {state.blueprint.variable_map[s.symbol] for s in state.ihcg.slots
-                        if s.role in {"CONTROL_PARAM", "DERIVED_OBSERVABLE"} and s.symbol in state.blueprint.variable_map}
+                    is_exec_ihcg_repair = str(base_heal_failure or "").startswith("EXECUTABLE_IHCG_MISMATCH:")
+                    protected = {
+                        state.blueprint.variable_map[s.symbol]
+                        for s in state.ihcg.slots
+                        if s.symbol in state.blueprint.variable_map
+                        and (s.role == "CONTROL_PARAM" or (s.role == "DERIVED_OBSERVABLE" and not is_exec_ihcg_repair))
+                    }
                     try: assert_sealed_observables(base_heal_code or "", healed_code or "", protected)
                     except ValueError as error:
                         from .epistemic import incomplete_certificate
@@ -2884,7 +2957,7 @@ class ResearchStateMachine:
         except (ValueError, SyntaxError, ReferenceError) as error:
             self._rollback_overlay(scratch)
             return {'status':'error', 'result_status':'ERROR', 'failure':f'PreWrite_Guard: {error}', 'candidate_code':candidate_code, 'contracts':contracts}
-        if declared:
+        if declared and state.ihcg is None:
             try:
                 await asyncio.to_thread(check_evolution_reference, bp.model_dump(), {}, unified)
             except (ReferenceError, ValueError, ImportError, KeyError) as error:

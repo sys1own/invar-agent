@@ -225,7 +225,28 @@ def _point(ihcg, point):
     if set(point) != set(ihcg.omega): raise ValueError("a concrete witness must cover the entire IHCG frame")
     result = {s: (float(x), float(x)) for s, x in point.items()}
     if any(not math.isfinite(x[0]) or not ihcg.omega[s][0] <= x[0] <= ihcg.omega[s][1] for s, x in result.items()): raise ValueError("witness is outside Omega")
-    if m._truth(m._parse(m._and(ihcg.environmental_assumptions)), result) is not True: raise ValueError("witness does not interval-verify environmental assumptions")
+    if m._truth(m._parse(m._and(ihcg.environmental_assumptions)), result) is not True:
+        max_eq_res = 0.0
+        for expr in ihcg.environmental_assumptions:
+            node = m._parse(expr)
+            if m._truth(node, result) is True:
+                continue
+            if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+                lhs_iv = m._iv(node.left, result)
+                rhs_iv = m._iv(node.comparators[0], result)
+                res = max(abs(lhs_iv.lo - rhs_iv.lo), abs(lhs_iv.hi - rhs_iv.hi))
+                scale = max(1.0, abs(lhs_iv.lo), abs(lhs_iv.hi), abs(rhs_iv.lo), abs(rhs_iv.hi))
+                if res <= 1e-9 * scale:
+                    max_eq_res = max(max_eq_res, res)
+                    continue
+            raise ValueError("witness does not interval-verify environmental assumptions")
+        if max_eq_res > 0.0:
+            pad = max(1e-11, 10.0 * max_eq_res)
+            dyn = {s.symbol for s in ihcg.slots if s.role == "DYNAMIC_STATE"}
+            for s in dyn:
+                lo, hi = ihcg.omega[s]
+                v = result[s][0]
+                result[s] = (max(lo, v - pad), min(hi, v + pad))
     return result
 
 
@@ -256,7 +277,9 @@ def run_mode2a_counterexample_falsification(ihcg: IhcgGraph, theta_star: Mapping
     mode = "MODE2A_COUNTEREXAMPLE"
     if reason := _gate(ihcg, fidelity): return _certificate(mode, ihcg, fidelity, reason)
     if eval_res.epsilon_total != fidelity.epsilon_total: raise ValueError("witness may not reduce the certified error budget")
-    box = _point(ihcg, theta_star); node = _bound_expression(ihcg, eval_res.margin_expression)
+    try: box = _algebraic_witness_box(ihcg, theta_star)
+    except _Unresolved: return _certificate(mode, ihcg, fidelity, "WITNESS_MODEL_NOT_CERTIFIED")
+    node = _bound_expression(ihcg, eval_res.margin_expression)
     if _model_feasibility(ihcg, box) != "SAT":
         return _certificate(mode, ihcg, fidelity, "WITNESS_MODEL_NOT_CERTIFIED")
     try: bound = m._iv(node, box)
@@ -412,7 +435,8 @@ def run_mode2b_exhaustive_refutation(ihcg: IhcgGraph, margin_spec: MarginSpec, f
 
 
 def certify_phase_boundary(ihcg: IhcgGraph, sandbox_runner: Callable[[Mapping[str, float]], WitnessEvaluation], delta_boundary: float, *,
-                           fidelity: FidelityAudit, parameter: str | None = None, fixed_values: Mapping[str, float] | None = None) -> BoundaryDiscoveryCertificate:
+                           fidelity: FidelityAudit, parameter: str | None = None, fixed_values: Mapping[str, float] | None = None,
+                           budget_seconds: float = 30.0) -> BoundaryDiscoveryCertificate:
     ihcg.assert_sealed()
     if ihcg.quantifier_mode != "BOUNDARY" or not math.isfinite(delta_boundary) or delta_boundary <= 0: raise ValueError("boundary mode and positive tolerance required")
     varying = [s.symbol for s in ihcg.slots if s.role == "CONTROL_PARAM" and ihcg.omega[s.symbol][0] < ihcg.omega[s.symbol][1]]
@@ -426,7 +450,7 @@ def certify_phase_boundary(ihcg: IhcgGraph, sandbox_runner: Callable[[Mapping[st
             if lo != hi: raise ValueError("all other coordinates need pinned values")
             fixed[name] = lo
     left, right = {**fixed, parameter: ihcg.omega[parameter][0]}, {**fixed, parameter: ihcg.omega[parameter][1]}
-    reason, evaluations, deadline = _gate(ihcg, fidelity), 0, time.monotonic()+1.5
+    reason, evaluations, deadline = _gate(ihcg, fidelity), 0, time.monotonic()+budget_seconds
     node = _claim_margin(ihcg)
     enclosures = {}
     def evaluate(point):

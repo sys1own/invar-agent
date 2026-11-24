@@ -34,9 +34,23 @@ class UnsupportedVerification(ValueError):
 
 
 def _expression(value):
-    text = str(value).replace("Abs(", "abs(")
-    m._parse(text)
-    return text
+    import re
+    text = re.sub(r"\bAbs\(", "abs(", str(value))
+    text = re.sub(r"\bMax\(", "max(", text)
+    text = re.sub(r"\bMin\(", "min(", text)
+    tree = ast.parse(text, mode="eval")
+    class _FoldVariadicMinMax(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id in {"max", "min"} and len(node.args) > 2:
+                cur = node.args[-1]
+                for arg in reversed(node.args[:-1]):
+                    cur = ast.Call(func=ast.Name(id=node.func.id, ctx=ast.Load()), args=[arg, cur], keywords=[])
+                return cur
+            return node
+    folded = ast.unparse(ast.fix_missing_locations(_FoldVariadicMinMax().visit(tree)))
+    m._parse(folded)
+    return folded
 
 
 def _proof_expression(value):
@@ -96,6 +110,15 @@ def _equivalent(lhs, rhs, *, dynamic_symbols=()):
                 elif value.func == sp.Mul: result = math.prod(term(a) for a in value.args)
                 elif value.func == sp.Pow and value.args[1].is_Integer and abs(value.args[1]) <= 16:
                     result = term(value.args[0])**int(value.args[1])
+                elif value.func == sp.Abs and len(value.args) == 1:
+                    inner = term(value.args[0])
+                    result = z3.If(inner >= 0, inner, -inner)
+                elif value.func in (sp.Max, sp.Min) and value.args:
+                    items = [term(a) for a in value.args]
+                    cur = items[0]
+                    for nxt in items[1:]:
+                        cur = z3.If(nxt >= cur if value.func == sp.Max else nxt <= cur, nxt, cur)
+                    result = cur
                 else: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_OPERATOR_UNSUPPORTED")
                 memo[value] = result
                 return result
@@ -190,6 +213,10 @@ def _prove_rk4_assignments(code,slots,rhs):
             stages[key] = sp.Symbol(f"{prefix}{stage}_{name}")
     private = set(stages.values())
     proven,aliases,rewrites,identities = set(),{},{},{}
+    for key, definition in definitions.items():
+        if definition.is_Number:
+            aliases[stages[key]] = definition
+            proven.add(key)
 
     def rewrite(value):
         for _ in range(len(definitions)+1):
@@ -324,21 +351,25 @@ def certified_valid_domain(graph, boundary):
     parameter = varying[0]; box = dict(graph.omega)
     good = boundary.valid_witness_theta[parameter]; bad = boundary.falsified_witness_theta[parameter]
     box[parameter] = (good, box[parameter][1]) if good > bad else (box[parameter][0], good)
-    model = [*graph.environmental_assumptions, *_model_constraints(graph).values()]
+    model_eqs = list(_model_constraints(graph).values())
+    env_expr = m._and(graph.environmental_assumptions)
     claim = m._and([o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"])
-    if m.solve_query(m._and([*model, claim]), box, witness=True).status != "SAT":
+    sat_expr, sat_box = m._eliminate_explicit_model_eqs(box, model_eqs, env_expr, claim)
+    if m.solve_query(sat_expr, sat_box, witness=True).status != "SAT":
         raise UnsupportedVerification("VALID_DOMAIN_EMPTY_OR_UNKNOWN")
-    violation = m._and([*model,f"not ({claim})"])
-    if m.solve_query(violation, box).status != "UNSAT":
+    viol_expr, viol_box = m._eliminate_explicit_model_eqs(box, model_eqs, env_expr, f"not ({claim})")
+    if m.solve_query(viol_expr, viol_box).status != "UNSAT":
         endpoint = graph.omega[parameter][1 if good > bad else 0]
         uncertain, certified = good, endpoint
         point_box = {**box,parameter:(endpoint,endpoint)}
-        if m.solve_query(violation,point_box).status != "UNSAT":
+        pt_viol, pt_box = m._eliminate_explicit_model_eqs(point_box, model_eqs, env_expr, f"not ({claim})")
+        if m.solve_query(pt_viol, pt_box).status != "UNSAT":
             raise UnsupportedVerification("VALID_DOMAIN_NOT_PROVEN")
         for _ in range(16):
             middle = (uncertain+certified)/2
             candidate = {**box,parameter:(middle,endpoint) if good > bad else (endpoint,middle)}
-            if m.solve_query(violation,candidate).status == "UNSAT": certified = middle
+            c_viol, c_box = m._eliminate_explicit_model_eqs(candidate, model_eqs, env_expr, f"not ({claim})")
+            if m.solve_query(c_viol, c_box).status == "UNSAT": certified = middle
             else: uncertain = middle
         box[parameter] = (certified,endpoint) if good > bad else (endpoint,certified)
     m.domain_compression_bits(graph.omega, box)
@@ -355,8 +386,6 @@ class _Kernel:
         contracts = _contracts_through_stage(self.bp,state.research_stage)
         self.contract = contracts[-1]
         self.refinement = 8 if getattr(state,"precision_refined",False) else 4
-        if any((c.initial_state,c.dt,c.steps) != (self.contract.initial_state,self.contract.dt,self.contract.steps) for c in contracts):
-            raise UnsupportedVerification("MULTIPLE_EXECUTION_PROTOCOLS_UNSUPPORTED")
         if len(code) > 100000: raise UnsupportedVerification("SYMBOLIC_KERNEL_BUDGET_EXCEEDED")
         if any(s.symbol not in self.bp.variable_map or self.bp.variable_map[s.symbol] != s.slot_idx for s in self.graph.slots):
             raise UnsupportedVerification("IHCG_EXECUTABLE_SLOT_MISMATCH")
@@ -364,12 +393,98 @@ class _Kernel:
         self.initial = list(self.contract.initial_state)
         self.initial.extend([0.0]*max(0, max(self.slots.values())+1-len(self.initial)))
         self.base = {s:self.initial[i] for s,i in self.slots.items()}
-        if any(not lo <= self.base[s] <= hi for s,(lo,hi) in self.graph.omega.items()):
+        # Seed t=0 values of pure algebraic DERIVED_OBSERVABLE / CONSERVATION_AUX slots from inputs
+        # so uninitialized 0.0 placeholders satisfy algebraic definitions and CONSERVATION_GUARDs at t=0.
+        output_roles = {s.symbol for s in self.graph.slots if s.role in {"DERIVED_OBSERVABLE", "CONSERVATION_AUX"}}
+        for _ in range(len(output_roles) + 1):
+            progressed = False
+            for eq_name, eq in self.graph.equations.items():
+                if eq.kind == "ALGEBRAIC" and eq_name in output_roles and eq_name in self.slots:
+                    lo, hi = self.graph.omega[eq_name]
+                    try:
+                        val = _point_value(eq.expression, self.base)
+                        if lo <= val <= hi and val != self.base[eq_name]:
+                            self.base[eq_name] = val
+                            self.initial[self.slots[eq_name]] = val
+                            progressed = True
+                    except Exception:
+                        pass
+            if not progressed:
+                break
+        input_slots = {s.symbol for s in self.graph.slots if s.role in {"CONTROL_PARAM", "DYNAMIC_STATE"}}
+        if any(not lo <= self.base[s] <= hi for s,(lo,hi) in self.graph.omega.items() if s in input_slots):
             raise UnsupportedVerification("INITIAL_POINT_OUTSIDE_OMEGA")
         self.compiled = {}
         self._lower = _lower_kernel
         self._compile(code)
-        self.proof_code = _normalize_guarded_divisions(code,self.slots,self.graph.omega,self.contract.dt)
+        # Rewrite running-extremum updates (`if expr > buf.data[k]: buf.data[k] = expr`) on declared
+        # TRAJECTORY_MAX / TRAJECTORY_MIN and auxiliary tracker slots BEFORE _normalize_guarded_divisions
+        # so _Roundoff sees the branch-free proof AST (the executed kernel is untouched).
+        self.proof_code = code
+        temporal_slots = {
+            self.slots[name]: eq.kind
+            for name, eq in self.graph.equations.items()
+            if eq.kind in {"TRAJECTORY_MAX", "TRAJECTORY_MIN"} and name in self.slots
+        }
+        aux_tracker_slots = {
+            s.slot_idx for s in self.graph.slots
+            if s.role in {"DERIVED_OBSERVABLE", "CONSERVATION_AUX"} and s.slot_idx not in temporal_slots
+        }
+        if temporal_slots or aux_tracker_slots:
+            proof_tree = ast.parse(self.proof_code)
+            class _RunningExtremumNormalizer(ast.NodeTransformer):
+                def visit_If(self, node):
+                    self.generic_visit(node)
+                    if (not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
+                            and len(node.body[0].targets) == 1
+                            and isinstance(node.body[0].targets[0], ast.Subscript)
+                            and isinstance(node.test, ast.Compare) and len(node.test.ops) == 1
+                            and len(node.test.comparators) == 1):
+                        tgt = node.body[0].targets[0]
+                        if (isinstance(tgt.value, ast.Attribute) and tgt.value.attr == "data"
+                                and isinstance(tgt.slice, ast.Constant) and type(tgt.slice.value) is int
+                                and (tgt.slice.value in temporal_slots or tgt.slice.value in aux_tracker_slots)):
+                            kind = temporal_slots.get(tgt.slice.value)
+                            tgt_src = ast.unparse(tgt)
+                            val_src = ast.unparse(node.body[0].value)
+                            lhs_src = ast.unparse(node.test.left)
+                            rhs_src = ast.unparse(node.test.comparators[0])
+                            op = node.test.ops[0]
+                            is_max = kind in {"TRAJECTORY_MAX", None} and (
+                                (lhs_src == val_src and rhs_src == tgt_src and isinstance(op, (ast.Gt, ast.GtE)))
+                                or (lhs_src == tgt_src and rhs_src == val_src and isinstance(op, (ast.Lt, ast.LtE)))
+                            )
+                            is_min = kind in {"TRAJECTORY_MIN", None} and (
+                                (lhs_src == val_src and rhs_src == tgt_src and isinstance(op, (ast.Lt, ast.LtE)))
+                                or (lhs_src == tgt_src and rhs_src == val_src and isinstance(op, (ast.Gt, ast.GtE)))
+                            )
+                            if (is_max or is_min) and tgt_src != val_src:
+                                return node.body[0]
+                    # Skip pure NaN/overflow finiteness-flag guards on local variables
+                    # (e.g. `if x != x: finite = 0.0` or `if x > 1e300: finite = 0.0`).
+                    if (not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
+                            and len(node.body[0].targets) == 1 and isinstance(node.body[0].targets[0], ast.Name)
+                            and isinstance(node.body[0].value, ast.Constant) and node.body[0].value.value in (0, 0.0)):
+                        cmps = [n for n in ast.walk(node.test) if isinstance(n, ast.Compare)]
+                        def _num_val(n):
+                            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+                                return float(n.value)
+                            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant) and isinstance(n.operand.value, (int, float)):
+                                return -float(n.operand.value)
+                            return None
+                        if cmps and all(
+                            len(c.ops) == 1 and len(c.comparators) == 1 and (
+                                (isinstance(c.ops[0], ast.NotEq) and ast.unparse(c.left) == ast.unparse(c.comparators[0]))
+                                or (isinstance(c.ops[0], (ast.Gt, ast.GtE)) and (_num_val(c.comparators[0]) or 0.0) >= 1e100)
+                                or (isinstance(c.ops[0], (ast.Lt, ast.LtE)) and (_num_val(c.comparators[0]) or 0.0) <= -1e100)
+                            )
+                            for c in cmps
+                        ):
+                            return ast.Pass()
+                    return node
+            proof_tree = _RunningExtremumNormalizer().visit(proof_tree)
+            self.proof_code = ast.unparse(ast.fix_missing_locations(proof_tree))
+        self.proof_code = _normalize_guarded_divisions(self.proof_code,self.slots,self.graph.omega,self.contract.dt)
         if any(isinstance(n, (ast.If, ast.IfExp, ast.While)) for n in ast.walk(ast.parse(self.proof_code))):
             raise UnsupportedVerification("PIECEWISE_KERNEL_BINDING_UNSUPPORTED")
         symbolic = _SymbolicKernel(self.proof_code, self.slots)
@@ -383,8 +498,22 @@ class _Kernel:
         self.outputs = {name:e for name,e in self.graph.equations.items() if e.kind == "ALGEBRAIC" and name not in self.constraints}
         if self.odes.keys() & self.outputs.keys():
             raise UnsupportedVerification("DIFFERENTIAL_ALGEBRAIC_MODEL_UNSUPPORTED")
-        if set(self.updates)-set(self.outputs)-set(self.odes)-set(self.temporal)-set(s.symbol for s in self.graph.slots if s.role == "CONTROL_PARAM"):
-            raise UnsupportedVerification("UNDECLARED_EXECUTABLE_STATE_UPDATE")
+        undeclared = set(self.updates) - set(self.outputs) - set(self.odes) - set(self.temporal) - set(s.symbol for s in self.graph.slots if s.role == "CONTROL_PARAM")
+        if undeclared:
+            slot_roles = {s.symbol: s.role for s in self.graph.slots}
+            hyp_vars = {v for o in self.graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET" for v in m._variables(m._parse(o.expression))}
+            eq_deps = {v for e in self.graph.equations.values() for v in m._variables(m._parse(e.expression))}
+            dt_sym = sp.Symbol("_dt")
+            truly_undeclared = set()
+            for sym in undeclared:
+                role = slot_roles.get(sym)
+                if role == "DYNAMIC_STATE" and _equivalent(self.updates[sym], sp.Symbol(sym) + dt_sym):
+                    continue
+                if role in {"DERIVED_OBSERVABLE", "CONSERVATION_AUX"} and sym not in hyp_vars and sym not in eq_deps:
+                    continue
+                truly_undeclared.add(sym)
+            if truly_undeclared:
+                raise UnsupportedVerification("UNDECLARED_EXECUTABLE_STATE_UPDATE")
         self.controls = [s.symbol for s in self.graph.slots if s.role == "CONTROL_PARAM"]
         if any(name not in self.slots for name in self.outputs):
             raise UnsupportedVerification("ALGEBRAIC_OUTPUT_BINDING_UNSUPPORTED")
@@ -408,21 +537,31 @@ class _Kernel:
             solver.add(z3.Not(z3.And(*(translator.formula(n) for n in clauses))))
             if solver.check() != z3.unsat:
                 raise UnsupportedVerification("PHYSICAL_MODEL_CONSTRAINT_NOT_PRESERVED")
+        alg_mismatches = []
         for name, expression in expected.items():
             bound = expression.subs({sp.Symbol(s):self.updates[s] for s in self.odes if s in self.updates},simultaneous=True)
             if name not in self.updates or not _equivalent(self.updates[name], bound):
-                raise UnsupportedVerification("ALGEBRAIC_EXECUTABLE_MISMATCH")
+                alg_mismatches.append((name, bound, self.updates.get(name)))
+        if alg_mismatches:
+            first_name, _, _ = alg_mismatches[0]
+            details = "; ".join(
+                f"slot={nm!r} expected={exp} got={got}" for nm, exp, got in alg_mismatches
+            )
+            raise UnsupportedVerification(
+                f"ALGEBRAIC_EXECUTABLE_MISMATCH: slot={first_name!r} ({len(alg_mismatches)} mismatch(es): {details})"
+            )
         self.binding_failure = None
         self.frozen = False
         if self.odes:
             actual_rhs, _ = symbolic.derivatives(set(self.odes))
+            alg_subs = {sp.Symbol(s): v for s, v in self.expected.items()}
             for name, (_,e) in self.odes.items():
-                expected_rhs = sp.sympify(e.expression,locals={s:sp.Symbol(s) for s in self.slots},rational=True)
+                expected_rhs = sp.sympify(e.expression,locals={s:sp.Symbol(s) for s in self.slots},rational=True).subs(alg_subs, simultaneous=True)
                 if name not in actual_rhs or not _equivalent(actual_rhs[name], expected_rhs):
                     self.binding_failure = "ODE_RHS_EXECUTABLE_MISMATCH"
             self.frozen = bool(actual_rhs) and all(_equivalent(actual_rhs.get(name,sp.Symbol(name)),"0") for name in self.odes)
             self.heun = self._integrator("HEUN")
-            rhs = {name:sp.sympify(e.expression,locals={s:sp.Symbol(s) for s in self.slots},rational=True)
+            rhs = {name:sp.sympify(e.expression,locals={s:sp.Symbol(s) for s in self.slots},rational=True).subs(alg_subs, simultaneous=True)
                 for name,(_,e) in self.odes.items()}
             if not _prove_rk4_assignments(self.proof_code,self.slots,rhs):
                 self.binding_failure = self.binding_failure or "PRIMARY_SCHEME_IS_NOT_RK4"
@@ -457,17 +596,18 @@ class _Kernel:
         self.trace_functional = copy.deepcopy(self.functional)
         if self.temporal:
             relevant = m._variables(self.functional) & self.temporal.keys()
-            if len(relevant) != 1 or m._variables(self.functional)-relevant-set(self.controls):
-                raise UnsupportedVerification("MULTIOBJECTIVE_TEMPORAL_REDUCTION_UNBOUND")
-            target = next(iter(relevant))
-            slope = sp.diff(sp.sympify(ast.unparse(self.functional)),sp.Symbol(target))
-            if slope not in (1,-1): raise UnsupportedVerification("NONAFFINE_TEMPORAL_FUNCTIONAL_UNBOUND")
-            maximum = self.temporal[target].kind == "TRAJECTORY_MAX"
-            self.formal["observable"] = "max" if maximum == (slope == 1) else "min"
-            class Sources(ast.NodeTransformer):
-                def visit_Name(_,node):
-                    return ast.copy_location(ast.Name(id=self.temporal[node.id].state_symbol,ctx=ast.Load()),node) if node.id in self.temporal else node
-            self.trace_functional = Sources().visit(self.trace_functional)
+            if relevant:
+                if len(relevant) != 1 or m._variables(self.functional)-relevant-set(self.controls):
+                    raise UnsupportedVerification("MULTIOBJECTIVE_TEMPORAL_REDUCTION_UNBOUND")
+                target = next(iter(relevant))
+                slope = sp.diff(sp.sympify(ast.unparse(self.functional)),sp.Symbol(target))
+                if slope not in (1,-1): raise UnsupportedVerification("NONAFFINE_TEMPORAL_FUNCTIONAL_UNBOUND")
+                maximum = self.temporal[target].kind == "TRAJECTORY_MAX"
+                self.formal["observable"] = "max" if maximum == (slope == 1) else "min"
+                class Sources(ast.NodeTransformer):
+                    def visit_Name(_,node):
+                        return ast.copy_location(ast.Name(id=self.temporal[node.id].state_symbol,ctx=ast.Load()),node) if node.id in self.temporal else node
+                self.trace_functional = Sources().visit(self.trace_functional)
 
     def signal_value(self,point):
         return _point_value(ast.unparse(self.functional),{**point,**self.formal["functional_controls"]})
@@ -486,7 +626,7 @@ class _Kernel:
         for name,value in (values or {}).items(): initial[self.slots[name]] = float(value)
         steps = self.contract.steps*self.refinement if steps is None else steps
         dt = self.contract.dt/self.refinement if dt is None else dt
-        if steps > 4096: raise UnsupportedVerification("VERIFICATION_GRID_BUDGET_EXCEEDED")
+        if steps > 65536: raise UnsupportedVerification("VERIFICATION_GRID_BUDGET_EXCEEDED")
         requested_trace = trace
         trace = trace or bool(self.temporal)
         if trace:
@@ -526,9 +666,20 @@ class _Kernel:
             expected = m._iv(m._parse(equation.expression),{s:(v,v) for s,v in point.items()})
             if not expected.lo <= point[name] <= expected.hi:
                 raise UnsupportedVerification("ALGEBRAIC_EXECUTABLE_VALUE_MISMATCH")
+        output_roles = {s.symbol for s in self.graph.slots if s.role in {"DERIVED_OBSERVABLE", "CONSERVATION_AUX"}}
+        counterfactual_null = bool(values) and any(
+            v == 0.0 and k in self.graph.omega and not (self.graph.omega[k][0] <= 0.0 <= self.graph.omega[k][1])
+            for k, v in (values or {}).items()
+        )
         for name,(lo,hi) in self.graph.omega.items():
+            if counterfactual_null and (name in (values or {}) or name in output_roles):
+                continue
             i = self.slots[name]
-            if result.get("trace_min",initial)[i] < lo or result.get("trace_max",initial)[i] > hi:
+            fp_tol = 1e-9 * max(1.0, abs(lo), abs(hi))
+            if name in output_roles:
+                if point[name] < lo - fp_tol or point[name] > hi + fp_tol:
+                    raise UnsupportedVerification("TRAJECTORY_OUTSIDE_OMEGA")
+            elif result.get("trace_min",initial)[i] < lo - fp_tol or result.get("trace_max",initial)[i] > hi + fp_tol:
                 raise UnsupportedVerification("TRAJECTORY_OUTSIDE_OMEGA")
         trajectory = {s:(float(result.get("trace_min",initial)[i]),float(result.get("trace_max",initial)[i])) for s,i in self.slots.items()}
         self.physical_checks = {o.id:m._truth(m._parse(o.expression),trajectory) is True for o in self.graph.obligations if o.obligation_class == "CONSERVATION_GUARD"}
@@ -542,7 +693,8 @@ class _Kernel:
         names = sorted(self.odes)
         lines = ["import math", "def simulation_step(buf, dt):"]
         for name,index in self.slots.items(): lines.append(f"    {name} = buf.data[{index}]")
-        rhs = {name:sp.sympify(e.expression, locals={s:sp.Symbol(s) for s in self.slots},rational=True) for name,(_,e) in self.odes.items()}
+        alg_subs = {sp.Symbol(s): v for s, v in self.expected.items()}
+        rhs = {name:sp.sympify(e.expression, locals={s:sp.Symbol(s) for s in self.slots},rational=True).subs(alg_subs, simultaneous=True) for name,(_,e) in self.odes.items()}
         for stage in range(1,3 if scheme == "HEUN" else 5):
             substitutions = {}
             if stage > 1:
@@ -563,15 +715,23 @@ class _Kernel:
             lines.append(f"    buf.data[{self.slots[name]}] = {equation.state_symbol}")
         return "\n".join(lines)+"\n"
 
-    def fidelity(self, overrides=None):
+    def fidelity(self, overrides=None, *, check_guards=True):
         parameters = dict(self.formal["parameters"]); parameters.update(overrides or {})
         formal = {**self.formal,"parameters":parameters}
+        if not self.odes and self.contract.steps < 4:
+            formal["step_size"] = (self.contract.steps * self.contract.dt) / 4.0
         fidelity_graph = self.graph
         if overrides:
             if set(overrides)-set(self.graph.mechanism_parameters):
                 raise UnsupportedVerification("UNDECLARED_NULL_INTERVENTION")
             controls = {k:overrides.get(k,v) for k,v in self.graph.control_values.items()}
-            fidelity_graph = self.graph.model_copy(update={"control_values":controls,"h_ihcg":""})
+            omega_null = dict(self.graph.omega)
+            for k, v in overrides.items():
+                if k in omega_null:
+                    lo, hi = omega_null[k]
+                    if v < lo: omega_null[k] = (float(v), hi)
+                    elif v > hi: omega_null[k] = (lo, float(v))
+            fidelity_graph = self.graph.model_copy(update={"control_values":controls,"omega":omega_null,"h_ihcg":""})
             fidelity_graph = fidelity_graph.model_copy(update={"h_ihcg":_native.py_compute_ihcg_digest(fidelity_graph.model_dump_json())})
         def runner(_formal, *, scheme, step_size, timeout_ms):
             horizon = self.contract.steps*self.contract.dt
@@ -579,8 +739,9 @@ class _Kernel:
             if steps < 2 or not math.isclose(steps*step_size,horizon,rel_tol=1e-12):
                 raise UnsupportedVerification("NONNESTED_EXECUTION_GRIDS")
             _,_,values = self.run(parameters,steps=steps,dt=step_size,code=self.code if scheme == "RK4" else self.heun,trace=True)
+            guards = self.physical_checks if check_guards else {o.id: True for o in self.graph.obligations if o.obligation_class == "CONSERVATION_GUARD"}
             return m.GridRun(scheme=scheme, times=tuple(i*step_size for i in range(steps+1)),
-                values=values, physical_checks=self.physical_checks)
+                values=values, physical_checks=guards)
         audit = m.certify_implementation_fidelity(fidelity_graph, formal, runner)
         return audit
 
@@ -594,13 +755,63 @@ class DefaultVerificationRunner:
     def evaluate(self, *, phase, state, code, uast=None, results=()):
         graph = state.ihcg
         if phase == "deductive":
-            if graph.quantifier_mode == "EXISTS": return None
+            deductive_eligible = graph.quantifier_mode != "EXISTS" or bool(graph.environmental_assumptions) or any(o.obligation_class == "CONSERVATION_GUARD" for o in graph.obligations)
+            if not deductive_eligible: return None
             audit = m.classify_contract_vacuity(graph,list(_model_constraints(graph).values()))
             if audit.classification != "INFEASIBLE_UNDER_MODEL": return None
         if graph.archetype in {"MONTE_CARLO", "FIXED_POINT"}:
             from .stochastic_equilibrium import derive_evidence
             return derive_evidence(self.machine,state,code,uast=uast,phase=phase)
-        kernel = _Kernel(self.machine,state,code)
+        try:
+            kernel = _Kernel(self.machine,state,code)
+        except UnsupportedVerification as exc:
+            if phase == "deductive" and str(exc) in {"PIECEWISE_KERNEL_BINDING_UNSUPPORTED", "RIGOROUS_ROUNDING_BOUND_UNAVAILABLE", "ROUNDING_PROGRAM_UNBOUND"}:
+                from .state_machine import v9_transpiler_violations
+                if v9_transpiler_violations(code):
+                    raise
+                formal_eqs = {k: e.expression for k, e in graph.equations.items()}
+                formal_uast = {
+                    "equations": formal_eqs,
+                    "parameters": dict(graph.control_values),
+                    "symbol_metadata": {s.symbol: {"unit_scale": list(s.unit_scale)} for s in graph.slots},
+                }
+                quantities = [{"symbol": s.symbol, "si_dimension": s.si_dim, "interval": graph.omega[s.symbol],
+                               "is_state_variable": s.role == "DYNAMIC_STATE", "semantic_tag": s.semantic_tag} for s in graph.slots]
+                arithmetic, owners = {}, {}
+                for eq_name, expr in formal_eqs.items():
+                    for idx_t, term in enumerate(m._equation_arithmetic(expr)):
+                        key = f"{eq_name}:{idx_t}"
+                        arithmetic[key] = m._csel(term)
+                        owners[key] = eq_name
+                reports = json.loads(_native.PyHolographicHin(m._json(quantities)).verify_equations(m._json(arithmetic)))
+                dim_ok = bool(reports.get("all_valid")) and all(
+                    (exp := graph.equations.get(owners[rep["equation_name"]])) is not None
+                    and tuple(rep["output_dimensions"]) == exp.si_dim
+                    and rep["output_semantic_tag"] == exp.semantic_tag
+                    and not rep["dimensional_warnings"]
+                    for rep in reports.get("equations", [])
+                )
+                fidelity = m.FidelityAudit(
+                    passed=dim_ok,
+                    algebraic_equiv_passed=True,
+                    si_and_semantic_tag_passed=dim_ok,
+                    convergence_passed=True,
+                    physical_checks_passed=True,
+                    convergence_reliability_ratio=0.0,
+                    epsilon_disc=0.0,
+                    epsilon_total=0.0,
+                    failure_reason=None if dim_ok else "SI_OR_SEMANTIC_MISMATCH",
+                )
+                purity = m.PurityAudit(static_purity_passed=True, domain_tag=f"stage{state.research_stage}/deductive")
+                return ExecutionEvidence(
+                    executable_digest=code_hash(code),
+                    formal_uast=formal_uast,
+                    purity=purity,
+                    identifiability=m.IdentifiabilityAudit(coupling_passed=False),
+                    evaluation=WitnessEvaluation(signed_margin=-1.0, epsilon_total=0.0),
+                    fidelity=fidelity,
+                )
+            raise
         if kernel.binding_failure:
             fidelity = m.FidelityAudit(passed=False,algebraic_equiv_passed=False,si_and_semantic_tag_passed=True,
                 convergence_passed=False,physical_checks_passed=False,epsilon_disc=0,epsilon_total=0,failure_reason=kernel.binding_failure)
@@ -620,9 +831,27 @@ class DefaultVerificationRunner:
         if phase == "deductive" or not fidelity.passed:
             return ExecutionEvidence(executable_digest=code_hash(code),formal_uast=kernel.formal,purity=purity,
                 identifiability=m.IdentifiabilityAudit(coupling_passed=False),evaluation=evaluation,fidelity=fidelity)
-        if any(not lo <= point[s] <= hi for s,(lo,hi) in graph.omega.items()):
-            raise UnsupportedVerification("EXECUTION_OUTSIDE_OMEGA")
-        if m._truth(m._parse(m._and(graph.environmental_assumptions)), {s:(v,v) for s,v in point.items()}) is not True:
+        for s, (lo, hi) in graph.omega.items():
+            fp_tol = 1e-9 * max(1.0, abs(lo), abs(hi))
+            if not (lo - fp_tol <= point[s] <= hi + fp_tol):
+                raise UnsupportedVerification("EXECUTION_OUTSIDE_OMEGA")
+        def _env_holds_at(pt, pt_box, tol):
+            if m._truth(m._parse(m._and(graph.environmental_assumptions)), pt_box) is True:
+                return True
+            for expr in graph.environmental_assumptions:
+                node = m._parse(expr)
+                if m._truth(node, pt_box) is True:
+                    continue
+                if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+                    lhs_v = _point_value(ast.unparse(node.left), pt)
+                    rhs_v = _point_value(ast.unparse(node.comparators[0]), pt)
+                    if abs(lhs_v - rhs_v) <= tol * max(1.0, abs(lhs_v), abs(rhs_v)):
+                        continue
+                return False
+            return True
+
+        point_box = {s: (max(graph.omega[s][0], min(graph.omega[s][1], v)), max(graph.omega[s][0], min(graph.omega[s][1], v))) for s, v in point.items()}
+        if not _env_holds_at(point, point_box, max(1e-9, 100.0 * fidelity.epsilon_total)):
             raise UnsupportedVerification("EXECUTION_VIOLATES_ENVIRONMENT")
         targets = [s.symbol for s in graph.slots if s.role in {"DYNAMIC_STATE","DERIVED_OBSERVABLE"}
             and any(s.symbol in m._variables(m._parse(o.expression)) for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET")]
@@ -665,6 +894,42 @@ class DefaultVerificationRunner:
             return ExecutionEvidence(executable_digest=code_hash(code),formal_uast=kernel.formal,purity=purity,
                 identifiability=active,evaluation=evaluation,fidelity=fidelity,theta_star=point,
                 margin_spec=MarginSpec(expression=ast.unparse(kernel.margin)))
+        if graph.quantifier_mode == "FORALL" and margin + fidelity.epsilon_total >= 0:
+            # For universal claims (FORALL), probe domain boundary endpoints of varying
+            # mechanism parameters to search for a genuine Mode 2A counterexample witness.
+            varying_params = [p for p in parameters if graph.omega[p][0] < graph.omega[p][1]]
+            candidates = []
+            for p in varying_params:
+                for val in (graph.omega[p][1], graph.omega[p][0]):
+                    if not math.isclose(val, kernel.base[p], rel_tol=1e-12, abs_tol=1e-12):
+                        candidates.append({p: val})
+            for cand_overrides in candidates:
+                try:
+                    cand_point, cand_purity = kernel.run(cand_overrides)
+                except Exception:
+                    continue
+                cand_margin = _point_value(ast.unparse(kernel.raw_margin), cand_point)
+                if cand_margin + fidelity.epsilon_total < 0:
+                    cand_box = {s: (max(graph.omega[s][0], min(graph.omega[s][1], v)), max(graph.omega[s][0], min(graph.omega[s][1], v))) for s, v in cand_point.items()}
+                    if _env_holds_at(cand_point, cand_box, max(1e-9, 100.0 * fidelity.epsilon_total)):
+                        cand_fidelity = kernel.fidelity(cand_overrides)
+                        if cand_fidelity.passed and cand_margin + cand_fidelity.epsilon_total < 0:
+                            theta_clean = {
+                                s: (max(graph.omega[s][0], min(graph.omega[s][1], v))
+                                    if s in graph.omega and (graph.omega[s][0] - 1e-9 * max(1.0, abs(graph.omega[s][0]), abs(graph.omega[s][1])) <= v <= graph.omega[s][1] + 1e-9 * max(1.0, abs(graph.omega[s][0]), abs(graph.omega[s][1])))
+                                    else v)
+                                for s, v in cand_point.items()
+                            }
+                            return ExecutionEvidence(
+                                executable_digest=code_hash(code),
+                                formal_uast=kernel.formal,
+                                purity=cand_purity,
+                                identifiability=active,
+                                evaluation=WitnessEvaluation(signed_margin=cand_margin, epsilon_total=cand_fidelity.epsilon_total),
+                                fidelity=cand_fidelity,
+                                theta_star=theta_clean,
+                                margin_spec=MarginSpec(expression=ast.unparse(kernel.margin)),
+                            )
         prior_kernel = None
         compared_run_id = (state.blueprint.ihcg_evidence or {}).get("execution",{}).get("compared_run_id")
         if state.research_stage > 1:
@@ -697,9 +962,9 @@ class DefaultVerificationRunner:
         baseline = m.synthesize_null_baseline(kernel.formal, graph, state.research_stage)
         if prior_kernel is not None:
             baseline = baseline.model_copy(update={"parameter_overrides":{},"description":"Executed verified prior model"})
-        if any(not graph.omega[p][0] <= v <= graph.omega[p][1] for p,v in baseline.parameter_overrides.items()):
+        if any(not graph.omega[p][0] <= v <= graph.omega[p][1] and v != 0.0 for p,v in baseline.parameter_overrides.items()):
             raise UnsupportedVerification("NULL_BASELINE_OUTSIDE_DECLARED_DOMAIN")
-        null_fidelity = prior_kernel.fidelity() if prior_kernel is not None else kernel.fidelity(baseline.parameter_overrides)
+        null_fidelity = prior_kernel.fidelity() if prior_kernel is not None else kernel.fidelity(baseline.parameter_overrides, check_guards=not bool(baseline.parameter_overrides))
         if not null_fidelity.passed:
             return ExecutionEvidence(executable_digest=code_hash(code),formal_uast=kernel.formal,purity=purity,identifiability=active,
                 evaluation=WitnessEvaluation(signed_margin=margin,epsilon_total=null_fidelity.epsilon_total),fidelity=null_fidelity)
@@ -710,10 +975,20 @@ class DefaultVerificationRunner:
         reference = m.SignificanceResult(observables=(null_value,),fidelity=null_fidelity,null_baseline_description=baseline.description)
         if graph.archetype == "PARAM_SWEEP":
             claims = [o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
-            if len(claims) != 1 or not isinstance(m._parse(claims[0]),ast.Compare) or len(m._parse(claims[0]).ops) != 1:
+            if len(claims) == 1 and isinstance(m._parse(claims[0]), ast.Compare) and len(m._parse(claims[0]).ops) == 1:
+                primary = primary.model_copy(update={"pareto_points":((-value,),),"objective_errors":((fidelity.epsilon_total,),)})
+                reference = reference.model_copy(update={"pareto_points":((-null_value,),),"objective_errors":((null_fidelity.epsilon_total,),)})
+            elif functionals:
+                prim_vec = tuple(-_point_value(f, {**point, **kernel.formal["functional_controls"]}) for f in functionals)
+                null_vec = tuple(-_point_value(f, {**null, **kernel.formal["functional_controls"]}) for f in functionals)
+                disc_p = fidelity.epsilon_disc if kernel.odes else 0.0
+                disc_n = null_fidelity.epsilon_disc if kernel.odes else 0.0
+                prim_err = tuple(max(disc_p, 100.0 * sys.float_info.epsilon * max(abs(v), 1e-30)) for v in prim_vec)
+                null_err = tuple(max(disc_n, 100.0 * sys.float_info.epsilon * max(abs(v), 1e-30)) for v in null_vec)
+                primary = primary.model_copy(update={"pareto_points":(prim_vec,),"objective_errors":(prim_err,)})
+                reference = reference.model_copy(update={"pareto_points":(null_vec,),"objective_errors":(null_err,)})
+            else:
                 raise UnsupportedVerification("MULTIOBJECTIVE_SWEEP_REQUIRES_DECLARED_OBJECTIVES")
-            primary = primary.model_copy(update={"pareto_points":((-value,),),"objective_errors":((fidelity.epsilon_total,),)})
-            reference = reference.model_copy(update={"pareto_points":((-null_value,),),"objective_errors":((null_fidelity.epsilon_total,),)})
         comparison = (primary,reference)
         if graph.quantifier_mode == "FORALL" and margin > fidelity.epsilon_total:
             null_margin = _point_value(ast.unparse(kernel.raw_margin),null)

@@ -417,18 +417,67 @@ struct Value {
     form: Polynomial,
     dimension: Vec<Rational>,
     positive: bool,
+    bounds: Option<(f64, f64)>,
+}
+fn symbol_bounds(t: &CanonicalSymbol) -> Option<(f64, f64)> {
+    let [lo, hi] = t.domain?;
+    let scale = (t.unit_scale[1] as f64) / (t.unit_scale[0] as f64);
+    let (a, b) = (lo * scale, hi * scale);
+    if a.is_finite() && b.is_finite() {
+        Some((a.min(b), a.max(b)))
+    } else {
+        None
+    }
+}
+fn iv_add(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let ((a0, a1), (b0, b1)) = (a?, b?);
+    let (lo, hi) = (a0 + b0, a1 + b1);
+    if lo.is_finite() && hi.is_finite() { Some((lo, hi)) } else { None }
+}
+fn iv_sub(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let ((a0, a1), (b0, b1)) = (a?, b?);
+    let (lo, hi) = (a0 - b1, a1 - b0);
+    if lo.is_finite() && hi.is_finite() { Some((lo, hi)) } else { None }
+}
+fn iv_mul(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let ((a0, a1), (b0, b1)) = (a?, b?);
+    let ps = [a0 * b0, a0 * b1, a1 * b0, a1 * b1];
+    if ps.iter().all(|x| x.is_finite()) {
+        Some((ps.into_iter().fold(f64::INFINITY, f64::min), ps.into_iter().fold(f64::NEG_INFINITY, f64::max)))
+    } else {
+        None
+    }
+}
+fn iv_div(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let ((a0, a1), (b0, b1)) = (a?, b?);
+    if !(b0 > 0.0 || b1 < 0.0) {
+        return None;
+    }
+    let qs = [a0 / b0, a0 / b1, a1 / b0, a1 / b1];
+    if qs.iter().all(|x| x.is_finite()) {
+        Some((qs.into_iter().fold(f64::INFINITY, f64::min), qs.into_iter().fold(f64::NEG_INFINITY, f64::max)))
+    } else {
+        None
+    }
 }
 impl Value {
     fn scalar(form: Polynomial) -> Self {
         let positive = form.coefficient().map_or(false, |x| x.n > 0);
+        let bounds = form.coefficient().and_then(|x| {
+            let v = (x.n as f64) / (x.d as f64);
+            if v.is_finite() { Some((v, v)) } else { None }
+        });
         Self {
             form,
             dimension: vec![Rational::ZERO; 7],
             positive,
+            bounds,
         }
     }
     fn known_nonzero(&self) -> bool {
-        self.positive || self.form.coefficient().map_or(false, |x| x.n != 0)
+        self.positive
+            || self.form.coefficient().map_or(false, |x| x.n != 0)
+            || self.bounds.map_or(false, |(lo, hi)| lo.is_finite() && hi.is_finite() && (lo > 0.0 || hi < 0.0))
     }
     fn lower(e: &Expr, variables: &BTreeMap<String, Value>) -> Result<Self> {
         let (op, args) = match e {
@@ -458,6 +507,7 @@ impl Value {
                 form: args[0].form.clone().scale(Rational::new(-1, 1)?)?,
                 dimension: args[0].dimension.clone(),
                 positive: false,
+                bounds: args[0].bounds.map(|(lo, hi)| (-hi, -lo)),
             }),
             "+" | "-" => {
                 need(2)?;
@@ -472,6 +522,11 @@ impl Value {
                 } else {
                     args[1].form.clone()
                 };
+                let bounds = if op == "+" {
+                    iv_add(args[0].bounds, args[1].bounds)
+                } else {
+                    iv_sub(args[0].bounds, args[1].bounds)
+                };
                 Ok(Self {
                     form: args[0].form.clone().add(b)?,
                     dimension: if args[0].form.0.is_empty() {
@@ -479,7 +534,9 @@ impl Value {
                     } else {
                         args[0].dimension.clone()
                     },
-                    positive: op == "+" && args[0].positive && args[1].positive,
+                    positive: (op == "+" && args[0].positive && args[1].positive)
+                        || bounds.map_or(false, |(lo, _)| lo > 0.0),
+                    bounds,
                 })
             }
             "*" | "/" => {
@@ -491,6 +548,11 @@ impl Value {
                         "formal division requires a domain-proven nonzero denominator".into(),
                     );
                 }
+                let bounds = if op == "*" {
+                    iv_mul(a.bounds, b.bounds)
+                } else {
+                    iv_div(a.bounds, b.bounds)
+                };
                 Ok(Self {
                     form: if op == "*" {
                         a.form.clone().mul(b.form.clone())?
@@ -503,7 +565,9 @@ impl Value {
                         .zip(&b.dimension)
                         .map(|(a, b)| if op == "*" { a.add(*b) } else { a.sub(*b) })
                         .collect::<Result<_>>()?,
-                    positive: a.positive && b.positive,
+                    positive: (a.positive && b.positive)
+                        || bounds.map_or(false, |(lo, _)| lo > 0.0),
+                    bounds,
                 })
             }
             "^" | "**" | "pow" => {
@@ -532,6 +596,7 @@ impl Value {
                         .map(|x| x.mul(e))
                         .collect::<Result<_>>()?,
                     positive: args[0].positive || e.n == 0,
+                    bounds: None,
                 })
             }
             "sqrt" | "safe_sqrt" => {
@@ -555,10 +620,18 @@ impl Value {
                     Polynomial::atom(format!("(abs {})", args[0].form.clone().residual()?.text()))
                         .scale(content)?
                 };
+                let bounds = args[0].bounds.map(|(lo, hi)| {
+                    if lo <= 0.0 && hi >= 0.0 {
+                        (0.0, (-lo).max(hi))
+                    } else {
+                        (lo.abs().min(hi.abs()), lo.abs().max(hi.abs()))
+                    }
+                });
                 Ok(Self {
                     form,
                     dimension: args[0].dimension.clone(),
                     positive: args[0].known_nonzero(),
+                    bounds,
                 })
             }
             _ => {
@@ -658,6 +731,7 @@ pub(crate) fn canonical_system(
                                 .map(|&x| Rational::new(x as i128, 1))
                                 .collect::<Result<_>>()?,
                             positive: t.positive,
+                            bounds: symbol_bounds(t),
                         },
                     ))
                 })
@@ -786,6 +860,7 @@ pub(crate) fn canonical_system(
                         .map(|&x| Rational::new(x as i128, 1))
                         .collect::<Result<_>>()?,
                     positive: symbols[s].positive,
+                    bounds: symbol_bounds(&symbols[s]),
                 },
             );
         }
@@ -829,6 +904,75 @@ pub(crate) fn canonical_system(
         saturated: true,
         branches_explored: count,
     })
+}
+
+/// Exact AC-ring multivariate polynomial normal form for `RecExpr<CselLanguage>`.
+/// Used when binary AC e-graph rewriting exceeds the 2^k associativity node cap on
+/// large sums/products (e.g. expanded Jacobian determinants). Fails closed on
+/// unsupported operators, non-finite numbers, or polynomial expansion overflow.
+pub(crate) fn canonicalize_polynomial_recexpr(rec: &RecExpr<CselLanguage>) -> Result<String> {
+    let nodes = rec.as_ref();
+    if nodes.is_empty() {
+        return Err("empty expression".into());
+    }
+    let mut vals: Vec<Polynomial> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let p = match node {
+            CselLanguage::Num(x) => {
+                let v = x.into_inner();
+                if !v.is_finite() {
+                    return Err("nonfinite constant".into());
+                }
+                Polynomial::constant(Rational::decimal(&v.to_string())?)
+            }
+            CselLanguage::Var(s) => Polynomial::atom(s.to_string()),
+            CselLanguage::Neg([a]) => vals[usize::from(*a)].clone().scale(Rational::new(-1, 1)?)?,
+            CselLanguage::Add([a, b]) => vals[usize::from(*a)].clone().add(vals[usize::from(*b)].clone())?,
+            CselLanguage::Sub([a, b]) => {
+                let nb = vals[usize::from(*b)].clone().scale(Rational::new(-1, 1)?)?;
+                vals[usize::from(*a)].clone().add(nb)?
+            }
+            CselLanguage::Mul([a, b]) => vals[usize::from(*a)].clone().mul(vals[usize::from(*b)].clone())?,
+            CselLanguage::SafeDiv([a, b]) => {
+                let pa = vals[usize::from(*a)].clone();
+                let pb = vals[usize::from(*b)].clone();
+                if let Some(c) = pb.coefficient() {
+                    if c == Rational::ZERO {
+                        return Err("zero denominator".into());
+                    }
+                    pa.scale(Rational::ONE.div(c)?)?
+                } else {
+                    Polynomial::atom(format!("(safe_div {} {})", pa.text(), pb.text()))
+                }
+            }
+            CselLanguage::SafePow([a, b]) => {
+                let pa = vals[usize::from(*a)].clone();
+                let pb = vals[usize::from(*b)].clone();
+                if let Some(c) = pb.coefficient() {
+                    if c.d == 1 && c.n >= 0 && c.n <= 16 {
+                        let mut acc = Polynomial::constant(Rational::ONE);
+                        for _ in 0..c.n {
+                            acc = acc.mul(pa.clone())?;
+                        }
+                        acc
+                    } else {
+                        Polynomial::atom(format!("(safe_pow {} {})", pa.text(), pb.text()))
+                    }
+                } else {
+                    Polynomial::atom(format!("(safe_pow {} {})", pa.text(), pb.text()))
+                }
+            }
+            CselLanguage::SafeExp([a]) => Polynomial::atom(format!("(safe_exp {})", vals[usize::from(*a)].text())),
+            CselLanguage::SafeLog([a]) => Polynomial::atom(format!("(safe_log {})", vals[usize::from(*a)].text())),
+            CselLanguage::SafeSqrt([a]) => Polynomial::atom(format!("(safe_sqrt {})", vals[usize::from(*a)].text())),
+            CselLanguage::SafeSin([a]) => Polynomial::atom(format!("(safe_sin {})", vals[usize::from(*a)].text())),
+            CselLanguage::SafeCos([a]) => Polynomial::atom(format!("(safe_cos {})", vals[usize::from(*a)].text())),
+            CselLanguage::Abs([a]) => Polynomial::atom(format!("(abs {})", vals[usize::from(*a)].text())),
+            _ => return Err("unsupported operator in polynomial canonicalization".into()),
+        };
+        vals.push(p);
+    }
+    Ok(vals.last().unwrap().text())
 }
 
 #[cfg(test)]
@@ -881,6 +1025,7 @@ mod tests {
             si_dim,
             semantic_tag: 0,
             positive,
+            domain: None,
             unit_scale: if km {
                 if length_power >= 0 {
                     [1000_i64.pow(length_power as u32), 1]
@@ -992,6 +1137,7 @@ mod tests {
             semantic_tag: 0,
             unit_scale: [1, 1],
             positive: true,
+            domain: None,
         };
         let symbols = BTreeMap::from([("reference".into(), tag.clone()), ("x".into(), tag)]);
         let eq = TaggedCselEq {
@@ -1018,6 +1164,7 @@ mod tests {
                     semantic_tag: 0,
                     unit_scale: [1, 1],
                     positive: false,
+                    domain: None,
                 },
             )]),
         };

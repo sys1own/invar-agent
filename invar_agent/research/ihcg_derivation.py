@@ -29,7 +29,7 @@ def extract_prompt_domains(prompt, symbols):
     for symbol in symbols:
         name = rf"(?<!\w){re.escape(symbol)}(?!\w)"
         patterns = [
-            (rf"{name}\s+in\s*\[\s*({_NUMBER})\s*,\s*({_NUMBER})\s*\]", False),
+            (rf"{name}\s+(?:in|across|over)\s*\[\s*({_NUMBER})\s*,\s*({_NUMBER})\s*\]", False),
             (rf"{name}\s+(?:between|from)\s+({_NUMBER})\s+(?:and|to)\s+({_NUMBER})(?!\w|\.\d)", False),
             (rf"{name}\s*(?:=(?!=)|is fixed at)\s*({_NUMBER})(?!\w|\.\d)", True),
         ]
@@ -37,6 +37,7 @@ def extract_prompt_domains(prompt, symbols):
         for pattern, point in patterns:
             for match in re.finditer(pattern,prompt):
                 if re.search(r"\b(?:at|when|initially|if|not|except|outside)\s*$",prompt[max(0,match.start()-20):match.start()],re.I): continue
+                if re.search(r"[+\-*/^=<>]\s*$",prompt[max(0,match.start()-10):match.start()]): continue
                 if re.match(r'\s*[* /+^(-]',prompt[match.end():].lstrip(' ')): continue
                 pair = [float(match[1]),float(match[1] if point else match[2])]
                 if not all(map(math.isfinite,pair)) or pair[0] > pair[1]:
@@ -125,9 +126,37 @@ def derive_ihcg_evidence(question, blueprint, raw):
         if name in declared and equation.get('kind','ALGEBRAIC') == 'ALGEBRAIC' and not isinstance(node,(ast.Compare,ast.BoolOp)):
             definitions[name] = node
     for expression in expressions: references.update(m._variables(m._parse(expression)))
+    # In two-stage typed_slots derivation, preserve any typed slots referenced by compiled blueprint contracts.
+    if blueprint.get('typed_slots'):
+        slot_by_idx = {slot.get('slot_idx'): slot['symbol'] for slot in slots if isinstance(slot.get('slot_idx'), int)}
+        for contract in (blueprint.get('contracts') or ()):
+            for inv in (contract.get('invariants') or ()):
+                assertion = inv.get('assertion') if isinstance(inv, dict) else getattr(inv, 'assertion', '')
+                for idx_str in re.findall(r'(?:state|buf\.data|data)\[(\d+)\]', str(assertion or '')):
+                    sym = slot_by_idx.get(int(idx_str))
+                    if sym in declared:
+                        references.add(sym)
     if references-declared:
         raise ValueError(f'missing typed slots for referenced symbols: {sorted(references-declared)}')
     selected = [slot for slot in slots if slot['symbol'] in references]
+    # Derive trajectory reduction state_symbol and semantic_tag when blueprint left them unspecified.
+    dynamic_names = {slot['symbol'] for slot in selected if slot.get('role') == 'DYNAMIC_STATE'}
+    for eq_name, equation in evidence.get('equations', {}).items():
+        kind = equation.get('kind')
+        if kind in {'ODE_RHS', 'FIXED_POINT_RESIDUAL', 'FIXED_POINT_MAP'} and not equation.get('state_symbol') and eq_name in dynamic_names:
+            equation['state_symbol'] = eq_name
+            audit.setdefault('derived_state_symbols', {})[eq_name] = eq_name
+        if kind in {'TRAJECTORY_MAX', 'TRAJECTORY_MIN'}:
+            if not equation.get('state_symbol') and str(equation.get('expression', '')).strip() in dynamic_names:
+                equation['state_symbol'] = str(equation['expression']).strip()
+                audit.setdefault('derived_trajectory_sources', {})[eq_name] = equation['state_symbol']
+            if equation.get('state_symbol') in dynamic_names:
+                target_slot = next((s for s in selected if s['symbol'] == eq_name and s.get('role') == 'DERIVED_OBSERVABLE'), None)
+                if target_slot is not None:
+                    expected_tag = m.TRAJECTORY_MAXIMUM if kind == 'TRAJECTORY_MAX' else m.TRAJECTORY_MINIMUM
+                    if target_slot.get('semantic_tag', 0) == 0:
+                        target_slot['semantic_tag'] = expected_tag
+                        audit.setdefault('derived_trajectory_tags', {})[eq_name] = expected_tag
     for index,slot in enumerate(selected):
         try: m.SlotSpec.model_validate_json(json.dumps(slot,allow_nan=False))
         except ValueError as error: raise ValueError(f'typed_slots[{index}]: {error}') from error
@@ -166,6 +195,13 @@ def derive_ihcg_evidence(question, blueprint, raw):
                 audit.setdefault('fixed_constants',{})[name] = value
     free_missing = references-set(definitions)-set(domain)
     if free_missing: raise ValueError(f'missing finite domains for free symbols: {sorted(free_missing)}')
+    for ctrl_name, ctrl_val in (evidence.get('control_values') or {}).items():
+        if ctrl_name in domain and isinstance(ctrl_val, (int, float)) and not isinstance(ctrl_val, bool) and math.isfinite(ctrl_val):
+            lo, hi = domain[ctrl_name]
+            if not (lo <= ctrl_val <= hi):
+                if math.isclose(ctrl_val, lo, rel_tol=1e-5, abs_tol=1e-12) or math.isclose(ctrl_val, hi, rel_tol=1e-5, abs_tol=1e-12):
+                    domain[ctrl_name] = [min(lo, float(ctrl_val)), max(hi, float(ctrl_val))]
+                    audit.setdefault('rounded_control_enclosures', {})[ctrl_name] = domain[ctrl_name]
     pending = {name:node for name,node in definitions.items() if name not in domain}
     resolved = set(domain)
     while pending:

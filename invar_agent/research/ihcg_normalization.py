@@ -9,6 +9,51 @@ ARCHETYPE_ALIASES = {"ODE": "ODE_PDE", "PDE": "ODE_PDE", "ODE/PDE": "ODE_PDE", "
 EQUATION_KIND_ALIASES = {"ODE": "ODE_RHS", "ALGEBRAIC_EXPRESSION": "ALGEBRAIC"}
 _PRESENTATION = {"latex", "display_latex"}
 _ASSIGNMENT = re.compile(r"^\s*(d([^\W\d]\w*)/dt|[^\W\d]\w*)\s*=(?!=)\s*(.+)$", re.S)
+_MATH_PREFIX = re.compile(r"\bmath\.(log|exp|sqrt|sin|cos|fabs)\s*\(")
+_LN_CALL = re.compile(r"\bln\s*\(")
+
+
+def _normalize_formal_expr(expr: str) -> str:
+    """Lossless mathematical syntax normalization (math.* prefix, ln -> log, ^ -> **, variadic min/max -> binary)."""
+    if not isinstance(expr, str):
+        return expr
+    out = _MATH_PREFIX.sub(lambda m: ("abs(" if m.group(1) == "fabs" else f"{m.group(1)}("), expr)
+    out = _LN_CALL.sub("log(", out)
+    if "^" in out:
+        try:
+            tree = ast.parse(out, mode="eval")
+            if any(isinstance(n, ast.BitXor) for n in ast.walk(tree)):
+                out = out.replace("^", "**")
+        except SyntaxError:
+            pass
+    if "min(" in out or "max(" in out:
+        try:
+            tree = ast.parse(out, mode="eval")
+            changed = False
+
+            class _FoldMinMax(ast.NodeTransformer):
+                def visit_Call(self, node):
+                    nonlocal changed
+                    self.generic_visit(node)
+                    if (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id in {"min", "max"}
+                        and not node.keywords
+                        and len(node.args) >= 3
+                    ):
+                        changed = True
+                        acc = node.args[-1]
+                        for arg in reversed(node.args[:-1]):
+                            acc = ast.Call(func=ast.Name(id=node.func.id, ctx=ast.Load()), args=[arg, acc], keywords=[])
+                        return acc
+                    return node
+
+            folded = _FoldMinMax().visit(tree)
+            if changed:
+                out = ast.unparse(ast.fix_missing_locations(folded))
+        except SyntaxError:
+            pass
+    return out
 
 
 def normalize_ihcg_evidence(raw):
@@ -38,7 +83,21 @@ def normalize_ihcg_evidence(raw):
     obligations = evidence.get('obligations', [])
     if isinstance(obligations, list):
         for i, obligation in enumerate(obligations):
-            if isinstance(obligation, dict): presentation(obligation, f'evidence.obligations[{i}]')
+            if isinstance(obligation, dict):
+                presentation(obligation, f'evidence.obligations[{i}]')
+                if isinstance(obligation.get('expression'), str):
+                    norm_expr = _normalize_formal_expr(obligation['expression'])
+                    if norm_expr != obligation['expression']:
+                        remember(f'evidence.obligations[{i}].expression', obligation['expression'])
+                        obligation['expression'] = norm_expr
+    environment = evidence.get('environmental_assumptions', [])
+    if isinstance(environment, list):
+        for i, expr in enumerate(environment):
+            if isinstance(expr, str):
+                norm_expr = _normalize_formal_expr(expr)
+                if norm_expr != expr:
+                    remember(f'evidence.environmental_assumptions[{i}]', expr)
+                    environment[i] = norm_expr
     dimensions = {s.get('symbol'): s.get('si_dim') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
     roles = {s.get('symbol'): s.get('role') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
     domain = pack.get('domain')
@@ -70,6 +129,12 @@ def normalize_ihcg_evidence(raw):
             kind = equation.get('kind')
             if isinstance(kind, str) and kind in EQUATION_KIND_ALIASES: equation['kind'] = EQUATION_KIND_ALIASES[kind]
             expression = equation.get('expression')
+            if isinstance(expression, str):
+                norm_expr = _normalize_formal_expr(expression)
+                if norm_expr != expression:
+                    remember(path + '.expression', expression)
+                    expression = norm_expr
+                    equation['expression'] = expression
             match = _ASSIGNMENT.fullmatch(expression) if isinstance(expression, str) else None
             target = key
             dims = dimensions.get(key)

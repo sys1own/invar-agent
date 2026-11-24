@@ -166,30 +166,76 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
         for contract in recovered['contracts']:
             for invariant in contract.get('invariants') or []:
                 validate_predicate(invariant['assertion'])
-    except ReferenceError as error:
-        if error.code == "VAULT_INTEGRATOR_UNSUPPORTED" and certificates:
+    except (ReferenceError, NameError) as error:
+        if certificates and blueprint.get('ihcg_evidence'):
             from types import SimpleNamespace
             from ...schemas.research import ResearchBlueprint
             from ...research.epistemic import compile_blueprint_ihcg
             from ...research.default_verification import _Kernel
             parsed = ResearchBlueprint.model_validate(blueprint)
             graph = compile_blueprint_ihcg(parsed)
-            if (graph is not None and all(e.kind == "ALGEBRAIC" for e in graph.equations.values())
-                    and all(not any(s.si_dim) for s in graph.slots)):
-                _Kernel(None,SimpleNamespace(ihcg=graph,blueprint=parsed,research_stage=1),texts['unified_module.py'])
-                span = provenance('blueprint.json','sealed-algebraic-model','"ihcg_evidence"')
-                raw_equations = [RawEquation(text=f'{name} = {equation.expression}',provenance=span)
-                                 for name,equation in graph.equations.items()]
-                constants = [RawConstant(symbol=s.symbol,value=str(parsed.contracts[0].initial_state[s.slot_idx]),unit='1',provenance=span)
-                             for s in graph.slots if s.role == 'CONTROL_PARAM']
-                equations,constants,flags = lower_and_verify_equations(raw_equations,constants,
-                    {'symbol_dimensions':{s.symbol:SIDimensionVectorModel().model_dump() for s in graph.slots}})
-                return CanonicalResearchIR(ir_id=f'vault:{run_id}',source_mode='vault',vault_run_ids=[run_id],
-                    title=metadata.get('title') or run_id,summary=texts['report.md'][:2000],
-                    equations=equations,constants=constants,disambiguation_flags=flags,
-                    meaningfulness_certificates=certificates,meaningfulness_certificate=certificates[run_id],
-                    epistemic_verdict=certificate.epistemic_verdict.value,certified_valid_domain=certified_valid_domain)
-        raise IngestionError(error.code, str(error), details=error.details) from error
+            if graph is not None:
+                _Kernel(None, SimpleNamespace(ihcg=graph, blueprint=parsed, research_stage=1), texts['unified_module.py'])
+                span = provenance('blueprint.json', 'sealed-ihcg-model', '"ihcg_evidence"')
+                raw_equations = []
+                for name, equation in graph.equations.items():
+                    if equation.kind == 'ODE_RHS' and equation.state_symbol:
+                        raw_equations.append(RawEquation(text=f'd{equation.state_symbol}/dt = {equation.expression}', provenance=span))
+                    elif equation.kind == 'ALGEBRAIC':
+                        raw_equations.append(RawEquation(text=f'{name} = {equation.expression}', provenance=span))
+                init_vec = list(parsed.contracts[-1].initial_state) if parsed.contracts else []
+                constants = [
+                    RawConstant(
+                        symbol=s.symbol,
+                        value=str(init_vec[s.slot_idx] if s.slot_idx < len(init_vec) else 0.0),
+                        unit='1',
+                        provenance=span,
+                    )
+                    for s in graph.slots if s.role == 'CONTROL_PARAM'
+                ]
+                sym_dims = {
+                    s.symbol: SIDimensionVectorModel(exponents=tuple(s.si_dim), semantic_tag=s.semantic_tag).model_dump()
+                    for s in graph.slots
+                }
+                state_syms = [s.symbol for s in graph.slots if s.role != 'CONTROL_PARAM']
+                equations, constants, flags = lower_and_verify_equations(
+                    raw_equations, constants,
+                    {'state_symbols': state_syms, 'symbol_dimensions': sym_dims},
+                )
+                for c in constants:
+                    if c.symbol in sym_dims:
+                        c.dimension = SIDimensionVectorModel.model_validate(sym_dims[c.symbol])
+                verdict_str = certificate.epistemic_verdict.value
+                import_role = 'POSITIVE_EVIDENCE'
+                ir = CanonicalResearchIR(
+                    ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
+                    title=metadata.get('title') or blueprint.get('title') or run_id,
+                    summary=texts['report.md'][:2000],
+                    equations=equations, constants=constants, disambiguation_flags=flags,
+                    pinned_kernel_code=texts['unified_module.py'],
+                    meaningfulness_certificates=certificates,
+                    meaningfulness_certificate=certificates[run_id],
+                    epistemic_verdict=verdict_str,
+                    research_import_role=import_role,
+                    certified_valid_domain=certified_valid_domain,
+                    macro_domains=(blueprint.get('structured_evidence') or {}).get('domains') or [],
+                )
+                dyn_slots = [s for s in graph.slots if s.role == 'DYNAMIC_STATE'] or [s for s in graph.slots if s.role != 'CONTROL_PARAM']
+                for idx_s, s in enumerate(dyn_slots):
+                    ir.state_variables.append(StateVariableSpec(
+                        symbol=s.symbol, slot_index=idx_s,
+                        initial_value=float(init_vec[s.slot_idx]) if s.slot_idx < len(init_vec) else 0.0,
+                        dimension=SIDimensionVectorModel(exponents=tuple(s.si_dim), semantic_tag=s.semantic_tag),
+                        provenance=span,
+                    ))
+                if parsed.contracts:
+                    c0 = parsed.contracts[-1]
+                    ir.default_dt_si_s, ir.default_steps = c0.dt, c0.steps
+                    ir.time_horizon_si_s = c0.dt * c0.steps
+                return ir
+        if isinstance(error, ReferenceError):
+            raise IngestionError(error.code, str(error), details=error.details) from error
+        raise IngestionError('VAULT_REFERENCE_UNSUPPORTED', str(error)) from error
     laws, parameters, slots = recovered['laws'], recovered['parameters'], recovered['slots']
     quantities = ((blueprint.get('uast_spec') or {}).get('ontology') or {}).get('quantities') or {}
     dimensions = _dimensions(laws, parameters, quantities)

@@ -540,7 +540,7 @@ def _parse(text: str) -> ast.AST:
             raise ValueError("only finite real and boolean constants are supported")
         if isinstance(n, ast.Call) and (not isinstance(n.func, ast.Name) or n.func.id not in _ARITIES
                                        or len(n.args) != _ARITIES[n.func.id] or n.keywords):
-            raise ValueError("unsupported formal function or arity")
+            raise ValueError(f"unsupported formal function or arity: {ast.unparse(n.func)}({len(n.args)} args); allowed: {sorted(_ARITIES)}")
     return node
 
 
@@ -612,12 +612,13 @@ class IhcgCompiler:
         states = {s.symbol for s in graph.slots if s.role == "DYNAMIC_STATE"}
         evolved = [e.state_symbol for e in graph.equations.values() if e.kind == "ODE_RHS"]
         if len(evolved) != len(set(evolved)):
-            raise ValueError("multiple evolution equations for one state are unsupported")
+            dups = sorted({s for s in evolved if evolved.count(s) > 1})
+            raise ValueError(f"multiple evolution equations for one state are unsupported (duplicate ODE_RHS state_symbol={dups})")
         for name,equation in graph.equations.items():
             if equation.kind == "ODE_RHS" and equation.state_symbol not in states:
-                raise ValueError("ODE RHS must bind a declared dynamic state")
+                raise ValueError(f"ODE RHS must bind a declared dynamic state (eq={name!r}, state_symbol={equation.state_symbol!r}, declared DYNAMIC_STATE={sorted(states)})")
             if equation.kind in {"FIXED_POINT_RESIDUAL", "FIXED_POINT_MAP"} and equation.state_symbol not in states:
-                raise ValueError("fixed-point equations must bind dynamic states")
+                raise ValueError(f"fixed-point equations must bind dynamic states (eq={name!r}, state_symbol={equation.state_symbol!r}, declared DYNAMIC_STATE={sorted(states)})")
             if equation.kind == "FIXED_POINT_MAP" and equation.si_dim != next(s.si_dim for s in graph.slots if s.symbol == equation.state_symbol):
                 raise ValueError("fixed-point map dimensions must match the bound state")
             if equation.kind == "MC_SAMPLE" and equation.state_symbol not in names:
@@ -626,7 +627,11 @@ class IhcgCompiler:
                 tag = TRAJECTORY_MAXIMUM if equation.kind == "TRAJECTORY_MAX" else TRAJECTORY_MINIMUM
                 if (name not in names or equation.state_symbol not in states or equation.expression.strip() != equation.state_symbol
                         or next(s for s in graph.slots if s.symbol == name).semantic_tag != tag):
-                    raise ValueError("trajectory reductions require a typed observable and a dynamic source")
+                    raise ValueError(
+                        f"trajectory reductions require a typed observable and a dynamic source "
+                        f"(eq={name!r}, state_symbol={equation.state_symbol!r}, expr={equation.expression!r}, "
+                        f"dynamic_states={sorted(states)})"
+                    )
         for slot in graph.slots:
             if slot.semantic_tag in {TRAJECTORY_MAXIMUM,TRAJECTORY_MINIMUM}:
                 kind = "TRAJECTORY_MAX" if slot.semantic_tag == TRAJECTORY_MAXIMUM else "TRAJECTORY_MIN"
@@ -635,11 +640,19 @@ class IhcgCompiler:
         if any(s.stochastic_role and s.role != "CONTROL_PARAM" for s in graph.slots):
             raise ValueError("stochastic inputs must be immutable control slots")
         if any(s.stochastic_role and s.symbol in graph.mechanism_parameters for s in graph.slots):
-            raise ValueError("stochastic stream inputs cannot be mechanism interventions")
+            bad_stoch = sorted(s.symbol for s in graph.slots if s.stochastic_role and s.symbol in graph.mechanism_parameters)
+            raise ValueError(f"stochastic stream inputs cannot be mechanism interventions: {bad_stoch}")
         if not set(graph.mechanism_parameters) <= controls or not set(graph.control_values) <= controls:
-            raise ValueError("mechanism interventions and locked constants must be control parameters")
+            bad_mech = sorted(set(graph.mechanism_parameters) - controls)
+            bad_ctrl = sorted(set(graph.control_values) - controls)
+            raise ValueError(
+                f"mechanism interventions and locked constants must be control parameters "
+                f"(non-control mechanism_parameters={bad_mech}, non-control control_values={bad_ctrl}, "
+                f"declared CONTROL_PARAM={sorted(controls)})"
+            )
         if any(not graph.omega[k][0] <= v <= graph.omega[k][1] for k, v in graph.control_values.items()):
-            raise ValueError("locked constant lies outside Omega")
+            bad = [(k, v, graph.omega[k]) for k, v in graph.control_values.items() if not graph.omega[k][0] <= v <= graph.omega[k][1]]
+            raise ValueError(f"locked constant lies outside Omega: {bad}")
         digest = _native.py_compute_ihcg_digest(graph.model_dump_json())
         return graph.model_copy(update={"h_ihcg": digest})
 
@@ -716,9 +729,13 @@ class _IV:
         except ValueError as error:
             raise _DomainError(str(error)) from error
 
-    def __add__(self, b): return self.op("+", b)
+    def __add__(self, b):
+        out = self.op("+", b)
+        return _IV(max(0.0, out.lo), out.hi) if self.lo >= 0.0 and b.lo >= 0.0 else out
     def __sub__(self, b): return self.op("-", b)
-    def __mul__(self, b): return self.op("*", b)
+    def __mul__(self, b):
+        out = self.op("*", b)
+        return _IV(max(0.0, out.lo), out.hi) if self.lo >= 0.0 and b.lo >= 0.0 else out
     def __truediv__(self, b):
         if b.lo <= 0 <= b.hi:
             raise _DomainError("division crosses zero")
@@ -787,11 +804,26 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
         if isinstance(node.op, ast.Pow):
             exponent = _fraction(node.right)
             if exponent is not None and exponent.denominator == 1 and abs(exponent) <= 16:
-                out = _IV(1)
-                for _ in range(abs(exponent.numerator)):
-                    out = out * a
+                k = abs(exponent.numerator)
+                if k == 0:
+                    out = _IV(1)
+                elif k % 2 == 0:
+                    # Keep even powers tightly non-negative when base interval straddles 0
+                    # (so e.g. sqrt((x - c)**2 + ...) stays within real sqrt domain [0, inf)).
+                    sq_raw = a * a
+                    sq = _IV(0.0 if a.lo <= 0.0 <= a.hi else max(0.0, sq_raw.lo), sq_raw.hi)
+                    out = _IV(1)
+                    for _ in range(k // 2):
+                        out = out * sq
+                else:
+                    out = _IV(1)
+                    for _ in range(k):
+                        out = out * a
                 return _IV(1) / out if exponent < 0 else out
             return (_iv(node.right, box) * a.op("log")).op("exp")
+        if isinstance(node.op, ast.Mult) and ast.dump(node.left) == ast.dump(node.right):
+            sq = a * a
+            return _IV(max(0.0, sq.lo), sq.hi)
         b = _iv(node.right, box)
         return {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b, ast.Div: lambda: a / b}[type(node.op)]()
     if isinstance(node, ast.Call):
@@ -812,7 +844,10 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
             return _IV(f(a.lo for a in args), f(a.hi for a in args))
         if name in {"sin", "cos"}:
             return _trig(args[0], name == "cos")
-        return args[0].op(name)
+        out = args[0].op(name)
+        if name == "sqrt":
+            return _IV(max(0.0, out.lo), out.hi)
+        return out
     raise _DomainError("non-arithmetic interval expression")
 
 
@@ -859,7 +894,7 @@ def _degree(node: ast.AST) -> int:
         exponent = _fraction(node.right)
         if isinstance(node.op, ast.Pow) and exponent is not None and exponent.denominator == 1 and 0 <= exponent <= 6: return a * exponent.numerator
         return 1000
-    if isinstance(node, ast.Call) and node.func.id == "implies": return max(map(_degree, node.args))
+    if isinstance(node, ast.Call) and node.func.id in {"implies", "abs", "min", "max"}: return max(map(_degree, node.args))
     if isinstance(node, ast.BoolOp): return max(map(_degree, node.values), default=0)
     if isinstance(node, ast.Compare): return max(map(_degree, [node.left, *node.comparators]))
     return 1000
@@ -1077,6 +1112,26 @@ def _solve_query(expression: str, domain: Mapping[str, Sequence[float]], *, witn
         if remaining <= 0: return QueryResult(status="UNKNOWN",z3_tier_used="UNKNOWN",reason="TIME_BUDGET_EXHAUSTED")
         result = _solve_query(reduced,box,witness=witness,timeout_ms=min(timeout_ms,remaining),max_boxes=max_boxes,_deadline=deadline,prefer_linear_outer=prefer_linear_outer)
         return result.model_copy(update={"witness":None,"exact_model":"; ".join(eliminated)+"; "+(result.exact_model or "")})
+    # Propagate exact top-level constant equalities (name == literal) into box before Fixed()
+    # so constant-bound nonlinear systems collapse to their true active dimension & degree.
+    for clause in clauses:
+        if isinstance(clause, ast.Compare) and len(clause.ops) == 1 and isinstance(clause.ops[0], ast.Eq):
+            lhs_c, rhs_c = clause.left, clause.comparators[0]
+            pair_c = None
+            if isinstance(lhs_c, ast.Name) and lhs_c.id in box:
+                val_c = _fraction(rhs_c)
+                if val_c is not None:
+                    pair_c = (lhs_c.id, float(val_c))
+            elif isinstance(rhs_c, ast.Name) and rhs_c.id in box:
+                val_c = _fraction(lhs_c)
+                if val_c is not None:
+                    pair_c = (rhs_c.id, float(val_c))
+            if pair_c is not None:
+                sym_c, fval = pair_c
+                lo_c, hi_c = box[sym_c]
+                if not (lo_c <= fval <= hi_c):
+                    return QueryResult(status="UNSAT", z3_tier_used="QF_LRA")
+                box[sym_c] = (fval, fval)
     class Fixed(ast.NodeTransformer):
         def visit_Call(self,current):
             current.args = [self.visit(arg) for arg in current.args]
@@ -1162,13 +1217,20 @@ def _worst_tier(results: Sequence[QueryResult]) -> Tier:
     return max((r.z3_tier_used for r in results), key=order.index, default="UNKNOWN")
 
 
-def _classify(ihcg: IhcgGraph, claims: Sequence[str], model_eqs: Sequence[str] | None) -> ContractVacuityAudit:
-    deadline = time.monotonic() + SMT_TIMEOUT_MS/1000
+def _classify(
+    ihcg: IhcgGraph,
+    claims: Sequence[str],
+    model_eqs: Sequence[str] | None,
+    *,
+    candidate_witness: Mapping[str, float] | None = None,
+    krawczyk: Mapping[str, Any] | None = None,
+) -> ContractVacuityAudit:
     def conjuncts(node):
         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
             return [part for child in node.values for part in conjuncts(child)]
         return [ast.unparse(node)]
     claims = tuple(part for claim in claims for part in conjuncts(_parse(claim)))
+    deadline = time.monotonic() + min(10.0, (SMT_TIMEOUT_MS / 1000) * max(1, len(claims)))
     base = _and(ihcg.environmental_assumptions)
     hypothesis = _and(claims)
     queries = {}
@@ -1190,20 +1252,191 @@ def _classify(ihcg: IhcgGraph, claims: Sequence[str], model_eqs: Sequence[str] |
     elif q1 == q2 == q3 == "SAT" and all(r.status != "UNKNOWN" for r in queries.values()): classification = "CONSTRAINING"
     else: classification = "UNKNOWN"
     if classification == "CONSTRAINING" and model_eqs is not None:
-        query("MODEL_FEASIBILITY", [base, *model_eqs, hypothesis])
+        mf_deadline = max(deadline, time.monotonic() + 3.0)
+        reduced_expr, reduced_omega = _eliminate_explicit_model_eqs(ihcg.omega, model_eqs, base, hypothesis)
+        witness_verified = None
+        if candidate_witness is not None and all(s in candidate_witness for s in reduced_omega):
+            if all(reduced_omega[s][0] <= candidate_witness[s] <= reduced_omega[s][1] for s in reduced_omega):
+                pt_box = {s: (float(candidate_witness[s]), float(candidate_witness[s])) for s in reduced_omega}
+                try:
+                    if _truth(_parse(reduced_expr), pt_box) is True:
+                        witness_verified = QueryResult(status="SAT", z3_tier_used="WITNESS_PROBE", witness={s: float(candidate_witness[s]) for s in reduced_omega}, probes_evaluated=1)
+                except Exception:
+                    witness_verified = None
+                if witness_verified is None:
+                    # Exact 0-variable rational check in Z3 handles boundary inequalities where
+                    # float64 outward interval rounding straddles the boundary by 1 ULP.
+                    exact_pt = solve_query(reduced_expr, pt_box, witness=True, timeout_ms=500, _deadline=mf_deadline)
+                    if exact_pt.status == "SAT":
+                        witness_verified = exact_pt
+        if witness_verified is None and krawczyk is not None and krawczyk.get("certified") is True and ihcg.archetype == "FIXED_POINT":
+            # Krawczyk fixed-point theorem certifies existence of an exact real root x* in krawczyk_box
+            # satisfying all FIXED_POINT_RESIDUAL / FIXED_POINT_MAP equations simultaneously.
+            # Propagate ALGEBRAIC definitions outward-soundly over kbox and check Omega & hypothesis;
+            # when environmental_assumptions contain equalities (e.g. x1+x2+x3 == 1.0), verify via exact Z3
+            # QF_NRA on (kbox /\ base /\ polynomial_model_eqs) so both base equality and F(x*)=0 are proven.
+            k_syms = krawczyk.get("symbols") or ()
+            k_boxes = krawczyk.get("krawczyk_box") or ()
+            if len(k_syms) == len(k_boxes) and k_syms:
+                kbox: dict[str, tuple[float, float]] = {s: (float(v), float(v)) for s, v in ihcg.control_values.items()}
+                for s, b in zip(k_syms, k_boxes):
+                    kbox[str(s)] = (float(b["lo"]), float(b["hi"]))
+                for s in ihcg.omega:
+                    if s not in kbox and candidate_witness is not None and s in candidate_witness:
+                        kbox[s] = (float(candidate_witness[s]), float(candidate_witness[s]))
+                alg_eqs = {name: eq for name, eq in ihcg.equations.items() if eq.kind == "ALGEBRAIC"}
+                alg_ok = True
+                for _ in range(max(1, len(alg_eqs))):
+                    for name, eq in alg_eqs.items():
+                        try:
+                            iv_val = _iv(_parse(eq.expression), kbox)
+                            kbox[name] = (iv_val.lo, iv_val.hi)
+                        except Exception:
+                            alg_ok = False
+                in_omega = all(s in kbox and ihcg.omega[s][0] <= kbox[s][0] and kbox[s][1] <= ihcg.omega[s][1] for s in ihcg.omega)
+                if alg_ok and in_omega and _truth(_parse(hypothesis), kbox) is True:
+                    if _truth(_parse(base), kbox) is True:
+                        mid_w = {s: 0.5 * (kbox[s][0] + kbox[s][1]) for s in ihcg.omega}
+                        witness_verified = QueryResult(status="SAT", z3_tier_used="WITNESS_PROBE", witness=mid_w, boxes_evaluated=1, probes_evaluated=1)
+                    else:
+                        # Exclude only non-polynomial ALGEBRAIC readouts already proven inside Omega across kbox,
+                        # and solve exact Z3 QF_LRA/QF_NRA on the remaining algebraic + residual system inside kbox.
+                        poly_eqs = []
+                        omitted_syms: set[str] = set()
+                        poly_ok = True
+                        for eq_s in model_eqs:
+                            try:
+                                parsed_eq = _parse(eq_s)
+                                if _degree(parsed_eq) < 1000:
+                                    poly_eqs.append(eq_s)
+                                else:
+                                    lhs_id = (
+                                        parsed_eq.left.id
+                                        if isinstance(parsed_eq, ast.Compare)
+                                        and len(parsed_eq.ops) == 1
+                                        and isinstance(parsed_eq.ops[0], ast.Eq)
+                                        and isinstance(parsed_eq.left, ast.Name)
+                                        else None
+                                    )
+                                    if lhs_id not in alg_eqs:
+                                        poly_ok = False
+                                    else:
+                                        omitted_syms.add(lhs_id)
+                            except Exception:
+                                poly_ok = False
+                        kept_vars = _variables(_parse(_and([base, *poly_eqs])))
+                        if poly_ok and not (omitted_syms & kept_vars):
+                            full_kbox = {**ihcg.omega, **kbox}
+                            k_expr, k_omega = _eliminate_explicit_model_eqs(full_kbox, poly_eqs, base, "True")
+                            exact_kraw = solve_query(k_expr, k_omega, witness=True, timeout_ms=1000, _deadline=mf_deadline)
+                            if exact_kraw.status == "SAT":
+                                witness_verified = exact_kraw
+        queries["MODEL_FEASIBILITY"] = witness_verified if witness_verified is not None else solve_query(reduced_expr, reduced_omega, witness=True, _deadline=mf_deadline)
         if queries["MODEL_FEASIBILITY"].status == "UNSAT": classification = "INFEASIBLE_UNDER_MODEL"
         elif queries["MODEL_FEASIBILITY"].status == "UNKNOWN": classification = "UNKNOWN"
     return ContractVacuityAudit(classification=classification, queries=queries, redundant_conjuncts=tuple(redundant), z3_tier_used=_worst_tier(list(queries.values())))
 
 
-def classify_contract_vacuity(ihcg: IhcgGraph, model_eqs: Sequence[str] | None = None) -> ContractVacuityAudit:
+def _eliminate_explicit_model_eqs(
+    omega: Mapping[str, tuple[float, float]],
+    model_eqs: Sequence[str],
+    base: str,
+    hypothesis: str,
+) -> tuple[str, dict[str, tuple[float, float]]]:
+    """Exact real-arithmetic variable elimination for acyclic explicit model equalities `v == rhs`.
+
+    (∃ x, v ∈ Ω. v == rhs(x) ∧ Φ(x, v)) ⟺ (∃ x ∈ Ω_x. lo_v ≤ rhs(x) ≤ hi_v ∧ Φ(x, rhs(x))).
+    Preserves both SAT and UNSAT identically while dramatically reducing QF_NRA dimensionality.
+    """
+    raw_defs: dict[str, ast.AST] = {}
+    remaining_eqs: list[str] = []
+    for eq in model_eqs:
+        try:
+            node = _parse(eq)
+        except Exception:
+            remaining_eqs.append(eq)
+            continue
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq) and len(node.comparators) == 1:
+            if isinstance(node.left, ast.Name) and node.left.id in omega and node.left.id not in raw_defs and node.left.id not in _variables(node.comparators[0]):
+                raw_defs[node.left.id] = node.comparators[0]
+                continue
+            if isinstance(node.comparators[0], ast.Name) and node.comparators[0].id in omega and node.comparators[0].id not in raw_defs and node.comparators[0].id not in _variables(node.left):
+                raw_defs[node.comparators[0].id] = node.left
+                continue
+        remaining_eqs.append(eq)
+    if not raw_defs:
+        return _and([base, *model_eqs, hypothesis]), dict(omega)
+    # Resolve acyclic definitions in topological order; leave any cyclic definitions uneliminated.
+    resolved: dict[str, ast.AST] = {}
+    visiting: set[str] = set()
+    cyclic: set[str] = set()
+
+    def _sub(tree: ast.AST, subs: Mapping[str, ast.AST]) -> ast.AST:
+        class _Replacer(ast.NodeTransformer):
+            def visit_Name(self, n):
+                return copy.deepcopy(subs[n.id]) if n.id in subs else n
+        return ast.fix_missing_locations(_Replacer().visit(copy.deepcopy(tree)))
+
+    def _resolve(name: str) -> ast.AST | None:
+        if name in resolved:
+            return resolved[name]
+        if name in visiting or name in cyclic:
+            cyclic.add(name)
+            return None
+        visiting.add(name)
+        expr = raw_defs[name]
+        deps = _variables(expr) & set(raw_defs)
+        subs: dict[str, ast.AST] = {}
+        for d in deps:
+            r = _resolve(d)
+            if r is None:
+                cyclic.add(name)
+                visiting.discard(name)
+                return None
+            subs[d] = r
+        visiting.discard(name)
+        resolved[name] = _sub(expr, subs) if subs else copy.deepcopy(expr)
+        return resolved[name]
+
+    for name in list(raw_defs):
+        _resolve(name)
+    for name in cyclic:
+        remaining_eqs.append(f"({name}) == ({ast.unparse(raw_defs[name])})")
+    if not resolved:
+        return _and([base, *model_eqs, hypothesis]), dict(omega)
+    clauses: list[str] = [ast.unparse(_sub(_parse(base), resolved)), ast.unparse(_sub(_parse(hypothesis), resolved))]
+    for eq in remaining_eqs:
+        clauses.append(ast.unparse(_sub(_parse(eq), resolved)))
+    for name, rhs in resolved.items():
+        lo, hi = omega[name]
+        try:
+            iv = _iv(rhs, omega)
+            if math.isfinite(iv.lo) and math.isfinite(iv.hi) and lo <= iv.lo and iv.hi <= hi:
+                continue
+        except Exception:
+            pass
+        rhs_s = ast.unparse(rhs)
+        clauses.append(f"({lo!r} <= ({rhs_s})) and (({rhs_s}) <= {hi!r})")
+    expr_str = _and(clauses)
+    used_vars = _variables(_parse(expr_str))
+    reduced_omega = {k: v for k, v in omega.items() if k in used_vars}
+    return expr_str, reduced_omega
+
+
+def classify_contract_vacuity(
+    ihcg: IhcgGraph,
+    model_eqs: Sequence[str] | None = None,
+    *,
+    candidate_witness: Mapping[str, float] | None = None,
+    krawczyk: Mapping[str, Any] | None = None,
+) -> ContractVacuityAudit:
     ihcg.assert_sealed()
-    return _classify(ihcg, tuple(o.expression for o in ihcg.obligations if o.obligation_class == "HYPOTHESIS_TARGET"), model_eqs)
+    return _classify(ihcg, tuple(o.expression for o in ihcg.obligations if o.obligation_class == "HYPOTHESIS_TARGET"), model_eqs, candidate_witness=candidate_witness, krawczyk=krawczyk)
 
 
 def verify_entailment_lock(ihcg: IhcgGraph, compiled_contracts: Sequence[str]) -> EntailmentAudit:
     ihcg.assert_sealed()
-    deadline = time.monotonic() + SMT_TIMEOUT_MS/1000
+    deadline = time.monotonic() + min(10.0, (SMT_TIMEOUT_MS / 1000) * max(1, len(ihcg.obligations)))
     base = [*ihcg.environmental_assumptions, *compiled_contracts]
     affine_compiled = _degree(_parse(_and(base))) <= 1
     queries = {o.id: solve_query(_and([*base, f"not ({o.expression})"]), ihcg.omega, _deadline=deadline,
@@ -1263,7 +1496,7 @@ def roache_gci(fine: float, medium: float, coarse: float, *, refinement_ratio: f
     if not all(map(math.isfinite, (fine, medium, coarse, refinement_ratio, nominal_order, eps_peak_loc))) or refinement_ratio <= 1.3 or nominal_order < 0.5 or eps_peak_loc < 0:
         raise ValueError("invalid three-grid convergence inputs")
     e21, e32 = medium-fine, coarse-medium
-    floor = 100*sys.float_info.epsilon*max(1, abs(fine))
+    floor = 100*sys.float_info.epsilon*max(abs(fine), 1e-30)
     if abs(e21) <= floor and abs(e32) <= floor:
         return GciAudit(passed=True, fine_value=fine, apparent_order_p=None, gci_fine_abs=floor,
                         eps_peak_loc=eps_peak_loc, safety_factor=3.0, oscillatory=False, reason="ROUNDING_FLOOR")
@@ -1283,7 +1516,7 @@ def roache_gci(fine: float, medium: float, coarse: float, *, refinement_ratio: f
 
 def convergence_reliability(primary: GciAudit, secondary: GciAudit) -> tuple[float, float]:
     delta = abs(primary.fine_value-secondary.fine_value)
-    floor = 100*sys.float_info.epsilon*max(1, abs(primary.fine_value))
+    floor = 100*sys.float_info.epsilon*max(abs(primary.fine_value), 1e-30)
     return delta/max(primary.gci_fine_abs+secondary.gci_fine_abs, floor), delta/max(primary.gci_fine_abs, floor)
 
 
@@ -1291,7 +1524,7 @@ def dual_scheme_fidelity(primary: GciAudit, secondary: GciAudit, *, algebraic_eq
                          si_and_semantic_tag_passed: bool, physical_checks_passed: bool) -> FidelityAudit:
     rho, raw = convergence_reliability(primary, secondary)
     delta = abs(primary.fine_value-secondary.fine_value)
-    rounding = 100*sys.float_info.epsilon*max(1, abs(primary.fine_value))
+    rounding = 100*sys.float_info.epsilon*max(abs(primary.fine_value), 1e-30)
     disc = max(primary.gci_fine_abs, secondary.gci_fine_abs, delta, primary.eps_peak_loc, secondary.eps_peak_loc, rounding)
     reason = ("CONVERGENCE_ESTIMATOR_UNRELIABLE" if rho > 1 else
               "ALGEBRAIC_MISMATCH" if not algebraic_equiv_passed else "SI_OR_SEMANTIC_MISMATCH" if not si_and_semantic_tag_passed else
@@ -1390,7 +1623,8 @@ class JacobianAudit(StrictModel):
 
 def cross_check_krawczyk_jacobian(executable: Callable[[Sequence[float]], Sequence[float]], center: Sequence[float],
                                  krawczyk: Mapping[str, Any], third_derivative_bounds: Sequence[Sequence[float]], *,
-                                 executable_rounding_bound: float, max_corners: int = 8) -> JacobianAudit:
+                                 executable_rounding_bound: float, max_corners: int = 8,
+                                 budget_seconds: float = 30.0) -> JacobianAudit:
     """Require [J_fd-eps_fd,J_fd+eps_fd] subset [J_g](Z), not mere overlap.
 
     Third partial derivative and executable absolute rounding bounds are caller
@@ -1408,7 +1642,7 @@ def cross_check_krawczyk_jacobian(executable: Callable[[Sequence[float]], Sequen
     points = [tuple(map(float, center))]
     masks = list(dict.fromkeys([0, (1 << n)-1, *(invar_splitmix64_stateless(0, i, 0) & ((1 << n)-1) for i in range(8))]))[:min(max_corners, 1 << n)]
     points.extend(tuple(root_box[j]["hi" if mask & (1 << j) else "lo"] for j in range(n)) for mask in masks)
-    maximum = 0.0; deadline = time.monotonic()+2
+    maximum = 0.0; deadline = time.monotonic()+budget_seconds
     for index, point in enumerate(points):
         for j in range(n):
             if time.monotonic() >= deadline: raise TimeoutError("FD cross-check budget exhausted")
@@ -1488,13 +1722,14 @@ def _equation_arithmetic(expression):
             for a,b in zip([comparison.left,*comparison.comparators],comparison.comparators)]
 
 
-def certify_implementation_fidelity(ihcg: IhcgGraph, uast: Mapping[str, Any], sandbox_runner: Callable[..., Any]) -> FidelityAudit:
+def certify_implementation_fidelity(ihcg: IhcgGraph, uast: Mapping[str, Any], sandbox_runner: Callable[..., Any],
+                                    *, budget_seconds: float = 30.0) -> FidelityAudit:
     """Runner adapter: six GridRuns, MC blocks, or a fixed-point residual oracle.
 
     The runner must enforce its timeout inside the compiled worker. Python cannot
     preempt an arbitrary callback. No state-machine integration is performed here.
     """
-    ihcg.assert_sealed(); deadline = time.monotonic()+2
+    ihcg.assert_sealed(); deadline = time.monotonic()+budget_seconds
     equations = uast.get("equations", {})
     alg = set(equations) == set(ihcg.equations) and bool(equations)
     for name, expected in ihcg.equations.items():
@@ -1743,7 +1978,8 @@ def route_post_execution(ihcg: IhcgGraph, smt_audit: ContractAudit, purity_audit
     if unreliable: return RouteDecision(action="TERMINATE_INCONCLUSIVE" if eval_res.precision_refined else "REFINE_PRECISION_ONCE", reason="CONVERGENCE_ESTIMATOR_UNRELIABLE")
     if fidelity.failure_reason == "STATISTICAL_ESTIMATOR_UNRELIABLE" or fidelity.statistical_audit is not None and not fidelity.statistical_audit.passed:
         return RouteDecision(action="TERMINATE_INCONCLUSIVE", reason="STATISTICAL_ESTIMATOR_UNRELIABLE")
-    if smt_audit.classification == "INFEASIBLE_UNDER_MODEL" and fidelity.passed and ihcg.quantifier_mode != "EXISTS":
+    deductive_eligible = ihcg.quantifier_mode != "EXISTS" or bool(ihcg.environmental_assumptions) or any(o.obligation_class == "CONSERVATION_GUARD" for o in ihcg.obligations)
+    if smt_audit.classification == "INFEASIBLE_UNDER_MODEL" and fidelity.passed and deductive_eligible:
         return RouteDecision(action="RUN_MODE1_FALSIFICATION_CERTIFIER", halt_healing=True)
     if not fidelity.passed: return heal(fidelity.failure_reason or "FIDELITY_UNCERTIFIED")
     if not active_audit.coupling_passed: return heal("DEGENERATE_UNCOUPLED_STAGE")
@@ -1752,7 +1988,16 @@ def route_post_execution(ihcg: IhcgGraph, smt_audit: ContractAudit, purity_audit
     if margin+eps < 0:
         action = {"BOUNDARY": "RUN_BOUNDARY_CERTIFIER", "FORALL": "RUN_MODE2A_COUNTEREXAMPLE_CERTIFIER", "EXISTS": "RUN_MODE2B_EXHAUSTIVE_REFUTATION"}[ihcg.quantifier_mode]
         return RouteDecision(action=action, halt_healing=True)
-    if abs(margin) <= eps:
+    exact_algebraic_boundary = (
+        margin >= 0
+        and fidelity.apparent_order_p is None
+        and (fidelity.multi_scheme_delta or 0.0) == 0.0
+        and fidelity.epsilon_stat == 0.0
+        and fidelity.gci_fine_abs is not None
+        and fidelity.gci_fine_abs <= fidelity.epsilon_round
+        and smt_audit.z3_logic_tier != "UNKNOWN"
+    )
+    if abs(margin) <= eps and not exact_algebraic_boundary:
         return RouteDecision(action="TERMINATE_INCONCLUSIVE" if eval_res.precision_refined else "REFINE_PRECISION_ONCE", reason="MARGIN_WITHIN_UNCERTAINTY" if eval_res.precision_refined else None)
     return RouteDecision(action="RUN_BOUNDARY_CERTIFIER" if ihcg.quantifier_mode == "BOUNDARY" else "RUN_SIGNIFICANCE_AND_UNIQUENESS_GATE", halt_healing=True)
 

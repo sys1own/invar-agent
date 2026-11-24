@@ -145,14 +145,23 @@ pub fn check_algebraic_equivalence(lhs: &str, rhs: &str, iter_limit: usize, node
 
 pub fn canonicalize_csel_expr(expr: &str) -> Result<String,String> {
     let expr = parse_verification_expr(expr)?;
+    // Large sums/products exceed 2^k associative e-nodes in egg; normalize directly via exact AC-ring polynomial form.
+    if expr.as_ref().len() > 48 {
+        if let Ok(poly) = crate::buckingham_pi::canonicalize_polynomial_recexpr(&expr) {
+            return Ok(poly);
+        }
+    }
     let runner = Runner::default().with_iter_limit(30).with_node_limit(20_000)
         .with_time_limit(std::time::Duration::from_millis(1500)).with_expr(&expr).run(&verification_rules());
-    if !matches!(runner.stop_reason,Some(egg::StopReason::Saturated)) { return Err("canonicalization did not saturate".into()); }
-    let extractor = Extractor::new(&runner.egraph,CanonicalLexCost);
-    Ok(extractor.find_best(runner.roots[0]).0.1)
+    if matches!(runner.stop_reason,Some(egg::StopReason::Saturated)) {
+        let extractor = Extractor::new(&runner.egraph,CanonicalLexCost);
+        return Ok(extractor.find_best(runner.roots[0]).0.1);
+    }
+    crate::buckingham_pi::canonicalize_polynomial_recexpr(&expr)
+        .map_err(|_| "canonicalization did not saturate".to_string())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CanonicalSymbol {
     pub role: crate::uast::WireRole,
     pub si_dim: [i8;7],
@@ -163,6 +172,9 @@ pub struct CanonicalSymbol {
     /// Domain evidence required when selecting nonzero repeating quantities.
     #[serde(default)]
     pub positive: bool,
+    /// Optional closed domain interval [lo, hi] in coordinate units for proving nonzero denominators.
+    #[serde(default, skip_serializing)]
+    pub domain: Option<[f64;2]>,
 }
 
 fn canonical_unit_scale() -> [i64;2] { [1,1] }
@@ -350,7 +362,7 @@ mod verification_tests {
     #[test]
     fn alpha_renaming_preserves_labels_and_fails_closed_on_caps() {
         use crate::uast::WireRole;
-        let tag=CanonicalSymbol {role:WireRole::DynamicState,si_dim:[0;7],semantic_tag:0,unit_scale:[1,1],positive:false};
+        let tag=CanonicalSymbol {role:WireRole::DynamicState,si_dim:[0;7],semantic_tag:0,unit_scale:[1,1],positive:false,domain:None};
         let a=TaggedCselEq {expr:"(+ x (* y z))".into(),symbols:std::collections::BTreeMap::from([("x".into(),tag.clone()),("y".into(),tag.clone()),("z".into(),tag.clone())])};
         let b=TaggedCselEq {expr:"(+ a (* c b))".into(),symbols:std::collections::BTreeMap::from([("a".into(),tag.clone()),("b".into(),tag.clone()),("c".into(),tag.clone())])};
         assert_eq!(compute_alpha_canonical_system(&[a.clone()],64).unwrap().canonical_system,compute_alpha_canonical_system(&[b],64).unwrap().canonical_system);
