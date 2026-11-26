@@ -1120,6 +1120,24 @@ def normalize_expression(
             ),),
         )
 
+    # Check raw bracket/paren nesting depth before fast-path (ast.parse strips redundant parens).
+    cur_nest = 0
+    for idx_ch, ch in enumerate(text):
+        if ch in "([":
+            cur_nest += 1
+            if cur_nest > max_depth:
+                return NormalizedExpr(
+                    canonical=None,
+                    diagnostics=(ExprDiagnostic(
+                        code="EXPRESSION_TOO_DEEP",
+                        message=f"Expression nesting depth exceeds cap ({max_depth}).",
+                        original=text[:120],
+                        column=idx_ch + 1,
+                    ),),
+                )
+        elif ch in ")]":
+            cur_nest = max(0, cur_nest - 1)
+
     # Fast path: if meaningfulness._parse(text) already accepts it (and no unsafe power tower),
     # return BYTE-IDENTICAL with zero transforms.
     try:
