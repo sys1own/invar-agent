@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from invar_agent.llm.telemetry import get_run_telemetry, reset_run_telemetry
+from invar_agent.llm.telemetry import get_llm_telemetry_summary, reset_llm_telemetry
 from invar_agent.research import meaningfulness as m
 from invar_agent.research.vault import ResearchVaultManager
 
@@ -139,7 +139,7 @@ def _run_http_case(case_id: str, prompt: str, *, seed: int | None = None, timeou
     ws_dir.mkdir(parents=True, exist_ok=True)
 
     server._STATE = None
-    reset_run_telemetry()
+    reset_llm_telemetry()
     app = server.create_app(ws_dir, provider="deepseek")
     client = TestClient(app)
 
@@ -166,10 +166,10 @@ def _run_http_case(case_id: str, prompt: str, *, seed: int | None = None, timeou
         run_uid = final_status_payload.get("run_uid") or run_uid
 
     elapsed_s = round(time.monotonic() - t0, 2)
-    tel = get_run_telemetry()
-    calls = len(getattr(tel, "calls", []) or [])
-    prompt_tokens = sum(int(getattr(c, "prompt_tokens", 0) or 0) for c in (getattr(tel, "calls", []) or []))
-    completion_tokens = sum(int(getattr(c, "completion_tokens", 0) or 0) for c in (getattr(tel, "calls", []) or []))
+    tel = get_llm_telemetry_summary() or {}
+    calls = int(tel.get("total_calls", 0) or 0)
+    prompt_tokens = int(tel.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(tel.get("completion_tokens", 0) or 0)
 
     cert_data: dict[str, Any] = {}
     meta_data: dict[str, Any] = {}
@@ -181,6 +181,11 @@ def _run_http_case(case_id: str, prompt: str, *, seed: int | None = None, timeou
     elif body.get("status") == "inconclusive":
         verdict = "INCONCLUSIVE_UNVERIFIED"
         reason_codes = [str(body.get("code") or "PLANNING_VALIDATION_FAILED")]
+        pfd = ((body.get("diagnostics") or {}).get("per_field_diagnostics") or [])
+        for d in pfd:
+            c = d.get("code")
+            if c and c not in reason_codes:
+                reason_codes.append(str(c))
     else:
         vm = ResearchVaultManager(ws_dir)
         # Find the persisted vault directory
@@ -238,10 +243,27 @@ def _run_http_case(case_id: str, prompt: str, *, seed: int | None = None, timeou
     return row
 
 
+_SYNTAX_FORMAT_CODES = frozenset({
+    "INVALID_EXPRESSION",
+    "INVALID_DERIVED_EXPRESSION",
+    "UNEXPECTED_TOKEN",
+    "UNSUPPORTED_TOKEN",
+    "APPROXIMATE_OPERATOR",
+    "STRICT_GATE_REJECTED",
+    "INVALID_MEMBERSHIP",
+    "ASSIGNMENT_IN_CALL",
+    "UNCLOSED_CALL",
+    "UNCLOSED_PAREN",
+    "UNEXPECTED_KEYWORD",
+    "INVALID_PREDICATE",
+})
+
+
 def _is_syntax_planning_failure(row: dict[str, Any]) -> bool:
-    if "PLANNING_VALIDATION_FAILED" not in row.get("reason_codes", []):
+    codes = set(row.get("reason_codes") or [])
+    if "PLANNING_VALIDATION_FAILED" not in codes:
         return False
-    return True
+    return bool(codes & _SYNTAX_FORMAT_CODES)
 
 
 @pytest.mark.parametrize("case_id,prompt,seed,group", [

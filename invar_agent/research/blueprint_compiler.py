@@ -600,6 +600,25 @@ def _lower_predicate_tree(
 ) -> Tuple[Optional[str], List[BlueprintDiagnostic]]:
     if depth > 32:
         return None, [BlueprintDiagnostic(code="PREDICATE_TOO_DEEP", field=field, message="Predicate nesting exceeds cap (32).")]
+    if isinstance(pred, str):
+        res = _fe_normalize(pred, declared_symbols=declared_symbols, domain=domain_preview, si_dims=si_dims)
+        if res.ok and res.canonical is not None:
+            return res.canonical, []
+        return None, [
+            BlueprintDiagnostic(
+                code=ed.code,
+                field=field,
+                message=ed.message,
+                original=ed.original,
+                column=ed.column,
+                offending_token=ed.offending_token,
+                hint=ed.hint,
+                suggested_fix=ed.hint,
+            )
+            for ed in res.diagnostics
+        ]
+    if isinstance(pred, dict) and {"lhs", "op", "rhs"} <= set(pred.keys()) and len(pred) == 3:
+        pred = {"rel": pred}
     if not isinstance(pred, dict) or len(pred) != 1:
         return None, [BlueprintDiagnostic(
             code="INVALID_PREDICATE",
@@ -986,6 +1005,46 @@ def compile_and_preflight_blueprint(
         )
 
     variable_map: Dict[str, int] = dict(bp.get("variable_map") or {})
+    if not raw_slots and variable_map:
+        # When blueprint emitted variable_map without typed_slots (and formalization obeyed
+        # "do not restate slots"), derive typed_slots deterministically from variable_map + equations.
+        ev_eqs = evidence.get("equations") if isinstance(evidence.get("equations"), dict) else {}
+        dynamic_states: Set[str] = set()
+        eq_dims: Dict[str, List[int]] = {}
+        for eq_k, eq_v in ev_eqs.items():
+            if isinstance(eq_v, dict):
+                kind_v = str(eq_v.get("kind") or "ALGEBRAIC")
+                st_sym = eq_v.get("state_symbol")
+                if kind_v in {"ODE_RHS", "FIXED_POINT_RESIDUAL", "FIXED_POINT_MAP"}:
+                    if isinstance(st_sym, str) and st_sym.isidentifier():
+                        dynamic_states.add(st_sym)
+                    elif isinstance(eq_k, str) and eq_k in variable_map:
+                        dynamic_states.add(eq_k)
+                dims_v = eq_v.get("si_dim")
+                if isinstance(dims_v, (list, tuple)) and len(dims_v) == 7 and all(type(x) is int for x in dims_v):
+                    eq_dims[eq_k] = list(dims_v)
+        synthesized: List[Dict[str, Any]] = []
+        for sym, idx_v in sorted(variable_map.items(), key=lambda kv: int(kv[1])):
+            if not isinstance(sym, str) or not sym.isidentifier():
+                continue
+            if sym in dynamic_states:
+                role = "DYNAMIC_STATE"
+                dims = [0] * 7
+            elif sym in ev_eqs:
+                role = "DERIVED_OBSERVABLE"
+                dims = eq_dims.get(sym, [0] * 7)
+            else:
+                role = "CONTROL_PARAM"
+                dims = [0] * 7
+            synthesized.append({
+                "symbol": sym,
+                "slot_idx": int(idx_v),
+                "si_dim": dims,
+                "role": role,
+                "semantic_tag": 0,
+            })
+        raw_slots = synthesized
+        bp["typed_slots"] = copy.deepcopy(synthesized)
     slots: List[Dict[str, Any]] = []
     slot_bounds: Dict[str, List[float]] = {}
     slot_fixed_values: Dict[str, float] = {}
