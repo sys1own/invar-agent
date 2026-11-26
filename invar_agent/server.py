@@ -1277,21 +1277,31 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 extra_context=_research_vault_context(req.question, req.attached_research_ids),
                 progress_cb=manager._progress,
             )
-        except FormalizationError as exc:
+        except (FormalizationError, ValueError) as exc:
             from invar_agent.research.epistemic import incomplete_certificate
             from invar_agent.research.vault import ResearchVaultManager
 
-            attempts_to_save = attempt_sink or list(exc.validation_attempts)
-            diag_dir = persist_formalization_diagnostics(
-                state.workspace_root,
-                diag_run_uid,
-                attempts_to_save,
-                extra_secrets=[state.api_key] if state.api_key else (),
-            )
-            detail = exc.structured_detail(
-                run_uid=diag_run_uid,
-                diagnostics_dir=str(diag_dir) if diag_dir else None,
-            )
+            if isinstance(exc, FormalizationError):
+                attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                diag_dir = persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempts_to_save,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
+                detail = exc.structured_detail(
+                    run_uid=diag_run_uid,
+                    diagnostics_dir=str(diag_dir) if diag_dir else None,
+                )
+            else:
+                detail = {
+                    "code": "PLANNING_VALIDATION_FAILED",
+                    "message": str(exc),
+                    "error_type": type(exc).__name__,
+                    "run_uid": diag_run_uid,
+                    "attempts": [],
+                    "per_field_diagnostics": [],
+                }
             certificate = incomplete_certificate(
                 diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
             )
@@ -1425,21 +1435,31 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 extra_context=direct_ctx,
                 progress_cb=manager._progress,
             )
-        except FormalizationError as exc:
+        except (FormalizationError, ValueError) as exc:
             from invar_agent.research.epistemic import incomplete_certificate
             from invar_agent.research.vault import ResearchVaultManager
 
-            attempts_to_save = attempt_sink or list(exc.validation_attempts)
-            diag_dir = persist_formalization_diagnostics(
-                state.workspace_root,
-                diag_run_uid,
-                attempts_to_save,
-                extra_secrets=[state.api_key] if state.api_key else (),
-            )
-            detail = exc.structured_detail(
-                run_uid=diag_run_uid,
-                diagnostics_dir=str(diag_dir) if diag_dir else None,
-            )
+            if isinstance(exc, FormalizationError):
+                attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                diag_dir = persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempts_to_save,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
+                detail = exc.structured_detail(
+                    run_uid=diag_run_uid,
+                    diagnostics_dir=str(diag_dir) if diag_dir else None,
+                )
+            else:
+                detail = {
+                    "code": "PLANNING_VALIDATION_FAILED",
+                    "message": str(exc),
+                    "error_type": type(exc).__name__,
+                    "run_uid": diag_run_uid,
+                    "attempts": [],
+                    "per_field_diagnostics": [],
+                }
             certificate = incomplete_certificate(
                 diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
             )
