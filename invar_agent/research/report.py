@@ -172,6 +172,16 @@ def render_meaningfulness_certificate(certificate, preserved=None) -> str:
         lines += ["", "| Stage/domain | Total | Preserved | Projected | Stabilized | Enforcement ratio |", "|---|---:|---:|---:|---:|---:|"]
         for domain, audit in sorted(audits.items()):
             lines.append(f"| {domain} | {audit.total_steps} | {audit.preserved_steps} | {audit.projected_steps} | {audit.stabilized_steps} | {audit.enforcement_ratio:.6g} |")
+    ledger = getattr(certificate, "assumptions_ledger", None) or getattr(getattr(certificate, "ihcg_anchor", None), "assumptions_ledger", None) or ()
+    if ledger:
+        lines += ["", "### Formalization Assumptions Ledger", "", "| Kind | Symbol / Field | Value / Expression | Source | Rationale |", "|---|---|---|---|---|"]
+        for item in ledger:
+            kind = getattr(item, "kind", None) or (item.get("kind") if isinstance(item, dict) else "")
+            sym = getattr(item, "symbol_or_field", None) or (item.get("symbol_or_field") if isinstance(item, dict) else "")
+            val = str(getattr(item, "value_or_expr", None) or (item.get("value_or_expr") if isinstance(item, dict) else "")).replace("|", "/")
+            src = getattr(item, "source", None) or (item.get("source") if isinstance(item, dict) else "")
+            rat = str(getattr(item, "rationale", None) or (item.get("rationale") if isinstance(item, dict) else "")).replace("|", "/")
+            lines.append(f"| `{kind}` | `{sym}` | `{val}` | `{src}` | {rat} |")
     lines += ["", "**Trust Boundary (TCB):** " + "; ".join(TRUST_BOUNDARY) + "."]
     lines += ["", "_Formal conclusions are conditional on the TCB. Rewrite sampling and differential/FD checks are empirical; libm bounds are assumed, and cooperative deadlines are not hard preemption. Unsupported interval operations fail closed._"]
     return "\n".join(lines)
@@ -245,6 +255,19 @@ def build_research_report(state) -> str:
             for inv in (getattr(c, "invariants", None) or []):
                 math_expr = format_contract_constraint_math(inv.assertion, variable_map)
                 lines.append(f"- `{c.contract_id}` / `{inv.variable_name}`: {math_expr} (`{inv.assertion}`)")
+    if getattr(bp, "assumptions_ledger", None):
+        lines.append("")
+        lines.append("**Formalization Assumptions Ledger:**")
+        lines.append("")
+        lines.append("| Kind | Symbol / Field | Value / Expression | Source | Rationale |")
+        lines.append("|---|---|---|---|---|")
+        for item in bp.assumptions_ledger:
+            kind = getattr(item, "kind", None) or (item.get("kind") if isinstance(item, dict) else "")
+            sym = getattr(item, "symbol_or_field", None) or (item.get("symbol_or_field") if isinstance(item, dict) else "")
+            val = str(getattr(item, "value_or_expr", None) or (item.get("value_or_expr") if isinstance(item, dict) else "")).replace("|", "/")
+            src = getattr(item, "source", None) or (item.get("source") if isinstance(item, dict) else "")
+            rat = str(getattr(item, "rationale", None) or (item.get("rationale") if isinstance(item, dict) else "")).replace("|", "/")
+            lines.append(f"| `{kind}` | `{sym}` | `{val}` | `{src}` | {rat} |")
     lines.append("")
 
     # 3. Literature & governing equations used

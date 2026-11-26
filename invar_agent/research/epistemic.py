@@ -24,7 +24,7 @@ TRUST_BOUNDARY = (
     "Z3 per-logic soundness", "egg rewrite-axiom soundness",
     "IntervalF64 IEEE-754 outward rounding", "HIN interval typing soundness",
     "adjoint.rs symbolic derivative & interval-extension soundness",
-    "[1. Ingest] prose→H_user binding",
+    "[1. Ingest] prose→FormalResearchSpec AST binding (audited via assumptions_ledger)",
 )
 
 

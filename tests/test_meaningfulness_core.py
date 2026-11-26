@@ -48,8 +48,10 @@ def test_ihcg_quote_binding_seal_and_mutation_detection():
         m.verify_claim_nontriviality(g, ["x > 0"])
     source = graph().model_dump(mode="json", exclude={"omega", "archetype", "h_ihcg"})
     source["obligations"][0]["prompt_quote"] = "wrong"
-    with pytest.raises(ValueError, match="quote"):
-        m.IhcgCompiler().compile_from_prompt("x > 0", source, {"x": [-2, 2], "k": [0, 1]}, "ODE_PDE")
+    # Non-blocking provenance: mismatched prompt_quote drops prompt_span without blocking deterministic sealing.
+    recompiled = m.IhcgCompiler().compile_from_prompt("x > 0", source, {"x": [-2, 2], "k": [0, 1]}, "ODE_PDE")
+    assert recompiled.obligations[0].prompt_span is None
+    recompiled.assert_sealed()
     with pytest.raises(ValueError): m.solve_query("__import__('os')", {})
     with pytest.raises(ValueError): m.solve_query("x > 0", {"x": [math.nan, 2]})
 

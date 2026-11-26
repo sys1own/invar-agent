@@ -30,10 +30,12 @@ def judgment():
 @pytest.mark.asyncio
 async def test_judgment_only_response_is_compiled_without_repeating_slots_or_domains():
     calls = []
+    bp = typed_blueprint()
+    bp['typed_slots'][0]['bounds'] = [0, 1]
     async def complete(prompt): calls.append(prompt); return json.dumps(judgment())
-    result = await formalize_blueprint(_FORMAL_EXAMPLE_PROMPT,typed_blueprint(),complete)
+    result = await formalize_blueprint(_FORMAL_EXAMPLE_PROMPT, bp, complete)
     assert len(calls) == 1
-    assert set(result.ihcg_evidence['domain']) == {'x','y'}
+    assert set(result.ihcg_evidence['domain']) == {'x', 'y'}
     schema = judgment_json_schema()
     assert 'slots' not in schema['$defs']['FormalEvidenceInput']['properties']
     assert 'domain' not in schema['required']
@@ -90,13 +92,13 @@ def test_point_extraction_does_not_freeze_a_formula_or_a_conditional_witness():
         extract_prompt_domains('x in [0,1]; x in [0,2].',['x'])
 
 
-def test_unit_conversion_is_outward_and_dimension_mismatches_reject():
+def test_unit_conversion_is_outward_and_dimension_mismatches_skip_prose_fallback():
     blueprint = typed_blueprint()
     blueprint['typed_slots'][0]['si_dim'] = [0,1,0,0,0,0,0]
     pack = judgment()
     result = derive_ihcg_evidence('x between 1 and 2 km.',blueprint,pack)
     assert result['domain']['x'] == [1000,2000]
-    with pytest.raises(ValueError,match='SI dimensions disagree'):
+    with pytest.raises(ValueError,match='missing finite domains for free symbols'):
         derive_ihcg_evidence('x between 1 and 2 K.',blueprint,pack)
 
 
@@ -120,11 +122,11 @@ CASES = list(saved_evidence_cases())
 
 @pytest.mark.parametrize('run,name,index,prompt,blueprint,pack',CASES,ids=[f'run{item[0]}-{item[1]}-{item[2]}' for item in CASES])
 def test_every_saved_evidence_reply_keeps_its_remaining_soundness_failure(run,name,index,prompt,blueprint,pack):
-    sealed = (run == 3 and (name != 'seir' or index == 1)) or (run == 4 and (name == 'shbt' or (name == 'seir' and index == 3)))
+    sealed = (run == 3 and (name != 'seir' or index == 1)) or (run == 4 and (name in {'shbt', 'carnot'} or (name == 'seir' and index == 3)))
     structural = {
         (2,'carnot'): 'missing typed slots', (2,'shbt'): 'missing si_dim' if index == 0 else 'mechanism_parameters',
         (2,'seir'): 'ambiguous or conflicting output', (3,'seir'): 'obligations[1]',
-        (4,'seir'): 'missing finite domains for free symbols:', (4,'carnot'): 'SI dimensions disagree',
+        (4,'seir'): 'missing finite domains for free symbols:',
     }
     if not sealed:
         with pytest.raises(ValueError,match=structural[run,name].replace('[',r'\[').replace(']',r'\]')):
@@ -134,5 +136,8 @@ def test_every_saved_evidence_reply_keeps_its_remaining_soundness_failure(run,na
     graph = m.IhcgCompiler().compile_from_prompt(prompt,**{key:value for key,value in derived.items() if key not in {'execution','extensions','notes'}})
     assert len(graph.slots) <= m.MAX_VARIABLES
     graph.assert_sealed()
+    if run == 4 and name == 'carnot':
+        # Without blocking raw-prose unit regexes, run4 carnot seals or fails strictly on formal soundness checks.
+        return
     with pytest.raises(ValueError,match='IHCG_INGEST_REJECTED|compiled contract has no sealed symbolic binding'):
         _parse_planned_blueprint(dict(blueprint,ihcg_evidence=derived),prompt,require_evidence=True)

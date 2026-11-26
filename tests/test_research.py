@@ -207,9 +207,15 @@ def test_planner_extract_json():
 
 
 @pytest.mark.asyncio
-async def test_planner_llm_path_handles_prompt_braces():
+async def test_planner_llm_path_handles_prompt_braces(monkeypatch):
     """Regression: PLANNER_PROMPT embeds a JSON example with literal braces;
     the question substitution must not use str.format() on it."""
+    from invar_agent.research.planner import parse_blueprint
+
+    async def _passthrough_formalize(question, blueprint, complete):
+        return parse_blueprint(blueprint)
+
+    monkeypatch.setattr("invar_agent.research.formalization.formalize_blueprint", _passthrough_formalize)
     captured = {}
 
     async def fake_llm(prompt):

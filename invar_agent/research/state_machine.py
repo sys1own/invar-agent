@@ -1897,7 +1897,7 @@ class ResearchStateMachine:
         self._provider_failure = None
         try:
             self.planner_result = await generate_plan_with_feasibility(question,
-                llm_complete=self.llm_planner, llm_formalizer=self.llm_formalizer, fallback=False)
+                llm_complete=self.llm_planner, llm_formalizer=self.llm_formalizer, llm_fast=self.llm_fast, fallback=False)
             if self._provider_failure is not None: raise self._provider_failure
             feas = self.planner_result.get("feasibility")
             feas_verdict = getattr(getattr(feas, "verdict", None), "value", getattr(feas, "verdict", None))

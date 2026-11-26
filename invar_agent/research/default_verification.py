@@ -537,10 +537,20 @@ class _Kernel:
             solver.add(z3.Not(z3.And(*(translator.formula(n) for n in clauses))))
             if solver.check() != z3.unsat:
                 raise UnsupportedVerification("PHYSICAL_MODEL_CONSTRAINT_NOT_PRESERVED")
+        locked_const_subs = {
+            sp.Symbol(s.symbol): sp.Rational(str(self.graph.omega[s.symbol][0]))
+            for s in self.graph.slots
+            if s.role == "CONTROL_PARAM"
+            and s.symbol not in self.graph.mechanism_parameters
+            and self.graph.omega[s.symbol][0] == self.graph.omega[s.symbol][1]
+        }
         alg_mismatches = []
         for name, expression in expected.items():
             bound = expression.subs({sp.Symbol(s):self.updates[s] for s in self.odes if s in self.updates},simultaneous=True)
-            if name not in self.updates or not _equivalent(self.updates[name], bound):
+            if name not in self.updates or not (
+                _equivalent(self.updates[name], bound)
+                or (locked_const_subs and _equivalent(self.updates[name].subs(locked_const_subs), bound.subs(locked_const_subs)))
+            ):
                 alg_mismatches.append((name, bound, self.updates.get(name)))
         if alg_mismatches:
             first_name, _, _ = alg_mismatches[0]
@@ -557,7 +567,10 @@ class _Kernel:
             alg_subs = {sp.Symbol(s): v for s, v in self.expected.items()}
             for name, (_,e) in self.odes.items():
                 expected_rhs = sp.sympify(e.expression,locals={s:sp.Symbol(s) for s in self.slots},rational=True).subs(alg_subs, simultaneous=True)
-                if name not in actual_rhs or not _equivalent(actual_rhs[name], expected_rhs):
+                if name not in actual_rhs or not (
+                    _equivalent(actual_rhs[name], expected_rhs)
+                    or (locked_const_subs and _equivalent(actual_rhs[name].subs(locked_const_subs), expected_rhs.subs(locked_const_subs)))
+                ):
                     self.binding_failure = "ODE_RHS_EXECUTABLE_MISMATCH"
             self.frozen = bool(actual_rhs) and all(_equivalent(actual_rhs.get(name,sp.Symbol(name)),"0") for name in self.odes)
             self.heun = self._integrator("HEUN")

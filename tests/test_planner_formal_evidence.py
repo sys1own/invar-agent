@@ -87,7 +87,6 @@ def test_normalizer_preserves_emitted_evidence(saved_plan):
     payload = repaired_plan(saved_plan)
     bp = parse_blueprint(payload)
     assert {key:value for key,value in bp.ihcg_evidence.items() if key != 'execution'} == payload["ihcg_evidence"]
-    assert 'derivation' in bp.ihcg_evidence['execution']['normalization_source']
     assert compile_blueprint_ihcg(bp) is not None
 
 
@@ -107,16 +106,23 @@ def test_quote_reanchoring_preserves_original_bytes_and_formula(saved_plan,quote
 
 
 @pytest.mark.parametrize("quote",["eta >= 0.64","eta > 0.65","eta can reach at least 0.65"])
-def test_quote_reanchoring_rejects_semantic_changes(saved_plan,quote):
+def test_quote_reanchoring_is_nonblocking_provenance_for_paraphrased_quotes(saved_plan,quote):
     payload = repaired_plan(saved_plan)
     payload["ihcg_evidence"]["evidence"]["obligations"][0]["prompt_quote"] = quote
-    with pytest.raises(ValueError,match="immutable prompt span"): parse_blueprint(payload)
+    bp = parse_blueprint(payload)
+    anchored = bp.ihcg_evidence["evidence"]["obligations"][0]
+    assert anchored.get("prompt_span") is None
+    assert anchored["expression"] == "eta >= 0.65"
+    assert compile_blueprint_ihcg(bp) is not None
 
 
-def test_quote_reanchoring_rejects_ambiguous_offsets(saved_plan):
+def test_quote_reanchoring_drops_ambiguous_offsets_nonblockingly(saved_plan):
     payload = repaired_plan(saved_plan)
     payload["ihcg_evidence"]["evidence"]["obligations"][0].update(prompt_quote="eta≥0.65",prompt_span=[0,1])
-    with pytest.raises(ValueError,match="unique immutable prompt span"): parse_blueprint(payload)
+    bp = parse_blueprint(payload)
+    anchored = bp.ihcg_evidence["evidence"]["obligations"][0]
+    assert anchored.get("prompt_span") is None
+    assert compile_blueprint_ihcg(bp) is not None
 
 
 def test_prose_extractor_does_not_guess_live_aliases_or_units(saved_plan):

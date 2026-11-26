@@ -143,19 +143,202 @@ class FeasibilityAssessment(BaseModel):
         return data
 
 
+AssumptionKind = Literal[
+    "GOVERNING_EQUATION",
+    "SI_CONSTANT",
+    "OPERATING_DOMAIN",
+    "INITIAL_CONDITION",
+    "HYPOTHESIS_FORMALIZATION",
+    "NULL_BASELINE",
+]
+
+AssumptionSource = Literal[
+    "USER_PROMPT",
+    "LITERATURE",
+    "REFERENCE_REGISTRY",
+    "SHBT_REGISTRY",
+    "LLM_DOMAIN_DEFAULT",
+]
+
+
+_VALID_ASSUMPTION_KINDS = {
+    "GOVERNING_EQUATION",
+    "SI_CONSTANT",
+    "OPERATING_DOMAIN",
+    "INITIAL_CONDITION",
+    "HYPOTHESIS_FORMALIZATION",
+    "NULL_BASELINE",
+}
+_VALID_ASSUMPTION_SOURCES = {
+    "USER_PROMPT",
+    "LITERATURE",
+    "REFERENCE_REGISTRY",
+    "SHBT_REGISTRY",
+    "LLM_DOMAIN_DEFAULT",
+}
+
+
+def coerce_assumption_entry(raw: Any) -> Optional[Dict[str, str]]:
+    """Deterministically normalize LLM-emitted assumption records into canonical FormalizationAssumption fields."""
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        return {
+            "kind": "GOVERNING_EQUATION",
+            "symbol_or_field": "model",
+            "value_or_expr": text[:400],
+            "source": "LLM_DOMAIN_DEFAULT",
+            "rationale": "",
+        }
+    if not isinstance(raw, dict):
+        return None
+    raw_kind = str(raw.get("kind") or raw.get("category") or raw.get("type") or "").strip().upper()
+    if raw_kind not in _VALID_ASSUMPTION_KINDS:
+        if any(k in raw for k in ("equation", "formula", "ode")):
+            raw_kind = "GOVERNING_EQUATION"
+        elif any(k in raw for k in ("bounds", "domain", "range")):
+            raw_kind = "OPERATING_DOMAIN"
+        elif any(k in raw for k in ("initial", "initial_value", "initial_condition")):
+            raw_kind = "INITIAL_CONDITION"
+        elif any(k in raw for k in ("null", "baseline")):
+            raw_kind = "NULL_BASELINE"
+        elif any(k in raw for k in ("value", "constant", "unit", "si_unit", "parameter")):
+            raw_kind = "SI_CONSTANT"
+        else:
+            raw_kind = "HYPOTHESIS_FORMALIZATION"
+    sym = ""
+    for k in ("symbol_or_field", "symbol", "parameter", "observable", "field", "name", "variable", "id"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            sym = v.strip()
+            break
+    if not sym:
+        sym = "model"
+    val = ""
+    for k in ("value_or_expr", "equation", "expression", "expr", "formula", "bounds", "domain"):
+        v = raw.get(k)
+        if v is not None and str(v).strip():
+            val = str(v).strip()
+            break
+    if not val and raw.get("value") is not None:
+        unit = str(raw.get("si_unit") or raw.get("unit") or "").strip()
+        val = f"{raw['value']} {unit}".strip()
+    if not val:
+        for k in ("statement", "description", "rationale", "text", "note"):
+            v = raw.get(k)
+            if isinstance(v, str) and v.strip():
+                val = v.strip()[:400]
+                break
+    if not val:
+        return None
+    raw_src = str(raw.get("source") or raw.get("provenance") or "").strip().upper()
+    if raw_src not in _VALID_ASSUMPTION_SOURCES:
+        if "USER" in raw_src or "PROMPT" in raw_src:
+            raw_src = "USER_PROMPT"
+        elif "SHBT" in raw_src:
+            raw_src = "SHBT_REGISTRY"
+        elif "REF" in raw_src or "CODATA" in raw_src or "REGISTRY" in raw_src:
+            raw_src = "REFERENCE_REGISTRY"
+        elif "LIT" in raw_src or "PAPER" in raw_src or "ARXIV" in raw_src:
+            raw_src = "LITERATURE"
+        else:
+            raw_src = "LLM_DOMAIN_DEFAULT"
+    rationale = ""
+    for k in ("rationale", "statement", "description", "justification", "notes", "note"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            rationale = v.strip()[:600]
+            break
+    return {
+        "kind": raw_kind,
+        "symbol_or_field": sym[:120],
+        "value_or_expr": val[:400],
+        "source": raw_src,
+        "rationale": rationale,
+    }
+
+
+class FormalizationAssumption(BaseModel):
+    """Auditable record of an equation, constant, domain, or baseline introduced during NL->AST translation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: AssumptionKind
+    symbol_or_field: str = Field(min_length=1)
+    value_or_expr: str = Field(min_length=1)
+    source: AssumptionSource = "LLM_DOMAIN_DEFAULT"
+    rationale: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_llm_shape(cls, value: Any) -> Any:
+        if isinstance(value, dict) and set(value.keys()) <= {"kind", "symbol_or_field", "value_or_expr", "source", "rationale"}:
+            return value
+        coerced = coerce_assumption_entry(value)
+        return coerced if coerced is not None else value
+
+
+class TypedConstant(BaseModel):
+    """Immutable typed SI physical or model constant (never required to occupy a mutable simulation slot)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1)
+    value: float = Field(allow_inf_nan=False)
+    si_unit: str = ""
+    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    source: AssumptionSource = "LLM_DOMAIN_DEFAULT"
+
+    @field_validator("si_dim", mode="before")
+    @classmethod
+    def _int_dims(cls, value):
+        if value is None:
+            return [0, 0, 0, 0, 0, 0, 0]
+        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
+            raise ValueError("SI dimensions must be seven integer exponents")
+        return list(value)
+
+
+class DerivedExpressionSpec(BaseModel):
+    """Pure algebraic expression over typed_slots and constants (never required to occupy a mutable slot unless promoted)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1)
+    expression: str = Field(min_length=1)
+    si_unit: str = ""
+    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    promote_to_slot: bool = False
+
+    @field_validator("si_dim", mode="before")
+    @classmethod
+    def _int_dims(cls, value):
+        if value is None:
+            return [0, 0, 0, 0, 0, 0, 0]
+        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
+            raise ValueError("SI dimensions must be seven integer exponents")
+        return list(value)
+
+
 class TypedResearchSlot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbol: str = Field(min_length=1)
     slot_idx: Optional[int] = Field(default=None, ge=0, strict=True)
-    si_dim: List[int] = Field(min_length=7, max_length=7)
-    role: Literal["CONTROL_PARAM", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "CONSERVATION_AUX"]
+    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    role: Literal["CONTROL_PARAM", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "CONSERVATION_AUX", "TIME_STEP"]
     semantic_tag: int = Field(default=0, ge=0, le=255)
     unit_scale: tuple[int, int] = (1, 1)
     is_falsification_target: bool = False
     stochastic_role: Optional[Literal["UNIFORM", "SEED", "COUNTER", "CHANNEL"]] = None
     value: Optional[float] = Field(default=None, allow_inf_nan=False)
     prompt_symbol: Optional[str] = None
+    si_unit: Optional[str] = None
+    initial_value: Optional[float] = Field(default=None, allow_inf_nan=False)
+    bounds: Optional[List[float]] = Field(default=None, min_length=2, max_length=2)
 
     @field_validator("si_dim", mode="before")
     @classmethod
@@ -163,6 +346,25 @@ class TypedResearchSlot(BaseModel):
         if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
             raise ValueError("SI dimensions must be seven integer exponents")
         return value
+
+
+class FormalResearchSpec(BaseModel):
+    """Four-namespace Blueprint AST emitted by the LLM Interpreter and compiled by Tier-0 before IHCG sealing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    typed_slots: List[TypedResearchSlot] = Field(default_factory=list, max_length=4096)
+    constants: Dict[str, TypedConstant] = Field(default_factory=dict, max_length=512)
+    derived_expressions: Dict[str, DerivedExpressionSpec] = Field(default_factory=dict, max_length=512)
+    equations: Dict[str, Any] = Field(default_factory=dict)
+    sweep_domain: Dict[str, List[float]] = Field(default_factory=dict)
+    hypothesis_obligations: List[Dict[str, Any]] = Field(default_factory=list)
+    environmental_assumptions: List[str] = Field(default_factory=list)
+    null_baseline: Optional[str] = None
+    quantifier_mode: Literal["FORALL", "EXISTS", "BOUNDARY"] = "FORALL"
+    archetype: Literal["ODE_PDE", "MONTE_CARLO", "FIXED_POINT", "PARAM_SWEEP"] = "ODE_PDE"
+    mechanism_parameters: List[str] = Field(default_factory=list)
+    assumptions_ledger: List[FormalizationAssumption] = Field(default_factory=list)
 
 
 class ResearchBlueprint(BaseModel):
@@ -216,6 +418,11 @@ class ResearchBlueprint(BaseModel):
     # Declarative ResearchComputeUAST specification (when synthesized via UAST/HIN pipeline).
     uast_spec: Optional[Dict[str, Any]] = None
     ihcg_evidence: Optional[Dict[str, Any]] = None
+    # Four-namespace Blueprint AST extensions + transparent formalization assumptions ledger.
+    constants: Dict[str, Any] = Field(default_factory=dict, max_length=512)
+    derived_expressions: Dict[str, Any] = Field(default_factory=dict, max_length=512)
+    assumptions_ledger: List[FormalizationAssumption] = Field(default_factory=list, max_length=512)
+    formal_spec: Optional[FormalResearchSpec] = None
 
 
 class ExtractedParameter(BaseModel):

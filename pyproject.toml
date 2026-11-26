@@ -20,6 +20,7 @@ dependencies = [
     "openai>=1.40",
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
+    "scipy>=1.13",
 ]
 
 [project.optional-dependencies]

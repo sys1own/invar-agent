@@ -22,53 +22,26 @@ from .scientific_integrity import SCIENTIFIC_CONTRACT
 # -- shared tool-mastery context ----------------------------------------------
 
 TOOLS_CONTEXT = SCIENTIFIC_CONTRACT + "\n\n" + """## Your execution tools (know them exactly)
-## Formal evidence at ingest
-For quantitative requests with explicit formal claims, `ihcg_evidence` is a
-REQUIRED blueprint field, not narrative text or `structured_evidence`:
-`{"evidence":{"slots":[{"slot_idx":0,"symbol":"<symbol>","si_dim":[0,0,0,0,0,0,0],"role":"DYNAMIC_STATE"}],"equations":{},"environmental_assumptions":[],"obligations":[{"id":"h","expression":"<formal claim>","obligation_class":"HYPOTHESIS_TARGET","prompt_quote":"<verbatim user text>","prompt_span":[0,1]}],"quantifier_mode":"FORALL","mechanism_parameters":[]},"domain":{},"archetype":"ODE_PDE"}`.
-Populate every slot and governing equation, use audited SI dimensions, and bind
-each obligation to an exact character span in the original user research_prompt.
-Copy research_prompt verbatim from the original request. Offsets are zero-based
-Python character offsets [start,end), not byte offsets. A quote must be a literal
-substring, not a paraphrase. Keep physical symbols, variable_map indices, domains,
-code and contracts consistent. A claimed bound must apply to the computed physical
-observable, not an input containing the desired answer. Retain strictness and
-quantifiers exactly; an execution tolerance must not weaken a sealed inequality.
-For a single bounded study use one stage. Later stages require explicit sealed
-IHCG extensions; do not manufacture stages just to rephrase a refutation.
+## Formal evidence at ingest (Four-Namespace Blueprint AST)
+Translate ANY clear research intent (even 1-2 sentences of casual English with zero equations or units) into a complete, falsifiable, SI-normalized Blueprint AST grounded in retrieved literature and registries.
+Log every added equation, SI constant, operating domain, initial condition, or null baseline in `assumptions_ledger`.
+CRITICAL ANTI-GAMING RULE: If the user asks whether a specific claim or threshold holds (including potentially false claims like "Can a reversible heat engine between 300 K and 600 K reach 65% efficiency?"), preserve the user's EXACT claimed predicate faithfully in `obligations` so the deterministic engine can prove OR formally falsify it — NEVER silently weaken or invert a false claim!
+Use four cleanly separated namespaces:
+- `typed_slots`: mutable simulation buffer slots ONLY (DYNAMIC_STATE, CONTROL_PARAM, DERIVED_OBSERVABLE, CONSERVATION_AUX, TIME_STEP).
+- `constants`: immutable typed SI physical/model constants (`R_gas`, `F_far`, `T_K`, `C_m`, pool totals, etc.). Constants are NEVER required to exist in `typed_slots`.
+- `derived_expressions`: pure algebraic definitions (`delta_p`, `aec_ratio`, etc.) over `typed_slots` and `constants`. Derived expressions are NEVER required to exist in `typed_slots` unless promoted.
+- `ihcg_evidence`: `{"evidence":{"slots":[...],"equations":{},"environmental_assumptions":[],"obligations":[{"id":"h","expression":"<formal claim>","obligation_class":"HYPOTHESIS_TARGET","prompt_quote":"<optional provenance quote>"}],"quantifier_mode":"FORALL","mechanism_parameters":[],"assumptions_ledger":[]},"domain":{},"archetype":"ODE_PDE"}`.
+Keep physical symbols, variable_map indices, domains, code and contracts consistent. A claimed bound must apply to the computed physical observable, not an input containing the desired answer. Retain strictness and quantifiers exactly; an execution tolerance must not weaken a sealed inequality.
+For a single bounded study use one stage. Later stages require explicit sealed IHCG extensions; do not manufacture stages just to rephrase a refutation.
 Formal JSON shapes are strict:
-- domain maps EVERY slot symbol (and no undeclared symbol) to a numeric
-  [lower, upper] array, including outputs and controls. Fixed values use [v,v].
-  Never use {"lower":...,"upper":...}, {"value":...}, or dimensionless flags here.
-- Every equation has expression and si_dim (seven integer SI exponents).
-  ALGEBRAIC is the default kind: name the equation by its derived output symbol
-  and put only its RHS in expression. Do not use assignment syntax `x = ...`.
-  ODE_RHS and FIXED_POINT_MAP/RESIDUAL require state_symbol bound to a DYNAMIC_STATE;
-  FIXED_POINT_MAP is not the kind for a simple algebraic readout.
-- Equation objects allow expression, si_dim, semantic_tag, kind and state_symbol;
-  never add latex or other display metadata. mechanism_parameters is a list of
-  declared CONTROL_PARAM symbol strings, not objects containing values or units.
-- archetype is ODE_PDE, MONTE_CARLO, FIXED_POINT or PARAM_SWEEP. ALGEBRAIC is an
-  equation kind, not an archetype; pure algebraic readouts can use ODE_PDE.
-- environmental_assumptions are formal Boolean expressions, not English prose.
-  obligations[].expression is also a formal expression, e.g. `Reff < 1`;
-  quantification belongs in quantifier_mode (FORALL, EXISTS, BOUNDARY), not
-  strings such as 'For all ... Therefore ...'. Boundary requests use BOUNDARY.
-  Keep prose in prompt_quote; it must quote the original claim exactly.
+- domain maps EVERY free slot symbol to a numeric [lower, upper] array. Fixed values use [v,v].
+- Every equation has expression and si_dim (seven integer SI exponents). ALGEBRAIC is the default kind; ODE_RHS and FIXED_POINT_MAP/RESIDUAL require state_symbol bound to a DYNAMIC_STATE.
+- archetype is ODE_PDE, MONTE_CARLO, FIXED_POINT or PARAM_SWEEP.
+- environmental_assumptions and obligations[].expression are formal Boolean expressions, not English prose; quantification belongs in quantifier_mode (FORALL, EXISTS, BOUNDARY).
 Use CONTROL_PARAM for held inputs and DERIVED_OBSERVABLE for pure readouts.
-An evolution equation must include `kind:"ODE_RHS"` and `state_symbol` naming
-the evolving state; its SI dimensions are state dimensions minus time.
-For equilibrium equations use kind FIXED_POINT_RESIDUAL (g(z)=0) or
-FIXED_POINT_MAP (z=F(z)), with state_symbol naming the corresponding state.
-For bounded Monte Carlo samplers use kind MC_SAMPLE and state_symbol naming
-the population-mean observable. Mark immutable stochastic input slots with
-stochastic_role UNIFORM, SEED, COUNTER, or CHANNEL; uniform inputs require
-domain [0,1]. Bind invar_rand_u01(seed,counter,channel) to those exact inputs.
-Do not invent a narrower domain, change a quantifier, or assign dimensionless
-units to an ambiguous quantity merely to obtain a certificate. Leave evidence
-absent when an honest binding cannot be established. The deterministic literal
-extractor accepts Claim:/Model:/Evolution:/Assume: lines and explicit `x in [a,b]`
-domains, with explicit SI vectors or an all-quantities-dimensionless declaration.
+An evolution equation must include `kind:"ODE_RHS"` and `state_symbol` naming the evolving state; its SI dimensions are state dimensions minus time.
+For equilibrium equations use kind FIXED_POINT_RESIDUAL (g(z)=0) or FIXED_POINT_MAP (z=F(z)), with state_symbol naming the corresponding state.
+For bounded Monte Carlo samplers use kind MC_SAMPLE and state_symbol naming the population-mean observable. Mark immutable stochastic input slots with stochastic_role UNIFORM, SEED, COUNTER, or CHANNEL; uniform inputs require domain [0,1]. Bind invar_rand_u01(seed,counter,channel) to those exact inputs.
 - Sandbox_Execute is AIR-GAPPED: no network, no disk, no imports. Your Python is
   transpiled to C++20 (-O3 -std=c++20 -fPIC -shared), compiled, and executed in an
   isolated subprocess with CPU/memory limits. Nothing else runs your code.
@@ -866,7 +839,9 @@ _BLUEPRINT_FIELDS = {
     "contracts", "code_template", "max_feedback_rounds", "verified_layers",
     "target_research_stages", "stage_objectives", "current_stage",
     "evolution_history", "unified_module_code", "feasibility", "variable_map",
-    "slot_roles", "typed_slots", "structured_evidence", "extracted_constants", "ihcg_evidence", "research_prompt",
+    "slot_roles", "typed_slots", "structured_evidence", "extracted_constants",
+    "ihcg_evidence", "research_prompt", "constants", "derived_expressions",
+    "assumptions_ledger", "formal_spec",
 }
 _CONTRACT_FIELDS = {
     "contract_id", "target_backend", "timeout_seconds", "invariants",
@@ -2081,6 +2056,34 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
                     ]
                     objs.append(f"Stage {s_idx}: Verify contracts {', '.join(c_ids)}")
                 out["stage_objectives"] = objs
+    if isinstance(out.get("typed_slots"), list):
+        _slot_allowed = {
+            "symbol", "slot_idx", "si_dim", "role", "semantic_tag", "unit_scale",
+            "is_falsification_target", "stochastic_role", "value", "prompt_symbol",
+            "si_unit", "initial_value", "bounds",
+        }
+        cleaned_slots = []
+        for s in out["typed_slots"]:
+            if isinstance(s, dict):
+                s_clean = {k: v for k, v in s.items() if k in _slot_allowed}
+                if "si_unit" not in s_clean and isinstance(s.get("unit"), str):
+                    s_clean["si_unit"] = s["unit"]
+                cleaned_slots.append(s_clean)
+            else:
+                cleaned_slots.append(s)
+        out["typed_slots"] = cleaned_slots
+    if "assumptions_ledger" in out:
+        from ..schemas.research import coerce_assumption_entry
+        raw_ledger = out["assumptions_ledger"]
+        if isinstance(raw_ledger, list):
+            out["assumptions_ledger"] = [
+                c for c in (coerce_assumption_entry(item) for item in raw_ledger) if c is not None
+            ]
+        elif isinstance(raw_ledger, dict):
+            coerced = coerce_assumption_entry(raw_ledger)
+            out["assumptions_ledger"] = [coerced] if coerced else []
+        else:
+            out.pop("assumptions_ledger", None)
     return out
 
 
@@ -2172,7 +2175,9 @@ def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
     if blueprint.typed_slots:
         for idx, raw_slot in enumerate(blueprint.typed_slots):
             slot_dict = raw_slot.model_dump(exclude_none=True) if hasattr(raw_slot, "model_dump") else dict(raw_slot)
-            check = {k: v for k, v in slot_dict.items() if k not in {"value", "prompt_symbol"}}
+            check = {k: v for k, v in slot_dict.items() if k not in {"value", "prompt_symbol", "si_unit", "initial_value", "bounds"}}
+            if check.get("role") == "TIME_STEP":
+                check["role"] = "DYNAMIC_STATE"
             if check.get("slot_idx") is None:
                 sym = check.get("symbol")
                 resolved_idx = blueprint.variable_map.get(sym)
@@ -2199,22 +2204,22 @@ def parse_blueprint(payload: Dict[str, Any]) -> ResearchBlueprint:
                                 f"which is not in variable_map (mapped_indices={sorted(mapped_indices)})"
                             )
     if blueprint.ihcg_evidence is not None:
-        pack = derive_ihcg_evidence(blueprint.research_prompt or blueprint.falsifiable_hypothesis,blueprint.model_dump(),blueprint.ihcg_evidence)
-        blueprint = blueprint.model_copy(update={'ihcg_evidence':pack})
+        pack = derive_ihcg_evidence(blueprint.research_prompt or blueprint.falsifiable_hypothesis, blueprint.model_dump(), blueprint.ihcg_evidence)
+        blueprint = blueprint.model_copy(update={'ihcg_evidence': pack})
     return attach_formal_evidence(blueprint)
 
 
-def _parse_planned_blueprint(payload,question,*,require_evidence=False):
+def _parse_planned_blueprint(payload, question, *, require_evidence=False):
     from . import meaningfulness as m
-    blueprint = parse_blueprint({**payload,"research_prompt":question})
+    blueprint = parse_blueprint({**payload, "research_prompt": question})
     pack = blueprint.ihcg_evidence
     if pack is None:
-        if require_evidence and re.search(r"\b[A-Za-z_]\w*\s*(?:>=|<=|==|!=|>|<|≥|≤)\s*[-+]?(?:\d|\.\d)",question):
-            raise ValueError("FORMAL_EVIDENCE_MISSING: explicit quantitative claim requires ihcg_evidence with exact prompt spans, SI dimensions, domains and executable bindings")
+        if require_evidence:
+            raise ValueError("FORMAL_EVIDENCE_MISSING: planned blueprint requires compiled ihcg_evidence")
     else:
-        graph = m.IhcgCompiler().compile_from_prompt(question,**{k:v for k,v in pack.items() if k not in {"extensions","execution","notes"}})
-        for extension in pack.get("extensions",()):
-            graph = m.IhcgCompiler().extend_stage(graph,question,extension["evidence"],extension["domain"],extension["archetype"])
+        graph = m.IhcgCompiler().compile_from_prompt(question, **{k: v for k, v in pack.items() if k not in {"extensions", "execution", "notes"}})
+        for extension in pack.get("extensions", ()):
+            graph = m.IhcgCompiler().extend_stage(graph, question, extension["evidence"], extension["domain"], extension["archetype"])
         from .epistemic import compile_blueprint_ihcg
         compile_blueprint_ihcg(blueprint)
     return blueprint
@@ -2231,17 +2236,20 @@ def _fill(template: str, **values: Any) -> str:
 def _blueprint_tools_context(fallback):
     if fallback: return TOOLS_CONTEXT
     head, rest = TOOLS_CONTEXT.split('## Formal evidence at ingest', 1)
-    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Include typed_slots: an array of {symbol, si_dim: seven integer SI exponents, role: CONTROL_PARAM|DYNAMIC_STATE|DERIVED_OBSERVABLE|CONSERVATION_AUX}, with optional semantic_tag, stochastic_role (UNIFORM|SEED|COUNTER|CHANNEL for MONTE_CARLO slots), unit_scale ([positive_int_num, positive_int_den], default [1, 1], never 0) and prompt_symbol (the exact original prompt identifier when renamed). Keep variable_map and typed_slots compact (at most 24 slots; the formal verifier enforces a hard cap of 32 bounded variables). NEVER write to any CONTROL_PARAM slot inside simulation_step (any computed parameter such as beta = R0 * gamma must have role="DERIVED_OBSERVABLE"). Declare every dimensional physical constant (e.g. k_B in J/K, eV_to_J, c, h, G) as a typed CONTROL_PARAM slot with its exact si_dim rather than hardcoding a bare numeric literal in formulas. Indices are derived from variable_map. Only genuinely fixed CONTROL_PARAM constants may include a literal value; never freeze a free parameter at initial_state. Contract invariants MUST reference only state[i] / buf.data[i] bound in variable_map (never telemetry["finite"], which Sandbox_Execute already enforces unconditionally). For ODE/dynamical kernels, write pure branch-free smooth RK4 updates with ZERO defensive clamping (`if x < 0: x = 0`, `max(0.0, ...)`) and ZERO `if t == 0:` guards (running peak `if x > buf.data[k]: buf.data[k] = x` on a TRAJECTORY_MAX slot is allowed). For fixed-point equilibrium problems (`FIXED_POINT`), write a pure branch-free `simulation_step` that evaluates the equilibrium residual vector `g(x)` (and any algebraic readouts) directly at `buf.data` — the engine automatically runs Newton, Krawczyk existence/uniqueness, Hurwitz interval stability, and IFT sensitivity. Keep executable, variable_map and all contracts consistent with the original request. Primary contract assertions must retain the original hypothesis expressed directly on the governing physical/mathematical observable slot (e.g. `state[eta_idx] >= 0.65`, NEVER a proxy counter like `feasible_count >= 1.0`), not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
+    return head + '- Sandbox_Execute' + rest.split('- Sandbox_Execute', 1)[1].split('## Worked formal-evidence example', 1)[0] + '\nDo not emit ihcg_evidence. A separate evidence-only formalization call follows this blueprint call. Translate ANY clear research intent (even 1-2 sentences of casual English with zero equations or units) into a complete, falsifiable, SI-normalized Blueprint grounded in retrieved literature and registries, logging every added equation/constant/domain/initial-condition/baseline in `assumptions_ledger`. CRITICAL ANTI-GAMING RULE: preserve the user\'s exact claimed predicate faithfully (never silently weaken or invert a potentially false claim). Separate mutable simulation buffer slots (`typed_slots`), immutable SI/model constants (`constants`), and pure algebraic helper definitions (`derived_expressions`). Include `typed_slots`: an array of `{symbol, si_dim: seven integer SI exponents, role: CONTROL_PARAM|DYNAMIC_STATE|DERIVED_OBSERVABLE|CONSERVATION_AUX|TIME_STEP}`, with optional `si_unit`, `initial_value`, `bounds`, `semantic_tag` (MUST be `0` unless using a reserved tag `251`–`254`; NEVER number `semantic_tag` sequentially like slot indices), `stochastic_role` (UNIFORM|SEED|COUNTER|CHANNEL for MONTE_CARLO slots), `unit_scale` ([positive_int_num, positive_int_den], default [1, 1], never 0). Keep `assumptions_ledger` concise (3–6 key entries). Keep variable_map and typed_slots compact (at most 24 slots; the formal verifier enforces a hard cap of 32 bounded variables). NEVER write to any CONTROL_PARAM slot inside simulation_step (any computed parameter such as beta = R0 * gamma must have role="DERIVED_OBSERVABLE"). Indices are derived from variable_map. Contract invariants MUST reference only state[i] / buf.data[i] bound in variable_map (never telemetry["finite"], which Sandbox_Execute already enforces unconditionally). For ODE/dynamical kernels, write pure branch-free smooth RK4 updates with ZERO defensive clamping (`if x < 0: x = 0`, `max(0.0, ...)`) and ZERO `if t == 0:` guards (running peak `if x > buf.data[k]: buf.data[k] = x` on a TRAJECTORY_MAX slot is allowed). For fixed-point equilibrium problems (`FIXED_POINT`), write a pure branch-free `simulation_step` that evaluates the equilibrium residual vector `g(x)` (and any algebraic readouts) directly at `buf.data`. Primary contract assertions must retain the original hypothesis expressed directly on the governing physical/mathematical observable slot (e.g. `state[eta_idx] >= 0.65`, NEVER a proxy counter like `feasible_count >= 1.0`), not its negation even when you expect falsification. Do not include mutually contradictory assertions or put the desired answer in an input slot.\n'
 
 
-async def _finish_planned_blueprint(payload, question, *, fallback, complete):
-    if not fallback and (payload.get('ihcg_evidence') is not None or re.search(r'\d',question)):
+async def _finish_planned_blueprint(payload, question, *, fallback, complete, repair_complete=None):
+    if not fallback:
+        import inspect as _inspect
         from .formalization import formalize_blueprint
-        core = parse_blueprint({**payload, 'ihcg_evidence':None, 'research_prompt':question})
+        core = parse_blueprint({**payload, 'ihcg_evidence': None, 'research_prompt': question})
         immutable = core.model_dump()
         immutable['ihcg_evidence'] = payload.get('ihcg_evidence')
+        if repair_complete is not None and 'repair_complete' in _inspect.signature(formalize_blueprint).parameters:
+            return await formalize_blueprint(question, immutable, complete, repair_complete=repair_complete)
         return await formalize_blueprint(question, immutable, complete)
-    return _parse_planned_blueprint(payload,question,require_evidence=not fallback)
+    return _parse_planned_blueprint(payload, question, require_evidence=False)
 
 
 def compact_literature_digest(
@@ -2651,6 +2659,7 @@ async def generate_research_plan(question: str,
                                  feasibility: Any = None,
                                  extra_context: str = "",
                                  llm_formalizer: Optional[Callable[[str], Any]] = None,
+                                 llm_fast: Optional[Callable[[str], Any]] = None,
                                  ) -> Dict[str, Any]:
     """Tier-2 REASONING plan synthesis; falls back to a deterministic blueprint.
 
@@ -2675,7 +2684,7 @@ async def generate_research_plan(question: str,
             data = _extract_json(str(raw))
             if isinstance(data, dict):
                 try:
-                    bp = await _finish_planned_blueprint(data,question,fallback=fallback,complete=llm_formalizer or llm_complete)
+                    bp = await _finish_planned_blueprint(data, question, fallback=fallback, complete=llm_formalizer or llm_complete, repair_complete=llm_fast or llm_formalizer)
                 except ValueError as exc:
                     from .formalization import FormalizationError
                     if isinstance(exc, FormalizationError): raise
@@ -2683,7 +2692,7 @@ async def generate_research_plan(question: str,
                     with llm_call_context("blueprint_schema_repair", attempt=2):
                         repaired = await llm_complete(prompt+"\n\nBLUEPRINT SCHEMA VALIDATION ERROR: "+str(exc)
                             +"\nReturn the complete corrected blueprint JSON without ihcg_evidence; a separate evidence-only call follows. Never fabricate absent physical information. Previous JSON:\n"+json.dumps(data))
-                    bp = await _finish_planned_blueprint(_extract_json(str(repaired)),question,fallback=False,complete=llm_formalizer or llm_complete)
+                    bp = await _finish_planned_blueprint(_extract_json(str(repaired)), question, fallback=False, complete=llm_formalizer or llm_complete, repair_complete=llm_fast or llm_formalizer)
                 bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
                 bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)
                 return {"blueprint": _attach_evidence(bp_dict, evidence),
@@ -2740,6 +2749,7 @@ async def generate_plan_with_feasibility(question: str,
                                          extra_context: str = "",
                                          progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
                                          llm_formalizer: Optional[Callable[[str], Any]] = None,
+                                         llm_fast: Optional[Callable[[str], Any]] = None,
                                          ) -> Dict[str, Any]:
     """Feasibility and blueprint synthesis, then bounded evidence-only formalization.
 
@@ -2882,7 +2892,7 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no blueprint object"}
         raise RuntimeError("research plan synthesis failed: no blueprint object in response")
     try:
-        bp = await _finish_planned_blueprint(bp_raw,question,fallback=fallback,complete=llm_formalizer or llm_complete)
+        bp = await _finish_planned_blueprint(bp_raw, question, fallback=fallback, complete=llm_formalizer or llm_complete, repair_complete=llm_fast or llm_formalizer)
     except Exception as exc:
         from .formalization import FormalizationError
         if isinstance(exc, FormalizationError): raise
@@ -2917,7 +2927,7 @@ async def generate_plan_with_feasibility(question: str,
                 bp_raw2 = data_retry2
         if not isinstance(bp_raw2, dict):
             raise
-        bp = await _finish_planned_blueprint(bp_raw2,question,fallback=False,complete=llm_formalizer or llm_complete)
+        bp = await _finish_planned_blueprint(bp_raw2, question, fallback=False, complete=llm_formalizer or llm_complete, repair_complete=llm_fast or llm_formalizer)
     bp_dict = _reconcile_time_horizon(bp.model_dump(), question, evidence)
     bp_dict["research_prompt"] = question
     # Tier-0 deterministic contract alignment autofix BEFORE running validation checks (0 tokens)
@@ -2969,7 +2979,7 @@ async def generate_plan_with_feasibility(question: str,
                         if not isinstance(bp_fix, dict) and isinstance(data_fix.get("contracts"), list) and data_fix.get("title"):
                             bp_fix = data_fix
                     if isinstance(bp_fix, dict):
-                        bp2 = await _finish_planned_blueprint(bp_fix,question,fallback=fallback,complete=llm_formalizer or llm_complete)
+                        bp2 = await _finish_planned_blueprint(bp_fix, question, fallback=fallback, complete=llm_formalizer or llm_complete, repair_complete=llm_fast or llm_formalizer)
                         bp_dict = _reconcile_time_horizon(bp2.model_dump(), question, evidence)
                         bp_dict["research_prompt"] = question
                         bp_dict = _autofix_blueprint_contract_alignment(bp_dict, question)

@@ -90,12 +90,40 @@ class SlotSpec(StrictModel):
         return data
 
 
+class FormalizationAssumptionRecord(StrictModel):
+    kind: Literal[
+        "GOVERNING_EQUATION",
+        "SI_CONSTANT",
+        "OPERATING_DOMAIN",
+        "INITIAL_CONDITION",
+        "HYPOTHESIS_FORMALIZATION",
+        "NULL_BASELINE",
+    ]
+    symbol_or_field: str = Field(min_length=1)
+    value_or_expr: str = Field(min_length=1)
+    source: Literal[
+        "USER_PROMPT",
+        "LITERATURE",
+        "REFERENCE_REGISTRY",
+        "SHBT_REGISTRY",
+        "LLM_DOMAIN_DEFAULT",
+    ] = "LLM_DOMAIN_DEFAULT"
+    rationale: str = ""
+
+
 class Obligation(StrictModel):
     id: str = Field(min_length=1)
     expression: str = Field(min_length=1)
     obligation_class: Literal["HYPOTHESIS_TARGET", "CONSERVATION_GUARD", "STAGE_COUPLING"]
-    prompt_quote: str = Field(min_length=1)
-    prompt_span: tuple[int, int]
+    prompt_quote: str = ""
+    prompt_span: tuple[int, int] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_obligation(self, handler):
+        data = handler(self)
+        if self.prompt_span is None:
+            data.pop("prompt_span", None)
+        return data
 
 
 class EquationSpec(StrictModel):
@@ -127,7 +155,15 @@ class IhcgGraph(StrictModel):
     stage_chain_digests: tuple[str, ...] = ()
     perturbation_target: bool = False
     mc_difference_bounds: tuple[float, float] | None = None
+    assumptions_ledger: tuple[FormalizationAssumptionRecord, ...] = ()
     h_ihcg: str = ""
+
+    @model_serializer(mode="wrap")
+    def serialize_ihcg(self, handler):
+        data = handler(self)
+        if not self.assumptions_ledger:
+            data.pop("assumptions_ledger", None)
+        return data
 
     def assert_sealed(self) -> None:
         if not hmac.compare_digest(self.h_ihcg, _native.py_compute_ihcg_digest(self.model_dump_json())):
@@ -421,6 +457,14 @@ class IhcgAnchor(StrictModel):
     quantifier_mode: Literal["FORALL", "EXISTS", "BOUNDARY"]
     archetype: Archetype
     prompt_obligation_quotes: tuple[dict[str, str], ...]
+    assumptions_ledger: tuple[FormalizationAssumptionRecord, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def serialize_anchor(self, handler):
+        data = handler(self)
+        if not self.assumptions_ledger:
+            data.pop("assumptions_ledger", None)
+        return data
 
 
 class MeaningfulnessCertificate(StrictModel):
@@ -445,12 +489,14 @@ class MeaningfulnessCertificate(StrictModel):
     z3_tier_used: Tier
     trust_boundary_version: Literal["invar.tcb.phase2a.native-libm16.v1"] = TRUST_BOUNDARY_VERSION
     uast_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    assumptions_ledger: tuple[FormalizationAssumptionRecord, ...] = ()
     blake3_receipt: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_serializer(mode="wrap")
     def serialize_certificate(self, handler):
         data = handler(self)
         if data.get("certified_valid_domain") is None: data.pop("certified_valid_domain",None)
+        if not self.assumptions_ledger: data.pop("assumptions_ledger", None)
         return data
 
     @model_validator(mode="after")
@@ -576,28 +622,54 @@ def _json(value: Any) -> str:
 
 
 class IhcgCompiler:
-    """Compile explicit formal evidence; never guess scientific prose semantics.
+    """Compile a typed Blueprint AST (FormalResearchSpec / evidence) into a sealed IHCG.
 
-    Evidence supplies slots, equations, assumptions, quoted obligations and the
-    quantifier mode. Each obligation is tied to an exact prompt character span.
-    The prose-to-formula semantic binding remains a declared ingestion TCB.
+    The deterministic compiler NEVER parses raw natural-language user prompts or rejects
+    obligations for paraphrasing/missing literal quote spans. Raw prompt text is retained
+    strictly as provenance metadata; every formalization assumption is surfaced in
+    ``assumptions_ledger``.
     """
+
+    def compile_from_spec(self, evidence: Mapping[str, Any], domain: Mapping[str, Sequence[float]], archetype: Archetype, *, prompt: str = "") -> IhcgGraph:
+        return self.compile_from_prompt(prompt, evidence, domain, archetype)
 
     def compile_from_prompt(self, prompt: str, evidence: Mapping[str, Any], domain: Mapping[str, Sequence[float]], archetype: Archetype) -> IhcgGraph:
         data = copy.deepcopy(dict(evidence))
         data.update(omega=_bounds(domain), archetype=archetype)
+        # Normalize optional provenance spans: keep valid spans, drop invalid/unmatched spans non-blockingly.
+        raw_obligations = data.get("obligations")
+        if isinstance(raw_obligations, (list, tuple)):
+            cleaned_obs = []
+            for ob in raw_obligations:
+                if isinstance(ob, dict):
+                    ob_copy = dict(ob)
+                    span = ob_copy.get("prompt_span")
+                    quote = ob_copy.get("prompt_quote", "")
+                    if span is not None:
+                        if not (
+                            isinstance(span, (list, tuple))
+                            and len(span) == 2
+                            and all(type(v) is int for v in span)
+                            and isinstance(prompt, str)
+                            and 0 <= span[0] < span[1] <= len(prompt)
+                            and isinstance(quote, str)
+                            and prompt[span[0]:span[1]] == quote
+                        ):
+                            ob_copy["prompt_span"] = None
+                    if not ob_copy.get("prompt_quote") and isinstance(ob_copy.get("expression"), str):
+                        ob_copy["prompt_quote"] = ob_copy["expression"]
+                    cleaned_obs.append(ob_copy)
+                else:
+                    cleaned_obs.append(ob)
+            data["obligations"] = cleaned_obs
         graph = IhcgGraph.model_validate_json(_json(data))
         names = {s.symbol for s in graph.slots}
         if names != set(graph.omega) or len(names) != len(graph.slots) or len({s.slot_idx for s in graph.slots}) != len(names):
             raise ValueError(f"IHCG slots and Omega must be one-to-one; missing_domain={sorted(names-set(graph.omega))}; undeclared_domain={sorted(set(graph.omega)-names)}; symbols={[s.symbol for s in graph.slots]}; indices={[s.slot_idx for s in graph.slots]}")
         if not graph.obligations or not any(o.obligation_class == "HYPOTHESIS_TARGET" for o in graph.obligations):
-            raise ValueError("at least one quoted primary hypothesis is required")
+            raise ValueError("at least one primary HYPOTHESIS_TARGET obligation is required")
         if len({o.id for o in graph.obligations}) != len(graph.obligations):
             raise ValueError("duplicate obligation identifiers")
-        for obligation in graph.obligations:
-            start, end = obligation.prompt_span
-            if not 0 <= start < end <= len(prompt) or prompt[start:end] != obligation.prompt_quote:
-                raise ValueError("obligation quote does not match its immutable prompt span")
         expressions = [(f"environmental_assumptions[{i}]", e) for i,e in enumerate(graph.environmental_assumptions)]
         expressions += [(f"obligations[{i}].expression", o.expression) for i,o in enumerate(graph.obligations)]
         expressions += [(f"equations[{name!r}].expression", e.expression) for name,e in graph.equations.items()]
@@ -2018,7 +2090,8 @@ def build_meaningfulness_certificate(*, run_id: str, verdict: EpistemicVerdict, 
     if checked.passed != nontriviality_audit.passed or checked.failure_reason != nontriviality_audit.failure_reason:
         raise ValueError("nontriviality audit is not bound to this IHCG")
     anchor = IhcgAnchor(ihcg_digest=ihcg.h_ihcg, stage_chain_digests=ihcg.stage_chain_digests, quantifier_mode=ihcg.quantifier_mode,
-                        archetype=ihcg.archetype, prompt_obligation_quotes=tuple({"quote": o.prompt_quote, "csel": o.expression, "class": o.obligation_class} for o in ihcg.obligations))
+                        archetype=ihcg.archetype, prompt_obligation_quotes=tuple({"quote": o.prompt_quote, "csel": o.expression, "class": o.obligation_class} for o in ihcg.obligations),
+                        assumptions_ledger=ihcg.assumptions_ledger)
     certificate = MeaningfulnessCertificate(run_id=run_id, epistemic_verdict=verdict, ihcg_anchor=anchor, contract_audit=contract_audit,
         nontriviality_audit=checked, purity_audit=purity_audit, fidelity_audit=fidelity_audit, identifiability_audit=identifiability_audit,
         significance_audit=significance_audit, falsification_certificate=falsification_certificate, boundary_certificate=boundary_certificate,
@@ -2028,7 +2101,7 @@ def build_meaningfulness_certificate(*, run_id: str, verdict: EpistemicVerdict, 
         relative_effect_size=significance_audit.relative_effect_size if significance_audit else None,
         domain_compression_bits=significance_audit.domain_compression_bits if significance_audit else None,
         z3_tier_used=_worst_tier([*checked.contract_audit.queries.values(), QueryResult(status="UNKNOWN", z3_tier_used=contract_audit.z3_logic_tier)]),
-        uast_digest=uast_digest, blake3_receipt="0"*64)
+        uast_digest=uast_digest, assumptions_ledger=ihcg.assumptions_ledger, blake3_receipt="0"*64)
     receipt = _native.py_compute_certificate_receipt(certificate.model_dump_json())
     return certificate.model_copy(update={"blake3_receipt": receipt})
 

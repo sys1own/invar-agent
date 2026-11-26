@@ -6,9 +6,11 @@ The Rust/PyO3 core, Python/Z3 substrate, restricted-Python-to-C++20 compiler and
 
 ## Scientific contract and eight gates
 
-Ingest seals the IHCG: original prompt, quoted obligations and character spans, quantifier, finite domain Ω, typed symbols, governing equations, immutable controls and stage commitments. Formal evidence must bind to the executable slots and contracts, not to an input containing the desired answer.
+`invar-agent` enforces a strict **Two-Boundary Architecture** separating natural-language interpretation from deterministic verification:
 
-Literal extraction requires unambiguous formula/domain/unit declarations; it does not invent units or ambiguous prose aliases. Quote re-anchoring tolerates whitespace and equivalent Unicode comparison/minus tokens, then stores the exact original substring. Paraphrases, changed numbers/strictness and ambiguous matches are rejected. Strict quantitative planning requests bounded repair for absent or invalid evidence. Healing cannot recalibrate sealed observables or silently weaken a hypothesis.
+1. **LLM Interpreter & Four-Namespace Blueprint AST (`FormalResearchSpec`)**: Only the LLM Interpreter layer (assisted by Literature Federation, `ReferenceRegistry`, and bottleneck-gated SHBT Federation) reads raw user prose. Users do not need to write flawless equations, SI units, or domain bounds; the Interpreter grounds missing physics/constants/domains in literature and registries, logs every added assumption transparently in `assumptions_ledger`, and emits a four-namespace Blueprint AST separating mutable simulation buffer slots (`typed_slots`), immutable SI constants (`constants`), pure algebraic definitions (`derived_expressions`), and governing equations/domains/obligations.
+2. **Tier-0 Deterministic Blueprint Compiler, Preflight & Bounded Tier-1 AST Repair (`blueprint_compiler.py`)**: Before sealing the IHCG, a zero-token deterministic compiler resolves all four namespaces, inlines pure derived expressions, binds dimensional SI constants, checks initial-state conservation and Z3 non-vacuity/non-tautology (while permitting genuine `INFEASIBLE` user claims to proceed to `VERIFIED_FALSIFICATION`), and runs a bounded Tier-1 targeted AST repair loop on structured diagnostics if needed.
+3. **Deterministic 9-Stage / 8-Gate Engine**: Once the Blueprint AST is sealed into the immutable BLAKE3 IHCG (`invar.ihcg.v1`), **the deterministic engine never parses raw natural-language user prompts**. Raw user text is retained strictly as provenance metadata (with optional, non-blocking quote/span links in `formal_evidence.py`), and all 8 epistemic gates, Duhem–Quine falsification certifiers, and Builder Studio `CanonicalResearchIR` admission checks hold strictly modulo the sealed Blueprint AST. Healing cannot recalibrate sealed observables or silently weaken a hypothesis.
 
 | Gate | Requirement |
 |---|---|
@@ -146,7 +148,7 @@ Numeric agreement and containment are checked without fitting intervals to obser
 | 3. `IntervalF64` IEEE-754 outward rounding | Interval-based conclusions require containment of real results. | IEEE edge tests cover subnormals, signed zero, infinity and near-overflow; differential checks cover containment. **Libm widening is assumed**, not a correctly-rounded-library proof. |
 | 4. HIN interval typing soundness | Typed wiring must preserve dimensions, semantic/role constraints and bounds. | Native typing/purity tests and differential lowering exercise accepted/rejected wires; finite examples and type acceptance do not prove arbitrary compiler correctness. |
 | 5. `adjoint.rs` symbolic derivative and interval-extension soundness | Jacobian, Krawczyk/IFT, sensitivity and stability arguments rely on these implementations. | Symbolic results are compared to complex-step/FD, including FD interval-Jacobian containment. FD agreement is not a proof for all inputs; unsupported extensions fail closed. |
-| 6. [1. Ingest] prose → H<sub>user</sub> binding | The formal graph must faithfully encode original claim, assumptions, units, domain and quantifier. | Exact-span/replay tests catch evidence loss, normalization drift and weakened contracts. A literal quote proves provenance, **not semantic equivalence of arbitrary prose and a formula**; human/model-binding audit remains necessary. |
+| 6. [1. Ingest] prose → `FormalResearchSpec` AST binding | The LLM Interpreter translates user prose into a typed Blueprint AST (`FormalResearchSpec`), logging every added equation, SI constant, operating domain, initial condition, or null baseline in `assumptions_ledger`. Once sealed into the IHCG, the deterministic engine never reads raw prose and all 8 formal gates hold strictly modulo the sealed Blueprint AST. | `test_blueprint_compiler.py` and replay tests verify four-namespace resolution, non-blocking provenance annotation, bounded Tier-1 AST repair, and post-seal anti-gaming. Automated translation does not prove semantic equivalence of arbitrary prose and a formula; human audit of `assumptions_ledger` and sealed obligations remains part of the TCB. |
 
 Additional operational assumptions include correct sandbox/compiler execution and scientific routines such as beta quantiles. Cooperative deadlines can overshoot inside library/native calls. Receipts prove artifact integrity/identity, not scientific truth. Unsupported operators, incomplete bindings and solver UNKNOWN must not become positive evidence or falsification certificates.
 
@@ -336,8 +338,9 @@ invar-agent/
 │   │   └── src/                     # GoI, HIN, adjoint, egg, HIS, Π, intervals
 │   ├── research/
 │   │   ├── state_machine.py         # Research loop and provider handling
-│   │   ├── planner.py               # Synthesis and formal validation
-│   │   ├── formal_evidence.py       # Literal extraction and quote anchoring
+│   │   ├── planner.py               # LLM Interpreter synthesis and bounded repair
+│   │   ├── blueprint_compiler.py    # Tier-0 four-namespace Blueprint AST compiler & preflight
+│   │   ├── formal_evidence.py       # Optional non-blocking provenance annotation
 │   │   ├── meaningfulness.py        # IHCG, gates, SMT, reliability, certificates
 │   │   ├── falsification.py         # Deductive, numerical, boundary certifiers
 │   │   ├── default_verification.py  # Executable binding and baseline evidence

@@ -355,10 +355,15 @@ class _Roundoff:
                 if not math.isfinite(error+actual.lo+actual.hi): raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
                 return ((nominal.lo,nominal.hi),error)
             raise UnsupportedVerification("RIGOROUS_ROUNDING_BOUND_UNAVAILABLE")
-        if isinstance(node,ast.Call) and ast.unparse(node.func) in {"exp","log","sqrt","sin","cos","math.exp","math.log","math.sqrt","math.sin","math.cos"}:
+        if isinstance(node,ast.Call) and ast.unparse(node.func) in {
+            "exp","log","sqrt","sin","cos","abs","fabs","logistic_sigmoid",
+            "math.exp","math.log","math.sqrt","math.sin","math.cos","math.fabs","math.logistic_sigmoid",
+        }:
             if len(node.args) != 1 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
             (lo,hi),error = self.expression(node.args[0],env,depth+1)
             name = ast.unparse(node.func).split(".")[-1]
+            if name == "fabs":
+                name = "abs"
             try:
                 nominal = m._iv(m._parse(f"{name}(a)"),{"a":(lo,hi)})
                 act_lo = math.nextafter(lo - error, -math.inf)
@@ -367,6 +372,28 @@ class _Roundoff:
                 elif self.guarded_sqrt_log and name == "log":
                     act_lo = max(1e-300, act_lo)
                 actual = m._iv(m._parse(f"{name}(a)"),{"a":(act_lo,math.nextafter(hi+error,math.inf))})
+            except m._DomainError:
+                if self.minimum_divisor > 0.0:
+                    return ((-math.inf, math.inf), math.inf)
+                raise
+            error = math.nextafter(max(abs(actual.lo-nominal.hi),abs(actual.hi-nominal.lo)),math.inf)
+            if not math.isfinite(error+actual.lo+actual.hi):
+                if self.minimum_divisor > 0.0:
+                    return ((-math.inf, math.inf), math.inf)
+                raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
+            return ((nominal.lo,nominal.hi),error)
+        if isinstance(node,ast.Call) and ast.unparse(node.func) in {"min","max","kl_term","hill_eq","michaelis_menten","math.kl_term","math.hill_eq","math.michaelis_menten"}:
+            name = ast.unparse(node.func).split(".")[-1]
+            arity = m._ARITIES[name]
+            if len(node.args) != arity or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
+            evaluated = [self.expression(arg,env,depth+1) for arg in node.args]
+            arg_names = [f"a{i}" for i in range(arity)]
+            expr = m._parse(f"{name}({','.join(arg_names)})")
+            nom_env = {arg_names[i]: evaluated[i][0] for i in range(arity)}
+            act_env = {arg_names[i]: (math.nextafter(evaluated[i][0][0]-evaluated[i][1], -math.inf), math.nextafter(evaluated[i][0][1]+evaluated[i][1], math.inf)) for i in range(arity)}
+            try:
+                nominal = m._iv(expr, nom_env)
+                actual = m._iv(expr, act_env)
             except m._DomainError:
                 if self.minimum_divisor > 0.0:
                     return ((-math.inf, math.inf), math.inf)
