@@ -8,9 +8,9 @@ import re
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional, Union
 
-from pydantic import create_model
+from pydantic import Field, create_model, model_validator
 
 from . import meaningfulness as m
 from .blueprint_compiler import compile_and_preflight_blueprint
@@ -138,12 +138,33 @@ def _encoding_feedback(question, pack):
     return issues
 
 
+class QuantifierBinderInput(m.StrictModel):
+    symbol: str = Field(min_length=1)
+    lo: Union[float, int, str]
+    hi: Union[float, int, str]
+    lo_open: bool = False
+    hi_open: bool = False
+
+
+class TypedObligationInput(m.StrictModel):
+    id: str = Field(min_length=1)
+    predicate: dict[str, Any] = Field(min_length=1)
+    obligation_class: Literal["HYPOTHESIS_TARGET", "CONSERVATION_GUARD", "STAGE_COUPLING"]
+    prompt_quote: str = ""
+    prompt_span: Optional[tuple[int, int]] = None
+
+
 def _evidence_pack_model():
-    names = ('slots', 'equations', 'environmental_assumptions', 'obligations',
-             'quantifier_mode', 'mechanism_parameters', 'control_values', 'perturbation_target',
-             'mc_difference_bounds', 'assumptions_ledger')
-    evidence = create_model('FormalEvidenceInput', __base__=m.StrictModel, **{
-        name: (m.IhcgGraph.model_fields[name].annotation, copy.deepcopy(m.IhcgGraph.model_fields[name])) for name in names})
+    names = ('slots', 'equations', 'quantifier_mode', 'mechanism_parameters',
+             'control_values', 'perturbation_target', 'mc_difference_bounds', 'assumptions_ledger')
+    fields: dict[str, Any] = {
+        name: (m.IhcgGraph.model_fields[name].annotation, copy.deepcopy(m.IhcgGraph.model_fields[name]))
+        for name in names
+    }
+    fields['obligations'] = (tuple[Union[m.Obligation, TypedObligationInput], ...], ...)
+    fields['environmental_assumptions'] = (tuple[Union[str, dict[str, Any]], ...], ())
+    fields['quantifier_binders'] = (tuple[QuantifierBinderInput, ...], ())
+    evidence = create_model('FormalEvidenceInput', __base__=m.StrictModel, **fields)
     pack = create_model('FormalEvidencePack', __base__=m.StrictModel,
         evidence=(evidence, ...), domain=(m.Bounds, ...),
         notes=(tuple[str, ...], ()),
@@ -216,7 +237,16 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
         'and/or/not, implies(a, b). NO Python ternary if/else, NO math. prefix, NO sum(), NO ln(). '
         'Allowed functions & exact arities: abs(x), sqrt(x), exp(x), log(x), sin(x), cos(x), min(a,b), max(a,b), '
         'pow(x,y), kl_term(p,q), logistic_sigmoid(x), hill_eq(x,k,n), michaelis_menten(x,v,k), implies(a,b). '
-        'environmental_assumptions must be executable Boolean expressions over declared symbols (e.g. "x >= 0"), never English sentences. '
+        'TYPED CHANNEL & PROSE SEPARATION: Put quantifiers in `quantifier_mode` + `evidence.quantifier_binders` '
+        '(`[{"symbol":"R0","lo":2,"hi":4,"lo_open":false,"hi_open":false}]`), ranges/fixed values in `domain` or typed '
+        '`environmental_assumptions` (`{"bound":{"symbol":...,"lo":...,"hi":...,"lo_open":false,"hi_open":false}}` or '
+        '`{"fixed":{"symbol":...,"value":...}}` or `{"predicate":...}`), units in `si_dim`, and ALL free prose/explanations '
+        'in `notes[]` — NEVER put quantifiers, units, "fixed at", or English sentences inside `expression`. '
+        'Obligations may use either `expression` (formal string) OR typed `predicate` (`{"rel":{"lhs":"Reff","op":"<","rhs":"1"}}`, '
+        '`{"all_of":[...]}`, `{"any_of":[...]}`, `{"not":p}`, `{"implies":[p,q]}`). '
+        'Quantified example: "for all R0 in [2,4], Reff<1" -> `quantifier_mode="BOUNDARY"`, `domain={"R0":[2,4],...}`, '
+        '`quantifier_binders=[{"symbol":"R0","lo":2,"hi":4,"lo_open":false,"hi_open":false}]`, '
+        'and obligation `{"id":"h0","expression":"Reff < 1","obligation_class":"HYPOTHESIS_TARGET"}` (bare inequality, never "For all ..."). '
         'Optional provenance: set `prompt_quote` to a brief quote or summary of the user claim (never blocks on paraphrasing). '
         'Preserve strict criteria exactly: x < 1 must not become x < 1 - epsilon.\n'
         'JSON schema derived from the compiler models:\n' + json.dumps(judgment_json_schema()) +

@@ -150,6 +150,7 @@ AssumptionKind = Literal[
     "INITIAL_CONDITION",
     "HYPOTHESIS_FORMALIZATION",
     "NULL_BASELINE",
+    "NOTE",
 ]
 
 AssumptionSource = Literal[
@@ -168,6 +169,7 @@ _VALID_ASSUMPTION_KINDS = {
     "INITIAL_CONDITION",
     "HYPOTHESIS_FORMALIZATION",
     "NULL_BASELINE",
+    "NOTE",
 }
 _VALID_ASSUMPTION_SOURCES = {
     "USER_PROMPT",

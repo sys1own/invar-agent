@@ -523,6 +523,411 @@ def _check_initial_pool_conservation(
     return diagnostics
 
 
+_ALLOWED_REL_OPS: Set[str] = {"<", "<=", ">", ">=", "==", "!="}
+
+
+def _eval_numeric_bound(val: Any) -> Optional[float]:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        f = float(val)
+        return f if math.isfinite(f) else None
+    if isinstance(val, str) and val.strip():
+        res = _fe_normalize(val)
+        if res.ok and res.canonical is not None:
+            try:
+                node = m._parse(res.canonical)
+                if not m._variables(node):
+                    iv = m._iv(node, {})
+                    if math.isfinite(iv.lo) and math.isfinite(iv.hi) and abs(iv.hi - iv.lo) <= 1e-9 * max(1.0, abs(iv.lo)):
+                        return 0.5 * (float(iv.lo) + float(iv.hi))
+            except Exception:
+                return None
+    return None
+
+
+def _format_bound_endpoint(
+    val: Any,
+    field: str,
+    declared_symbols: Set[str],
+    domain_preview: Mapping[str, Tuple[float, float]],
+    si_dims: Mapping[str, Any],
+) -> Tuple[Optional[str], Optional[BlueprintDiagnostic]]:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if not math.isfinite(float(val)):
+            return None, BlueprintDiagnostic(
+                code="INVALID_BOUND",
+                field=field,
+                message=f"Non-finite bound value {val!r}.",
+            )
+        return repr(val), None
+    if isinstance(val, str) and val.strip():
+        res = _fe_normalize(val, declared_symbols=declared_symbols, domain=domain_preview, si_dims=si_dims)
+        if res.ok and res.canonical is not None:
+            node = m._parse(res.canonical)
+            if isinstance(node, (ast.Compare, ast.BoolOp)):
+                return None, BlueprintDiagnostic(
+                    code="INVALID_BOUND",
+                    field=field,
+                    message="Bound endpoint must be an arithmetic expression, not a comparison/boolean.",
+                    original=val,
+                    column=1,
+                )
+            return res.canonical, None
+        ed = res.diagnostics[0] if res.diagnostics else None
+        return None, BlueprintDiagnostic(
+            code=ed.code if ed else "INVALID_BOUND",
+            field=field,
+            message=ed.message if ed else f"Invalid bound expression {val!r}.",
+            original=val,
+            column=ed.column if ed else 1,
+            offending_token=ed.offending_token if ed else None,
+            hint=ed.hint if ed else "",
+        )
+    return None, BlueprintDiagnostic(
+        code="INVALID_BOUND",
+        field=field,
+        message=f"Bound endpoint must be a finite number or arithmetic string, got {type(val).__name__}.",
+    )
+
+
+def _lower_predicate_tree(
+    pred: Any,
+    field: str,
+    *,
+    declared_symbols: Set[str],
+    domain_preview: Mapping[str, Tuple[float, float]],
+    si_dims: Mapping[str, Any],
+    depth: int = 0,
+) -> Tuple[Optional[str], List[BlueprintDiagnostic]]:
+    if depth > 32:
+        return None, [BlueprintDiagnostic(code="PREDICATE_TOO_DEEP", field=field, message="Predicate nesting exceeds cap (32).")]
+    if not isinstance(pred, dict) or len(pred) != 1:
+        return None, [BlueprintDiagnostic(
+            code="INVALID_PREDICATE",
+            field=field,
+            message="Predicate must be a single-key object: rel | all_of | any_of | not | implies.",
+        )]
+    key, val = next(iter(pred.items()))
+    if key == "rel":
+        if not isinstance(val, dict) or not {"lhs", "op", "rhs"} <= set(val.keys()):
+            return None, [BlueprintDiagnostic(
+                code="INVALID_PREDICATE",
+                field=f"{field}.rel",
+                message="rel predicate requires lhs, op, rhs.",
+            )]
+        op = val["op"]
+        if op not in _ALLOWED_REL_OPS:
+            return None, [BlueprintDiagnostic(
+                code="INVALID_PREDICATE",
+                field=f"{field}.rel.op",
+                message=f"Unsupported relational operator {op!r}; allowed: {sorted(_ALLOWED_REL_OPS)}.",
+            )]
+        lhs_raw, rhs_raw = val["lhs"], val["rhs"]
+        if not isinstance(lhs_raw, str) or not isinstance(rhs_raw, str):
+            return None, [BlueprintDiagnostic(
+                code="INVALID_PREDICATE",
+                field=f"{field}.rel",
+                message="rel.lhs and rel.rhs must be arithmetic expression strings.",
+            )]
+        diags: List[BlueprintDiagnostic] = []
+        lhs_res = _fe_normalize(lhs_raw, declared_symbols=declared_symbols, domain=domain_preview, si_dims=si_dims)
+        rhs_res = _fe_normalize(rhs_raw, declared_symbols=declared_symbols, domain=domain_preview, si_dims=si_dims)
+        for side_name, side_raw, side_res in (("lhs", lhs_raw, lhs_res), ("rhs", rhs_raw, rhs_res)):
+            if not side_res.ok or side_res.canonical is None:
+                for ed in side_res.diagnostics:
+                    diags.append(BlueprintDiagnostic(
+                        code=ed.code,
+                        field=f"{field}.rel.{side_name}",
+                        message=ed.message,
+                        original=ed.original,
+                        column=ed.column,
+                        offending_token=ed.offending_token,
+                        hint=ed.hint,
+                    ))
+            else:
+                side_node = m._parse(side_res.canonical)
+                if isinstance(side_node, (ast.Compare, ast.BoolOp)):
+                    diags.append(BlueprintDiagnostic(
+                        code="NON_ARITHMETIC_OPERAND",
+                        field=f"{field}.rel.{side_name}",
+                        message=f"rel.{side_name} must be an arithmetic expression, not a comparison/boolean.",
+                        original=side_raw,
+                        column=1,
+                    ))
+        if diags:
+            return None, diags
+        op_map = {
+            "<": ast.Lt(), "<=": ast.LtE(), ">": ast.Gt(),
+            ">=": ast.GtE(), "==": ast.Eq(), "!=": ast.NotEq(),
+        }
+        cmp_node = ast.Compare(
+            left=m._parse(lhs_res.canonical),
+            ops=[op_map[op]],
+            comparators=[m._parse(rhs_res.canonical)],
+        )
+        return ast.unparse(ast.fix_missing_locations(cmp_node)), []
+
+    if key in ("all_of", "any_of"):
+        if not isinstance(val, list) or not val:
+            return None, [BlueprintDiagnostic(code="INVALID_PREDICATE", field=f"{field}.{key}", message=f"{key} must be a non-empty list.")]
+        sub_nodes: List[ast.AST] = []
+        diags = []
+        for idx, sub in enumerate(val):
+            s_expr, s_diags = _lower_predicate_tree(
+                sub, f"{field}.{key}[{idx}]",
+                declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims, depth=depth + 1,
+            )
+            diags.extend(s_diags)
+            if s_expr is not None:
+                sub_nodes.append(m._parse(s_expr))
+        if diags:
+            return None, diags
+        if len(sub_nodes) == 1:
+            return ast.unparse(sub_nodes[0]), []
+        bool_node = ast.BoolOp(op=ast.And() if key == "all_of" else ast.Or(), values=sub_nodes)
+        return ast.unparse(ast.fix_missing_locations(bool_node)), []
+
+    if key == "not":
+        s_expr, s_diags = _lower_predicate_tree(
+            val, f"{field}.not",
+            declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims, depth=depth + 1,
+        )
+        if s_diags or s_expr is None:
+            return None, s_diags
+        not_node = ast.UnaryOp(op=ast.Not(), operand=m._parse(s_expr))
+        return ast.unparse(ast.fix_missing_locations(not_node)), []
+
+    if key == "implies":
+        if not isinstance(val, list) or len(val) != 2:
+            return None, [BlueprintDiagnostic(code="INVALID_PREDICATE", field=f"{field}.implies", message="implies requires a 2-element list [antecedent, consequent].")]
+        p_expr, p_diags = _lower_predicate_tree(
+            val[0], f"{field}.implies[0]",
+            declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims, depth=depth + 1,
+        )
+        q_expr, q_diags = _lower_predicate_tree(
+            val[1], f"{field}.implies[1]",
+            declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims, depth=depth + 1,
+        )
+        if p_diags or q_diags or p_expr is None or q_expr is None:
+            return None, p_diags + q_diags
+        return f"implies({p_expr}, {q_expr})", []
+
+    return None, [BlueprintDiagnostic(
+        code="INVALID_PREDICATE",
+        field=field,
+        message=f"Unknown predicate operator {key!r}; allowed: rel, all_of, any_of, not, implies.",
+    )]
+
+
+def _lower_bound_object(
+    bound: Any,
+    field: str,
+    *,
+    declared_symbols: Set[str],
+    domain_preview: Mapping[str, Tuple[float, float]],
+    si_dims: Mapping[str, Any],
+) -> Tuple[Optional[str], List[BlueprintDiagnostic]]:
+    if not isinstance(bound, dict) or not {"symbol", "lo", "hi"} <= set(bound.keys()):
+        return None, [BlueprintDiagnostic(
+            code="INVALID_BOUND",
+            field=field,
+            message="Bound object requires symbol, lo, hi (optional lo_open, hi_open).",
+        )]
+    sym = bound["symbol"]
+    if not isinstance(sym, str) or not sym.isidentifier():
+        return None, [BlueprintDiagnostic(code="INVALID_BOUND", field=f"{field}.symbol", message=f"Invalid symbol {sym!r}.")]
+    lo_open = bool(bound.get("lo_open", False))
+    hi_open = bool(bound.get("hi_open", False))
+    lo_s, lo_d = _format_bound_endpoint(bound["lo"], f"{field}.lo", declared_symbols, domain_preview, si_dims)
+    hi_s, hi_d = _format_bound_endpoint(bound["hi"], f"{field}.hi", declared_symbols, domain_preview, si_dims)
+    diags = [d for d in (lo_d, hi_d) if d is not None]
+    if diags or lo_s is None or hi_s is None:
+        return None, diags
+
+    lo_val = _eval_numeric_bound(bound["lo"])
+    hi_val = _eval_numeric_bound(bound["hi"])
+    if lo_val is not None and hi_val is not None and lo_val > hi_val:
+        return None, [BlueprintDiagnostic(
+            code="INVALID_BOUND",
+            field=field,
+            symbol=sym,
+            message=f"Bound lower {lo_val} exceeds upper {hi_val} for {sym!r}.",
+        )]
+    if sym in domain_preview and lo_val is not None and hi_val is not None:
+        dom_lo, dom_hi = domain_preview[sym]
+        tol = 1e-12 * max(1.0, abs(dom_lo), abs(dom_hi))
+        if lo_val < dom_lo - tol or hi_val > dom_hi + tol:
+            return None, [BlueprintDiagnostic(
+                code="BINDER_OUTSIDE_DOMAIN",
+                field=field,
+                symbol=sym,
+                message=f"Binder/bound [{lo_val}, {hi_val}] for {sym!r} is not a subset of declared domain[{sym!r}] = [{dom_lo}, {dom_hi}].",
+                suggested_fix=f"Ensure binder/bound for {sym!r} lies within domain[{sym!r}].",
+            )]
+    lo_op = "<" if lo_open else "<="
+    hi_op = "<" if hi_open else "<="
+    return f"{lo_s} {lo_op} {sym} {hi_op} {hi_s}", []
+
+
+def _lower_typed_channel(
+    pack: Dict[str, Any],
+    *,
+    declared_symbols: Set[str],
+    domain_preview: Mapping[str, Tuple[float, float]],
+    si_dims: Mapping[str, Any],
+    assumptions_ledger: List[Dict[str, Any]],
+) -> List[BlueprintDiagnostic]:
+    """Deterministically lower LLM-facing typed predicates/bounds/fixed/binders/notes into canonical strings."""
+    evidence = pack["evidence"]
+    diags: List[BlueprintDiagnostic] = []
+
+    def _remember(path: str, orig: Any) -> None:
+        ex = pack.setdefault("execution", {})
+        if isinstance(ex, dict):
+            hist = ex.setdefault("normalization_source", {})
+            if isinstance(hist, dict):
+                hist.setdefault(path, copy.deepcopy(orig))
+
+    # 1. Obligations: accept either `expression` OR typed `predicate` (never both, never neither)
+    for idx, ob in enumerate(evidence.get("obligations") or []):
+        if not isinstance(ob, dict):
+            continue
+        has_expr = ob.get("expression") is not None
+        has_pred = ob.get("predicate") is not None
+        if has_expr and has_pred:
+            diags.append(BlueprintDiagnostic(
+                code="INVALID_OBLIGATION",
+                field=f"obligations[{idx}]",
+                message="Obligation must specify exactly one of 'expression' or 'predicate', not both.",
+            ))
+            continue
+        if has_pred:
+            pred_obj = ob.pop("predicate")
+            lowered, p_diags = _lower_predicate_tree(
+                pred_obj,
+                f"obligations[{idx}].predicate",
+                declared_symbols=declared_symbols,
+                domain_preview=domain_preview,
+                si_dims=si_dims,
+            )
+            diags.extend(p_diags)
+            if lowered is not None:
+                _remember(f"evidence.obligations[{idx}].predicate", pred_obj)
+                ob["expression"] = lowered
+
+    # 2. Environmental assumptions: string OR {"bound":...} | {"fixed":...} | {"predicate":...}
+    raw_env = evidence.get("environmental_assumptions")
+    if isinstance(raw_env, list):
+        new_env: List[str] = []
+        for idx, item in enumerate(raw_env):
+            if isinstance(item, str):
+                new_env.append(item)
+                continue
+            if isinstance(item, dict) and len(item) == 1:
+                kind, payload = next(iter(item.items()))
+                if kind == "bound":
+                    expr_s, b_diags = _lower_bound_object(
+                        payload, f"environmental_assumptions[{idx}].bound",
+                        declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims,
+                    )
+                    diags.extend(b_diags)
+                    if expr_s is not None:
+                        _remember(f"evidence.environmental_assumptions[{idx}]", item)
+                        new_env.append(expr_s)
+                    continue
+                if kind == "fixed":
+                    if not isinstance(payload, dict) or not {"symbol", "value"} <= set(payload.keys()):
+                        diags.append(BlueprintDiagnostic(
+                            code="INVALID_ASSUMPTION",
+                            field=f"environmental_assumptions[{idx}].fixed",
+                            message="fixed assumption requires symbol and value.",
+                        ))
+                        continue
+                    sym = payload["symbol"]
+                    if not isinstance(sym, str) or not sym.isidentifier():
+                        diags.append(BlueprintDiagnostic(
+                            code="INVALID_ASSUMPTION",
+                            field=f"environmental_assumptions[{idx}].fixed.symbol",
+                            message=f"Invalid symbol {sym!r}.",
+                        ))
+                        continue
+                    val_s, val_d = _format_bound_endpoint(
+                        payload["value"], f"environmental_assumptions[{idx}].fixed.value",
+                        declared_symbols, domain_preview, si_dims,
+                    )
+                    if val_d is not None or val_s is None:
+                        if val_d:
+                            diags.append(val_d)
+                        continue
+                    _remember(f"evidence.environmental_assumptions[{idx}]", item)
+                    new_env.append(f"{sym} == {val_s}")
+                    continue
+                if kind == "predicate":
+                    expr_s, p_diags = _lower_predicate_tree(
+                        payload, f"environmental_assumptions[{idx}].predicate",
+                        declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims,
+                    )
+                    diags.extend(p_diags)
+                    if expr_s is not None:
+                        _remember(f"evidence.environmental_assumptions[{idx}]", item)
+                        new_env.append(expr_s)
+                    continue
+            diags.append(BlueprintDiagnostic(
+                code="INVALID_ASSUMPTION",
+                field=f"environmental_assumptions[{idx}]",
+                message="Environmental assumption must be a formal string or typed {bound|fixed|predicate} object.",
+            ))
+        evidence["environmental_assumptions"] = new_env
+
+    # 3. Quantifier binders: [{symbol, lo, hi, lo_open?, hi_open?}] -> checked ⊆ domain & lowered to env assumptions
+    binders = evidence.pop("quantifier_binders", None)
+    if binders is None:
+        binders = pack.pop("quantifier_binders", None)
+    else:
+        pack.pop("quantifier_binders", None)
+    if binders:
+        if not isinstance(binders, (list, tuple)):
+            diags.append(BlueprintDiagnostic(
+                code="INVALID_QUANTIFIER_BINDERS",
+                field="quantifier_binders",
+                message="quantifier_binders must be a list of {symbol, lo, hi, lo_open?, hi_open?} objects.",
+            ))
+        else:
+            _remember("evidence.quantifier_binders", binders)
+            env_list = list(evidence.get("environmental_assumptions") or [])
+            for idx, b in enumerate(binders):
+                expr_s, b_diags = _lower_bound_object(
+                    b, f"quantifier_binders[{idx}]",
+                    declared_symbols=declared_symbols, domain_preview=domain_preview, si_dims=si_dims,
+                )
+                diags.extend(b_diags)
+                if expr_s is not None and expr_s not in env_list:
+                    env_list.append(expr_s)
+            evidence["environmental_assumptions"] = env_list
+
+    # 4. Notes: free prose -> lowered into assumptions_ledger as kind="NOTE" (never executed, never in sealed IhcgGraph)
+    raw_notes: List[Any] = []
+    if isinstance(pack.get("notes"), (list, tuple)):
+        raw_notes.extend(pack["notes"])
+    ev_notes = evidence.pop("notes", None)
+    if isinstance(ev_notes, (list, tuple)):
+        raw_notes.extend(ev_notes)
+    seen_notes = {(e.get("kind"), e.get("value_or_expr")) for e in assumptions_ledger}
+    for note in raw_notes:
+        if isinstance(note, str) and note.strip():
+            text = note.strip()[:400]
+            if ("NOTE", text) not in seen_notes:
+                seen_notes.add(("NOTE", text))
+                assumptions_ledger.append({
+                    "kind": "NOTE",
+                    "symbol_or_field": "notes",
+                    "value_or_expr": text,
+                    "source": "LLM_DOMAIN_DEFAULT",
+                    "rationale": "Non-executable formalization note.",
+                })
+
+    return diags
+
+
 def compile_and_preflight_blueprint(
     blueprint_dict: Mapping[str, Any],
     ihcg_pack: Mapping[str, Any],
@@ -712,6 +1117,17 @@ def compile_and_preflight_blueprint(
 
     fe_diags: List[BlueprintDiagnostic] = []
     fe_binder_assumptions: List[str] = []
+
+    # Step 3 typed-channel lowering pre-pass (obligations.predicate, typed environmental_assumptions,
+    # quantifier_binders, notes -> assumptions_ledger[kind=NOTE]).
+    typed_diags = _lower_typed_channel(
+        pack,
+        declared_symbols=all_declared,
+        domain_preview=domain_preview,
+        si_dims=slot_dims_map,
+        assumptions_ledger=assumptions_ledger,
+    )
+    fe_diags.extend(typed_diags)
 
     # Normalize derived_expressions via front end (non-blocking here so unreferenced
     # blueprint helpers never block compilation; referenced ones are checked in _resolve_derived_topological).
@@ -1343,8 +1759,10 @@ def compile_and_preflight_blueprint(
         )
 
     # Attach non-blocking provenance spans and assumptions ledger.
-    if assumptions_ledger:
-        pack["evidence"]["assumptions_ledger"] = assumptions_ledger
+    # NOTE entries live in bp["assumptions_ledger"] / preflight.assumptions_ledger, never in sealed IhcgGraph hashes.
+    sealed_ledger = [e for e in assumptions_ledger if e.get("kind") != "NOTE"]
+    if sealed_ledger:
+        pack["evidence"]["assumptions_ledger"] = sealed_ledger
     pack = _anchor_evidence(question or bp.get("research_prompt") or "", pack)
 
     # 7. Compile candidate IhcgGraph (strict structural validation without prose blocking).
