@@ -1278,6 +1278,9 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 progress_cb=manager._progress,
             )
         except FormalizationError as exc:
+            from invar_agent.research.epistemic import incomplete_certificate
+            from invar_agent.research.vault import ResearchVaultManager
+
             attempts_to_save = attempt_sink or list(exc.validation_attempts)
             diag_dir = persist_formalization_diagnostics(
                 state.workspace_root,
@@ -1285,13 +1288,40 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 attempts_to_save,
                 extra_secrets=[state.api_key] if state.api_key else (),
             )
-            raise HTTPException(
-                status_code=502,
-                detail=exc.structured_detail(
-                    run_uid=diag_run_uid,
-                    diagnostics_dir=str(diag_dir) if diag_dir else None,
-                ),
+            detail = exc.structured_detail(
+                run_uid=diag_run_uid,
+                diagnostics_dir=str(diag_dir) if diag_dir else None,
             )
+            certificate = incomplete_certificate(
+                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+            )
+            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            (vault_dir / "meaningfulness_certificate.json").write_text(
+                certificate.model_dump_json(indent=2), encoding="utf-8"
+            )
+            (vault_dir / "report.md").write_text(
+                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                encoding="utf-8",
+            )
+            (vault_dir / "metadata.json").write_text(
+                json.dumps(dict(
+                    run_id=diag_run_uid,
+                    status="INCONCLUSIVE_UNVERIFIED",
+                    failure_reason="PLANNING_VALIDATION_FAILED",
+                    planning_error=detail["message"],
+                    diagnostics=detail,
+                )),
+                encoding="utf-8",
+            )
+            return {
+                "status": "inconclusive",
+                "code": "PLANNING_VALIDATION_FAILED",
+                "started": False,
+                "blueprint": None,
+                "run_uid": diag_run_uid,
+                "diagnostics": detail,
+            }
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
@@ -1396,6 +1426,9 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 progress_cb=manager._progress,
             )
         except FormalizationError as exc:
+            from invar_agent.research.epistemic import incomplete_certificate
+            from invar_agent.research.vault import ResearchVaultManager
+
             attempts_to_save = attempt_sink or list(exc.validation_attempts)
             diag_dir = persist_formalization_diagnostics(
                 state.workspace_root,
@@ -1403,13 +1436,40 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 attempts_to_save,
                 extra_secrets=[state.api_key] if state.api_key else (),
             )
-            raise HTTPException(
-                status_code=502,
-                detail=exc.structured_detail(
-                    run_uid=diag_run_uid,
-                    diagnostics_dir=str(diag_dir) if diag_dir else None,
-                ),
+            detail = exc.structured_detail(
+                run_uid=diag_run_uid,
+                diagnostics_dir=str(diag_dir) if diag_dir else None,
             )
+            certificate = incomplete_certificate(
+                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+            )
+            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            (vault_dir / "meaningfulness_certificate.json").write_text(
+                certificate.model_dump_json(indent=2), encoding="utf-8"
+            )
+            (vault_dir / "report.md").write_text(
+                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                encoding="utf-8",
+            )
+            (vault_dir / "metadata.json").write_text(
+                json.dumps(dict(
+                    run_id=diag_run_uid,
+                    status="INCONCLUSIVE_UNVERIFIED",
+                    failure_reason="PLANNING_VALIDATION_FAILED",
+                    planning_error=detail["message"],
+                    diagnostics=detail,
+                )),
+                encoding="utf-8",
+            )
+            return {
+                "status": "inconclusive",
+                "code": "PLANNING_VALIDATION_FAILED",
+                "started": False,
+                "blueprint": None,
+                "run_uid": diag_run_uid,
+                "diagnostics": detail,
+            }
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,

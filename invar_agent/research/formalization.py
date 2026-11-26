@@ -1,5 +1,6 @@
 """Four-namespace NL->AST formalization with Tier-0 Blueprint Compiler and bounded Tier-1 AST repair."""
 
+import ast
 import copy
 import hashlib
 import json
@@ -7,13 +8,15 @@ import os
 import re
 import time
 from contextvars import ContextVar
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional, Union
 
 from pydantic import Field, create_model, model_validator
 
 from . import meaningfulness as m
-from .blueprint_compiler import compile_and_preflight_blueprint
+from .blueprint_compiler import BlueprintDiagnostic, compile_and_preflight_blueprint
+from .expr_frontend import normalize_expression as _fe_normalize
 from .ihcg_derivation import derive_ihcg_evidence
 
 
@@ -185,6 +188,226 @@ def judgment_json_schema():
     return schema
 
 
+_REPAIRABLE_EXPR_CODES = frozenset({
+    "INVALID_EXPRESSION",
+    "INVALID_DERIVED_EXPRESSION",
+    "UNEXPECTED_TOKEN",
+    "UNSUPPORTED_TOKEN",
+    "APPROXIMATE_OPERATOR",
+    "STRICT_GATE_REJECTED",
+    "INVALID_MEMBERSHIP",
+    "ASSIGNMENT_IN_CALL",
+    "UNCLOSED_CALL",
+    "UNCLOSED_PAREN",
+    "UNEXPECTED_KEYWORD",
+})
+
+_NUM_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?")
+_STRICT_LT_RE = re.compile(r"(?<![<>=!])<(?![=<>])")
+_STRICT_GT_RE = re.compile(r"(?<![<>=!\-])>(?![=])")
+
+
+def _extract_numeric_fractions(text: str) -> list[Fraction]:
+    out: list[Fraction] = []
+    for match in _NUM_LITERAL_RE.finditer(text):
+        try:
+            out.append(Fraction(match.group(0)))
+        except (ValueError, ZeroDivisionError):
+            continue
+    return out
+
+
+def _check_meaning_lock(
+    original: str,
+    candidate_canonical: str,
+    declared_symbols: set[str],
+) -> tuple[bool, str]:
+    """Meaning-lock guard for targeted field repair.
+
+    Enforces:
+    1. All numeric literals present in the original must survive in the repaired AST.
+    2. Explicit strict `<` / `>` comparisons in the original must survive as strict `<` / `>` (never weakened to <= / >=).
+    3. All free symbols in the repaired AST must be declared (when declared_symbols is non-empty).
+    """
+    try:
+        tree = m._parse(candidate_canonical)
+    except (ValueError, SyntaxError) as exc:
+        return False, f"strict gate rejected candidate: {exc}"
+
+    # 1. Declared symbols check
+    if declared_symbols:
+        cand_vars = m._variables(tree)
+        undeclared = sorted(cand_vars - declared_symbols)
+        if undeclared:
+            return False, f"repair introduced undeclared symbols: {undeclared}"
+
+    # 2. Numeric literals preservation check
+    orig_nums = _extract_numeric_fractions(original)
+    if orig_nums:
+        cand_nums: list[Fraction] = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Constant) and type(n.value) in (int, float):
+                try:
+                    cand_nums.append(Fraction(str(n.value)))
+                except (ValueError, ZeroDivisionError):
+                    pass
+        for req_num in orig_nums:
+            req_f = float(req_num)
+            tol = 1e-12 * max(1.0, abs(req_f))
+            if not any(abs(float(c) - req_f) <= tol for c in cand_nums):
+                return False, f"numeric literal {req_num} from original did not survive repair"
+
+    # 3. Explicit strict < / > preservation check
+    orig_has_strict = bool(_STRICT_LT_RE.search(original) or _STRICT_GT_RE.search(original))
+    if orig_has_strict:
+        cand_ops = [op for n in ast.walk(tree) if isinstance(n, ast.Compare) for op in n.ops]
+        if not any(isinstance(op, (ast.Lt, ast.Gt)) for op in cand_ops):
+            return False, "strict inequality (< or >) from original was weakened or dropped"
+
+    return True, ""
+
+
+def _apply_field_patch(pack: dict[str, Any], field_path: str, new_expr: str) -> bool:
+    """Apply a repaired expression string to a specific field path inside pack."""
+    evidence = pack.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    m_ob = re.fullmatch(r"obligations\[(\d+)\]\.expression", field_path)
+    if m_ob:
+        idx = int(m_ob.group(1))
+        obs = evidence.get("obligations")
+        if isinstance(obs, list) and 0 <= idx < len(obs) and isinstance(obs[idx], dict):
+            obs[idx]["expression"] = new_expr
+            obs[idx].pop("predicate", None)
+            return True
+    m_ea = re.fullmatch(r"environmental_assumptions\[(\d+)\]", field_path)
+    if m_ea:
+        idx = int(m_ea.group(1))
+        eas = evidence.get("environmental_assumptions")
+        if isinstance(eas, list) and 0 <= idx < len(eas):
+            eas[idx] = new_expr
+            return True
+    m_eq = re.fullmatch(r"equations\.([A-Za-z_]\w*)\.expression", field_path)
+    if m_eq:
+        eq_name = m_eq.group(1)
+        eqs = evidence.get("equations")
+        if isinstance(eqs, dict) and eq_name in eqs and isinstance(eqs[eq_name], dict):
+            eqs[eq_name]["expression"] = new_expr
+            return True
+    return False
+
+
+async def _targeted_field_repair(
+    pack: dict[str, Any],
+    blueprint: dict[str, Any],
+    failing_diags: list[BlueprintDiagnostic],
+    caller,
+    *,
+    question: str,
+    max_attempts: int = 2,
+) -> Optional[Any]:
+    """Run bounded per-field repair before whole-pack retries.
+
+    Sends ONLY the failing fields with original text, error, column, caret, grammar,
+    and declared symbol table. Applies meaning-lock guard to every patched field.
+    Returns a passing BlueprintPreflightResult if repair succeeds, else None.
+    """
+    from ..llm.telemetry import llm_call_context
+    from .planner import _extract_json
+
+    repairable = [
+        d for d in failing_diags
+        if d.code in _REPAIRABLE_EXPR_CODES and d.original is not None
+    ]
+    if not repairable or len(repairable) != len(failing_diags):
+        return None
+
+    # Collect declared symbols from blueprint + pack
+    declared: set[str] = set()
+    for s in (blueprint.get("typed_slots") or []):
+        if isinstance(s, dict) and isinstance(s.get("symbol"), str):
+            declared.add(s["symbol"])
+    for s in (pack.get("typed_slots") or []):
+        if isinstance(s, dict) and isinstance(s.get("symbol"), str):
+            declared.add(s["symbol"])
+    for s in ((pack.get("evidence") or {}).get("slots") or []):
+        if isinstance(s, dict) and isinstance(s.get("symbol"), str):
+            declared.add(s["symbol"])
+    for cmap in (blueprint.get("constants"), pack.get("constants")):
+        if isinstance(cmap, dict):
+            declared.update(k for k in cmap if isinstance(k, str))
+    for dmap in (blueprint.get("derived_expressions"), pack.get("derived_expressions")):
+        if isinstance(dmap, dict):
+            declared.update(k for k in dmap if isinstance(k, str))
+    domain = pack.get("domain") if isinstance(pack.get("domain"), dict) else {}
+
+    field_lines = [d.format_one() for d in repairable]
+    base_repair_prompt = (
+        "Repair ONLY the failing formal expression fields listed below. "
+        "Do NOT return a full blueprint or evidence pack; return ONLY a compact JSON object "
+        'mapping each failing field path to its repaired formal expression string, e.g. '
+        '{"patches": {"obligations[0].expression": "Reff < 1.0"}}.\n'
+        "Grammar: +, -, *, /, **, ==, !=, <, <=, >, >=, and, or, not, implies(a, b).\n"
+        f"Allowed functions: {sorted(m._ARITIES.keys())}\n"
+        f"Declared symbols: {sorted(declared)}\n"
+        "PRESERVE EVERY NUMERIC LITERAL AND STRICT INEQUALITY (< / >) EXACTLY. Never weaken or invent symbols.\n"
+        "Failing fields:\n" + "\n".join(field_lines)
+    )[:4000]
+
+    repair_prompt = base_repair_prompt
+    for r_attempt in range(1, max_attempts + 1):
+        with llm_call_context("ihcg_field_repair", attempt=r_attempt):
+            raw = await caller(repair_prompt)
+        try:
+            parsed = _extract_json(str(raw))
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # If the caller returned a full pack instead of a patch dict, abort targeted repair
+        if "evidence" in parsed and "archetype" in parsed:
+            return None
+        patches = parsed.get("patches") if isinstance(parsed.get("patches"), dict) else parsed
+        if not isinstance(patches, dict):
+            continue
+
+        candidate_pack = copy.deepcopy(pack)
+        guard_failures: list[str] = []
+        applied = 0
+        for d in repairable:
+            if d.field not in patches or not isinstance(patches[d.field], str):
+                guard_failures.append(f"{d.field}: missing patched string")
+                continue
+            cand_raw = patches[d.field]
+            fe = _fe_normalize(cand_raw, declared_symbols=declared, domain=domain)
+            if not fe.ok or fe.canonical is None:
+                msg = fe.diagnostics[0].message if fe.diagnostics else "failed normalization"
+                guard_failures.append(f"{d.field}: {msg}")
+                continue
+            ok_lock, reason = _check_meaning_lock(d.original or "", fe.canonical, declared)
+            if not ok_lock:
+                guard_failures.append(f"{d.field}: meaning-lock rejected ({reason})")
+                continue
+            if _apply_field_patch(candidate_pack, d.field, fe.canonical):
+                applied += 1
+
+        if not guard_failures and applied == len(repairable):
+            recheck = compile_and_preflight_blueprint(
+                blueprint, candidate_pack, question=question, run_z3_preflight=True
+            )
+            if recheck.ok:
+                return recheck
+            guard_failures.append(recheck.error_summary())
+
+        repair_prompt = (
+            base_repair_prompt
+            + "\nPrevious repair rejected:\n"
+            + "\n".join(guard_failures)
+            + "\nReturn ONLY corrected JSON {\"patches\": {...}}."
+        )[:4800]
+    return None
+
+
 async def formalize_blueprint(question, blueprint, complete, *, repair_complete=None):
     from ..llm.telemetry import llm_call_context
     from .planner import _FORMAL_EXAMPLE_PACK, _FORMAL_EXAMPLE_PROMPT, _extract_json, _parse_planned_blueprint, compute_healing_error_fingerprint
@@ -281,6 +504,18 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
                 raise ValueError('ihcg_evidence.extensions: evidence-only formalization cannot add stage extensions')
             # Layer 3 Tier-0 Deterministic Blueprint Compiler & Preflight Gate
             preflight = compile_and_preflight_blueprint(blueprint, pack, question=question, run_z3_preflight=True)
+            if not preflight.ok:
+                # Step 4: targeted per-field repair (max 2 attempts, meaning-locked) before whole-pack retry
+                repaired = await _targeted_field_repair(
+                    pack,
+                    blueprint,
+                    preflight.diagnostics,
+                    repair_complete or complete,
+                    question=question,
+                    max_attempts=2,
+                )
+                if repaired is not None and repaired.ok:
+                    preflight = repaired
             if not preflight.ok:
                 preflight_diags = [d.to_dict() for d in preflight.diagnostics]
                 diagnostic_block = preflight.diagnostic_list_json()
