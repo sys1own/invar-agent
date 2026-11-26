@@ -554,7 +554,23 @@ let serverLlm = null;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
-  if (!r.ok) throw new Error(path + ' -> ' + r.status + ' ' + (await r.text()).slice(0, 300));
+  if (!r.ok) {
+    const rawText = await r.text();
+    let msg = rawText;
+    try {
+      const parsed = JSON.parse(rawText);
+      const d = parsed && parsed.detail;
+      if (d && typeof d === 'object') {
+        const fields = (d.per_field_diagnostics || []).slice(0, 3)
+          .map(f => `${f.field || 'field'}: ${f.message || f.code}${f.column ? ' (col ' + f.column + ')' : ''}`)
+          .join(' | ');
+        msg = `${d.code || 'ERROR'}${fields ? ' — ' + fields : (d.message ? ' — ' + d.message : '')}`;
+      } else if (typeof d === 'string') {
+        msg = d;
+      }
+    } catch (_) { /* keep rawText */ }
+    throw new Error(path + ' -> ' + r.status + ' ' + msg);
+  }
   const ct = r.headers.get('content-type') || '';
   return ct.includes('json') ? r.json() : r.blob();
 }
@@ -1283,6 +1299,14 @@ async function runResearchDirect(text, feasibility) {
     // Refusal cards render ONLY on actual refusals — a passing feasibility
     // verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE) must never look like
     // an abort; execution streams proceed normally.
+    if (data.status === 'inconclusive') {
+      const diags = ((data.diagnostics && data.diagnostics.per_field_diagnostics) || []).slice(0, 4)
+        .map(d => `${d.field || 'field'}: ${d.message || d.code}${d.column ? ' (col ' + d.column + ')' : ''}`)
+        .join('; ');
+      addMsg('system', `Research inconclusive (${data.code || 'PLANNING_VALIDATION_FAILED'}): ${diags || (data.diagnostics && data.diagnostics.message) || 'formalization did not validate.'}`);
+      statusEl.textContent = '';
+      return;
+    }
     const verdict = data.feasibility ? String(data.feasibility.verdict || '').toUpperCase() : '';
     const isRefused = data.status === 'refused' ||
       verdict === 'REFUSED_IMPOSSIBLE' || verdict === 'REFUSED_UNSUITABLE' ||

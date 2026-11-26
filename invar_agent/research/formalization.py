@@ -1,7 +1,14 @@
 """Four-namespace NL->AST formalization with Tier-0 Blueprint Compiler and bounded Tier-1 AST repair."""
 
 import copy
+import hashlib
 import json
+import os
+import re
+import time
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 from pydantic import create_model
 
@@ -10,11 +17,101 @@ from .blueprint_compiler import compile_and_preflight_blueprint
 from .ihcg_derivation import derive_ihcg_evidence
 
 
+_FORMALIZATION_ATTEMPT_SINK: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+    "formalization_attempt_sink", default=None
+)
+
+_SECRET_ENV_VARS = (
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+_INLINE_KEY_RE = re.compile(r"\b(sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{20,})\b")
+
+
+def _redact_secrets(value: Any, extra_secrets: Iterable[str] = ()) -> Any:
+    secrets = [s for s in extra_secrets if isinstance(s, str) and len(s) >= 8]
+    for env_name in _SECRET_ENV_VARS:
+        val = os.environ.get(env_name)
+        if val and len(val) >= 8:
+            secrets.append(val)
+
+    def _scrub(obj: Any) -> Any:
+        if isinstance(obj, str):
+            out = obj
+            for s in secrets:
+                if s in out:
+                    out = out.replace(s, "[REDACTED]")
+            return _INLINE_KEY_RE.sub("[REDACTED]", out)
+        if isinstance(obj, dict):
+            return {k: _scrub(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_scrub(v) for v in obj]
+        return obj
+
+    return _scrub(value)
+
+
+def persist_formalization_diagnostics(
+    workspace_root: str | Path,
+    run_uid: str,
+    attempts: Iterable[dict[str, Any]],
+    *,
+    extra_secrets: Iterable[str] = (),
+) -> Optional[Path]:
+    """Persist per-attempt formalization diagnostics under <workspace>/.invar/diagnostics/formalization/<run_uid>/."""
+    attempt_list = list(attempts)
+    if not attempt_list:
+        return None
+    safe_uid = re.sub(r"[^A-Za-z0-9_.\-]", "_", str(run_uid or "unknown"))
+    out_dir = Path(workspace_root) / ".invar" / "diagnostics" / "formalization" / safe_uid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for idx, item in enumerate(attempt_list, start=1):
+        attempt_num = item.get("attempt", idx)
+        sanitized = _redact_secrets(item, extra_secrets=extra_secrets)
+        (out_dir / f"attempt_{attempt_num}.json").write_text(
+            json.dumps(sanitized, indent=2, default=str),
+            encoding="utf-8",
+        )
+    return out_dir
+
+
 class FormalizationError(ValueError):
     def __init__(self, attempts):
         self.validation_attempts = tuple(copy.deepcopy(attempts))
         super().__init__('FORMALIZATION_VALIDATION_FAILED\n' + '\n'.join(
             f"attempt {item['attempt']}: {item['error']}" for item in attempts))
+
+    def structured_detail(self, *, run_uid: Optional[str] = None, diagnostics_dir: Optional[str] = None) -> dict[str, Any]:
+        per_field: list[dict[str, Any]] = []
+        for item in self.validation_attempts:
+            for d in (item.get("diagnostics") or []):
+                if isinstance(d, dict):
+                    per_field.append({"attempt": item.get("attempt"), **d})
+        out: dict[str, Any] = {
+            "code": "PLANNING_VALIDATION_FAILED",
+            "message": str(self),
+            "attempts": [
+                {
+                    "attempt": item.get("attempt"),
+                    "error_type": item.get("error_type"),
+                    "error": item.get("error"),
+                    "prompt_sha256": item.get("prompt_sha256"),
+                    "elapsed_s": item.get("elapsed_s"),
+                    "diagnostics": item.get("diagnostics") or [],
+                    "encoding_diagnostics": item.get("encoding_diagnostics") or [],
+                }
+                for item in self.validation_attempts
+            ],
+            "per_field_diagnostics": per_field,
+        }
+        if run_uid:
+            out["run_uid"] = run_uid
+        if diagnostics_dir:
+            out["diagnostics_dir"] = diagnostics_dir
+        return out
 
 
 def _encoding_feedback(question, pack):
@@ -130,14 +227,19 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
     errors = []
     seen_fingerprints = set()
     active_complete = complete
+    attempt_sink = _FORMALIZATION_ATTEMPT_SINK.get()
     for attempt in range(1, 4):
         caller = active_complete if attempt == 1 else (repair_complete or complete)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        t0 = time.monotonic()
         with llm_call_context('ihcg_formalization', attempt=attempt):
             raw = await caller(prompt)
+        elapsed_s = round(time.monotonic() - t0, 3)
         validated = False
         pack = None
         compiled_pack = None
         diagnostic_block = ""
+        preflight_diags: list[dict[str, Any]] = []
         try:
             pack = _extract_json(str(raw))
             if not isinstance(pack, dict) or not {'evidence', 'archetype'} <= pack.keys():
@@ -150,6 +252,7 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
             # Layer 3 Tier-0 Deterministic Blueprint Compiler & Preflight Gate
             preflight = compile_and_preflight_blueprint(blueprint, pack, question=question, run_z3_preflight=True)
             if not preflight.ok:
+                preflight_diags = [d.to_dict() for d in preflight.diagnostics]
                 diagnostic_block = preflight.diagnostic_list_json()
                 raise ValueError(preflight.error_summary())
             compiled_bp = preflight.compiled_blueprint
@@ -158,14 +261,25 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
                 {k: v for k, v in compiled_pack.items() if k != 'execution'}, allow_nan=False
             ))
             validated = True
-            return _parse_planned_blueprint(
+            result_bp = _parse_planned_blueprint(
                 {**compiled_bp, 'ihcg_evidence': compiled_pack},
                 question,
                 require_evidence=True,
             )
+            if attempt_sink is not None:
+                attempt_sink.append({
+                    "attempt": attempt,
+                    "ok": True,
+                    "prompt_sha256": prompt_sha256,
+                    "elapsed_s": elapsed_s,
+                    "raw_response": _redact_secrets(str(raw)),
+                    "diagnostics": [],
+                    "encoding_diagnostics": [],
+                })
+            return result_bp
         except (ValueError, TypeError, SyntaxError) as error:
             feedback_target = compiled_pack if isinstance(compiled_pack, dict) else pack
-            additional = _encoding_feedback(question, feedback_target) if validated and isinstance(feedback_target, dict) else []
+            additional = _encoding_feedback(question, feedback_target) if isinstance(feedback_target, dict) else []
             err_text = str(error)
             if "'COMPILED_FEASIBILITY': 'UNSAT'" in err_text:
                 additional.append(
@@ -174,12 +288,20 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
                     "contract value lies strictly inside `domain[sym]`, and remove overly tight point equalities from "
                     "`environmental_assumptions`."
                 )
-            errors.append(dict(
+            attempt_record = dict(
                 attempt=attempt,
+                ok=False,
                 error_type=type(error).__name__,
                 error=err_text,
+                prompt_sha256=prompt_sha256,
+                elapsed_s=elapsed_s,
+                raw_response=_redact_secrets(str(raw)),
+                diagnostics=preflight_diags,
                 encoding_diagnostics=additional,
-            ))
+            )
+            errors.append(attempt_record)
+            if attempt_sink is not None:
+                attempt_sink.append(attempt_record)
             fp = compute_healing_error_fingerprint(err_text)
             if attempt >= 3 and fp in seen_fingerprints:
                 break

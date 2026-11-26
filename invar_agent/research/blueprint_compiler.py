@@ -66,6 +66,10 @@ class BlueprintDiagnostic:
     message: str
     symbol: Optional[str] = None
     suggested_fix: str = ""
+    original: Optional[str] = None
+    column: Optional[int] = None
+    offending_token: Optional[str] = None
+    hint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -77,7 +81,66 @@ class BlueprintDiagnostic:
             out["symbol"] = self.symbol
         if self.suggested_fix:
             out["suggested_fix"] = self.suggested_fix
+        if self.original is not None:
+            out["original"] = self.original
+        if self.column is not None:
+            out["column"] = self.column
+        if self.offending_token is not None:
+            out["offending_token"] = self.offending_token
+        if self.hint:
+            out["hint"] = self.hint
         return out
+
+    def format_one(self) -> str:
+        parts = [f"[{self.code}] {self.field}: {self.message}"]
+        if self.original is not None:
+            parts.append(f"expression={self.original!r}")
+            if self.column is not None and self.column >= 1:
+                col_idx = min(max(self.column - 1, 0), len(self.original))
+                caret = " " * col_idx + "^"
+                parts.append(f"col {self.column}:\n  {self.original}\n  {caret}")
+        if self.offending_token:
+            parts.append(f"token={self.offending_token!r}")
+        if self.hint:
+            parts.append(f"hint={self.hint}")
+        return " | ".join(parts)
+
+
+def _make_parse_diagnostic(
+    field: str,
+    expression: str,
+    exc: Exception,
+    *,
+    code: str = "INVALID_EXPRESSION",
+    symbol: Optional[str] = None,
+    suggested_fix: str = "",
+) -> BlueprintDiagnostic:
+    col: Optional[int] = None
+    tok: Optional[str] = None
+    if isinstance(exc, SyntaxError):
+        raw_offset = getattr(exc, "offset", None)
+        if isinstance(raw_offset, int) and raw_offset >= 1:
+            col = raw_offset
+            tail = expression[max(0, col - 1):]
+            m_tok = re.match(r"\s*([A-Za-z_]\w*|\d+(?:\.\d+)?|[^\s])", tail)
+            if m_tok:
+                tok = m_tok.group(1)
+    hint = (
+        "Use formal Python-subset expressions over declared symbols "
+        "(+, -, *, /, **, ==, !=, <, <=, >, >=, and, or, not, implies(a,b)); "
+        "never English prose, quantifiers, or trailing units."
+    )
+    return BlueprintDiagnostic(
+        code=code,
+        field=field,
+        message=str(exc),
+        symbol=symbol,
+        suggested_fix=suggested_fix or hint,
+        original=expression,
+        column=col,
+        offending_token=tok,
+        hint=hint,
+    )
 
 
 @dataclass
@@ -93,7 +156,7 @@ class BlueprintPreflightResult:
         return json.dumps([d.to_dict() for d in self.diagnostics], indent=2)
 
     def error_summary(self) -> str:
-        return "; ".join(f"[{d.code}] {d.field}: {d.message}" for d in self.diagnostics)
+        return "; ".join(d.format_one() for d in self.diagnostics)
 
 
 def _extract_module_scalar_constants(code: str) -> Dict[str, float]:
@@ -275,11 +338,12 @@ def _resolve_derived_topological(
         try:
             node = m._parse(spec["expression"])
         except (ValueError, SyntaxError) as exc:
-            diagnostics.append(BlueprintDiagnostic(
+            diagnostics.append(_make_parse_diagnostic(
+                f"derived_expressions.{sym}",
+                spec["expression"],
+                exc,
                 code="INVALID_DERIVED_EXPRESSION",
-                field=f"derived_expressions.{sym}",
                 symbol=sym,
-                message=str(exc),
                 suggested_fix=f"Rewrite derived_expressions.{sym} using supported scalar math syntax.",
             ))
             continue
@@ -725,30 +789,30 @@ def compile_and_preflight_blueprint(
                 try:
                     eq_obj["expression"] = _substitute_ast_symbols(eq_obj["expression"], expanded_derived)
                 except (ValueError, SyntaxError) as exc:
-                    diagnostics.append(BlueprintDiagnostic(
-                        code="INVALID_EXPRESSION",
-                        field=f"equations.{eq_name}",
-                        message=str(exc),
+                    diagnostics.append(_make_parse_diagnostic(
+                        f"equations.{eq_name}.expression",
+                        eq_obj["expression"],
+                        exc,
                     ))
         for ob_idx, ob in enumerate(evidence.get("obligations") or []):
             if isinstance(ob, dict) and isinstance(ob.get("expression"), str):
                 try:
                     ob["expression"] = _substitute_ast_symbols(ob["expression"], expanded_derived)
                 except (ValueError, SyntaxError) as exc:
-                    diagnostics.append(BlueprintDiagnostic(
-                        code="INVALID_EXPRESSION",
-                        field=f"obligations[{ob_idx}].expression",
-                        message=str(exc),
+                    diagnostics.append(_make_parse_diagnostic(
+                        f"obligations[{ob_idx}].expression",
+                        ob["expression"],
+                        exc,
                     ))
         new_env = []
         for e_idx, expr in enumerate(evidence.get("environmental_assumptions") or []):
             try:
                 new_env.append(_substitute_ast_symbols(expr, expanded_derived))
             except (ValueError, SyntaxError) as exc:
-                diagnostics.append(BlueprintDiagnostic(
-                    code="INVALID_EXPRESSION",
-                    field=f"environmental_assumptions[{e_idx}]",
-                    message=str(exc),
+                diagnostics.append(_make_parse_diagnostic(
+                    f"environmental_assumptions[{e_idx}]",
+                    str(expr),
+                    exc,
                 ))
         evidence["environmental_assumptions"] = new_env
 
@@ -773,19 +837,19 @@ def compile_and_preflight_blueprint(
             try:
                 refs.update(m._variables(m._parse(ob["expression"])))
             except (ValueError, SyntaxError) as exc:
-                errs.append(BlueprintDiagnostic(
-                    code="INVALID_EXPRESSION",
-                    field=f"obligations[{ob_idx}].expression",
-                    message=str(exc),
+                errs.append(_make_parse_diagnostic(
+                    f"obligations[{ob_idx}].expression",
+                    ob["expression"],
+                    exc,
                 ))
         for e_idx, expr in enumerate(evidence.get("environmental_assumptions") or []):
             try:
                 refs.update(m._variables(m._parse(expr)))
             except (ValueError, SyntaxError) as exc:
-                errs.append(BlueprintDiagnostic(
-                    code="INVALID_EXPRESSION",
-                    field=f"environmental_assumptions[{e_idx}]",
-                    message=str(exc),
+                errs.append(_make_parse_diagnostic(
+                    f"environmental_assumptions[{e_idx}]",
+                    str(expr),
+                    exc,
                 ))
         for eq_name, eq_obj in equations.items():
             if not isinstance(eq_obj, dict) or not isinstance(eq_obj.get("expression"), str):
@@ -798,10 +862,10 @@ def compile_and_preflight_blueprint(
             try:
                 refs.update(m._variables(m._parse(eq_obj["expression"])))
             except (ValueError, SyntaxError) as exc:
-                errs.append(BlueprintDiagnostic(
-                    code="INVALID_EXPRESSION",
-                    field=f"equations.{eq_name}.expression",
-                    message=str(exc),
+                errs.append(_make_parse_diagnostic(
+                    f"equations.{eq_name}.expression",
+                    eq_obj["expression"],
+                    exc,
                 ))
             if eq_name in declared_slots:
                 refs.add(eq_name)
