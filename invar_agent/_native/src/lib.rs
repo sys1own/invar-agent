@@ -16,6 +16,7 @@ mod buckingham_pi;
 mod csel_egraph;
 mod deterministic_healer;
 mod egraph_healer;
+mod expr_parser;
 mod goi_matrix;
 mod goi_solver;
 mod goi_wavefront;
@@ -23,6 +24,10 @@ mod hin_arena;
 mod hin_engine;
 mod his;
 mod holographic_hin;
+mod kernel_compiler;
+mod sci_ir;
+mod scope_check;
+mod solvers;
 mod uast;
 #[cfg(test)]
 mod epistemic_tests;
@@ -67,6 +72,127 @@ fn py_compute_cds_digests(py: Python<'_>, canon_model: &str, canon_claim: &str, 
 #[pyfunction]
 fn py_compute_certificate_receipt(py: Python<'_>, payload_json: &str) -> PyResult<String> {
     py.allow_threads(|| his::compute_certificate_receipt(payload_json)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_jcs_canonicalize(py: Python<'_>, json_str: &str) -> PyResult<String> {
+    py.allow_threads(|| his::jcs_canonicalize_str(json_str)).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn seal_sciir_ihcg(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| his::seal_sciir_ihcg(sciir_json).and_then(epistemic_json))
+        .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_domain_commit_json(py: Python<'_>, domain_byte: u8, json_str: &str) -> PyResult<String> {
+    py.allow_threads(|| his::commit_jcs_json(domain_byte, json_str))
+        .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_domain_commit_raw(py: Python<'_>, domain_byte: u8, raw_bytes: &[u8]) -> PyResult<String> {
+    let owned = raw_bytes.to_vec();
+    Ok(py.allow_threads(|| his::domain_byte_blake3_hex(domain_byte, &owned)))
+}
+
+#[pyfunction]
+fn py_parse_sci_expr(py: Python<'_>, expr: &str) -> PyResult<String> {
+    py.allow_threads(|| expr_parser::parse_expr(expr).and_then(epistemic_json))
+        .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_scope_check_sci_ir(py: Python<'_>, scope_req_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let req: scope_check::ScopeCheckRequest = serde_json::from_str(scope_req_json)
+            .map_err(|e| format!("ScopeCheckRequest parse error: {e}"))?;
+        let resp = scope_check::check_scope_and_lower(&req);
+        epistemic_json(resp)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compile_sciir_cpp20(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        epistemic_json(kernel_compiler::compile_cpp20_kernel(&ir))
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_compute_diagonal_scales(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        epistemic_json(buckingham_pi::compute_diagonal_affine_scales(&ir))
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_solve_sciir_ode(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        solvers::ode::integrate_sci_ir_ode(&ir, None).and_then(epistemic_json)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_solve_sciir_mc(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        solvers::mc::run_sci_ir_monte_carlo(&ir, None).and_then(epistemic_json)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_solve_sciir_fixed_point(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        solvers::fixed_point::solve_sci_ir_fixed_point(&ir, None).and_then(epistemic_json)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_solve_sciir_sweep(py: Python<'_>, sciir_json: &str) -> PyResult<String> {
+    py.allow_threads(|| -> Result<String, String> {
+        let ir: sci_ir::SciIR = serde_json::from_str(sciir_json).map_err(|e| e.to_string())?;
+        ir.validate()?;
+        solvers::sweep::run_sci_ir_sweep(&ir).and_then(epistemic_json)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_validate_mprk22_alpha(alpha: f64) -> PyResult<bool> {
+    solvers::ode::validate_mprk22_alpha(alpha)
+        .map(|_| true)
+        .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_clopper_pearson_ci(k: u64, n: u64, alpha: f64) -> PyResult<(f64, f64)> {
+    Ok(solvers::mc::clopper_pearson_ci(k, n, alpha))
+}
+
+#[pyfunction]
+fn py_certify_lyapunov_stability(py: Python<'_>, jacobian: Vec<Vec<f64>>) -> PyResult<String> {
+    py.allow_threads(|| {
+        let cert = solvers::fixed_point::certify_stability_3tier(&jacobian);
+        epistemic_json(cert)
+    })
+    .map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -374,6 +500,21 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_compute_ihcg_stage_chain, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_cds_digests, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_certificate_receipt, m)?)?;
+    m.add_function(wrap_pyfunction!(py_jcs_canonicalize, m)?)?;
+    m.add_function(wrap_pyfunction!(seal_sciir_ihcg, m)?)?;
+    m.add_function(wrap_pyfunction!(py_domain_commit_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_domain_commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(py_parse_sci_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scope_check_sci_ir, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compile_sciir_cpp20, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_diagonal_scales, m)?)?;
+    m.add_function(wrap_pyfunction!(py_solve_sciir_ode, m)?)?;
+    m.add_function(wrap_pyfunction!(py_solve_sciir_mc, m)?)?;
+    m.add_function(wrap_pyfunction!(py_solve_sciir_fixed_point, m)?)?;
+    m.add_function(wrap_pyfunction!(py_solve_sciir_sweep, m)?)?;
+    m.add_function(wrap_pyfunction!(py_validate_mprk22_alpha, m)?)?;
+    m.add_function(wrap_pyfunction!(py_clopper_pearson_ci, m)?)?;
+    m.add_function(wrap_pyfunction!(py_certify_lyapunov_stability, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_observational_purity, m)?)?;
     m.add_function(wrap_pyfunction!(py_check_algebraic_equivalence, m)?)?;
     m.add_function(wrap_pyfunction!(py_canonicalize_csel_expr, m)?)?;

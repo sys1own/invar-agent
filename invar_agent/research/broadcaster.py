@@ -32,13 +32,15 @@ class ResearchEventBroadcaster:
         """Monotonic event counter; subscribers use it to ignore replayed history."""
         return self._seq
 
-    def subscribe(self) -> "queue.Queue[Dict[str, Any]]":
+    def subscribe(self, since_seq: int = 0) -> "queue.Queue[Dict[str, Any]]":
         q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1000)
         with self._lock:
             self._subscribers.append(q)
-            # Replay recent events so late subscribers (UI reconnects, tests)
-            # do not miss the start of a run.
+            # Replay recent events after `since_seq` (supporting SSE Last-Event-ID)
+            # so late or reconnecting clients do not miss or duplicate events.
             for payload in self._history[-200:]:
+                if since_seq > 0 and int(payload.get("seq", 0)) <= since_seq:
+                    continue
                 try:
                     q.put_nowait(payload)
                 except queue.Full:

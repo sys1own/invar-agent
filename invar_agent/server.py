@@ -529,6 +529,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         def builder_dependencies_unavailable(path: str):
             raise HTTPException(503, 'Install invar-agent[ingest,scientific] to enable Builder Studio')
     app.state.builder_service = builder_service
+    app.state.invar_state = state
     terminal_manager = TerminalSessionManager(state.workspace_root)
     app.state.terminal_manager = terminal_manager
 
@@ -1425,13 +1426,18 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         }
 
     @app.get("/api/v1/research/stream")
-    def api_research_stream() -> StreamingResponse:
+    def api_research_stream(request: Request) -> StreamingResponse:
         manager = state.ensure_research_manager()
-        q = state.research_broadcaster.subscribe()
+        raw_last_id = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID") or ""
+        try:
+            since_seq = int(raw_last_id.strip()) if raw_last_id.strip() else 0
+        except ValueError:
+            since_seq = 0
+        q = state.research_broadcaster.subscribe(since_seq=since_seq)
         # Sequence watermark: replayed history (seq <= watermark) must never
         # close the stream; only fresh terminal events do.
         initial_seq = state.research_broadcaster.seq
-        terminal_events = ("research_completed", "research_failed")
+        terminal_events = ("research_completed", "research_failed", "terminal_verdict")
 
         def event_generator():
             # Sync generator (same pattern as /api/agent/stream): the broadcaster
@@ -1441,21 +1447,29 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     try:
                         payload = q.get(timeout=RESEARCH_SSE_HEARTBEAT)
                     except queue.Empty:
-                        # SSE comment heartbeat: keeps browsers/proxies alive
-                        # during long Tier-2 LLM re-synthesis calls.
-                        yield ": keep-alive\n\n"
+                        # SSE v2.0 15s keepalive comment: prevents nginx/proxy/browser idle drops.
+                        yield ": keep-alive ping\n\n"
                         continue
+                    seq_id = payload.get("seq", 0)
                     terminal = (payload.get("event") in terminal_events
-                                and payload.get("seq", 0) > initial_seq)
-                    yield f"data: {json.dumps({**payload, 'event_version': '2.0'}, default=str)}\n\n"
+                                and seq_id > initial_seq)
+                    body = json.dumps({**payload, "event_version": "2.0"}, default=str)
+                    yield f"id: {seq_id}\ndata: {body}\n\n"
                     if terminal:
-                        # Graceful close after the final event; EventSource
-                        # reconnects and replays history without re-closing.
+                        # Graceful close after flushing the absorbing terminal verdict.
                         break
             finally:
                 state.research_broadcaster.unsubscribe(q)
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 

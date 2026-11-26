@@ -13,7 +13,7 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 blake3 = "1.5"
 regex = "1.10"
 rustpython-parser = "0.4"

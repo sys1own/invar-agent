@@ -6,11 +6,19 @@ The Rust/PyO3 core, Python/Z3 substrate, restricted-Python-to-C++20 compiler and
 
 ## Scientific contract and eight gates
 
-`invar-agent` enforces a strict **Two-Boundary Architecture** separating natural-language interpretation from deterministic verification:
+`invar-agent` implements the **Invar-Agent vNext Correct-by-Construction Scientific Compiler Architecture**, enforcing a strict **Two-Boundary Architecture** separating natural-language interpretation from deterministic compilation and verification:
 
-1. **LLM Interpreter & Four-Namespace Blueprint AST (`FormalResearchSpec`)**: Only the LLM Interpreter layer (assisted by Literature Federation, `ReferenceRegistry`, and bottleneck-gated SHBT Federation) reads raw user prose. Users do not need to write flawless equations, SI units, or domain bounds; the Interpreter grounds missing physics/constants/domains in literature and registries, logs every added assumption transparently in `assumptions_ledger`, and emits a four-namespace Blueprint AST separating mutable simulation buffer slots (`typed_slots`), immutable SI constants (`constants`), pure algebraic definitions (`derived_expressions`), and governing equations/domains/obligations.
-2. **Tier-0 Deterministic Blueprint Compiler, Preflight & Bounded Tier-1 AST Repair (`blueprint_compiler.py`)**: Before sealing the IHCG, a zero-token deterministic compiler resolves all four namespaces, inlines pure derived expressions, binds dimensional SI constants, checks initial-state conservation and Z3 non-vacuity/non-tautology (while permitting genuine `INFEASIBLE` user claims to proceed to `VERIFIED_FALSIFICATION`), and runs a bounded Tier-1 targeted AST repair loop on structured diagnostics if needed.
-3. **Deterministic 9-Stage / 8-Gate Engine**: Once the Blueprint AST is sealed into the immutable BLAKE3 IHCG (`invar.ihcg.v1`), **the deterministic engine never parses raw natural-language user prompts**. Raw user text is retained strictly as provenance metadata (with optional, non-blocking quote/span links in `formal_evidence.py`), and all 8 epistemic gates, Duhem–Quine falsification certifiers, and Builder Studio `CanonicalResearchIR` admission checks hold strictly modulo the sealed Blueprint AST. Healing cannot recalibrate sealed observables or silently weaken a hypothesis.
+1. **Staged 3-Pass Scientific IR Synthesizer (`invar_agent/ir/`)**: Only the LLM Interpreter layer (assisted by Literature Federation, `ReferenceRegistry`, and bottleneck-gated SHBT Federation) reads raw user prose. Using append-only `Block A || Block B` KV-cache-friendly prompt templates and rationale-before-declaration JSON ordering:
+   - **Pass 1 (`FrozenSymbolTable`)** partitions every symbol into strongly typed roles (`STATE`, `CONTROL_PARAM`, `CONSTANT`, `DERIVED_OBSERVABLE`, `INDEPENDENT_VAR`), declares conserved stoichiometric pools (`conservation_pools`), and logs every inferred physical constant/domain/initial condition transparently in `assumptions_ledger`.
+   - **Pass 2 (`ModelBodyDraft`)** synthesizes acyclic `let_bindings`, `dynamics_or_residuals`, `observables`, and faithful `obligations` against the immutable `FrozenSymbolTable`.
+   - **Pass 3 (Deterministic Rust Scope/Type/DAG Checker & Bounded Micro-Repair)** parses expressions via a zero-eval Pratt parser (`expr_parser.rs`), enforces the 4-scope lexical graph, Kahn `let`-DAG topological ordering + Tarjan SCC cycle extraction, Theorem A.1 4-tier injective alias resolution (`pi_1`/`pi_2`/`pi_3` with `⊥_AMBIG` collision poisoning), `Chk-ODE-RHS` (banning `DERIVED_OBSERVABLE` from dynamics/let-bindings), and bidirectional `Q^7` SI dimensional checking (`scope_check.rs`), with bounded single-symbol micro-repair (`<= 2` repairs, `<= 256` tokens, strict epistemic lock).
+2. **Single-Authority Rust RFC 8785 JCS Sealing & 1-Byte Domain BLAKE3 Commitments (`his.rs`, `ihcg_bridge.py`)**: Sealed `SciIR` (`invar.sciir.v2`, aliased as `CanonicalResearchIR` for Builder Studio) is canonicalized via self-contained Rust RFC 8785 UTF-16 JCS (`float_roundtrip` exact IEEE-754 round-trip, duplicate-key & NaN/Inf rejection) and bound with 1-byte domain-separated BLAKE3 commitments: `0x01 || JCS(SciIR)`, `0x02 || JCS(IHCG_v1)`, `0x03 || raw_kernel_source`, `0x04 || JCS(EvidenceRecord)`, and `0x05 || JCS(VerdictReceipt)`.
+3. **Deterministic Archetype Kernel Compiler & Native Rust Solver Suite (`kernel_compiler.rs`, `solvers/`)**: Lowers sealed `SciIR` through diagonal affine Buckingham–Π scaling (`buckingham_pi.rs`) to flat `SciBufferSpec` C-ABI C++20 (`-std=c++20 -O3 -fno-fast-math -ffp-contract=off`) and native Rust solvers:
+   - **ODE (`solvers/ode.rs`)**: `RK4`, `DOPRI5`, `MPRK22(1.0)` (strictly rejecting `alpha != 1.0`), `ROS2(γ₊)` (`< 1e-13` linear invariant drift on overlapping stoichiometry), `Rosenbrock23` (`+ h d f_t`), `SDIRK2`, and symplectic `ImplicitMidpoint` (`< 1e-3` non-secular Hamiltonian energy error over 10,000 steps).
+   - **Monte Carlo (`solvers/mc.rs`)**: Stateless `SplitMix64` CRN, Welford–CGL parallel merge, Maurer–Pontil Empirical Bernstein CI, zero-dependency pure-math Lentz CF Clopper–Pearson (`< 1e-12` vs SciPy), and Vehtari rank-normalized split-`R_hat` & bulk `ESS`.
+   - **Fixed-Point & Sweep (`solvers/fixed_point.rs`, `solvers/sweep.rs`)**: Deuflhard affine-invariant damped Newton, central-FD Jacobian cross-check (`JACOBIAN_MISMATCH`), 3-tier stability certification (Routh–Hurwitz, Gershgorin, and continuous Lyapunov `J^T P + P J = -I` Cholesky SPD for non-normal/near-defective Jacobians), parallel Rayon parameter sweeps with adaptive bisection, and algebraic-closure Newton solving.
+4. **Provably Total 6-Absorbing-State FSM, SSE v2.0 & Bespoke Hole Verifier (`total_fsm.py`, `hole_verifier.py`)**: Lexicographic Lyapunov budgets `(b_pass, b_repair, b_exec) <= (2, 2, 2)` and `TotalBoundaryAdapter` lift every boundary fault into a cryptographically committed `VerdictReceipt` (0% HTTP 500/502s). SSE v2.0 streams emit `X-Accel-Buffering: no`, `Cache-Control: no-cache, no-transform`, monotonic `id:` frames with `Last-Event-ID` replay, and 15 s keepalive heartbeats. Any `<5%` bespoke Python hole is statically verified by `hole_verifier.py` (`<= 50 KB`) for AST safety, static loop bounds, and MELL observational purity.
+5. **Deterministic 9-Stage / 8-Gate Engine & Builder Studio Unification**: Once sealed, **the deterministic engine never parses raw natural-language user prompts**. All 8 epistemic gates, Duhem–Quine falsification certifiers, and Builder Studio `CanonicalResearchIR.from_sci_ir` admission checks share the exact same `0x01 || JCS(SciIR)` BLAKE3 commitment and lossless 8-macro-domain bijection.
 
 | Gate | Requirement |
 |---|---|
@@ -319,6 +327,14 @@ Verified across all live computational archetypes, terminal epistemic verdicts, 
 | **R7a** Duplicate vs R6 (`sir_peak_universal_bound_test`) | `INCONCLUSIVE_UNVERIFIED` | `INCONCLUSIVE_UNVERIFIED` (`uniqueness_audit.passed=False`) | `0.7956` | `0.0` | `fd4de850101d4381a2ca70cc606f62d9c70b09ab206eccf5567aa579a0388196` | Caught Vault duplicate against R6, 4 calls (`43,894` in / `118,973` out) |
 | **R7b** Contradictory impossibility (`T>=500 and T<=300`) | `REFUSED_IMPOSSIBLE` | `REFUSED_IMPOSSIBLE` | — | — | `480b130ba07303ed6593225cca98574e9c34269763b9a88bc9366517e56d9c7f` | Fast precheck refusal in `11.38s`, 1 call (`7,119` in / `607` out) |
 
+**Invar-Agent vNext Live E2E Matrix (`L1`–`L5`, DeepSeek `deepseek-flash` / `deepseek-v4-pro`):**
+- **L1** (Casual natural-language OXPHOS): `VERIFIED` (`14.04s`, 1st-try Pass 1 + Pass 2, 0 micro-repairs, pool conservation drift `1.15e-14`).
+- **L2** (Detailed multi-pool conserved OXPHOS): `VERIFIED` (`17.20s`, both adenine & redox pools conserved to `3.73e-14`).
+- **L3** (Carnot efficiency falsification trap, `η >= 0.75` for `T_H = 600 K`, `T_C ∈ [250, 350] K`): `FALSIFIED` (`8.16s`, `heal_count == 0`, 25 sweep points).
+- **L4** (Open-boundary radiative-convective energy balance): `VERIFIED` (`12.55s`, `ALGEBRAIC_CLOSURE` Newton closure solved and certified).
+- **L5** (Builder Studio `CanonicalResearchIR` unification from sealed `SciIR`): `PASS` (`commitment_match=True`, identical `0x01 || JCS(SciIR)` BLAKE3 hash across Python/C++20/Rust targets + `hole_verifier.py` audit).
+- **Telemetry**: 8 LLM calls total (`51.89s`, `8,576 / 18,231` KV-cache hit tokens = `47.0%`, 0% HTTP 500/502s).
+
 **Builder Studio v2.0 E2E (`B1`–`B4`):**
 - **B1** (`seirv_boundary_workbench` from **R1**): `POSITIVE_EVIDENCE`, `ir_blake3_digest=0120b2e5...`, `parity_rc=0`, live launch health `200`, clean stop `200`, export `81,908 bytes` (30 files) (`41.66s`).
 - **B2** (`shbt_frontier_calibration_lib` from **R4**): `COMPLETED` build + `PATCH /override` (`ir_digest` `1e162f80...` → `68054338...`) + `COMPLETED` incremental rebuild, export `41,662 bytes` (19 files) (`17.68s`).
@@ -335,7 +351,9 @@ invar-agent/
 ├── invar_agent/
 │   ├── _native/
 │   │   ├── Cargo.toml
-│   │   └── src/                     # GoI, HIN, adjoint, egg, HIS, Π, intervals
+│   │   └── src/                     # SciIR, Pratt parser, scope/SI checker, RFC 8785 JCS, kernel compiler, solvers (ODE/MC/FP/Sweep), GoI, HIN, adjoint, egg, HIS, Π
+│   ├── ir/                          # SciIR v2 schema, 3-pass staged synthesizer, prefix templates, JSON recovery, IHCG/JCS bridge, TotalBoundaryAdapter FSM, UAST lowering
+│   ├── compiler/                    # hole_verifier.py (<= 50 KB AST safety, static loop bounds, MELL purity)
 │   ├── research/
 │   │   ├── state_machine.py         # Research loop and provider handling
 │   │   ├── planner.py               # LLM Interpreter synthesis and bounded repair
@@ -350,8 +368,8 @@ invar-agent/
 │   │   ├── reference_annotations.py
 │   │   ├── epistemic.py             # Receipts and execution/certificate bridge
 │   │   ├── shbt_federation.py
-│   │   └── ...                      # Feasibility, search/extraction, reports, vault, SSE
-│   ├── builder/                     # Studio API, ingestion/IR, guards, emitters
+│   │   └── ...                      # Feasibility, search/extraction, reports, vault, SSE v2.0
+│   ├── builder/                     # Studio API, ingestion/IR (CanonicalResearchIR.from_sci_ir), guards, emitters
 │   ├── uast/                        # Schemas, compiler, totalized math, native bridge
 │   ├── transpiler/                  # Restricted Python frontend and C++/HIN
 │   ├── runtime/                     # C-ABI and isolated Python execution
@@ -362,9 +380,9 @@ invar-agent/
 │   ├── schemas/                     # Blueprint/contract/shared models
 │   ├── static/                      # Workspace, Research, Builder UI
 │   ├── latex_normalizer.py
-│   └── server.py                    # FastAPI and SSE
+│   └── server.py                    # FastAPI and SSE v2.0
 ├── scripts/
-└── tests/                           # Unit, differential, traps/controls, opt-in live
+└── tests/                           # Unit, CI gates, 540-system Hypothesis fuzz suite, differential, traps/controls, opt-in live
 ```
 
 ## Roadmap

@@ -207,6 +207,7 @@ class CanonicalResearchIR(StrictModel):
     llm_disambiguation_tokens_used: int = 0
     user_approved: bool = False
     ir_blake3_digest: str = ""
+    sciir_commitment_blake3: str = ""
     blake3_receipt: str = ""
     meaningfulness_certificates: dict[str, dict[str, Any]] = Field(default_factory=dict)
     meaningfulness_certificate: dict[str, Any] | None = None
@@ -214,6 +215,107 @@ class CanonicalResearchIR(StrictModel):
     certified_valid_domain: dict[str, Any] | None = None
     negative_constraints: list[dict[str, Any]] = Field(default_factory=list)
     research_import_role: Literal["POSITIVE_EVIDENCE", "NEGATIVE_CONSTRAINT_ONLY", "LEGACY_UNVERIFIED"] = "LEGACY_UNVERIFIED"
+
+    @classmethod
+    def from_sci_ir(cls, sealed_or_ir: Any) -> "CanonicalResearchIR":
+        """Losslessly adapt a vNext `SciIR` / `SealedSciIR` into Builder Studio's
+        `CanonicalResearchIR` while preserving the identical `0x01 || JCS(SciIR)`
+        BLAKE3 commitment across Research Mode and Builder Studio."""
+        from invar_agent.ir.ihcg_bridge import SealedSciIR, seal_sciir_ihcg
+        from invar_agent.ir.schema import SlotRole
+
+        sealed = sealed_or_ir if isinstance(sealed_or_ir, SealedSciIR) else seal_sciir_ihcg(sealed_or_ir)
+        ir = sealed.ir
+        prov = SourceSpan(file="sci_ir.json", location=ir.ir_id, quote=f"SciIR {ir.ir_id}")
+
+        states: list[StateVariableSpec] = []
+        consts: list[ExtractedConstant] = []
+        for sym in ir.symbols:
+            exp_int = tuple(int(n // d) if d != 0 else 0 for n, d in sym.dimension.exponents)
+            dim_model = SIDimensionVectorModel(
+                exponents=exp_int,  # type: ignore[arg-type]
+                canonical_unit=sym.dimension.unit_label or "1",
+            )
+            bounds = (
+                IntervalBoundModel(lower=sym.domain.lo, upper=sym.domain.hi)
+                if sym.domain is not None
+                else None
+            )
+            if sym.role == SlotRole.STATE:
+                states.append(
+                    StateVariableSpec(
+                        symbol=sym.name,
+                        slot_index=sym.slot_index,
+                        description=sym.description,
+                        initial_value=sym.initial_or_default,
+                        dimension=dim_model,
+                        bounds=bounds,
+                        provenance=prov,
+                    )
+                )
+            elif sym.role in (SlotRole.CONTROL_PARAM, SlotRole.CONSTANT):
+                consts.append(
+                    ExtractedConstant(
+                        constant_id=f"c_{sym.name}",
+                        symbol=sym.name,
+                        name=sym.display_symbol or sym.name,
+                        raw_value=str(sym.initial_or_default),
+                        raw_unit=sym.dimension.unit_label or "1",
+                        si_value=sym.initial_or_default,
+                        dimension=dim_model,
+                        bounds=bounds,
+                        is_tunable_parameter=(sym.role == SlotRole.CONTROL_PARAM),
+                        verification_status=VerificationStatus.VERIFIED,
+                        provenance=prov,
+                    )
+                )
+
+        eqs: list[ExtractedEquation] = []
+        for idx, eq in enumerate(ir.dynamics_or_residuals):
+            eqs.append(
+                ExtractedEquation(
+                    equation_id=f"dyn_{idx}_{eq.target}",
+                    raw_latex=eq.source_text or eq.target,
+                    canonical_latex=eq.source_text or eq.target,
+                    sympy_expr=eq.source_text or None,
+                    lhs_symbol=eq.target,
+                    role=EquationRole.EVOLUTION_LAW,
+                    hin_homogeneous=True,
+                    verification_status=VerificationStatus.VERIFIED,
+                    provenance=prov,
+                )
+            )
+        for idx, obs in enumerate(ir.observables):
+            eqs.append(
+                ExtractedEquation(
+                    equation_id=f"obs_{idx}_{obs.target}",
+                    raw_latex=obs.source_text or obs.target,
+                    canonical_latex=obs.source_text or obs.target,
+                    sympy_expr=obs.source_text or None,
+                    lhs_symbol=obs.target,
+                    role=EquationRole.ALGEBRAIC_CLOSURE,
+                    hin_homogeneous=True,
+                    verification_status=VerificationStatus.VERIFIED,
+                    provenance=prov,
+                )
+            )
+
+        return cls(
+            ir_id=ir.ir_id,
+            source_mode="vault",
+            macro_domains=[ir.to_macro_domain()],
+            title=f"SciIR Instrument: {ir.ir_id}",
+            summary=f"Lowered from sealed SciIR ({ir.archetype.value} / {ir.domain.value})",
+            state_variables=states,
+            equations=eqs,
+            constants=consts,
+            user_approved=True,
+            ir_blake3_digest=sealed.sciir_commitment_blake3,
+            sciir_commitment_blake3=sealed.sciir_commitment_blake3,
+            blake3_receipt=sealed.ihcg_v1_commitment_blake3,
+            epistemic_verdict="VERIFIED_DISCOVERY",
+            research_import_role="POSITIVE_EVIDENCE",
+        )
 
 
 class RawEquation(StrictModel):

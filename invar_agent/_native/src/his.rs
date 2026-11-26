@@ -6,7 +6,313 @@
 //! order-independent (XOR-folded) so that concurrent wavefront commits can be
 //! merged without re-hashing the entire repository.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+
+/// 1-byte domain separation prefixes for Invar-Agent vNext BLAKE3 commitments.
+pub const DOMAIN_SCIIR: u8 = 0x01;
+pub const DOMAIN_IHCG_V1: u8 = 0x02;
+pub const DOMAIN_KERNEL_SOURCE: u8 = 0x03;
+pub const DOMAIN_EVIDENCE_RECORD: u8 = 0x04;
+pub const DOMAIN_VERDICT_RECEIPT: u8 = 0x05;
+
+#[derive(Debug, Clone)]
+enum JcsValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    Str(String),
+    Array(Vec<JcsValue>),
+    Object(Vec<(String, JcsValue)>),
+}
+
+impl<'de> serde::Deserialize<'de> for JcsValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct JcsVisitor;
+        impl<'de> Visitor<'de> for JcsVisitor {
+            type Value = JcsValue;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a valid RFC 8785 JSON value without duplicate keys")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(JcsValue::Null)
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(JcsValue::Bool(v))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(JcsValue::Int(v))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(JcsValue::Uint(v))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if !v.is_finite() {
+                    return Err(E::custom("RFC 8785 forbids NaN/Infinity floats"));
+                }
+                Ok(JcsValue::Float(v))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(JcsValue::Str(v.to_string()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(JcsValue::Str(v))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(elem) = seq.next_element()? {
+                    out.push(elem);
+                }
+                Ok(JcsValue::Array(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut seen = HashSet::new();
+                let mut entries = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, JcsValue>()? {
+                    if !seen.insert(k.clone()) {
+                        return Err(de::Error::custom(format!(
+                            "RFC 8785 duplicate object key rejected: {k}"
+                        )));
+                    }
+                    entries.push((k, v));
+                }
+                Ok(JcsValue::Object(entries))
+            }
+        }
+        deserializer.deserialize_any(JcsVisitor)
+    }
+}
+
+/// Format an IEEE-754 finite f64 strictly per ECMA-262 Number::toString / RFC 8785 §3.2.2.3.
+pub fn format_es2015_f64(v: f64) -> Result<String, String> {
+    if !v.is_finite() {
+        return Err("RFC 8785 forbids NaN or Infinity".into());
+    }
+    if v == 0.0 {
+        return Ok("0".into());
+    }
+    let negative = v.is_sign_negative();
+    let abs_v = v.abs();
+
+    // Use serde_json's Ryū serializer for exact IEEE-754 shortest round-trip digits.
+    let raw = serde_json::to_string(&abs_v).map_err(|e| e.to_string())?;
+    let (mantissa_str, base_exp): (&str, i32) = if let Some((m, e)) = raw.split_once(['e', 'E']) {
+        (
+            m,
+            e.parse::<i32>()
+                .map_err(|_| format!("invalid exponent in {raw}"))?,
+        )
+    } else {
+        (raw.as_str(), 0)
+    };
+
+    // Parse mantissa_str into normalized significant digits (no leading/trailing zeros)
+    // and base-10 exponent `exp` such that `abs_v = d0.d1... * 10^exp`.
+    let (int_part, frac_part) = mantissa_str.split_once('.').unwrap_or((mantissa_str, ""));
+    let combined = format!("{int_part}{frac_part}");
+    let first_nz = combined
+        .find(|c: char| c != '0')
+        .ok_or_else(|| format!("unexpected zero mantissa: {raw}"))?;
+    let mut digits = combined[first_nz..].to_string();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    let exp = base_exp + (int_part.len() as i32) - (first_nz as i32) - 1;
+
+    let k = digits.len() as i32;
+    let n = exp + 1; // abs_v = 0.<digits> * 10^n
+
+    let mut out = String::with_capacity(28);
+    if negative {
+        out.push('-');
+    }
+
+    if k <= n && n <= 21 {
+        out.push_str(&digits);
+        for _ in 0..(n - k) {
+            out.push('0');
+        }
+    } else if 0 < n && n <= 21 {
+        let split = n as usize;
+        out.push_str(&digits[..split]);
+        out.push('.');
+        out.push_str(&digits[split..]);
+    } else if -6 < n && n <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-n) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else {
+        out.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        let e_val = n - 1;
+        if e_val >= 0 {
+            out.push('+');
+            out.push_str(&e_val.to_string());
+        } else {
+            out.push('-');
+            out.push_str(&(-e_val).to_string());
+        }
+    }
+
+    Ok(out)
+}
+
+fn write_jcs_string(s: &str, out: &mut String) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn write_jcs_value(val: &JcsValue, out: &mut String) -> Result<(), String> {
+    match val {
+        JcsValue::Null => out.push_str("null"),
+        JcsValue::Bool(true) => out.push_str("true"),
+        JcsValue::Bool(false) => out.push_str("false"),
+        JcsValue::Int(i) => {
+            // Integers within IEEE-754 exact range format as plain decimal; outside use f64 rule
+            if (-9_007_199_254_740_991i64..=9_007_199_254_740_991i64).contains(i) {
+                out.push_str(&i.to_string());
+            } else {
+                out.push_str(&format_es2015_f64(*i as f64)?);
+            }
+        }
+        JcsValue::Uint(u) => {
+            if *u <= 9_007_199_254_740_991u64 {
+                out.push_str(&u.to_string());
+            } else {
+                out.push_str(&format_es2015_f64(*u as f64)?);
+            }
+        }
+        JcsValue::Float(f) => {
+            out.push_str(&format_es2015_f64(*f)?);
+        }
+        JcsValue::Str(s) => write_jcs_string(s, out),
+        JcsValue::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_jcs_value(item, out)?;
+            }
+            out.push(']');
+        }
+        JcsValue::Object(entries) => {
+            // RFC 8785 §3.2.3: sort object property names by UTF-16 code units.
+            let mut sorted: Vec<&(String, JcsValue)> = entries.iter().collect();
+            sorted.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+            out.push('{');
+            for (idx, (k, v)) in sorted.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_jcs_string(k, out);
+                out.push(':');
+                write_jcs_value(v, out)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize a JSON string strictly according to RFC 8785 (JCS).
+/// Rejects duplicate object keys, NaN/Infinity, and malformed JSON.
+pub fn jcs_canonicalize_str(json_str: &str) -> Result<String, String> {
+    let val: JcsValue = serde_json::from_str(json_str)
+        .map_err(|e| format!("RFC 8785 JCS parse error: {e}"))?;
+    let mut out = String::with_capacity(json_str.len());
+    write_jcs_value(&val, &mut out)?;
+    Ok(out)
+}
+
+/// Compute a 1-byte domain-separated BLAKE3 commitment: `BLAKE3(domain_byte || payload)`.
+pub fn domain_byte_blake3_hex(domain_byte: u8, payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[domain_byte]);
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Compute a 1-byte domain-separated BLAKE3 commitment over RFC 8785 JCS-canonicalized JSON.
+pub fn commit_jcs_json(domain_byte: u8, json_str: &str) -> Result<String, String> {
+    let canon = jcs_canonicalize_str(json_str)?;
+    Ok(domain_byte_blake3_hex(domain_byte, canon.as_bytes()))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SciIrSealReceipt {
+    pub schema_version: String,
+    pub sciir_commitment_blake3: String,
+    pub ihcg_v1_commitment_blake3: String,
+    pub canonical_sciir_jcs: String,
+}
+
+/// Single-authority Rust sealing entrypoint for `SciIR` (`invar.sciir.v2`).
+/// Validates the JSON against `SciIR` (rejecting unknown fields & non-finite floats),
+/// rejects duplicate keys, canonicalizes via RFC 8785 UTF-16 JCS, and computes
+/// `0x01 || JCS(SciIR)` and `0x02 || JCS(IHCG_v1_projection)`.
+pub fn seal_sciir_ihcg(sciir_json: &str) -> Result<SciIrSealReceipt, String> {
+    // 1. Validate duplicate keys + RFC 8785 JCS on raw input
+    let _raw_jcs = jcs_canonicalize_str(sciir_json)?;
+
+    // 2. Deserialize strictly into SciIR and validate finiteness
+    let ir: crate::sci_ir::SciIR = serde_json::from_str(sciir_json)
+        .map_err(|e| format!("SciIR schema validation failed: {e}"))?;
+    ir.validate()?;
+
+    // 3. Serialize canonical SciIR struct -> RFC 8785 JCS -> 0x01 commitment
+    let ir_serialized = serde_json::to_string(&ir).map_err(|e| e.to_string())?;
+    let canonical_sciir_jcs = jcs_canonicalize_str(&ir_serialized)?;
+    let sciir_commitment_blake3 =
+        domain_byte_blake3_hex(DOMAIN_SCIIR, canonical_sciir_jcs.as_bytes());
+
+    // 4. Deterministic projection to IHCG v1 summary object -> 0x02 commitment
+    let ihcg_proj = serde_json::json!({
+        "schema_version": "invar.ihcg.v1",
+        "sciir_commitment_blake3": &sciir_commitment_blake3,
+        "ir_id": &ir.ir_id,
+        "archetype": &ir.archetype,
+        "domain": &ir.domain,
+        "symbol_count": ir.symbols.len(),
+        "dynamics_count": ir.dynamics_or_residuals.len(),
+        "observable_count": ir.observables.len(),
+        "obligation_count": ir.obligations.len(),
+    });
+    let ihcg_proj_str = serde_json::to_string(&ihcg_proj).map_err(|e| e.to_string())?;
+    let ihcg_v1_commitment_blake3 = commit_jcs_json(DOMAIN_IHCG_V1, &ihcg_proj_str)?;
+
+    Ok(SciIrSealReceipt {
+        schema_version: "invar.sciir.v2".to_string(),
+        sciir_commitment_blake3,
+        ihcg_v1_commitment_blake3,
+        canonical_sciir_jcs,
+    })
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CdsTriplet { pub model_hash: String, pub claim_hash: String, pub full_hash: String }
@@ -193,5 +499,42 @@ mod tests {
         let digest = reg.compute_xor_blake3_digest();
         assert!(reg.verify_parity(&digest));
         assert!(!reg.verify_parity(&"0".repeat(64)));
+    }
+
+    #[test]
+    fn rfc8785_jcs_utf16_sorting_and_numbers() {
+        // UTF-16 code unit ordering: U+1F600 ("😀" -> 0xD83D 0xDE00) MUST sort BEFORE U+E000 (0xE000).
+        let input = "{\"\\uE000\":2,\"😀\":1}";
+        let canon = jcs_canonicalize_str(input).unwrap();
+        assert_eq!(canon, "{\"😀\":1,\"\u{E000}\":2}");
+
+        // RFC 8785 §3.2.2.3 & Appendix B number formatting vectors
+        assert_eq!(format_es2015_f64(-0.0).unwrap(), "0");
+        assert_eq!(format_es2015_f64(0.0).unwrap(), "0");
+        assert_eq!(format_es2015_f64(1.0).unwrap(), "1");
+        assert_eq!(format_es2015_f64(4.50).unwrap(), "4.5");
+        assert_eq!(format_es2015_f64(2e-3).unwrap(), "0.002");
+        assert_eq!(format_es2015_f64(1e-6).unwrap(), "0.000001");
+        assert_eq!(format_es2015_f64(1e-7).unwrap(), "1e-7");
+        assert_eq!(format_es2015_f64(1e20).unwrap(), "100000000000000000000");
+        assert_eq!(format_es2015_f64(1e21).unwrap(), "1e+21");
+        assert_eq!(format_es2015_f64(1e30).unwrap(), "1e+30");
+        assert!(format_es2015_f64(f64::NAN).is_err());
+        assert!(format_es2015_f64(f64::INFINITY).is_err());
+
+        // Duplicate key rejection
+        assert!(jcs_canonicalize_str(r#"{"a":1,"a":2}"#).is_err());
+
+        // 1-byte domain separation
+        let h1 = domain_byte_blake3_hex(DOMAIN_SCIIR, b"{}");
+        let h2 = domain_byte_blake3_hex(DOMAIN_IHCG_V1, b"{}");
+        let h3 = domain_byte_blake3_hex(DOMAIN_KERNEL_SOURCE, b"{}");
+        let h4 = domain_byte_blake3_hex(DOMAIN_EVIDENCE_RECORD, b"{}");
+        let h5 = domain_byte_blake3_hex(DOMAIN_VERDICT_RECEIPT, b"{}");
+        assert_eq!(h1.len(), 64);
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+        assert_ne!(h3, h4);
+        assert_ne!(h4, h5);
     }
 }

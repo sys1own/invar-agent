@@ -975,6 +975,87 @@ pub(crate) fn canonicalize_polynomial_recexpr(rec: &RecExpr<CselLanguage>) -> Re
     Ok(vals.last().unwrap().text())
 }
 
+/// Diagonal affine nondimensionalization scales for extreme SI conditioning (`1e-24..1e18`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiagonalAffineScaling {
+    /// Characteristic scale `S_i > 0` for each STATE slot (`y_hat_i = y_i / S_i`).
+    pub state_scales: Vec<f64>,
+    /// Characteristic time scale `tau_0 > 0` (`t_hat = (t - t_0) / tau_0`).
+    pub tau_0: f64,
+    /// Nondimensionalized initial state vector `y_hat(0)`.
+    pub scaled_initial_states: Vec<f64>,
+    /// Dimensionless Pi-group descriptors inferred from symbol scales.
+    pub pi_groups: Vec<String>,
+}
+
+/// Compute diagonal affine scaling `(S, tau_0, pi_groups)` for a `SciIR` system.
+/// States belonging to the same `ConservationPoolSpec` share the pool's characteristic
+/// total scale so linear conservation laws stay exact in scaled coordinates.
+pub fn compute_diagonal_affine_scales(ir: &crate::sci_ir::SciIR) -> DiagonalAffineScaling {
+    let mut states: Vec<&crate::sci_ir::SymbolDecl> = ir
+        .symbols
+        .iter()
+        .filter(|s| s.role == crate::sci_ir::SlotRole::State)
+        .collect();
+    states.sort_by_key(|s| s.slot_index);
+
+    // Map pool_id -> characteristic pool scale (> 0)
+    let mut pool_scale: BTreeMap<String, f64> = BTreeMap::new();
+    for pool in &ir.conservation_pools {
+        if pool.expected_total.is_finite() && pool.expected_total.abs() > 1e-30 {
+            pool_scale.insert(pool.pool_id.clone(), pool.expected_total.abs());
+        }
+    }
+
+    let mut state_scales = Vec::with_capacity(states.len());
+    let mut scaled_initial_states = Vec::with_capacity(states.len());
+    let mut pi_groups = Vec::new();
+
+    for st in &states {
+        let mut s = if let Some(ref pid) = st.pool_id {
+            pool_scale.get(pid).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if s <= 1e-30 {
+            if st.initial_or_default.is_finite() && st.initial_or_default.abs() > 1e-30 {
+                s = st.initial_or_default.abs();
+            } else if let Some(ref dom) = st.domain {
+                let mag = dom.hi.abs().max(dom.lo.abs());
+                s = if mag > 1e-30 { mag } else { 1.0 };
+            } else {
+                s = 1.0;
+            }
+        }
+        // Normalize to nearest power-of-2 or exact positive characteristic magnitude
+        if !s.is_finite() || s <= 1e-30 {
+            s = 1.0;
+        }
+        state_scales.push(s);
+        scaled_initial_states.push(st.initial_or_default / s);
+        pi_groups.push(format!("pi_{} = {} / {:.6e}", st.name, st.name, s));
+    }
+
+    let tau_0 = match &ir.config {
+        crate::sci_ir::ArchetypeConfig::OdePde { t_span, .. } => {
+            let dt = (t_span.1 - t_span.0).abs();
+            if dt.is_finite() && dt > 1e-30 {
+                dt
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    };
+
+    DiagonalAffineScaling {
+        state_scales,
+        tau_0,
+        scaled_initial_states,
+        pi_groups,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

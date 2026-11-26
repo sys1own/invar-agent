@@ -127,7 +127,8 @@ class DeepSeekChatClient:
     # -- chat interface (mirrors ChatLLMClient) ---------------------------------
 
     def generate(self, messages: List[Dict[str, str]], temperature: float = 0.2,
-                 max_tokens: int = 4096, thinking: Optional[bool] = None) -> str:
+                 max_tokens: int = 4096, thinking: Optional[bool] = None,
+                 json_object: bool = False) -> str:
         """Multi-turn chat completion; returns the assistant message content.
 
         ``temperature`` is accepted for interface compatibility but deliberately
@@ -138,6 +139,8 @@ class DeepSeekChatClient:
         start = time.perf_counter()
 
         extra: Dict[str, Any] = {}
+        if json_object:
+            extra["response_format"] = {"type": "json_object"}
         if thinking is False or (thinking is None and builder_transport_active()):
             # DeepSeek thinking mode burns the whole completion budget on
             # reasoning (observed: 1024/1024 tokens, empty content). Planning
@@ -248,7 +251,10 @@ class DeepSeekChatClient:
         max_retry_budget = 16384
         for _ in range(0 if builder_transport_active() else 1):
             choice0 = response.choices[0]
-            _txt = (choice0.message.content or "").strip()
+            _raw_content = choice0.message.content or ""
+            _txt = _raw_content.strip()
+            # DeepSeek U+0020 whitespace-only stall: non-empty whitespace with no visible payload.
+            _whitespace_only = len(_raw_content) > 0 and len(_txt) == 0
             _truncated_json = (
                 getattr(choice0, "finish_reason", None) == "length"
                 and _txt.startswith(("{", "```"))
@@ -256,7 +262,9 @@ class DeepSeekChatClient:
             )
             if _txt and not _truncated_json:
                 break
-            if getattr(choice0, "finish_reason", None) != "length" or budget >= max_retry_budget:
+            if not _whitespace_only and (
+                getattr(choice0, "finish_reason", None) != "length" or budget >= max_retry_budget
+            ):
                 break
             budget = min(max(budget * 2, 4096), max_retry_budget)
             retry_extra = dict(extra)

@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "hypothesis>=6.100"]
 ingest = ["pdfplumber>=0.11", "pypdf>=5.0", "pylatexenc>=2.10", "lark>=1.1", "sympy>=1.13"]
 scientific = ["scipy>=1.13", "h5py>=3.11", "pyarrow>=17.0"]
 
