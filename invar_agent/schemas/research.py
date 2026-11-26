@@ -105,7 +105,7 @@ class FeasibilityAssessment(BaseModel):
     rationale: str
     violated_boundary: Optional[str] = None
     reformulation: Optional[str] = None
-    assessed_by: Literal["heuristic", "llm"] = "heuristic"
+    assessed_by: Literal["heuristic", "heuristic_offline", "llm"] = "heuristic_offline"
 
     @field_validator("verdict", mode="before")
     @classmethod

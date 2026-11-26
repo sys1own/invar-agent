@@ -125,7 +125,7 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
             verdict="OPTIMAL_DIRECT",
             rationale=(f"Solved via SHBT Frontier Solvability Federation ({repos}): "
                        "provides exact open-ledger/WZW/LANR/ZPE governing equations and SI constants."),
-            assessed_by="heuristic")
+            assessed_by="heuristic_offline")
     # Impossible: explicit pattern, or conservation + gain co-occurrence.
     # Note: computational dynamical benchmarks often explain why *explicit*
     # schemes (RK4/Euler) "violate conservation" — never treat that as an
@@ -143,7 +143,7 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
                 reformulation=("Reformulate as a consistency check (e.g. verify that "
                                "invariants hold and bound the achievable gain) or ask "
                                "for the maximum permissible rate within the constraints."),
-                assessed_by="heuristic")
+                assessed_by="heuristic_offline")
     if _CONSERVATION_WORDS.search(q) and _GAIN_WORDS.search(q) \
             and re.search(r"105%|>\s*100%|exceed\w*.*consumption|self[- ]sustain", q):
         return FeasibilityAssessment(
@@ -155,7 +155,7 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
             reformulation=("Split into two verifiable sub-problems: (1) verify "
                            "conservation/invariant bounds, (2) maximise efficiency "
                            "subject to those bounds."),
-            assessed_by="heuristic")
+            assessed_by="heuristic_offline")
     unsuitable = _UNSUITABLE_PATTERNS + ([] if _QUANTITATIVE_HINTS.search(q) else _TASKS_REQUIRING_MODEL)
     for pattern, what in unsuitable:
         if re.search(pattern, q):
@@ -168,7 +168,7 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
                 reformulation=("Recast as a quantitative proxy (e.g. a measurable "
                                "metric with an explicit mathematical model) or use "
                                "the Builder Agent for qualitative artefacts."),
-                assessed_by="heuristic")
+                assessed_by="heuristic_offline")
     for pattern, what in _SURROGATE_PATTERNS:
         if re.search(pattern, q):
             return FeasibilityAssessment(
@@ -180,12 +180,28 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
                 reformulation=("Define a 1D/2D reduced-order or asymptotic model "
                                "(e.g. scaling laws, moment closures) and verify its "
                                "invariants instead of the full system."),
-                assessed_by="heuristic")
+                assessed_by="heuristic_offline")
     return FeasibilityAssessment(
         verdict="OPTIMAL_DIRECT",
         rationale=("Quantitative research question compatible with literature "
                    "search + deterministic native compute verification."),
-        assessed_by="heuristic")
+        assessed_by="heuristic_offline")
+
+
+def format_advisory_hint(heuristic: FeasibilityAssessment) -> str:
+    """Format an offline heuristic pre-check as a non-binding advisory hint for the LLM interpreter."""
+    verdict = str(getattr(heuristic.verdict, "value", heuristic.verdict))
+    if verdict == "OPTIMAL_DIRECT":
+        return ""
+    return (
+        "\n\nADVISORY HEURISTIC PRE-CHECK (non-binding hint; you are the interpreter): "
+        f"offline keyword check suggested verdict={verdict} ({heuristic.rationale}). "
+        "If the user makes a concrete falsifiable mathematical/physical claim (even a potentially false or "
+        "contradictory one like T>=500 and T<=300 or Carnot eta>=0.65), formalize it faithfully as "
+        "OPTIMAL_DIRECT so the deterministic formal checker can prove or formally falsify it. "
+        "Only issue REFUSED_UNSUITABLE for non-mathematical prose/gibberish or REFUSED_IMPOSSIBLE for "
+        "undecidable/non-formalizable requests."
+    )
 
 
 # -- LLM refinement ------------------------------------------------------------
@@ -352,27 +368,27 @@ async def evaluate_research_feasibility(
         question: str,
         llm_complete: Optional[Callable[[str], Any]] = None,
         use_llm: bool = True, *, ihcg_input: Optional[Dict[str, Any]] = None) -> FeasibilityAssessment:
-    """Classify a research request; heuristic first, optional Tier-2 refinement.
+    """Classify a research request.
 
-    The deterministic heuristic is authoritative for clear-cut refusals; the LLM
-    refinement can override OPTIMAL_DIRECT / SURROGATE verdicts and sharpen
-    rationales, but can never *downgrade* a heuristic REFUSAL into a run.
+    When an LLM is configured (``llm_complete is not None and use_llm``), heuristic
+    keyword checks are passed strictly as non-binding ADVISORY HINTS to the LLM
+    interpreter. Offline heuristic refusals (``assessed_by='heuristic_offline'``)
+    apply only when no LLM is configured.
     """
     if ihcg_input is not None:
         try: compile_ingest_ihcg(question, **ihcg_input)
         except ValueError as error:
             return FeasibilityAssessment(verdict="REFUSED_UNSUITABLE", rationale=str(error), violated_boundary="Phi_lock/Phi_nonvac")
     heuristic = _heuristic_verdict(question)
-    if heuristic.verdict in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
-        return heuristic
     if llm_complete is not None and use_llm:
         try:
-            raw = await llm_complete(FEASIBILITY_PROMPT.replace("{question}", question))
+            prompt = FEASIBILITY_PROMPT.replace("{question}", question) + format_advisory_hint(heuristic)
+            raw = await llm_complete(prompt)
             data = _extract_json(str(raw))
             if data is not None:
                 llm_assessment = _assessment_from_llm(data)
                 if llm_assessment is not None:
                     return override_refusal_for_computational_benchmark(question, llm_assessment)
-        except Exception:  # noqa: BLE001 - heuristic stands on LLM failure
+        except Exception:  # noqa: BLE001 - offline heuristic stands on LLM failure
             pass
     return heuristic

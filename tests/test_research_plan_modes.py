@@ -110,13 +110,31 @@ async def test_combined_plan_retains_original_equations_without_llm_restatement(
 
 @pytest.mark.asyncio
 async def test_generate_plan_with_feasibility_refusal_fast_path():
-    async def llm(prompt: str):  # pragma: no cover - must not be called
-        raise AssertionError("LLM must not be called for clear-cut refusals")
+    # Offline (no LLM): heuristic refusal triggers with assessed_by='heuristic_offline'.
+    out_offline = await generate_plan_with_feasibility(
+        "design a perpetual motion machine with COP = 1.25", llm_complete=None)
+    assert out_offline["blueprint"] is None
+    assert out_offline["feasibility"].verdict.startswith("REFUSED")
+    assert out_offline["feasibility"].assessed_by == "heuristic_offline"
 
-    out = await generate_plan_with_feasibility(
+    # Online (LLM configured): heuristic is passed as an advisory hint to the LLM interpreter.
+    seen = []
+
+    async def llm(prompt: str):
+        seen.append(prompt)
+        return (
+            '{"feasibility": {"verdict": "REFUSED_IMPOSSIBLE", '
+            '"rationale": "Perpetual motion violates thermodynamics", '
+            '"violated_boundary": "conservation", "reformulation": "bound efficiency"}, '
+            '"blueprint": null}'
+        )
+
+    out_online = await generate_plan_with_feasibility(
         "design a perpetual motion machine with COP = 1.25", llm_complete=llm)
-    assert out["blueprint"] is None
-    assert out["feasibility"].verdict.startswith("REFUSED")
+    assert len(seen) == 1
+    assert "ADVISORY HEURISTIC PRE-CHECK" in seen[0]
+    assert out_online["blueprint"] is None
+    assert out_online["feasibility"].verdict.startswith("REFUSED")
 
 
 @pytest.mark.asyncio
@@ -163,13 +181,31 @@ async def test_generate_expert_research_prompt():
 
 @pytest.mark.asyncio
 async def test_generate_expert_research_prompt_refused():
-    async def llm(prompt: str):  # pragma: no cover - must not be called
-        raise AssertionError("LLM must not be called for clear-cut refusals")
+    # Offline (no LLM): heuristic refusal triggers with assessed_by='heuristic_offline'.
+    out_offline = await generate_expert_research_prompt(
+        "COP = 1.25 heat pump", llm_complete=None)
+    assert out_offline["expert_prompt"] == ""
+    assert out_offline["feasibility"].verdict.startswith("REFUSED")
+    assert out_offline["feasibility"].assessed_by == "heuristic_offline"
 
-    out = await generate_expert_research_prompt(
+    # Online (LLM configured): heuristic is passed as an advisory hint to the LLM interpreter.
+    seen = []
+
+    async def llm(prompt: str):
+        seen.append(prompt)
+        return (
+            '{"feasibility": {"verdict": "REFUSED_IMPOSSIBLE", '
+            '"rationale": "Over-unity claim", '
+            '"violated_boundary": "thermodynamics", "reformulation": "compute Carnot COP"}, '
+            '"expert_prompt": ""}'
+        )
+
+    out_online = await generate_expert_research_prompt(
         "COP = 1.25 heat pump", llm_complete=llm)
-    assert out["expert_prompt"] == ""
-    assert out["feasibility"].verdict.startswith("REFUSED")
+    assert len(seen) == 1
+    assert "ADVISORY HEURISTIC PRE-CHECK" in seen[0]
+    assert out_online["expert_prompt"] == ""
+    assert out_online["feasibility"].verdict.startswith("REFUSED")
 
 
 # -- observables + quantitative report -------------------------------------------

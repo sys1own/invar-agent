@@ -1363,12 +1363,12 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         blueprint JSON. Requires an LLM provider (no offline stub path).
         """
         state.ensure_research_manager()
-        # Clear-cut heuristic refusals are answered without an LLM key.
-        from invar_agent.research.feasibility import _heuristic_verdict
-        heuristic = _heuristic_verdict(req.question)
-        if heuristic.verdict.startswith("REFUSED"):
-            return {"status": "refused", "feasibility": heuristic.model_dump()}
         if not state.api_key:
+            # Offline heuristic refusals apply only when no LLM is configured.
+            from invar_agent.research.feasibility import _heuristic_verdict
+            heuristic = _heuristic_verdict(req.question)
+            if heuristic.verdict.startswith("REFUSED"):
+                return {"status": "refused", "feasibility": heuristic.model_dump()}
             raise HTTPException(
                 status_code=400,
                 detail="Plan Mode requires an LLM provider: configure an API key first")
