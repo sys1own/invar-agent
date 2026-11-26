@@ -16,7 +16,7 @@ _LN_CALL = re.compile(r"\bln\s*\(")
 from .expr_frontend import normalize_expression as _fe_normalize
 
 
-def _normalize_formal_expr(
+def _normalize_formal_expr_detailed(
     expr: str,
     *,
     declared_symbols=(),
@@ -38,8 +38,15 @@ def _normalize_formal_expr(
         quantifier_mode=quantifier_mode,
     )
     if res.ok and res.canonical is not None:
-        return res.canonical, res.transforms, res.binder_assumptions
+        canon = res.canonical.replace(" ** ", "**") if res.transforms else res.canonical
+        return canon, res.transforms, res.binder_assumptions
     return expr, (), ()
+
+
+def _normalize_formal_expr(expr: str) -> str:
+    """Lossless mathematical syntax normalization returning canonical expression string."""
+    canon, _, _ = _normalize_formal_expr_detailed(expr)
+    return canon
 
 
 def normalize_ihcg_evidence(raw):
@@ -85,7 +92,7 @@ def normalize_ihcg_evidence(raw):
             if isinstance(obligation, dict):
                 presentation(obligation, f'evidence.obligations[{i}]')
                 if isinstance(obligation.get('expression'), str):
-                    norm_expr, transforms, binder_assumps = _normalize_formal_expr(
+                    norm_expr, transforms, binder_assumps = _normalize_formal_expr_detailed(
                         obligation['expression'],
                         declared_symbols=declared_symbols,
                         domain=raw_domain,
@@ -100,7 +107,7 @@ def normalize_ihcg_evidence(raw):
     if isinstance(environment, list):
         for i, expr in enumerate(environment):
             if isinstance(expr, str):
-                norm_expr, transforms, binder_assumps = _normalize_formal_expr(
+                norm_expr, transforms, binder_assumps = _normalize_formal_expr_detailed(
                     expr,
                     declared_symbols=declared_symbols,
                     domain=raw_domain,
@@ -162,7 +169,7 @@ def normalize_ihcg_evidence(raw):
                     if lhs not in dimensions or (key in dimensions and key != lhs) or equation.get('kind', 'ALGEBRAIC') != 'ALGEBRAIC':
                         raise ValueError(path+': assignment has an ambiguous or conflicting output symbol')
                     target, dims = lhs, dimensions[lhs]
-                norm_rhs, transforms, _ = _normalize_formal_expr(
+                norm_rhs, transforms, _ = _normalize_formal_expr_detailed(
                     rhs,
                     declared_symbols=declared_symbols,
                     domain=raw_domain,
@@ -173,7 +180,7 @@ def normalize_ihcg_evidence(raw):
                     frontend_transforms[path + '.expression'] = list(transforms)
                 equation['expression'] = norm_rhs
             elif isinstance(expression, str):
-                norm_expr, transforms, _ = _normalize_formal_expr(
+                norm_expr, transforms, _ = _normalize_formal_expr_detailed(
                     expression,
                     declared_symbols=declared_symbols,
                     domain=raw_domain,
