@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import meaningfulness as m
+from .expr_frontend import normalize_expression as _fe_normalize
 from .formal_evidence import _anchor_evidence
 from .ihcg_normalization import normalize_ihcg_evidence
 
@@ -559,13 +560,14 @@ def compile_and_preflight_blueprint(
     pack.pop("constants", None)
     pack.pop("derived_expressions", None)
     pack.pop("assumptions_ledger", None)
+    pack_typed_slots = pack.pop("typed_slots", None)
     evidence = pack["evidence"]
     evidence.pop("constants", None)
     evidence.pop("derived_expressions", None)
     evidence.pop("assumptions_ledger", None)
 
     # 1. Assemble mutable typed_slots namespace.
-    raw_slots = bp.get("typed_slots") or evidence.get("slots") or []
+    raw_slots = bp.get("typed_slots") or pack_typed_slots or evidence.get("slots") or []
     if not isinstance(raw_slots, (list, tuple)) or any(not isinstance(s, dict) for s in raw_slots):
         return BlueprintPreflightResult(
             ok=False,
@@ -658,7 +660,8 @@ def compile_and_preflight_blueprint(
             assumptions_ledger=assumptions_ledger,
         )
 
-    # Normalize pack syntax (math.exp -> exp, ^ -> **, lower/upper -> [lo, hi], etc.).
+    # Pre-pass: run the deterministic token-level expression front end on obligations,
+    # equations, derived_expressions, and environmental_assumptions BEFORE the first _parse.
     raw_domain = pack.get("domain", {})
     if not isinstance(raw_domain, dict):
         return BlueprintPreflightResult(
@@ -672,6 +675,121 @@ def compile_and_preflight_blueprint(
             compiled_ihcg_pack=pack,
             assumptions_ledger=assumptions_ledger,
         )
+
+    slot_dims_map = {s["symbol"]: s.get("si_dim") for s in slots if isinstance(s, dict) and "symbol" in s}
+    all_declared = declared_slots | set(constants.keys()) | set(derived_exprs.keys())
+    q_mode = evidence.get("quantifier_mode")
+    # Build numeric domain preview for binder subset checks
+    domain_preview: Dict[str, Tuple[float, float]] = {}
+    for k, v in raw_domain.items():
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            try:
+                domain_preview[k] = (float(v[0]), float(v[1]))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(v, dict):
+            lo_k = "lower" if "lower" in v else ("min" if "min" in v else None)
+            hi_k = "upper" if "upper" in v else ("max" if "max" in v else None)
+            if lo_k and hi_k:
+                try:
+                    domain_preview[k] = (float(v[lo_k]), float(v[hi_k]))
+                except (TypeError, ValueError):
+                    pass
+    for sym, bnd in slot_bounds.items():
+        domain_preview.setdefault(sym, (float(bnd[0]), float(bnd[1])))
+
+    def _fe_record_transform(path: str, original_expr: str, transforms: Tuple[str, ...]) -> None:
+        if not transforms:
+            return
+        ex = pack.setdefault("execution", {})
+        if isinstance(ex, dict):
+            hist = ex.setdefault("normalization_source", {})
+            if isinstance(hist, dict):
+                hist.setdefault(path, original_expr)
+                tmap = hist.setdefault("expr_frontend_transforms", {})
+                if isinstance(tmap, dict):
+                    tmap[path] = list(transforms)
+
+    fe_diags: List[BlueprintDiagnostic] = []
+    fe_binder_assumptions: List[str] = []
+
+    # Normalize derived_expressions via front end (non-blocking here so unreferenced
+    # blueprint helpers never block compilation; referenced ones are checked in _resolve_derived_topological).
+    derived_fe_errors: Dict[str, List[BlueprintDiagnostic]] = {}
+    for d_sym, d_spec in derived_exprs.items():
+        if isinstance(d_spec, dict) and isinstance(d_spec.get("expression"), str):
+            res = _fe_normalize(
+                d_spec["expression"],
+                declared_symbols=all_declared,
+                domain=domain_preview,
+                si_dims=slot_dims_map,
+                quantifier_mode=q_mode,
+            )
+            if res.ok and res.canonical is not None:
+                if res.canonical != d_spec["expression"] or res.transforms:
+                    _fe_record_transform(f"derived_expressions.{d_sym}.expression", d_spec["expression"], res.transforms)
+                    d_spec["expression"] = res.canonical
+            else:
+                derived_fe_errors[d_sym] = [
+                    BlueprintDiagnostic(
+                        code=ed.code,
+                        field=f"derived_expressions.{d_sym}.expression",
+                        symbol=d_sym,
+                        message=ed.message,
+                        original=ed.original,
+                        column=ed.column,
+                        offending_token=ed.offending_token,
+                        hint=ed.hint,
+                        suggested_fix=ed.hint,
+                    )
+                    for ed in res.diagnostics
+                ]
+
+    # Normalize obligations via front end (surfaces rich ExprDiagnostics on failure)
+    for ob_idx, ob in enumerate(evidence.get("obligations") or []):
+        if isinstance(ob, dict) and isinstance(ob.get("expression"), str):
+            res = _fe_normalize(
+                ob["expression"],
+                declared_symbols=all_declared,
+                domain=domain_preview,
+                si_dims=slot_dims_map,
+                quantifier_mode=q_mode,
+            )
+            if res.ok and res.canonical is not None:
+                if res.canonical != ob["expression"] or res.transforms:
+                    _fe_record_transform(f"evidence.obligations[{ob_idx}].expression", ob["expression"], res.transforms)
+                    ob["expression"] = res.canonical
+                fe_binder_assumptions.extend(res.binder_assumptions)
+            else:
+                for ed in res.diagnostics:
+                    fe_diags.append(BlueprintDiagnostic(
+                        code=ed.code,
+                        field=f"obligations[{ob_idx}].expression",
+                        message=ed.message,
+                        original=ed.original,
+                        column=ed.column,
+                        offending_token=ed.offending_token,
+                        hint=ed.hint,
+                        suggested_fix=ed.hint,
+                    ))
+
+    if fe_binder_assumptions:
+        env_list = list(evidence.get("environmental_assumptions") or [])
+        for ba in fe_binder_assumptions:
+            if ba not in env_list:
+                env_list.append(ba)
+        evidence["environmental_assumptions"] = env_list
+
+    if fe_diags:
+        return BlueprintPreflightResult(
+            ok=False,
+            diagnostics=fe_diags,
+            compiled_blueprint=bp,
+            compiled_ihcg_pack=pack,
+            assumptions_ledger=assumptions_ledger,
+        )
+
+    # Normalize pack syntax (equations assignment splitting, domain objects, etc.).
     pack["domain"] = {}
     try:
         pack = normalize_ihcg_evidence(pack)
@@ -772,7 +890,12 @@ def compile_and_preflight_blueprint(
             pass
 
     # Topologically expand referenced pure derived_expressions and inline them into equations, obligations, and assumptions.
-    expanded_derived, derived_diags = _resolve_derived_topological(needed_derived)
+    for sym in sorted(needed_derived):
+        if sym in derived_fe_errors:
+            diagnostics.extend(derived_fe_errors[sym])
+    expanded_derived, derived_diags = _resolve_derived_topological(
+        {k: v for k, v in needed_derived.items() if k not in derived_fe_errors}
+    )
     diagnostics.extend(derived_diags)
     if diagnostics:
         return BlueprintPreflightResult(

@@ -122,7 +122,7 @@ CASES = list(saved_evidence_cases())
 
 @pytest.mark.parametrize('run,name,index,prompt,blueprint,pack',CASES,ids=[f'run{item[0]}-{item[1]}-{item[2]}' for item in CASES])
 def test_every_saved_evidence_reply_keeps_its_remaining_soundness_failure(run,name,index,prompt,blueprint,pack):
-    sealed = (run == 3 and (name != 'seir' or index == 1)) or (run == 4 and (name in {'shbt', 'carnot'} or (name == 'seir' and index == 3)))
+    sealed = (run == 3) or (run == 4 and (name in {'shbt', 'carnot'} or (name == 'seir' and index == 3)))
     structural = {
         (2,'carnot'): 'missing typed slots', (2,'shbt'): 'missing si_dim' if index == 0 else 'mechanism_parameters',
         (2,'seir'): 'ambiguous or conflicting output', (3,'seir'): 'obligations[1]',

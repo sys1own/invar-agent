@@ -195,7 +195,7 @@ def test_all_saved_raw_replies_normalize_or_fail_precisely(run,name,index,prompt
     raw = _extract_json(response)['blueprint']; before = copy.deepcopy(raw)
     expected = {(2,'seir'):r'ihcg_evidence.evidence.', (2,'carnot'):'missing typed slots',
         (2,'shbt'):'missing si_dim' if index == 0 else 'mechanism_parameters',
-        (3,'seir'):'obligations' if index == 0 else "redundant_conjuncts=\\('4', '5'\\)",
+        (3,'seir'):'sealed symbolic binding' if index == 0 else "redundant_conjuncts=\\('4', '5'\\)",
         (3,'carnot'):'sealed symbolic binding', (3,'shbt'):'redundant_conjuncts='}
     with pytest.raises(ValueError,match=expected[run,name]): _parse_planned_blueprint(raw,prompt,require_evidence=True)
     assert raw == before
