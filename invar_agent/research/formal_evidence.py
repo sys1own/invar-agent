@@ -12,6 +12,7 @@ import copy
 import re
 
 from . import meaningfulness as m
+from .expr_frontend import normalize_expression as _fe_normalize
 
 
 def _quote_tokens(text):
@@ -85,38 +86,47 @@ def attach_formal_evidence(blueprint):
         label, formula = match[1].lower(), match[2].strip().rstrip(".")
         if label in {"claim", "hypothesis"}:
             start = match.start(2) + len(match[2]) - len(match[2].lstrip())
-            claims.append(dict(id=f"h{len(claims)}", expression=formula, obligation_class="HYPOTHESIS_TARGET",
+            fe = _fe_normalize(formula, declared_symbols=bounds.keys(), domain=bounds)
+            expr_out = fe.canonical if fe.ok and fe.canonical is not None else formula
+            claims.append(dict(id=f"h{len(claims)}", expression=expr_out, obligation_class="HYPOTHESIS_TARGET",
                 prompt_quote=prompt[start:start + len(formula)], prompt_span=[start, start + len(formula)]))
         elif label == "assume":
-            assumptions.append(formula)
+            fe = _fe_normalize(formula, declared_symbols=bounds.keys(), domain=bounds)
+            assumptions.append(fe.canonical if fe.ok and fe.canonical is not None else formula)
         else:
             item = re.fullmatch(r"(?:d([A-Za-z_]\w*)/dt|([A-Za-z_]\w*))\s*=\s*([^=].*)", formula)
             if item is None:
                 return blueprint
             state, name, rhs = item.groups()
+            fe = _fe_normalize(rhs, declared_symbols=bounds.keys(), domain=bounds)
+            rhs_out = fe.canonical if fe.ok and fe.canonical is not None else rhs
             key = f"d_{state}_dt" if state else name
-            equations[key] = dict(expression=rhs, si_dim=[0] * 7, **(dict(kind="ODE_RHS", state_symbol=state) if state else {}))
+            equations[key] = dict(expression=rhs_out, si_dim=[0] * 7, **(dict(kind="ODE_RHS", state_symbol=state) if state else {}))
     if not claims:
         formula = blueprint.falsifiable_hypothesis.strip()
         start = prompt.find(formula)
         if start >= 0:
+            fe = _fe_normalize(formula, declared_symbols=bounds.keys(), domain=bounds)
+            cand = fe.canonical if fe.ok and fe.canonical is not None else formula
             try:
-                node = m._parse(formula)
+                node = m._parse(cand)
             except (ValueError, SyntaxError):
                 node = None
             if isinstance(node, (ast.Compare, ast.BoolOp)):
-                claims.append(dict(id="h0", expression=formula, obligation_class="HYPOTHESIS_TARGET",
+                claims.append(dict(id="h0", expression=cand, obligation_class="HYPOTHESIS_TARGET",
                     prompt_quote=formula, prompt_span=[start, start + len(formula)]))
     if not claims or not bounds:
         return blueprint
     for match in re.finditer(r"(?m)^\s*([A-Za-z_]\w*)\s*=(?!=)\s*([^\n]+)$", prompt):
         name, rhs = match[1], match[2].strip()
         if name not in equations:
+            fe = _fe_normalize(rhs, declared_symbols=bounds.keys(), domain=bounds)
+            rhs_out = fe.canonical if fe.ok and fe.canonical is not None else rhs
             try:
-                m._parse(rhs)
+                m._parse(rhs_out)
             except (ValueError, SyntaxError):
                 return blueprint
-            equations[name] = dict(expression=rhs, si_dim=[0] * 7)
+            equations[name] = dict(expression=rhs_out, si_dim=[0] * 7)
     if not claims or not equations or not bounds:
         return blueprint
     dimensions = {name: [int(v) for v in match[2].split(",")] for match in re.finditer(

@@ -105,7 +105,7 @@ class FeasibilityAssessment(BaseModel):
     rationale: str
     violated_boundary: Optional[str] = None
     reformulation: Optional[str] = None
-    assessed_by: Literal["heuristic", "llm"] = "heuristic"
+    assessed_by: Literal["heuristic", "heuristic_offline", "llm"] = "heuristic_offline"
 
     @field_validator("verdict", mode="before")
     @classmethod
@@ -150,6 +150,7 @@ AssumptionKind = Literal[
     "INITIAL_CONDITION",
     "HYPOTHESIS_FORMALIZATION",
     "NULL_BASELINE",
+    "NOTE",
 ]
 
 AssumptionSource = Literal[
@@ -168,6 +169,7 @@ _VALID_ASSUMPTION_KINDS = {
     "INITIAL_CONDITION",
     "HYPOTHESIS_FORMALIZATION",
     "NULL_BASELINE",
+    "NOTE",
 }
 _VALID_ASSUMPTION_SOURCES = {
     "USER_PROMPT",

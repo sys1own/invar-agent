@@ -57,7 +57,7 @@ async def test_raw_validation_failures_repair_once_then_persist(replies,scenario
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
     assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
     diagnostic = json.loads((directory/'metadata.json').read_text())['planning_error']
-    assert ('UNRESOLVED_SYMBOL' if scenario == 'carnot' else 'INVALID_EXPRESSION') in diagnostic or ('missing typed slots' if scenario == 'carnot' else 'mechanism_parameters') in diagnostic
+    assert ('UNRESOLVED_SYMBOL' if scenario in {'carnot', 'shbt'} else 'INVALID_EXPRESSION') in diagnostic or ('missing typed slots' if scenario == 'carnot' else 'mechanism_parameters') in diagnostic
     assert any(e.get('event') == 'research_completed' for e in events)
     tampered = result.meaningfulness_certificate.model_dump(mode='json')
     tampered['failure_reason'] = 'changed'

@@ -13,47 +13,40 @@ _MATH_PREFIX = re.compile(r"\bmath\.(log|exp|sqrt|sin|cos|fabs)\s*\(")
 _LN_CALL = re.compile(r"\bln\s*\(")
 
 
-def _normalize_formal_expr(expr: str) -> str:
-    """Lossless mathematical syntax normalization (math.* prefix, ln -> log, ^ -> **, variadic min/max -> binary)."""
+from .expr_frontend import normalize_expression as _fe_normalize
+
+
+def _normalize_formal_expr_detailed(
+    expr: str,
+    *,
+    declared_symbols=(),
+    domain=None,
+    si_dims=None,
+    quantifier_mode=None,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Lossless mathematical syntax normalization via the deterministic token-level front end.
+
+    Returns ``(canonical_or_original, transforms, binder_assumptions)``.
+    """
     if not isinstance(expr, str):
-        return expr
-    out = _MATH_PREFIX.sub(lambda m: ("abs(" if m.group(1) == "fabs" else f"{m.group(1)}("), expr)
-    out = _LN_CALL.sub("log(", out)
-    if "^" in out:
-        try:
-            tree = ast.parse(out, mode="eval")
-            if any(isinstance(n, ast.BitXor) for n in ast.walk(tree)):
-                out = out.replace("^", "**")
-        except SyntaxError:
-            pass
-    if "min(" in out or "max(" in out:
-        try:
-            tree = ast.parse(out, mode="eval")
-            changed = False
+        return expr, (), ()
+    res = _fe_normalize(
+        expr,
+        declared_symbols=declared_symbols,
+        domain=domain,
+        si_dims=si_dims,
+        quantifier_mode=quantifier_mode,
+    )
+    if res.ok and res.canonical is not None:
+        canon = res.canonical.replace(" ** ", "**") if res.transforms else res.canonical
+        return canon, res.transforms, res.binder_assumptions
+    return expr, (), ()
 
-            class _FoldMinMax(ast.NodeTransformer):
-                def visit_Call(self, node):
-                    nonlocal changed
-                    self.generic_visit(node)
-                    if (
-                        isinstance(node.func, ast.Name)
-                        and node.func.id in {"min", "max"}
-                        and not node.keywords
-                        and len(node.args) >= 3
-                    ):
-                        changed = True
-                        acc = node.args[-1]
-                        for arg in reversed(node.args[:-1]):
-                            acc = ast.Call(func=ast.Name(id=node.func.id, ctx=ast.Load()), args=[arg, acc], keywords=[])
-                        return acc
-                    return node
 
-            folded = _FoldMinMax().visit(tree)
-            if changed:
-                out = ast.unparse(ast.fix_missing_locations(folded))
-        except SyntaxError:
-            pass
-    return out
+def _normalize_formal_expr(expr: str) -> str:
+    """Lossless mathematical syntax normalization returning canonical expression string."""
+    canon, _, _ = _normalize_formal_expr_detailed(expr)
+    return canon
 
 
 def normalize_ihcg_evidence(raw):
@@ -80,26 +73,56 @@ def normalize_ihcg_evidence(raw):
     if isinstance(slots, list):
         for i, slot in enumerate(slots):
             if isinstance(slot, dict): presentation(slot, f'evidence.slots[{i}]')
+    dimensions = {s.get('symbol'): s.get('si_dim') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
+    roles = {s.get('symbol'): s.get('role') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
+    declared_symbols = set(dimensions.keys())
+    raw_domain = pack.get('domain') if isinstance(pack.get('domain'), dict) else {}
+    q_mode = evidence.get('quantifier_mode')
+    frontend_transforms = {}
+    extra_binder_assumptions = []
+
+    def _record_fe(path, original, transforms):
+        remember(path, original)
+        if transforms:
+            frontend_transforms[path] = list(transforms)
+
     obligations = evidence.get('obligations', [])
     if isinstance(obligations, list):
         for i, obligation in enumerate(obligations):
             if isinstance(obligation, dict):
                 presentation(obligation, f'evidence.obligations[{i}]')
                 if isinstance(obligation.get('expression'), str):
-                    norm_expr = _normalize_formal_expr(obligation['expression'])
-                    if norm_expr != obligation['expression']:
-                        remember(f'evidence.obligations[{i}].expression', obligation['expression'])
+                    norm_expr, transforms, binder_assumps = _normalize_formal_expr_detailed(
+                        obligation['expression'],
+                        declared_symbols=declared_symbols,
+                        domain=raw_domain,
+                        si_dims=dimensions,
+                        quantifier_mode=q_mode,
+                    )
+                    if norm_expr != obligation['expression'] or transforms:
+                        _record_fe(f'evidence.obligations[{i}].expression', obligation['expression'], transforms)
                         obligation['expression'] = norm_expr
+                    extra_binder_assumptions.extend(binder_assumps)
     environment = evidence.get('environmental_assumptions', [])
     if isinstance(environment, list):
         for i, expr in enumerate(environment):
             if isinstance(expr, str):
-                norm_expr = _normalize_formal_expr(expr)
-                if norm_expr != expr:
-                    remember(f'evidence.environmental_assumptions[{i}]', expr)
+                norm_expr, transforms, binder_assumps = _normalize_formal_expr_detailed(
+                    expr,
+                    declared_symbols=declared_symbols,
+                    domain=raw_domain,
+                    si_dims=dimensions,
+                    quantifier_mode=q_mode,
+                )
+                if norm_expr != expr or transforms:
+                    _record_fe(f'evidence.environmental_assumptions[{i}]', expr, transforms)
                     environment[i] = norm_expr
-    dimensions = {s.get('symbol'): s.get('si_dim') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
-    roles = {s.get('symbol'): s.get('role') for s in slots if isinstance(s, dict)} if isinstance(slots, list) else {}
+                extra_binder_assumptions.extend(binder_assumps)
+        for ba in extra_binder_assumptions:
+            if ba not in environment:
+                environment.append(ba)
+    elif extra_binder_assumptions:
+        evidence['environmental_assumptions'] = list(dict.fromkeys(extra_binder_assumptions))
     domain = pack.get('domain')
     if isinstance(domain, dict):
         for name, bounds in list(domain.items()):
@@ -129,12 +152,6 @@ def normalize_ihcg_evidence(raw):
             kind = equation.get('kind')
             if isinstance(kind, str) and kind in EQUATION_KIND_ALIASES: equation['kind'] = EQUATION_KIND_ALIASES[kind]
             expression = equation.get('expression')
-            if isinstance(expression, str):
-                norm_expr = _normalize_formal_expr(expression)
-                if norm_expr != expression:
-                    remember(path + '.expression', expression)
-                    expression = norm_expr
-                    equation['expression'] = expression
             match = _ASSIGNMENT.fullmatch(expression) if isinstance(expression, str) else None
             target = key
             dims = dimensions.get(key)
@@ -152,8 +169,28 @@ def normalize_ihcg_evidence(raw):
                     if lhs not in dimensions or (key in dimensions and key != lhs) or equation.get('kind', 'ALGEBRAIC') != 'ALGEBRAIC':
                         raise ValueError(path+': assignment has an ambiguous or conflicting output symbol')
                     target, dims = lhs, dimensions[lhs]
-                equation['expression'] = rhs
+                norm_rhs, transforms, _ = _normalize_formal_expr_detailed(
+                    rhs,
+                    declared_symbols=declared_symbols,
+                    domain=raw_domain,
+                    si_dims=dimensions,
+                    quantifier_mode=q_mode,
+                )
+                if transforms:
+                    frontend_transforms[path + '.expression'] = list(transforms)
+                equation['expression'] = norm_rhs
             elif isinstance(expression, str):
+                norm_expr, transforms, _ = _normalize_formal_expr_detailed(
+                    expression,
+                    declared_symbols=declared_symbols,
+                    domain=raw_domain,
+                    si_dims=dimensions,
+                    quantifier_mode=q_mode,
+                )
+                if norm_expr != expression or transforms:
+                    _record_fe(path + '.expression', expression, transforms)
+                    expression = norm_expr
+                    equation['expression'] = expression
                 try: boolean = isinstance(ast.parse(expression, mode='eval').body, (ast.Compare, ast.BoolOp))
                 except SyntaxError: boolean = False
                 if boolean: dims = [0]*7
@@ -173,7 +210,7 @@ def normalize_ihcg_evidence(raw):
             normalized[target] = equation
             if target != key or equation != raw_equation: remember(path, raw_equation)
         evidence['equations'] = normalized
-    if source:
+    if source or frontend_transforms:
         execution = pack.setdefault('execution', {})
         if not isinstance(execution, dict): raise ValueError('ihcg_evidence.execution: expected an object')
         history = execution.setdefault('normalization_source', {})
@@ -181,4 +218,8 @@ def normalize_ihcg_evidence(raw):
         for path, value in source.items():
             if path in history and history[path] != value: raise ValueError('normalization source collision: '+path)
             history[path] = value
+        if frontend_transforms:
+            existing_tf = history.setdefault('expr_frontend_transforms', {})
+            if isinstance(existing_tf, dict):
+                existing_tf.update(frontend_transforms)
     return pack

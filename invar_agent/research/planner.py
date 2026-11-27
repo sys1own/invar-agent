@@ -2761,6 +2761,7 @@ async def generate_plan_with_feasibility(question: str,
     from ..llm.telemetry import llm_call_context
     from .feasibility import (
         _heuristic_verdict,
+        format_advisory_hint,
         is_computational_dynamical_benchmark,
         override_refusal_for_computational_benchmark,
     )
@@ -2769,14 +2770,12 @@ async def generate_plan_with_feasibility(question: str,
     await _emit_plan_progress(
         progress_cb,
         "feasibility_precheck",
-        f"Heuristic feasibility pre-check: verdict={heuristic.verdict}",
+        f"Heuristic feasibility pre-check (advisory when LLM configured): verdict={heuristic.verdict}",
         verdict=str(heuristic.verdict),
     )
-    bypass = assume_feasible and llm_complete is not None
-    if heuristic.verdict.startswith("REFUSED") and not bypass:
-        # Fast path: clear-cut refusals never reach the LLM.
-        return {"feasibility": heuristic, "blueprint": None, "source": "heuristic"}
     if llm_complete is None:
+        if heuristic.verdict.startswith("REFUSED") and not assume_feasible:
+            return {"feasibility": heuristic, "blueprint": None, "source": "heuristic_offline"}
         if fallback:
             return {"feasibility": heuristic,
                     "blueprint": dict(_FALLBACK_BLUEPRINT), "source": "fallback"}
@@ -2795,17 +2794,19 @@ async def generate_plan_with_feasibility(question: str,
                    literature=compacted_lit,
                    question=question)
     prompt += _evidence_prompt_block(evidence)
+    if not assume_feasible:
+        advisory = format_advisory_hint(heuristic)
+        if advisory:
+            prompt += advisory
     from .shbt_federation import resolve_shbt_solvability
     shbt_res = resolve_shbt_solvability(question)
     if shbt_res.should_activate and shbt_res.evidence_markdown:
         prompt += (
             "\n\n"
             + shbt_res.evidence_markdown
-            + "\n\nAUTHORITATIVE SHBT SOLVABILITY DIRECTIVE: This frontier physics "
-            "problem is SOLVABLE in open-boundary physics via the SHBT Frontier Knowledge "
-            "Federation (`verdict`: `OPTIMAL_DIRECT`). Do NOT output `REFUSED_IMPOSSIBLE` "
-            "and NEVER set `blueprint` to null; you MUST emit both `feasibility` and the "
-            "complete `blueprint` JSON object using the verified SHBT equations and SI constants above."
+            + "\n\nADVISORY SHBT REGISTRY CONTEXT (non-binding hint; you are the interpreter): "
+            "The SHBT Frontier Knowledge Federation matched domain keywords and provides the open-boundary "
+            "equations and SI constants above if applicable to the user's request."
         )
     if extra_context:
         prompt += "\n\n" + extra_context
@@ -3018,18 +3019,22 @@ async def generate_expert_research_prompt(question: str,
     from ..llm.telemetry import llm_call_context
     from .feasibility import (
         _heuristic_verdict,
+        format_advisory_hint,
         is_computational_dynamical_benchmark,
         override_refusal_for_computational_benchmark,
     )
 
     heuristic = _heuristic_verdict(question)
-    if heuristic.verdict.startswith("REFUSED"):
-        return {"feasibility": heuristic, "expert_prompt": "", "source": "heuristic"}
     if llm_complete is None:
+        if heuristic.verdict.startswith("REFUSED"):
+            return {"feasibility": heuristic, "expert_prompt": "", "source": "heuristic_offline"}
         raise RuntimeError("expert prompt synthesis failed: no LLM planner configured")
     prompt = _fill(EXPERT_PROMPT_PLANNER_PROMPT, tools="",
                    literature=compact_literature_digest(literature or [], question=question),
                    question=question)
+    advisory = format_advisory_hint(heuristic)
+    if advisory:
+        prompt += advisory
     if extra_context:
         prompt += "\n\n" + extra_context
     with llm_call_context("expert_prompt_planning", attempt=1):

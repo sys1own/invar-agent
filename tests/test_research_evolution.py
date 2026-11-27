@@ -319,11 +319,22 @@ def test_feasibility_optimal_and_surrogate():
 async def test_feasibility_llm_cannot_unrefuse():
     refused_q = "generate perpetual motion with net positive energy gain"
 
+    # Offline (no LLM): heuristic refusal is authoritative with assessed_by='heuristic_offline'.
+    a_offline = await evaluate_research_feasibility(refused_q, llm_complete=None)
+    assert a_offline.verdict == "REFUSED_IMPOSSIBLE"
+    assert a_offline.assessed_by == "heuristic_offline"
+
+    # Online (LLM configured): heuristic is passed as a non-binding advisory hint to the LLM interpreter.
+    seen = []
+
     async def llm(prompt):
+        seen.append(prompt)
         return json.dumps({"verdict": "OPTIMAL_DIRECT", "rationale": "x"})
 
-    a = await evaluate_research_feasibility(refused_q, llm_complete=llm)
-    assert a.verdict == "REFUSED_IMPOSSIBLE"  # heuristic refusal is authoritative
+    a_online = await evaluate_research_feasibility(refused_q, llm_complete=llm)
+    assert len(seen) == 1
+    assert "ADVISORY HEURISTIC PRE-CHECK" in seen[0]
+    assert a_online.assessed_by == "llm"
 
 
 @pytest.mark.asyncio

@@ -1252,11 +1252,22 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
 
         Never returns the canned kdv_soliton_scaling stub when an LLM provider
         is configured: with a key, ``fallback=False`` and synthesis errors
-        surface as HTTP 502. The stub is restricted to explicit offline
+        surface structured diagnostics. The stub is restricted to explicit offline
         (no-key) mode.
         """
+        import uuid as _uuid
+        from invar_agent.research.formalization import (
+            FormalizationError,
+            _FORMALIZATION_ATTEMPT_SINK,
+            persist_formalization_diagnostics,
+        )
+
         manager = state.ensure_research_manager()
         has_llm = bool(state.api_key)
+        diag_run_uid = f"plan-{_uuid.uuid4().hex[:12]}"
+        attempt_sink: list[dict[str, Any]] = []
+        sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
+        diag_dir: Optional[Path] = None
         try:
             outcome = await generate_plan_with_feasibility(
                 req.question,
@@ -1266,10 +1277,74 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 extra_context=_research_vault_context(req.question, req.attached_research_ids),
                 progress_cb=manager._progress,
             )
+        except (FormalizationError, ValueError) as exc:
+            from invar_agent.research.epistemic import incomplete_certificate
+            from invar_agent.research.vault import ResearchVaultManager
+
+            if isinstance(exc, FormalizationError):
+                attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                diag_dir = persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempts_to_save,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
+                detail = exc.structured_detail(
+                    run_uid=diag_run_uid,
+                    diagnostics_dir=str(diag_dir) if diag_dir else None,
+                )
+            else:
+                detail = {
+                    "code": "PLANNING_VALIDATION_FAILED",
+                    "message": str(exc),
+                    "error_type": type(exc).__name__,
+                    "run_uid": diag_run_uid,
+                    "attempts": [],
+                    "per_field_diagnostics": [],
+                }
+            certificate = incomplete_certificate(
+                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+            )
+            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            (vault_dir / "meaningfulness_certificate.json").write_text(
+                certificate.model_dump_json(indent=2), encoding="utf-8"
+            )
+            (vault_dir / "report.md").write_text(
+                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                encoding="utf-8",
+            )
+            (vault_dir / "metadata.json").write_text(
+                json.dumps(dict(
+                    run_id=diag_run_uid,
+                    status="INCONCLUSIVE_UNVERIFIED",
+                    failure_reason="PLANNING_VALIDATION_FAILED",
+                    planning_error=detail["message"],
+                    diagnostics=detail,
+                )),
+                encoding="utf-8",
+            )
+            return {
+                "status": "inconclusive",
+                "code": "PLANNING_VALIDATION_FAILED",
+                "started": False,
+                "blueprint": None,
+                "run_uid": diag_run_uid,
+                "diagnostics": detail,
+            }
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
-                detail=f"research plan synthesis failed: {str(exc)[:300]}")
+                detail=f"research plan synthesis failed: {str(exc)}")
+        finally:
+            _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
+            if attempt_sink and diag_dir is None:
+                persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempt_sink,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
         feasibility = outcome["feasibility"]
         if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "blueprint": None,
@@ -1298,12 +1373,12 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         blueprint JSON. Requires an LLM provider (no offline stub path).
         """
         state.ensure_research_manager()
-        # Clear-cut heuristic refusals are answered without an LLM key.
-        from invar_agent.research.feasibility import _heuristic_verdict
-        heuristic = _heuristic_verdict(req.question)
-        if heuristic.verdict.startswith("REFUSED"):
-            return {"status": "refused", "feasibility": heuristic.model_dump()}
         if not state.api_key:
+            # Offline heuristic refusals apply only when no LLM is configured.
+            from invar_agent.research.feasibility import _heuristic_verdict
+            heuristic = _heuristic_verdict(req.question)
+            if heuristic.verdict.startswith("REFUSED"):
+                return {"status": "refused", "feasibility": heuristic.model_dump()}
             raise HTTPException(
                 status_code=400,
                 detail="Plan Mode requires an LLM provider: configure an API key first")
@@ -1315,7 +1390,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
-                detail=f"expert prompt synthesis failed: {str(exc)[:300]}")
+                detail=f"expert prompt synthesis failed: {str(exc)}")
         feasibility = result["feasibility"]
         if str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "feasibility": feasibility.model_dump()}
@@ -1329,6 +1404,13 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         verified loop (single combined Tier-2 call), streaming via
         /api/v1/research/stream.
         """
+        import uuid as _uuid
+        from invar_agent.research.formalization import (
+            FormalizationError,
+            _FORMALIZATION_ATTEMPT_SINK,
+            persist_formalization_diagnostics,
+        )
+
         manager = state.ensure_research_manager()
         has_llm = bool(state.api_key)
         prior_verdict = str((req.prior_feasibility or {}).get("verdict") or "")
@@ -1339,6 +1421,10 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             _research_vault_context(req.question, req.attached_research_ids)
             if req.attached_research_ids else ""
         )
+        diag_run_uid = f"run-{_uuid.uuid4().hex[:12]}"
+        attempt_sink: list[dict[str, Any]] = []
+        sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
+        diag_dir: Optional[Path] = None
         try:
             outcome = await generate_plan_with_feasibility(
                 req.question,
@@ -1349,10 +1435,74 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 extra_context=direct_ctx,
                 progress_cb=manager._progress,
             )
+        except (FormalizationError, ValueError) as exc:
+            from invar_agent.research.epistemic import incomplete_certificate
+            from invar_agent.research.vault import ResearchVaultManager
+
+            if isinstance(exc, FormalizationError):
+                attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                diag_dir = persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempts_to_save,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
+                detail = exc.structured_detail(
+                    run_uid=diag_run_uid,
+                    diagnostics_dir=str(diag_dir) if diag_dir else None,
+                )
+            else:
+                detail = {
+                    "code": "PLANNING_VALIDATION_FAILED",
+                    "message": str(exc),
+                    "error_type": type(exc).__name__,
+                    "run_uid": diag_run_uid,
+                    "attempts": [],
+                    "per_field_diagnostics": [],
+                }
+            certificate = incomplete_certificate(
+                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+            )
+            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            (vault_dir / "meaningfulness_certificate.json").write_text(
+                certificate.model_dump_json(indent=2), encoding="utf-8"
+            )
+            (vault_dir / "report.md").write_text(
+                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                encoding="utf-8",
+            )
+            (vault_dir / "metadata.json").write_text(
+                json.dumps(dict(
+                    run_id=diag_run_uid,
+                    status="INCONCLUSIVE_UNVERIFIED",
+                    failure_reason="PLANNING_VALIDATION_FAILED",
+                    planning_error=detail["message"],
+                    diagnostics=detail,
+                )),
+                encoding="utf-8",
+            )
+            return {
+                "status": "inconclusive",
+                "code": "PLANNING_VALIDATION_FAILED",
+                "started": False,
+                "blueprint": None,
+                "run_uid": diag_run_uid,
+                "diagnostics": detail,
+            }
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
-                detail=f"research plan synthesis failed: {str(exc)[:300]}")
+                detail=f"research plan synthesis failed: {str(exc)}")
+        finally:
+            _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
+            if attempt_sink and diag_dir is None:
+                persist_formalization_diagnostics(
+                    state.workspace_root,
+                    diag_run_uid,
+                    attempt_sink,
+                    extra_secrets=[state.api_key] if state.api_key else (),
+                )
         feasibility = outcome["feasibility"]
         if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
             return {"status": "refused", "started": False, "blueprint": None,
