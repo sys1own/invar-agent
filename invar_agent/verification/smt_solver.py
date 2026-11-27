@@ -38,14 +38,12 @@ class SMTSolverBridge:
 
     def __init__(self, default_timeout_ms: int = 5000) -> None:
         self.default_timeout_ms = default_timeout_ms
-        self._solver = z3.Solver()
         self._declared: dict[str, z3.ExprRef] = {}
 
     # -- environment management -------------------------------------------------
 
     def reset(self) -> None:
-        self._solver = z3.Solver()
-        self._declared = {}
+        self._declared.clear()
 
     def declare(self, name: str, sort: str = "Int") -> z3.ExprRef:
         if name in self._declared:
@@ -97,17 +95,12 @@ class SMTSolverBridge:
 
     # -- solving -----------------------------------------------------------------
 
-    def check_sat(
+    def _check_sat_locked(
         self,
         constraints: list[z3.BoolRef],
         timeout_ms: Optional[int] = None,
         track: Optional[dict[str, z3.ExprRef]] = None,
     ) -> SMTResult:
-        """Check satisfiability of ``constraints`` (conjoined).
-
-        ``track`` optionally maps witness names to expressions to extract from
-        the model when SAT.
-        """
         timeout = timeout_ms if timeout_ms is not None else self.default_timeout_ms
         solver = z3.Solver()
         solver.set("timeout", max(1, int(timeout)))
@@ -134,6 +127,47 @@ class SMTSolverBridge:
             return SMTResult(SMTStatus.TIMEOUT, elapsed_ms=elapsed, diagnostics=["z3 returned unknown (timeout)"])
         return SMTResult(SMTStatus.UNKNOWN, elapsed_ms=elapsed)
 
+    def check_sat(
+        self,
+        constraints: list[z3.BoolRef],
+        timeout_ms: Optional[int] = None,
+        track: Optional[dict[str, z3.ExprRef]] = None,
+    ) -> SMTResult:
+        """Check satisfiability of ``constraints`` (conjoined).
+
+        ``track`` optionally maps witness names to expressions to extract from
+        the model when SAT.
+        """
+        from ..runtime.isolation import run_on_z3_thread
+
+        return run_on_z3_thread(self._check_sat_locked, constraints, timeout_ms, track)
+
+    def _prove_postcondition_locked(
+        self,
+        preconditions: list[str],
+        postconditions: list[str],
+        local_env: Optional[dict[str, Any]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> SMTResult:
+        self.reset()
+        try:
+            pre: list[z3.BoolRef] = []
+            for clause in preconditions:
+                pre.append(self.compile_clause(clause, local_env))
+            # Negate each postcondition and conjoin: violation exists if all hold.
+            violations: list[z3.BoolRef] = []
+            for clause in postconditions:
+                violations.append(z3.Not(self.compile_clause(clause, local_env)))
+            constraints = pre + violations
+            track = dict(self._declared)
+            if local_env:
+                for k, v in local_env.items():
+                    if isinstance(v, z3.ExprRef):
+                        track.setdefault(k, v)
+            return self._check_sat_locked(constraints, timeout_ms=timeout_ms, track=track)
+        finally:
+            self._declared.clear()
+
     def prove_postcondition(
         self,
         preconditions: list[str],
@@ -143,21 +177,15 @@ class SMTSolverBridge:
     ) -> SMTResult:
         """Prove ``preconditions => postconditions`` by checking
         ``preconditions AND NOT(postconditions)`` for unsatisfiability."""
-        self.reset()
-        pre: list[z3.BoolRef] = []
-        for clause in preconditions:
-            pre.append(self.compile_clause(clause, local_env))
-        # Negate each postcondition and conjoin: violation exists if all hold.
-        violations: list[z3.BoolRef] = []
-        for clause in postconditions:
-            violations.append(z3.Not(self.compile_clause(clause, local_env)))
-        constraints = pre + violations
-        track = dict(self._declared)
-        if local_env:
-            for k, v in local_env.items():
-                if isinstance(v, z3.ExprRef):
-                    track.setdefault(k, v)
-        return self.check_sat(constraints, timeout_ms=timeout_ms, track=track)
+        from ..runtime.isolation import run_on_z3_thread
+
+        return run_on_z3_thread(
+            self._prove_postcondition_locked,
+            preconditions,
+            postconditions,
+            local_env,
+            timeout_ms,
+        )
 
 
 def _next_is_expr(tokens: list[str], pos: int) -> bool:

@@ -13,17 +13,43 @@ are required for divergence detection.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import ctypes
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+
+_EXPORTED_SYMBOLS_CACHE_MAX = 512
+_EXPORTED_SYMBOLS_CACHE: "OrderedDict[tuple[str, int, int], tuple[str, ...]]" = OrderedDict()
+_EXPORTED_SYMBOLS_LOCK = threading.Lock()
+
+
+def _direct_python_executable() -> str:
+    """Resolve the direct base CPython executable for stdlib-only C-ABI runner
+    subprocesses, avoiding the Windows .venv redirector double-spawn."""
+    base = getattr(sys, "_base_executable", None)
+    if base and base != sys.executable:
+        base_path = Path(base)
+        if base_path.is_file():
+            try:
+                if Path(sys.base_prefix).resolve() in base_path.resolve().parents:
+                    return str(base_path)
+            except OSError:
+                pass
+    if os.name == "nt":
+        candidate = Path(sys.base_prefix) / "python.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
 
 try:
     import resource
@@ -529,18 +555,46 @@ class DynamicCABIBridge:
                 pass
 
     def exported_symbols(self, so_path: Path) -> List[str]:
-        """List exported function symbols via ``nm -D`` (empty if unavailable)."""
+        """List exported function symbols via ``nm -D`` (empty if unavailable).
+
+        Results are memoized in a bounded thread-safe LRU keyed by
+        ``(os.path.realpath(path), stat.st_size, stat.st_mtime_ns)`` so any
+        modified binary misses immediately while repeated executions of the
+        same compiled library avoid redundant ``nm`` subprocess spawns.
+        """
         nm = shutil.which("nm")
         if nm is None:
             return []
+        cache_key: Optional[tuple[str, int, int]] = None
+        try:
+            real_path = os.path.realpath(str(so_path))
+            st = os.stat(real_path)
+            cache_key = (real_path, st.st_size, st.st_mtime_ns)
+        except OSError:
+            cache_key = None
+
+        if cache_key is not None:
+            with _EXPORTED_SYMBOLS_LOCK:
+                cached = _EXPORTED_SYMBOLS_CACHE.get(cache_key)
+                if cached is not None:
+                    _EXPORTED_SYMBOLS_CACHE.move_to_end(cache_key)
+                    return list(cached)
+
         proc = subprocess.run([nm, "-D", "--defined-only", str(so_path)],
                               capture_output=True, text=True, timeout=30)
-        symbols = []
+        symbols: List[str] = []
         for line in proc.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[1] in ("T", "W"):
                 symbols.append(parts[2])
-        return symbols
+        frozen = tuple(symbols)
+        if cache_key is not None:
+            with _EXPORTED_SYMBOLS_LOCK:
+                _EXPORTED_SYMBOLS_CACHE[cache_key] = frozen
+                _EXPORTED_SYMBOLS_CACHE.move_to_end(cache_key)
+                while len(_EXPORTED_SYMBOLS_CACHE) > _EXPORTED_SYMBOLS_CACHE_MAX:
+                    _EXPORTED_SYMBOLS_CACHE.popitem(last=False)
+        return list(frozen)
 
     @staticmethod
     def resolve_entry(entry: str, kernel_mode: str = RK4_ODE) -> str:
@@ -695,7 +749,7 @@ class DynamicCABIBridge:
             start = time.perf_counter()
             try:
                 proc = subprocess.run(
-                    [sys.executable, str(runner), str(so_path), entry,
+                    [_direct_python_executable(), "-I", str(runner), str(so_path), entry,
                      json.dumps([float(v) for v in initial_state]), str(float(dt)), str(int(steps)), json.dumps(trace_slots)],
                     capture_output=True, text=True, timeout=timeout_seconds + 10,
                     preexec_fn=preexec, cwd=str(run_dir))

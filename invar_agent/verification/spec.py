@@ -69,8 +69,18 @@ class SpecVerifier:
         try:
             if clause.kind == "pre":
                 # Preconditions are assumptions: check they are satisfiable.
-                result = self.bridge.check_sat([self.bridge.compile_clause(clause.expression, local_env)],
-                                               timeout_ms=spec.timeout_ms)
+                from ..runtime.isolation import run_on_z3_thread
+
+                def _check_pre():
+                    try:
+                        return self.bridge.check_sat(
+                            [self.bridge.compile_clause(clause.expression, local_env)],
+                            timeout_ms=spec.timeout_ms,
+                        )
+                    finally:
+                        self.bridge.reset()
+
+                result = run_on_z3_thread(_check_pre)
                 obligation.status = ObligationStatus.PROVEN if result.status == SMTStatus.UNSAT_PROVEN or result.status == SMTStatus.SAT_COUNTEREXAMPLE else ObligationStatus.TIMEOUT
                 obligation.witness = result.witness
             elif clause.kind == "post":

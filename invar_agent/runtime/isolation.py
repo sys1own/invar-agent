@@ -7,6 +7,9 @@ fragile deny-lists with a strict AST allow-list plus OS process/memory/CPU limit
 from __future__ import annotations
 
 import ast
+from collections import deque
+import gc
+import inspect
 import json
 import math
 import os
@@ -16,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, TypeVar
 
@@ -23,17 +27,148 @@ _T = TypeVar("_T")
 
 # Process-wide reentrant lock + dedicated single-thread executor for Z3.
 # On Windows, Z3's global C++ context is thread-affine and crashes with
-# access violations / `b'unreachable'` when touched across multiple OS threads.
+# access violations / `b'unreachable'` / 0xC0000374 heap corruption when
+# Z3 objects are created, used, or finalized across multiple OS threads.
 Z3_GLOBAL_LOCK = threading.RLock()
 _Z3_THREAD_NAME = "invar-z3-worker"
 _Z3_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix=_Z3_THREAD_NAME)
+_Z3_WORKER_TID: Optional[int] = None
+_Z3_CALL_DEPTH = threading.local()
+_Z3_DEFERRED_RELEASES: deque[tuple[Callable[[Any], Any], Any]] = deque()
+_Z3_DEFERRED_COUNT = 0
+_Z3_FINALIZERS_INSTALLED = False
+_Z3_INSTALL_LOCK = threading.Lock()
+_Z3_DRAIN_SCHEDULED = False
+
+
+def get_z3_worker_tid() -> Optional[int]:
+    """Return the OS thread ident of the dedicated Z3 worker, or None if not yet started."""
+    return _Z3_WORKER_TID
+
+
+def is_on_z3_thread() -> bool:
+    """Return True if the caller is currently executing on the dedicated Z3 worker thread."""
+    tid = _Z3_WORKER_TID
+    if tid is not None:
+        return threading.get_ident() == tid
+    return threading.current_thread().name.startswith(_Z3_THREAD_NAME)
+
+
+def get_z3_deferred_release_count() -> int:
+    """Return total count of Z3 finalizers intercepted on foreign threads and deferred."""
+    return _Z3_DEFERRED_COUNT
+
+
+def _drain_z3_deferred_releases() -> int:
+    """Execute any deferred Z3 C-handle releases on the dedicated Z3 worker thread."""
+    global _Z3_DRAIN_SCHEDULED
+    drained = 0
+    while _Z3_DEFERRED_RELEASES:
+        try:
+            orig_del, obj = _Z3_DEFERRED_RELEASES.popleft()
+        except IndexError:
+            break
+        try:
+            orig_del(obj)
+        except Exception:
+            pass
+        drained += 1
+    _Z3_DRAIN_SCHEDULED = False
+    return drained
+
+
+def _install_z3_finalizer_confinement() -> None:
+    """Wrap Z3 wrapper ``__del__`` methods so C-level ``Z3_*_dec_ref`` calls never
+    execute on a foreign thread (e.g. during cyclic GC on MainThread)."""
+    global _Z3_FINALIZERS_INSTALLED
+    if _Z3_FINALIZERS_INSTALLED:
+        return
+    with _Z3_INSTALL_LOCK:
+        if _Z3_FINALIZERS_INSTALLED:
+            return
+        try:
+            import z3  # type: ignore
+        except Exception:
+            _Z3_FINALIZERS_INSTALLED = True
+            return
+
+        for _name, cls in inspect.getmembers(z3, inspect.isclass):
+            if "__del__" not in cls.__dict__:
+                continue
+            orig_del = cls.__dict__["__del__"]
+            if getattr(orig_del, "_invar_z3_confined", False):
+                continue
+
+            def _make_confined_del(orig: Callable[[Any], Any]) -> Callable[[Any], None]:
+                def _confined_del(self: Any) -> None:
+                    global _Z3_DEFERRED_COUNT
+                    worker_tid = _Z3_WORKER_TID
+                    if (
+                        worker_tid is None
+                        or threading.get_ident() == worker_tid
+                        or sys.is_finalizing()
+                    ):
+                        orig(self)
+                        return
+                    # Lock-free handoff only: never call _Z3_EXECUTOR.submit()
+                    # from inside __del__, because cyclic GC can trigger while
+                    # ThreadPoolExecutor._shutdown_lock is held on this thread.
+                    _Z3_DEFERRED_COUNT += 1
+                    _Z3_DEFERRED_RELEASES.append((orig, self))
+
+                _confined_del._invar_z3_confined = True  # type: ignore[attr-defined]
+                return _confined_del
+
+            try:
+                setattr(cls, "__del__", _make_confined_del(orig_del))
+            except (TypeError, AttributeError):
+                pass
+        _Z3_FINALIZERS_INSTALLED = True
+
+
+def _clear_exception_frames(exc: BaseException) -> None:
+    """Clear all local variables from exception tracebacks while still on the Z3 thread
+    so no frame holding Z3 objects can cross the thread boundary."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        tb = cur.__traceback__
+        if tb is not None:
+            traceback.clear_frames(tb)
+            cur.__traceback__ = None
+        cur = cur.__cause__ or cur.__context__
+
+
+def _run_confined(fn: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
+    global _Z3_WORKER_TID
+    if _Z3_WORKER_TID is None:
+        _Z3_WORKER_TID = threading.get_ident()
+    _install_z3_finalizer_confinement()
+
+    depth = getattr(_Z3_CALL_DEPTH, "depth", 0)
+    _Z3_CALL_DEPTH.depth = depth + 1
+    if depth == 0:
+        _drain_z3_deferred_releases()
+    try:
+        return fn(*args, **kwargs)
+    except BaseException as exc:
+        _clear_exception_frames(exc)
+        raise
+    finally:
+        _Z3_CALL_DEPTH.depth = depth
+        if depth == 0:
+            _drain_z3_deferred_releases()
+            if gc.isenabled():
+                gc.collect(0)
+            _drain_z3_deferred_releases()
 
 
 def run_on_z3_thread(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
     """Execute a Z3 computation on the dedicated single-threaded Z3 OS worker."""
-    if threading.current_thread().name.startswith(_Z3_THREAD_NAME):
-        return fn(*args, **kwargs)
-    return _Z3_EXECUTOR.submit(fn, *args, **kwargs).result()
+    if is_on_z3_thread():
+        return _run_confined(fn, args, kwargs)
+    return _Z3_EXECUTOR.submit(_run_confined, fn, args, kwargs).result()
 
 
 def _direct_python_executable() -> str:

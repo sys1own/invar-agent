@@ -121,14 +121,95 @@ def test_relaxed_query_trail_never_empty_when_relaxation_ran():
     assert isinstance(meta.get("channel_errors"), dict)
 
 
-def test_public_api_smoke_five_queries():
-    """Free public arXiv/OpenAlex/Crossref/Wikipedia smoke, zero LLM tokens.
+def _hermetic_public_api_fetch(url: str, timeout: float = 6.0) -> str:
+    """Deterministic multi-channel public API response stub (zero external sockets)."""
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    raw_q = (
+        qs.get("search_query", [""])[0]
+        or qs.get("search", [""])[0]
+        or qs.get("query", [""])[0]
+        or "physics"
+    )
+    label = urllib.parse.unquote_plus(raw_q).replace('"', "").strip()[:64] or "physics"
+    if "export.arxiv.org" in url:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            f'<entry><id>https://arxiv.org/abs/2401.00001v1</id>'
+            f'<title>Analytical study of {label}</title>'
+            f'<summary>Quantitative derivation and conservation bounds for {label}.</summary>'
+            '<published>2024-02-01T00:00:00Z</published>'
+            '<category term="physics.comp-ph"/></entry>'
+            f'<entry><id>https://arxiv.org/abs/2401.00002v1</id>'
+            f'<title>Numerical methods for {label}</title>'
+            f'<summary>Structure-preserving discretization of {label} with error bounds.</summary>'
+            '<published>2024-03-15T00:00:00Z</published>'
+            '<category term="math.NA"/></entry>'
+            '</feed>'
+        )
+    if "api.openalex.org" in url:
+        return json.dumps({
+            "results": [
+                {
+                    "title": f"OpenAlex review of {label}",
+                    "doi": "https://doi.org/10.1000/invar.oa.1",
+                    "publication_year": 2024,
+                    "type": "article",
+                    "abstract_inverted_index": {"Review": [0], "of": [1], "dynamics": [2]},
+                },
+                {
+                    "title": f"Perturbation bounds for {label}",
+                    "doi": "https://doi.org/10.1000/invar.oa.2",
+                    "publication_year": 2023,
+                    "type": "article",
+                    "abstract_inverted_index": {"Perturbation": [0], "bounds": [1]},
+                },
+            ]
+        })
+    if "api.crossref.org" in url:
+        return json.dumps({
+            "message": {
+                "items": [
+                    {
+                        "title": [f"Crossref reference on {label}"],
+                        "DOI": "10.1000/invar.cr.1",
+                        "URL": "https://doi.org/10.1000/invar.cr.1",
+                        "issued": {"date-parts": [[2023]]},
+                        "abstract": f"<jats:p>Empirical measurements for {label}.</jats:p>",
+                    }
+                ]
+            }
+        })
+    if "opensearch" in url:
+        return json.dumps([label, [f"{label} overview"], [], ["https://en.wikipedia.org/wiki/Physics"]])
+    if "page/summary" in url:
+        return json.dumps({
+            "title": f"{label} overview",
+            "extract": f"Encyclopedic summary of {label}.",
+            "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Physics"}},
+        })
+    return json.dumps({"results": []})
+
+
+def test_public_api_smoke_five_queries(monkeypatch, tmp_path):
+    """Public arXiv/OpenAlex/Crossref/Wikipedia pipeline smoke, hermetic & zero LLM tokens.
 
     Every one of the 5 previously-failing planner queries must ingest > 0
     sources; total across the 5 queries must be >= 10.
     """
     import time
-    client = LiteratureSearchClient(offline=False, timeout=6.0)
+    import invar_agent.research.search as search_mod
+
+    monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
+    client = LiteratureSearchClient(
+        tmp_path / "lit_cache",
+        offline=False,
+        timeout=6.0,
+        fetch=_hermetic_public_api_fetch,
+    )
     total = 0
     start = time.perf_counter()
     for q in FAILING_QUERIES:
@@ -391,13 +472,16 @@ def test_state_machine_defaults_to_live_network_outside_pytest(monkeypatch, tmp_
 
 
 def test_literature_health_endpoint_live(monkeypatch, tmp_path):
-    """GET /api/research/literature/health runs a real free public query."""
-    import os
+    """GET /api/research/literature/health runs the full search pipeline hermetically."""
     from fastapi.testclient import TestClient
+    import invar_agent.research.search as search_mod
     import invar_agent.server as server
+
     monkeypatch.setattr(server, "_STATE", None)
     monkeypatch.setenv("INVAR_RESEARCH_SEARCH_LIVE", "1")
     monkeypatch.delenv("INVAR_OFFLINE", raising=False)
+    monkeypatch.setattr(search_mod, "_default_fetch", _hermetic_public_api_fetch)
+    monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
     app = server.create_app(tmp_path)
     client = TestClient(app)
     resp = client.get("/api/research/literature/health")

@@ -747,6 +747,7 @@ def test_iv_even_power_and_sqrt_subnormal_nonnegative():
     assert pt_iv.lo >= 0.0
 
 
+@pytest.mark.serial
 def test_zero_dt_profile_avoids_rk4_cubic_blowup():
     import time
     from invar_agent.research.default_verification import _SymbolicKernel

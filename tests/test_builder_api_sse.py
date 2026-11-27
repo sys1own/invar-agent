@@ -248,6 +248,7 @@ def test_builder_client_uses_current_server_provider_and_key(builder_client,monk
     assert calls[0]['provider']=='deepseek' and calls[0]['api_key']=='test-only-not-a-secret'
 
 
+@pytest.mark.serial
 def test_builder_stream_returns_immediately_for_pre_completed_build(builder_client, tmp_path):
     """R2-ARCH-003: /api/v1/builder/stream must return in < 2 s for an already-terminal build
     even when the broadcaster has no prior history for that build_id."""

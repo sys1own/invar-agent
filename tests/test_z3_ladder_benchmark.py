@@ -4,6 +4,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import get_args
 
+import pytest
+
 from invar_agent.research.extractor import MACRO_SCIENTIFIC_DOMAINS
 from invar_agent.research.meaningfulness import Archetype, solve_query
 
@@ -116,6 +118,7 @@ PROBLEMS = tuple(Problem(name,domain,PROBLEM_ARCHETYPES[i][j],expression,bounds,
 )
 
 
+@pytest.mark.serial
 def test_scientific_ladder_soundness_and_tier_breakdown():
     assert len(PROBLEMS) == len({p.name for p in PROBLEMS}) == 60
     assert {p.domain for p in PROBLEMS} == set(MACRO_SCIENTIFIC_DOMAINS)

@@ -12,9 +12,12 @@ invar_agent_native = pytest.importorskip("invar_agent._native")
 from invar_agent._native import PyDeterministicHealer
 
 
+@pytest.mark.serial
 def test_tier0_reflex_heals_under_2ms_zero_tokens():
     healer = PyDeterministicHealer()
     source = "def broken(x)\n    return x\n"
+    # Warm up regex/instruction cache before micro-benchmarking sub-2ms latency.
+    healer.match_and_heal("SyntaxError", "expected ':'", source, 1)
     start = time.perf_counter()
     result = healer.match_and_heal("SyntaxError", "expected ':'", source, 1)
     elapsed_ms = (time.perf_counter() - start) * 1000.0

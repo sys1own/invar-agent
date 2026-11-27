@@ -100,33 +100,36 @@ def _equivalent(lhs, rhs, *, dynamic_symbols=()):
                 else: canonical[primitive] = (variable,content)
             lhs,rhs = [sp.expand(value.xreplace(aliases)) for value in reduced]
             if lhs == rhs: return True
-            memo = {}
-            def term(value):
-                if value in memo: return memo[value]
-                if len(memo) > 20000: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_BUDGET")
-                if value.is_Symbol: result = z3.Real(str(value))
-                elif value.is_Number: result = z3.RealVal(str(value))
-                elif value.func == sp.Add: result = z3.Sum(*(term(a) for a in value.args))
-                elif value.func == sp.Mul: result = math.prod(term(a) for a in value.args)
-                elif value.func == sp.Pow and value.args[1].is_Integer and abs(value.args[1]) <= 16:
-                    result = term(value.args[0])**int(value.args[1])
-                elif value.func == sp.Abs and len(value.args) == 1:
-                    inner = term(value.args[0])
-                    result = z3.If(inner >= 0, inner, -inner)
-                elif value.func in (sp.Max, sp.Min) and value.args:
-                    items = [term(a) for a in value.args]
-                    cur = items[0]
-                    for nxt in items[1:]:
-                        cur = z3.If(nxt >= cur if value.func == sp.Max else nxt <= cur, nxt, cur)
-                    result = cur
-                else: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_OPERATOR_UNSUPPORTED")
-                memo[value] = result
-                return result
             from ..runtime.isolation import run_on_z3_thread
             def _z3_check_1():
-                solver = z3.SolverFor("QF_NRA"); solver.set(timeout=500,rlimit=2_000_000)
-                solver.add(term(lhs) != term(rhs))
-                return solver.check() == z3.unsat
+                memo = {}
+                def term(value):
+                    if value in memo: return memo[value]
+                    if len(memo) > 20000: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_BUDGET")
+                    if value.is_Symbol: result = z3.Real(str(value))
+                    elif value.is_Number: result = z3.RealVal(str(value))
+                    elif value.func == sp.Add: result = z3.Sum(*(term(a) for a in value.args))
+                    elif value.func == sp.Mul: result = math.prod(term(a) for a in value.args)
+                    elif value.func == sp.Pow and value.args[1].is_Integer and abs(value.args[1]) <= 16:
+                        result = term(value.args[0])**int(value.args[1])
+                    elif value.func == sp.Abs and len(value.args) == 1:
+                        inner = term(value.args[0])
+                        result = z3.If(inner >= 0, inner, -inner)
+                    elif value.func in (sp.Max, sp.Min) and value.args:
+                        items = [term(a) for a in value.args]
+                        cur = items[0]
+                        for nxt in items[1:]:
+                            cur = z3.If(nxt >= cur if value.func == sp.Max else nxt <= cur, nxt, cur)
+                        result = cur
+                    else: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_OPERATOR_UNSUPPORTED")
+                    memo[value] = result
+                    return result
+                try:
+                    solver = z3.SolverFor("QF_NRA"); solver.set(timeout=500,rlimit=2_000_000)
+                    solver.add(term(lhs) != term(rhs))
+                    return solver.check() == z3.unsat
+                finally:
+                    memo.clear()
             return run_on_z3_thread(_z3_check_1)
     result = json.loads(_native.py_check_algebraic_equivalence(
         m._json(_proof_expression(lhs)), m._json(_proof_expression(rhs)),

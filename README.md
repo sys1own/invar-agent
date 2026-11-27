@@ -295,27 +295,38 @@ uvicorn invar_agent.server:app --host 127.0.0.1 --port 8000
 Configure an existing `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the environment/console. Never commit credentials. Offline verification does not require provider access.
 
 ```bash
-# Native workspace, from repository root
+# Fast two-lane offline suite (cargo test + pytest-xdist parallel lane + serial lane)
+python scripts/run_offline_tests.py                     # defaults to INVAR_TEST_WORKERS=6
+python scripts/run_offline_tests.py --workers 8         # higher concurrency on >16 GB hosts
+python scripts/run_offline_tests.py --pytest-only       # skip cargo test
+
+# Explicit two-lane pytest commands
+pytest -m "not live and not serial" -n auto --maxprocesses=6 --dist loadgroup
+pytest -m "serial and not live" -n 0
+
+# Native workspace, from repository root (cache target/ or use sccache in CI for fast cold builds)
 cargo test
 
-# Offline Python
-pytest -v -m "not live"
+# Serial offline Python (debugging / single-process)
+pytest -v -m "not live" -n 0
 
-# Hermetic environment
+# Hermetic environment (with optional Z3 release-thread confinement probe)
 env -u GEMINI_API_KEY -u OPENROUTER_API_KEY -u OPENAI_API_KEY \
     -u DEEPSEEK_API_KEY -u DEEPSEEK_API \
-    INVAR_OFFLINE=1 INVAR_RESEARCH_SEARCH_LIVE=0 \
-    pytest -v -m "not live"
+    INVAR_OFFLINE=1 INVAR_RESEARCH_SEARCH_LIVE=0 INVAR_Z3_THREAD_PROBE=1 \
+    python scripts/run_offline_tests.py --pytest-only --verify-partition
 
 # TCB checks and current Z3 tier breakdown
-pytest -v -s -m "not live" tests/test_tcb_soundness.py tests/test_z3_ladder_benchmark.py
+pytest -v -s -m "not live" -n 0 tests/test_tcb_soundness.py tests/test_z3_ladder_benchmark.py
 
-# Translation validation
-pytest -v -m "not live" tests/test_uast_differential_lowering.py
+# Translation validation & C-ABI parity
+pytest -v -m "not live" tests/test_uast_differential_lowering.py tests/test_cabi_accel_parity.py
 
 # Opt-in live acceptance, with an existing provider key
 pytest -v -m live
 ```
+
+**Runtime & Test Hardening**: All Z3 solver paths (including `research/smt.py` and `verification/{smt_solver,smt_engine,concolic,spec}.py`) are strictly confined to the dedicated single-thread Z3 worker in `runtime/isolation.py` with traceback frame scrubbing and deferred cross-thread C-handle finalization (`tests/test_z3_thread_confinement.py`). `runtime/cabi_bridge.py` applies two lossless broad-system accelerations: bounded `(realpath, size, mtime_ns)` LRU memoization for `exported_symbols` (`nm -D`) and direct base-interpreter (`-I`) launch for the stdlib-only C-ABI runner subprocess (`tests/test_cabi_accel_parity.py`). `tests/conftest.py` isolates `INVAR_WORKSPACE_DIR`, `INVAR_CONFIG_PATH`, Hypothesis databases, and Rayon/BLAS thread counts per `pytest-xdist` worker.
 
 Offline traps cover weakening/vacuity, frozen/uncoupled dynamics, deductive Carnot refutation, universal/existential numerical refutation and algebraic/unit-rescaled duplicates. Positive controls cover SEIR-V boundaries, structural IV/2SLS versus OLS, SIRS equilibrium and conditional SHBT closure. Pipeline tests exercise persisted receipts, purity, lineage and Builder admission.
 

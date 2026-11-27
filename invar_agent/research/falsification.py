@@ -182,6 +182,10 @@ def _run_mode1_locked(ihcg, locked, mode, fidelity, deadline, run_carcara):
                             model_consistency_status=consistency, solver_calls=calls, external_checker_status=external)
     except _Unresolved as error:
         return _certificate(mode, ihcg, fidelity, str(error), model_consistency_status=consistency, solver_calls=calls, budget_exhausted=str(error) == "BUDGET_EXHAUSTED")
+    finally:
+        formulas.clear()
+        tr.vars.clear()
+        tr.constraints.clear()
 
 
 def _claim_margin(ihcg, *, substitute_model=True):

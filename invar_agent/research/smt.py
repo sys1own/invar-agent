@@ -112,12 +112,10 @@ class _Translator:
         raise ValueError(f"untranslatable formula {ast.unparse(node)!r}")
 
 
-def check_invariants_consistent(assertions: List[str],
-                                timeout_ms: int = 2000) -> SMTReport:
-    """Return whether the conjunction of ``assertions`` is satisfiable."""
-    if not HAVE_Z3:
-        return SMTReport(satisfiable=True, checked=0,
-                         untranslatable=list(assertions), engine="unavailable")
+def _check_invariants_consistent_locked(
+    assertions: List[str],
+    timeout_ms: int = 2000,
+) -> SMTReport:
     tr = _Translator()
     solver = z3.Solver()
     solver.set("timeout", timeout_ms)
@@ -144,3 +142,14 @@ def check_invariants_consistent(assertions: List[str],
                          untranslatable=untranslatable, unsat_core=core)
     # sat or unknown: unknown is treated as "not refuted".
     return SMTReport(satisfiable=True, checked=checked, untranslatable=untranslatable)
+
+
+def check_invariants_consistent(assertions: List[str],
+                                timeout_ms: int = 2000) -> SMTReport:
+    """Return whether the conjunction of ``assertions`` is satisfiable."""
+    if not HAVE_Z3:
+        return SMTReport(satisfiable=True, checked=0,
+                         untranslatable=list(assertions), engine="unavailable")
+    from ..runtime.isolation import run_on_z3_thread
+
+    return run_on_z3_thread(_check_invariants_consistent_locked, assertions, timeout_ms)

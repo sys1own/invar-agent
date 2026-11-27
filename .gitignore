@@ -9,6 +9,7 @@ target/
 *.so
 *.pyd
 .pytest_cache/
+.hypothesis/
 *.egg-info/
 dist/
 build/

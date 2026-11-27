@@ -67,6 +67,7 @@ def test_hin_engine_annihilation_and_fault_slice():
     assert net2.trace_causal_fault_slice(d, 1) == ["C"]
 
 
+@pytest.mark.serial
 def test_deterministic_healer_repairs_three_fault_classes_under_2ms():
     healer = PyDeterministicHealer()
 

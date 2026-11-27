@@ -176,6 +176,23 @@ class ConcolicExecutor:
         seed_values: dict[str, Any],
         max_depth: int = 6,
     ) -> ConcolicReport:
+        from ..runtime.isolation import run_on_z3_thread
+
+        return run_on_z3_thread(
+            self._explore_locked,
+            func,
+            input_names,
+            seed_values,
+            max_depth,
+        )
+
+    def _explore_locked(
+        self,
+        func: Callable[..., Any],
+        input_names: list[str],
+        seed_values: dict[str, Any],
+        max_depth: int = 6,
+    ) -> ConcolicReport:
         report = ConcolicReport()
         input_vars = {name: z3.Int(name) for name in input_names}
         seen: set[tuple] = set()
@@ -194,18 +211,20 @@ class ConcolicExecutor:
                 name: SymbolicShadowValue(inputs.get(name, 0), input_vars.get(name, z3.IntVal(0)), collector, name=name)
                 for name in input_names
             }
-            exc: Optional[BaseException] = None
+            exc_name: Optional[str] = None
+            exc_msg = ""
             try:
                 func(**shadows)
             except Exception as e:  # noqa: BLE001 - concolic harness captures all
-                exc = e
+                exc_name = type(e).__name__
+                exc_msg = str(e)
 
-            if exc is not None:
+            if exc_name is not None:
                 report.findings.append(
                     ConcolicFinding(
                         inputs={k: _concrete(v) for k, v in inputs.items()},
-                        exception=type(exc).__name__,
-                        traceback_tail=str(exc),
+                        exception=exc_name,
+                        traceback_tail=exc_msg,
                         path_conditions=[c.description for c in collector.conditions],
                     )
                 )

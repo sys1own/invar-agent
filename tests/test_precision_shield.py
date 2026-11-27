@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import z3
 
+from invar_agent.runtime.isolation import run_on_z3_thread
 from invar_agent.verification.chiasmus import ChiasmusSymmetryVerifier
 from invar_agent.verification.concolic import ConcolicExecutor
 from invar_agent.verification.holographic import HolographicVerifier
@@ -11,22 +12,26 @@ from invar_agent.verification.smt_solver import SMTStatus, SMTSolverBridge
 
 def test_smt_proves_abs_result_nonnegative():
     bridge = SMTSolverBridge(default_timeout_ms=2000)
-    result = bridge.prove_postcondition(
-        [],
-        ["result >= 0"],
-        local_env={"result": z3.Abs(z3.Int("x"))},
-        timeout_ms=2000,
+    result = run_on_z3_thread(
+        lambda: bridge.prove_postcondition(
+            [],
+            ["result >= 0"],
+            local_env={"result": z3.Abs(z3.Int("x"))},
+            timeout_ms=2000,
+        )
     )
     assert result.status == SMTStatus.UNSAT_PROVEN
 
 
 def test_smt_finds_discount_counterexample_witness():
     bridge = SMTSolverBridge(default_timeout_ms=2000)
-    result = bridge.prove_postcondition(
-        ["discount > price"],
-        ["price - discount >= 0"],
-        local_env={"price": z3.Int("price"), "discount": z3.Int("discount")},
-        timeout_ms=2000,
+    result = run_on_z3_thread(
+        lambda: bridge.prove_postcondition(
+            ["discount > price"],
+            ["price - discount >= 0"],
+            local_env={"price": z3.Int("price"), "discount": z3.Int("discount")},
+            timeout_ms=2000,
+        )
     )
     assert result.status == SMTStatus.SAT_COUNTEREXAMPLE
     witness = result.witness or {}

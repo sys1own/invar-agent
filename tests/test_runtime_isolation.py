@@ -24,6 +24,8 @@ from invar_agent.runtime.isolation import (
 )
 import invar_agent.server as server
 
+pytestmark = pytest.mark.xdist_group("os_rlimit")
+
 
 AST_ESCAPE_CORPUS = [
     ("import_os", "import os\ndef simulation_step(buf, dt):\n    os.system('echo pwn')\n"),

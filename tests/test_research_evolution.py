@@ -260,7 +260,10 @@ def _fake_fetch(url, timeout=8.0):
     raise ConnectionError(url)
 
 
-def test_search_client_live_with_fake_fetch(tmp_path):
+def test_search_client_live_with_fake_fetch(monkeypatch, tmp_path):
+    import invar_agent.research.search as search_mod
+
+    monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
     client = LiteratureSearchClient(tmp_path / "cache", fetch=_fake_fetch)
     results = client.search("KdV soliton", max_results=2)
     sources = {r.source for r in results}
@@ -272,7 +275,10 @@ def test_search_client_live_with_fake_fetch(tmp_path):
     assert [r.title for r in again] == [r.title for r in results]
 
 
-def test_search_client_offline_hermetic(tmp_path):
+def test_search_client_offline_hermetic(monkeypatch, tmp_path):
+    import invar_agent.research.search as search_mod
+
+    monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
     client = LiteratureSearchClient(tmp_path / "cache", offline=True, fetch=_fake_fetch)
     assert client.search("anything") == []
     # Populate cache offline-bytes, then offline reads them back.
@@ -282,11 +288,21 @@ def test_search_client_offline_hermetic(tmp_path):
     assert len(offline.search("q1", max_results=1)) >= 1
 
 
-def test_search_client_network_failure_falls_back(tmp_path):
-    def boom(url):
+def test_search_client_network_failure_falls_back(monkeypatch, tmp_path):
+    import invar_agent.research.search as search_mod
+
+    sleeps: list[float] = []
+    attempts: list[str] = []
+    monkeypatch.setattr(search_mod.time, "sleep", sleeps.append)
+
+    def boom(url, timeout=8.0):
+        attempts.append(url)
         raise TimeoutError(url)
+
     client = LiteratureSearchClient(tmp_path / "cache", fetch=boom)
     assert client.search("offline query", max_results=2) == []
+    assert len(attempts) >= 3
+    assert 1.5 in sleeps and 4.0 in sleeps
 
 
 # -- epistemic gate ------------------------------------------------------------

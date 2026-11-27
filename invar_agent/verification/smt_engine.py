@@ -37,13 +37,18 @@ class SymbolicVerificationEngine:
         witness = None
         # SMT postcondition proof over the declared clause environment.
         if contract.smt_postconditions:
-            local_env = self._env_from_units(code_units)
-            result = self.bridge.prove_postcondition(
-                contract.smt_preconditions,
-                contract.smt_postconditions,
-                local_env=local_env,
-                timeout_ms=contract.smt_timeout_ms,
-            )
+            from ..runtime.isolation import run_on_z3_thread
+
+            def _verify_on_z3():
+                local_env = self._env_from_units(code_units)
+                return self.bridge.prove_postcondition(
+                    contract.smt_preconditions,
+                    contract.smt_postconditions,
+                    local_env=local_env,
+                    timeout_ms=contract.smt_timeout_ms,
+                )
+
+            result = run_on_z3_thread(_verify_on_z3)
             witness = result.witness
             if result.status.value != "UNSAT_PROVEN":
                 diagnostics.append(

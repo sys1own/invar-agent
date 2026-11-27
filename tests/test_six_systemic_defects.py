@@ -751,6 +751,7 @@ def test_validate_variant_schemes_handles_rk4_range_loop_and_list_buffers():
     }
 
 
+@pytest.mark.serial
 def test_nested_nonlinear_rk4_piecewise_exp_completes_under_one_second():
     import time
     from types import SimpleNamespace

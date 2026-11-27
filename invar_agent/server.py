@@ -358,6 +358,10 @@ def get_state(workspace_root: str | Path | None = None, provider: Optional[str] 
     global _STATE
     if _STATE is None:
         _STATE = ServerState(workspace_root, provider_override=provider)
+    elif workspace_root is not None:
+        target = resolve_project_workspace(workspace_root)
+        if target != _STATE.workspace_root:
+            _STATE = ServerState(workspace_root, provider_override=provider)
     return _STATE
 
 

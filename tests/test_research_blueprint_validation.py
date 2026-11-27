@@ -132,6 +132,13 @@ def test_research_run_endpoint_payload_with_oversized_title(client, monkeypatch)
         return json.dumps(payload)
 
     monkeypatch.setattr(server, "_plan_llm_callable", _fake_plan_llm)
+    monkeypatch.setattr(
+        server,
+        "_staged_llm_callable",
+        lambda _state: (lambda *_a, **_kw: _fake_plan_llm(_state, "")),
+    )
+    # Prevent approve() from launching a background thread that contacts the live LLM API.
+    monkeypatch.setattr(state.ensure_research_manager(), "approve", lambda run_uid=None: True)
 
     resp = client.post("/api/v1/research/run", json={
         "question": "quantify Martian entry aerothermodynamics for a 650 kg probe",
