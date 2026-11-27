@@ -375,6 +375,40 @@ class FrozenSymbolTable(BaseModel):
             updated.append(sym.model_copy(update={"slot_index": idx}))
         return self.model_copy(update={"symbols": updated})
 
+    @model_validator(mode="after")
+    def _derive_dimensions_from_units(self) -> "FrozenSymbolTable":
+        """UPG-008: Compute exact SI exponents in [M,L,T,I,Theta,N,J] order from unit_label."""
+        from invar_agent.ir.units import UnitError, parse_unit
+
+        for idx, sym in enumerate(self.symbols):
+            lbl = (sym.dimension.unit_label or "").strip()
+            if not lbl or lbl in {"1", "dimensionless", "unitless"}:
+                continue
+            try:
+                parsed = parse_unit(lbl)
+            except UnitError:
+                # If caller explicitly provided non-zero exponents (legacy fixture), keep them;
+                # otherwise reject unknown unit_label into the Pass-1 repair budget.
+                if any(n != 0 for n, _d in sym.dimension.exponents):
+                    continue
+                raise ValueError(f"UNIT_UNKNOWN: symbols.{sym.name} has unknown unit_label {lbl!r}")
+            computed = [(int(f.numerator), int(f.denominator)) for f in parsed.dim]
+            if list(sym.dimension.exponents) != computed:
+                old_exp = list(sym.dimension.exponents)
+                if any(n != 0 for n, _d in old_exp):
+                    self.assumptions_ledger.append(
+                        AssumptionEntry(
+                            id=f"UNIT_DIM_OVERRIDE_{sym.name}",
+                            statement=f"Computed SI exponents {computed} from unit_label={lbl!r} overriding declared {old_exp}",
+                            source="COMPILER_UNIT_PARSER",
+                            falsifiable_impact="Enforces dimensional consistency from declared unit",
+                        )
+                    )
+                self.symbols[idx] = sym.model_copy(
+                    update={"dimension": SiDimension(exponents=computed, unit_label=lbl)}
+                )
+        return self
+
 
 class RawLetDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")

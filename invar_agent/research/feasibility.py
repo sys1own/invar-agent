@@ -115,75 +115,8 @@ _QUANTITATIVE_HINTS = re.compile(
     r"thermodynamic\w*|kinetic\w*|fluid\w*|acoustic\w*)\b", re.I)
 
 
-def _smt_contradiction_core(question: str) -> Optional[list[str]]:
-    """Detect direct scalar inequality contradictions (e.g. `M > 10` and `M < 5`)
-    and certify emptiness via Z3 SMT Q1 with a minimal UNSAT core."""
-    text = str(question or "")
-    # Extract simple scalar comparisons like "M > 10", "x <= 5.0", "mass >= 10"
-    pat = re.compile(
-        r"\b([A-Za-z][A-Za-z0-9_]{0,24})\s*(<=|>=|<|>|==)\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\b"
-    )
-    grouped: Dict[str, list[tuple[str, float, str]]] = {}
-    for m_obj in pat.finditer(text):
-        sym, op, num_s = m_obj.group(1), m_obj.group(2), m_obj.group(3)
-        if sym.lower() in {"if", "and", "or", "is", "to", "at", "in", "of", "for", "by", "on"}:
-            continue
-        try:
-            val = float(num_s)
-        except ValueError:
-            continue
-        grouped.setdefault(sym, []).append((op, val, f"{sym} {op} {num_s}"))
-    candidates = {sym: clauses for sym, clauses in grouped.items() if len(clauses) >= 2}
-    if not candidates:
-        return None
-    from ..runtime.isolation import run_on_z3_thread
-    import z3
-
-    def _check():
-        for sym, clauses in candidates.items():
-            solver = z3.Solver()
-            solver.set("smt.core.minimize", True)
-            solver.set(timeout=300)
-            var = z3.Real(sym)
-            labels: Dict[str, str] = {}
-            for idx, (op, val, raw) in enumerate(clauses):
-                rv = z3.RealVal(str(val))
-                expr = {
-                    "<": var < rv,
-                    "<=": var <= rv,
-                    ">": var > rv,
-                    ">=": var >= rv,
-                    "==": var == rv,
-                }[op]
-                lbl = z3.Bool(f"$q1_{idx}")
-                labels[str(lbl)] = raw
-                solver.assert_and_track(expr, lbl)
-            if solver.check() == z3.unsat:
-                core = [labels[str(b)] for b in solver.unsat_core() if str(b) in labels]
-                if len(core) >= 2:
-                    return sorted(core)
-        return None
-
-    return run_on_z3_thread(_check)
-
-
 def _heuristic_verdict(question: str) -> FeasibilityAssessment:
     q = question.lower()
-    # ARCH-003 (T-R5): Certify direct scalar contradictions via Z3 SMT Q1 UNSAT core
-    # BEFORE any SHBT or surrogate check.
-    smt_core = _smt_contradiction_core(question)
-    if smt_core:
-        return FeasibilityAssessment(
-            verdict="REFUSED_IMPOSSIBLE",
-            rationale=(
-                f"Direct mathematical contradiction certified by SMT Q1 UNSAT core: "
-                f"{' AND '.join(smt_core)} has an empty feasible set."
-            ),
-            violated_boundary="SMT Q1 UNSAT (contradictory scalar constraints)",
-            reformulation="Remove or reconcile the contradictory inequality bounds so the feasible set is non-empty.",
-            smt_unsat_core=smt_core,
-            assessed_by="heuristic_offline",
-        )
     # Impossible: explicit pattern, or conservation + gain co-occurrence.
     # ARCH-011: Impossibility checks ALWAYS run before SHBT (SHBT NEVER overrides refusals).
     is_comp_bench = bool(_COMPUTATIONAL_BENCHMARK_HINTS.search(q))

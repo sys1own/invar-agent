@@ -33,56 +33,25 @@ def _native():
 
 
 def unit_dimension(unit: str) -> SIDimensionVectorModel:
-    aliases = {"F": "s^4*A^2/(kg*m^2)", "S": "s^3*A^2/(kg*m^2)", "Pa": "kg/(m*s^2)", "J": "kg*m^2/s^2", "W": "kg*m^2/s^3",
-               "T": "kg/(s^2*A)", "Hz": "1/s", "N": "kg*m/s^2", "C": "A*s",
-               "V": "kg*m^2/(s^3*A)", "L": "m^3", "rad": "1", "Morgan": "1",
-               "fraction": "1", "dimensionless": "1", "unitless": "1", "units": "1", "dB": "1", "bit": "1", "bp": "1", "kg/kg": "1"}
-    unit = (unit or "1").strip()
-    # ARCH-009 (BUG-018): Normalize Unicode superscripts and middle-dots in compound units
-    # such as `W/(m²·K)`, `m·s⁻¹`, `J/(kg·K)`, `F/m²`.
-    unit = (
-        unit.replace("·", "*")
-        .replace("⋅", "*")
-        .replace("×", "*")
-        .replace("−", "-")
-        .replace("²", "**2")
-        .replace("³", "**3")
-        .replace("⁻¹", "**-1")
-        .replace("⁻²", "**-2")
-        .replace("⁻³", "**-3")
-    )
-    bases = {name: tuple(int(i == index) for i in range(7))
-             for index, name in enumerate(("m", "kg", "s", "A", "K", "mol", "cd"))}
-    for name, expanded in aliases.items():
-        unit = re.sub(rf"\b{re.escape(name)}\b", f"({expanded})", unit)
+    from invar_agent.ir.units import UnitError, parse_unit, sci_to_builder
 
-    def dimension(node):
-        if isinstance(node, ast.Constant) and node.value == 1:
-            return (0,) * 7
-        if isinstance(node, ast.Name) and node.id in bases:
-            return bases[node.id]
-        if isinstance(node, ast.BinOp):
-            left = dimension(node.left)
-            if isinstance(node.op, ast.Pow):
-                exponent = ast.literal_eval(node.right)
-                if isinstance(exponent, float) and abs(exponent * 2 - round(exponent * 2)) < 1e-9 and abs(exponent) <= 127:
-                    return tuple(int(round(v * exponent)) for v in left)
-                if not isinstance(exponent, int) or abs(exponent) > 127:
-                    raise ValueError("Invalid SI exponent")
-                return tuple(v * exponent for v in left)
-            right = dimension(node.right)
-            sign = -1 if isinstance(node.op, ast.Div) else 1
-            if not isinstance(node.op, (ast.Mult, ast.Div)):
-                raise ValueError("Invalid SI operator")
-            return tuple(a + sign * b for a, b in zip(left, right))
-        raise ValueError("Unknown SI unit")
+    raw = (unit or "1").strip()
+    if raw.lower() in {"fraction", "units", "db", "kg/kg"}:
+        return SIDimensionVectorModel(exponents=(0, 0, 0, 0, 0, 0, 0))
     try:
-        powers = dimension(ast.parse((unit or "1").replace("^", "**"), mode="eval").body)
-        if any(abs(v) > 127 for v in powers):
-            raise ValueError("SI exponent overflow")
-    except (ValueError, SyntaxError, TypeError) as exc:
-        raise FormalGateError("HIN_UNKNOWN_UNIT", unit) from exc
-    return SIDimensionVectorModel(exponents=powers)
+        parsed = parse_unit(raw)
+    except UnitError as exc:
+        raise FormalGateError("HIN_UNKNOWN_UNIT", raw) from exc
+    b_dim = sci_to_builder(parsed.dim)
+    int_powers: list[int] = []
+    for frac in b_dim:
+        if frac.denominator != 1:
+            raise FormalGateError("HIN_FRACTIONAL_DIMENSION", f"Unit {raw!r} has non-integer SI exponent {frac}")
+        val = int(frac.numerator)
+        if abs(val) > 127:
+            raise FormalGateError("HIN_UNKNOWN_UNIT", f"SI exponent overflow in {raw!r}")
+        int_powers.append(val)
+    return SIDimensionVectorModel(exponents=tuple(int_powers))  # type: ignore[arg-type]
 
 
 _RESERVED_KW_MANGLE = {
@@ -344,20 +313,19 @@ def to_csel(expr) -> dict:
             return {"kind": "call", "func": "sqrt", "args": [to_csel(expr.base)]}
         return {"kind": "binary", "op": "^", "left": to_csel(expr.base), "right": to_csel(expr.exp)}
     if isinstance(expr, sp.Piecewise):
-        # For CSEL/HIN lowering, pick the primary non-zero interior branch (last default branch if non-zero,
-        # otherwise the first non-zero branch).
-        for branch_expr, cond in reversed(expr.args):
-            if cond == sp.true and branch_expr != 0:
-                return to_csel(branch_expr)
-        for branch_expr, _cond in expr.args:
-            if branch_expr != 0:
-                return to_csel(branch_expr)
-        return {"kind": "literal", "value": 0.0}
+        raise FormalGateError("CSEL_PIECEWISE_UNSUPPORTED", f"Piecewise expression cannot be silently unwrapped in CSEL: {expr}")
     if expr.func in (sp.Min, sp.Max) and expr.args:
-        for arg in expr.args:
-            if arg != 0:
-                return to_csel(arg)
-        return {"kind": "literal", "value": 0.0}
+        fn_name = "min" if expr.func is sp.Min else "max"
+        items = [to_csel(arg) for arg in expr.args]
+        while len(items) > 1:
+            nxt = []
+            for i in range(0, len(items), 2):
+                if i + 1 < len(items):
+                    nxt.append({"kind": "call", "func": fn_name, "args": [items[i], items[i + 1]]})
+                else:
+                    nxt.append(items[i])
+            items = nxt
+        return items[0]
     names = {
         sp.log: "log", sp.exp: "exp", sp.sin: "sin", sp.cos: "cos", sp.Abs: "abs",
         sp.tan: "tan", sp.asin: "asin", sp.acos: "acos", sp.atan: "atan",
@@ -454,18 +422,33 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
     metadata = vault_metadata or {}
     constants = [normalize_constant(raw, f"constant:{index}") for index, raw in enumerate(raw_constants)]
     equations, flags = [], []
+    from invar_agent.ir.units import UnitError, parse_unit as _parse_si_unit
     for raw in raw_eqs:
-        canonical = clean_math(raw.text)
+        # UPG-006 P1-b: normalize number-adjacent LaTeX scientific notation before classification
+        raw_norm = re.sub(r"(?<=\d)\s*\\(?:times|cdot)\s*10\^\{?\s*([-+]?\d+)\s*\}?", r"e\1", raw.text.strip())
+        canonical = clean_math(raw_norm)
         role = classify_equation(canonical)
-        numeric_text = re.sub(r"\\(?:mathrm|text)\{([^{}]*)\}", r"\1", raw.text.strip().strip("$"))
-        numeric = re.fullmatch(rf"([A-Za-z_]\w*)\s*=\s*({NUMBER})(?:\s+(.+))?", numeric_text)
-        if numeric and role != EquationRole.INITIAL_CONDITION and (numeric[3] is None or not re.search(r"[+*=<>]", numeric[3])):
-            try:
-                constants.append(normalize_constant(RawConstant(symbol=numeric[1], value=numeric[2], unit=numeric[3] or "1", provenance=raw.provenance), f"constant:{len(constants)}"))
+        # Grammar-based constant vs equation classification:
+        # constant iff RHS is NUMBER or NUMBER ws UNIT_EXPR completely consumed by parse_unit
+        # and NOT immediately followed by an explicit operator outside \mathrm{}/\text{}.
+        stripped_raw = raw_norm.strip().strip("$").strip()
+        op_after_num = re.fullmatch(rf"([A-Za-z_]\w*)\s*=\s*({NUMBER})\s*(?:\\(?:cdot|times)|[*+\-/^(]).*", stripped_raw)
+        numeric_text = re.sub(r"\\(?:mathrm|text)\{([^{}]*)\}", r"\1", stripped_raw)
+        numeric = None if op_after_num else re.fullmatch(rf"([A-Za-z_]\w*)\s*=\s*({NUMBER})(?:\s+(.+))?", numeric_text)
+        if numeric and role != EquationRole.INITIAL_CONDITION:
+            unit_cand = (numeric[3] or "").strip()
+            is_valid_const = False
+            if not unit_cand:
+                is_valid_const = True
+            elif not re.search(r"[+*=<>]", unit_cand):
+                try:
+                    _parse_si_unit(unit_cand)
+                    is_valid_const = True
+                except UnitError:
+                    is_valid_const = False
+            if is_valid_const:
+                constants.append(normalize_constant(RawConstant(symbol=numeric[1], value=numeric[2], unit=unit_cand or "1", provenance=raw.provenance), f"constant:{len(constants)}"))
                 continue
-            except FormalGateError:
-                if numeric[3] is not None:
-                    raise
         equations.append(ExtractedEquation(equation_id=f"equation:{len(equations)}", raw_latex=raw.text,
             canonical_latex=canonical, role=role, provenance=raw.provenance))
     defined = {c.symbol for c in constants} | set(metadata.get("state_symbols", []))

@@ -163,6 +163,7 @@ class ServerState:
         self.copilot: Optional[CopilotAgent] = None
         self.research_broadcaster = ResearchEventBroadcaster()
         self.research_manager: Optional[ResearchRunManager] = None
+        self.background_tasks: set[asyncio.Task[Any]] = set()
         self._load_startup_llm_config(provider_override)
 
     # -- LLM configuration ---------------------------------------------------
@@ -996,23 +997,29 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             yield path
 
     def _software_export_zip(root: Path) -> "io.BytesIO":
-        buf = io.BytesIO()
+        import tempfile as _tf
+        from invar_agent.builder.export_utils import ExportBlockedError, write_scanned_zip
+
+        members: dict[str, bytes | Path] = {}
         manifest_files: list[str] = []
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in _iter_software_workspace_files(root):
-                rel = path.relative_to(root).as_posix()
-                manifest_files.append(rel)
-                zf.write(path, rel)
-            manifest = {
-                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "file_count": len(manifest_files),
-                "files": sorted(manifest_files),
-                "research_provenance": _research_provenance(root),
-            }
-            zf.writestr("INVAR_BUILD_MANIFEST.json",
-                        json.dumps(manifest, indent=2, default=str))
-        buf.seek(0)
-        return buf
+        for path in _iter_software_workspace_files(root):
+            rel = path.relative_to(root).as_posix()
+            manifest_files.append(rel)
+            members[rel] = path
+        manifest = {
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "file_count": len(manifest_files),
+            "files": sorted(manifest_files),
+            "research_provenance": _research_provenance(root),
+        }
+        members["INVAR_BUILD_MANIFEST.json"] = json.dumps(manifest, indent=2, default=str).encode("utf-8")
+        with _tf.TemporaryDirectory(prefix="invar_ws_exp_") as td:
+            out_zip = Path(td) / "workspace.zip"
+            try:
+                write_scanned_zip(members, out_zip, workspace_root=root)
+            except ExportBlockedError as exc:
+                raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+            return io.BytesIO(out_zip.read_bytes())
 
     def _research_provenance(root: Path) -> list[str]:
         prov = root / ".invar_research_provenance.json"
@@ -1097,30 +1104,67 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 "files_imported": imported, "file_count": len(imported)}
 
     def _vault_zip_bytes(run_ids: Optional[list[str]] = None) -> "io.BytesIO":
+        import tempfile as _tf
+        from invar_agent.builder.export_utils import ExportBlockedError, write_scanned_zip
         from invar_agent.research.vault import ResearchVaultManager
+
         vault = ResearchVaultManager(state.workspace_root)
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            dirs = []
-            if run_ids:
-                for rid in run_ids:
-                    d = vault.run_dir(rid)
-                    if d.is_dir():
-                        dirs.append(d)
-            else:
-                dirs = sorted((vault.root / d.name for d in vault.root.iterdir()
-                               if d.is_dir()), key=lambda p: p.name) \
-                    if vault.root.is_dir() else []
-            if not dirs:
-                raise HTTPException(status_code=404, detail="no research runs to export")
+        dirs = []
+        if run_ids:
+            for rid in run_ids:
+                d = vault.run_dir(rid)
+                if d.is_dir():
+                    dirs.append(d)
+        else:
+            dirs = sorted((vault.root / d.name for d in vault.root.iterdir()
+                           if d.is_dir()), key=lambda p: p.name) \
+                if vault.root.is_dir() else []
+        if not dirs:
+            raise HTTPException(status_code=404, detail="no research runs to export")
+
+        with _tf.TemporaryDirectory(prefix="invar_vault_exp_") as td:
+            td_path = Path(td)
+            if run_ids and len(run_ids) == 1:
+                members: dict[str, bytes | Path] = {}
+                for directory in dirs:
+                    for path in sorted(directory.rglob("*")):
+                        if path.is_dir():
+                            continue
+                        rel = path.relative_to(directory).as_posix()
+                        members[f"{directory.name}/{rel}"] = path
+                out_zip = td_path / "vault.zip"
+                try:
+                    write_scanned_zip(members, out_zip, workspace_root=state.workspace_root)
+                except ExportBlockedError as exc:
+                    raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+                return io.BytesIO(out_zip.read_bytes())
+
+            # Export-all: skip any legacy leaking run and list it in EXPORT_SKIPPED.json
+            all_members: dict[str, bytes | Path] = {}
+            skipped: list[dict[str, str]] = []
             for directory in dirs:
+                run_members: dict[str, Path] = {}
                 for path in sorted(directory.rglob("*")):
                     if path.is_dir():
                         continue
                     rel = path.relative_to(directory).as_posix()
-                    zf.write(path, f"{directory.name}/{rel}")
-        buf.seek(0)
-        return buf
+                    run_members[f"{directory.name}/{rel}"] = path
+                probe_zip = td_path / f"probe_{directory.name}.zip"
+                try:
+                    write_scanned_zip(run_members, probe_zip, workspace_root=state.workspace_root)
+                    all_members.update(run_members)
+                except ExportBlockedError as exc:
+                    skipped.append({"run_id": directory.name, "code": exc.code, "reason": exc.message})
+                finally:
+                    probe_zip.unlink(missing_ok=True)
+            if skipped:
+                all_members["EXPORT_SKIPPED.json"] = json.dumps({"skipped": skipped}, indent=2).encode("utf-8")
+            out_zip = td_path / "vault_all.zip"
+            try:
+                write_scanned_zip(all_members, out_zip, workspace_root=state.workspace_root)
+            except ExportBlockedError as exc:
+                raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+            return io.BytesIO(out_zip.read_bytes())
 
     @app.get("/api/v1/research/vault/{run_id}/export-zip")
     def api_research_vault_export_zip(run_id: str) -> Response:
@@ -1344,6 +1388,55 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         return bp, seeded
 
 
+    def persist_planning_terminal(
+        run_uid: str,
+        question: str,
+        outcome_status: str,
+        *,
+        detail: Optional[dict[str, Any]] = None,
+        feasibility: Any = None,
+    ) -> None:
+        """UPG-010: Persist planning-stage terminal outcomes (clarification/refusal/no-blueprint) with telemetry."""
+        from invar_agent.llm.telemetry import get_llm_telemetry_summary
+        from invar_agent.research.epistemic import incomplete_certificate
+        from invar_agent.research.vault import ResearchVaultManager, write_vault_manifest
+
+        diag = dict(detail or {})
+        if feasibility is not None:
+            diag["feasibility"] = feasibility.model_dump() if hasattr(feasibility, "model_dump") else feasibility
+        certificate = incomplete_certificate(run_uid, question, outcome_status, diagnostics=diag)
+        vault_dir = ResearchVaultManager(state.workspace_root).run_dir(run_uid)
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        (vault_dir / "meaningfulness_certificate.json").write_text(
+            certificate.model_dump_json(indent=2), encoding="utf-8"
+        )
+        (vault_dir / "blueprint.json").write_text(
+            json.dumps({"blueprint_id": run_uid, "research_prompt": question, "kind": "planning"}, indent=2),
+            encoding="utf-8",
+        )
+        (vault_dir / "unified_module.py").write_text("", encoding="utf-8")
+        (vault_dir / "report.md").write_text(
+            f"# Research Planning Outcome ({outcome_status})\n\nPrompt: {question[:400]}\n",
+            encoding="utf-8",
+        )
+        meta = {
+            "run_id": run_uid,
+            "kind": "planning",
+            "status": outcome_status,
+            "epistemic_verdict": outcome_status,
+            "failure_reason": outcome_status,
+            "diagnostics": diag,
+            "llm_telemetry": get_llm_telemetry_summary(),
+        }
+        (vault_dir / "metadata.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+        write_vault_manifest(
+            vault_dir,
+            run_id=run_uid,
+            epistemic_verdict=outcome_status,
+            status=outcome_status,
+            llm_telemetry=meta["llm_telemetry"],
+        )
+
     @app.post("/api/v1/research/plan")
     async def api_research_plan(req: ResearchPlanRequest) -> dict[str, Any]:
         """Feasibility gate + blueprint synthesis in a SINGLE Tier-2 call.
@@ -1363,127 +1456,160 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         manager = state.ensure_research_manager()
         has_llm = bool(state.api_key)
         diag_run_uid = f"plan-{_uuid.uuid4().hex[:12]}"
+        manager.broadcaster.begin_run(diag_run_uid)
+
+        async def _plan_progress(channel: str, payload: dict[str, Any]) -> None:
+            await manager._progress(channel, payload, run_uid=diag_run_uid)
+
+        from invar_agent.llm.telemetry import run_context_scope
+
         attempt_sink: list[dict[str, Any]] = []
         sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
         diag_dir: Optional[Path] = None
-        try:
-            outcome = await generate_plan_with_feasibility(
-                req.question,
-                llm_complete=(
-                    (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
-                staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
-                fallback=not has_llm,
-                extra_context=_research_vault_context(req.question, req.attached_research_ids),
-                progress_cb=manager._progress,
-            )
-        except (FormalizationError, ValueError) as exc:
-            from invar_agent.research.epistemic import incomplete_certificate
-            from invar_agent.research.vault import ResearchVaultManager
+        with run_context_scope(diag_run_uid) as plan_ctx:
+            try:
+                from invar_agent.research.search import retrieve_before_sealing
 
-            if isinstance(exc, FormalizationError):
-                attempts_to_save = attempt_sink or list(exc.validation_attempts)
-                diag_dir = persist_formalization_diagnostics(
-                    state.workspace_root,
-                    diag_run_uid,
-                    attempts_to_save,
-                    extra_secrets=[state.api_key] if state.api_key else (),
+                lit_items, lit_digest, lit_status = await retrieve_before_sealing(
+                    req.question,
+                    manager.search_client,
+                    progress_cb=_plan_progress,
                 )
-                detail = exc.structured_detail(
-                    run_uid=diag_run_uid,
-                    diagnostics_dir=str(diag_dir) if diag_dir else None,
+                plan_ctx.literature = list(lit_items)
+                plan_ctx.literature_digest = lit_digest
+                outcome = await generate_plan_with_feasibility(
+                    req.question,
+                    llm_complete=(
+                        (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                    staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
+                    fallback=not has_llm,
+                    literature=lit_items,
+                    literature_digest=lit_digest,
+                    literature_status=lit_status,
+                    extra_context=_research_vault_context(req.question, req.attached_research_ids),
+                    progress_cb=_plan_progress,
                 )
-            else:
-                detail = {
+            except (FormalizationError, ValueError) as exc:
+                from invar_agent.research.epistemic import incomplete_certificate
+                from invar_agent.research.vault import ResearchVaultManager
+
+                if isinstance(exc, FormalizationError):
+                    attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                    diag_dir = persist_formalization_diagnostics(
+                        state.workspace_root,
+                        diag_run_uid,
+                        attempts_to_save,
+                        extra_secrets=[state.api_key] if state.api_key else (),
+                    )
+                    from invar_agent.redact import to_portable_uri
+                    detail = exc.structured_detail(
+                        run_uid=diag_run_uid,
+                        diagnostics_dir=to_portable_uri(diag_dir, state.workspace_root) if diag_dir else None,
+                    )
+                else:
+                    detail = {
+                        "code": "PLANNING_VALIDATION_FAILED",
+                        "message": str(exc),
+                        "error_type": type(exc).__name__,
+                        "run_uid": diag_run_uid,
+                        "attempts": [],
+                        "per_field_diagnostics": [],
+                    }
+                certificate = incomplete_certificate(
+                    diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+                )
+                vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+                vault_dir.mkdir(parents=True, exist_ok=True)
+                (vault_dir / "meaningfulness_certificate.json").write_text(
+                    certificate.model_dump_json(indent=2), encoding="utf-8"
+                )
+                (vault_dir / "report.md").write_text(
+                    f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                    encoding="utf-8",
+                )
+                (vault_dir / "metadata.json").write_text(
+                    json.dumps(dict(
+                        run_id=diag_run_uid,
+                        status="INCONCLUSIVE_UNVERIFIED",
+                        failure_reason="PLANNING_VALIDATION_FAILED",
+                        planning_error=detail["message"],
+                        diagnostics=detail,
+                    )),
+                    encoding="utf-8",
+                )
+                return {
+                    "status": "inconclusive",
                     "code": "PLANNING_VALIDATION_FAILED",
-                    "message": str(exc),
-                    "error_type": type(exc).__name__,
+                    "started": False,
+                    "blueprint": None,
                     "run_uid": diag_run_uid,
-                    "attempts": [],
-                    "per_field_diagnostics": [],
+                    "diagnostics": detail,
                 }
-            certificate = incomplete_certificate(
-                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
-            )
-            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
-            vault_dir.mkdir(parents=True, exist_ok=True)
-            (vault_dir / "meaningfulness_certificate.json").write_text(
-                certificate.model_dump_json(indent=2), encoding="utf-8"
-            )
-            (vault_dir / "report.md").write_text(
-                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
-                encoding="utf-8",
-            )
-            (vault_dir / "metadata.json").write_text(
-                json.dumps(dict(
-                    run_id=diag_run_uid,
-                    status="INCONCLUSIVE_UNVERIFIED",
-                    failure_reason="PLANNING_VALIDATION_FAILED",
-                    planning_error=detail["message"],
-                    diagnostics=detail,
-                )),
-                encoding="utf-8",
-            )
-            return {
-                "status": "inconclusive",
-                "code": "PLANNING_VALIDATION_FAILED",
-                "started": False,
-                "blueprint": None,
-                "run_uid": diag_run_uid,
-                "diagnostics": detail,
-            }
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=502,
-                detail=f"research plan synthesis failed: {str(exc)}")
-        finally:
-            _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
-            if attempt_sink and diag_dir is None:
-                persist_formalization_diagnostics(
-                    state.workspace_root,
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"research plan synthesis failed: {str(exc)}")
+            finally:
+                _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
+                if attempt_sink and diag_dir is None:
+                    persist_formalization_diagnostics(
+                        state.workspace_root,
+                        diag_run_uid,
+                        attempt_sink,
+                        extra_secrets=[state.api_key] if state.api_key else (),
+                    )
+            feasibility = outcome["feasibility"]
+            if feasibility is not None:
+                verdict_upper = str(feasibility.verdict.value).upper()
+                if verdict_upper == "NEEDS_CLARIFICATION":
+                    f_dump = feasibility.model_dump()
+                    persist_planning_terminal(
+                        diag_run_uid, req.question, "NEEDS_CLARIFICATION", feasibility=feasibility
+                    )
+                    return {
+                        "state": "NEEDS_CLARIFICATION",
+                        "status": "needs_clarification",
+                        "run_uid": diag_run_uid,
+                        "blueprint": None,
+                        "questions": list(
+                            getattr(feasibility, "questions", None)
+                            or f_dump.get("questions")
+                            or getattr(feasibility, "clarifying_questions", None)
+                            or f_dump.get("clarifying_questions")
+                            or []
+                        ),
+                        "feasibility": f_dump,
+                        "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
+                    }
+                if verdict_upper.startswith("REFUSED"):
+                    f_dump = feasibility.model_dump()
+                    persist_planning_terminal(
+                        diag_run_uid, req.question, verdict_upper, feasibility=feasibility
+                    )
+                    return {
+                        "state": verdict_upper,
+                        "status": "refused",
+                        "run_uid": diag_run_uid,
+                        "blueprint": None,
+                        "refusal": f_dump,
+                        "feasibility": f_dump,
+                        "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
+                    }
+            blueprint_dict = outcome["blueprint"]
+            if not blueprint_dict:
+                persist_planning_terminal(
                     diag_run_uid,
-                    attempt_sink,
-                    extra_secrets=[state.api_key] if state.api_key else (),
+                    req.question,
+                    "INCONCLUSIVE_UNVERIFIED",
+                    detail={"code": "NO_BLUEPRINT", "message": "research plan synthesis returned no blueprint"},
                 )
-        feasibility = outcome["feasibility"]
-        if feasibility is not None:
-            verdict_upper = str(feasibility.verdict.value).upper()
-            if verdict_upper == "NEEDS_CLARIFICATION":
-                f_dump = feasibility.model_dump()
                 return {
-                    "state": "NEEDS_CLARIFICATION",
-                    "status": "needs_clarification",
+                    "state": "INCONCLUSIVE_UNVERIFIED",
+                    "status": "inconclusive",
                     "run_uid": diag_run_uid,
                     "blueprint": None,
-                    "questions": list(
-                        getattr(feasibility, "questions", None)
-                        or f_dump.get("questions")
-                        or getattr(feasibility, "clarifying_questions", None)
-                        or f_dump.get("clarifying_questions")
-                        or []
-                    ),
-                    "feasibility": f_dump,
-                    "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
+                    "diagnostics_summary": {"code": "NO_BLUEPRINT", "message": "research plan synthesis returned no blueprint"},
                 }
-            if verdict_upper.startswith("REFUSED"):
-                f_dump = feasibility.model_dump()
-                return {
-                    "state": verdict_upper,
-                    "status": "refused",
-                    "run_uid": diag_run_uid,
-                    "blueprint": None,
-                    "refusal": f_dump,
-                    "feasibility": f_dump,
-                    "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
-                }
-        blueprint_dict = outcome["blueprint"]
-        if not blueprint_dict:
-            return {
-                "state": "INCONCLUSIVE_UNVERIFIED",
-                "status": "inconclusive",
-                "run_uid": diag_run_uid,
-                "blueprint": None,
-                "diagnostics_summary": {"code": "NO_BLUEPRINT", "message": "research plan synthesis returned no blueprint"},
-            }
         bp = ResearchBlueprint.model_validate(blueprint_dict)
         if feasibility is not None:
             bp = bp.model_copy(update={"feasibility": feasibility})
@@ -1552,13 +1678,13 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             _research_vault_context(req.question, req.attached_research_ids)
             if req.attached_research_ids else ""
         )
-        # ARCH-010: Allocate run_uid BEFORE planning starts and create a run-scoped
-        # telemetry session that propagates across planning + execution.
+        # ARCH-010 / UPG-010: Allocate run_uid BEFORE planning starts and create a run-scoped
+        # RunContext + LLMTelemetrySession that propagates across planning + execution.
         from invar_agent.llm.telemetry import (
-            LLMTelemetrySession,
-            _ACTIVE_SESSION,
             get_llm_telemetry_summary,
+            run_context_scope,
         )
+        from invar_agent.research.search import retrieve_before_sealing
 
         diag_run_uid = manager.allocate_run_uid()
 
@@ -1568,21 +1694,31 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         async def _execute_plan_and_dispatch(*, background: bool = False) -> dict[str, Any]:
             attempt_sink: list[dict[str, Any]] = []
             sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
-            telemetry_token = _ACTIVE_SESSION.set(LLMTelemetrySession(run_id=diag_run_uid))
             diag_dir: Optional[Path] = None
-            try:
+            with run_context_scope(diag_run_uid) as run_ctx:
                 try:
+                    lit_items, lit_digest, lit_status = await retrieve_before_sealing(
+                        req.question,
+                        manager.search_client,
+                        progress_cb=_scoped_plan_progress,
+                    )
+                    run_ctx.literature = list(lit_items)
+                    run_ctx.literature_digest = lit_digest
                     outcome = await generate_plan_with_feasibility(
                         req.question,
                         llm_complete=(
                             (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
                         staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
                         fallback=not has_llm,
+                        literature=lit_items,
+                        literature_digest=lit_digest,
+                        literature_status=lit_status,
                         assume_feasible=assume_feasible,
                         extra_context=direct_ctx,
                         progress_cb=_scoped_plan_progress,
                     )
                 except (FormalizationError, ValueError) as exc:
+                    from invar_agent.redact import to_portable_uri
                     from invar_agent.research.epistemic import incomplete_certificate
                     from invar_agent.research.vault import ResearchVaultManager, write_vault_manifest
 
@@ -1596,7 +1732,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                         )
                         detail = exc.structured_detail(
                             run_uid=diag_run_uid,
-                            diagnostics_dir=str(diag_dir) if diag_dir else None,
+                            diagnostics_dir=to_portable_uri(diag_dir, state.workspace_root) if diag_dir else None,
                         )
                     else:
                         detail = {
@@ -1699,6 +1835,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     if verdict_upper == "NEEDS_CLARIFICATION":
                         questions = list(getattr(feasibility, "questions", None) or [])
                         missing_fields = list(getattr(feasibility, "missing_fields", None) or [])
+                        persist_planning_terminal(
+                            diag_run_uid, req.question, "NEEDS_CLARIFICATION",
+                            detail={"questions": questions, "missing_fields": missing_fields},
+                            feasibility=feasibility,
+                        )
                         state.research_broadcaster.publish_terminal(
                             diag_run_uid,
                             status="NEEDS_CLARIFICATION",
@@ -1722,6 +1863,10 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                             "diagnostics_summary": feasibility.rationale,
                         }
                     if verdict_upper.startswith("REFUSED"):
+                        persist_planning_terminal(
+                            diag_run_uid, req.question, verdict_upper,
+                            feasibility=feasibility,
+                        )
                         state.research_broadcaster.publish_terminal(
                             diag_run_uid,
                             status=verdict_upper,
@@ -1741,6 +1886,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                         }
                 blueprint_dict = outcome["blueprint"]
                 if not blueprint_dict:
+                    persist_planning_terminal(
+                        diag_run_uid, req.question, "INCONCLUSIVE_UNVERIFIED",
+                        detail={"error": "research plan synthesis returned no blueprint"},
+                        feasibility=feasibility,
+                    )
                     state.research_broadcaster.publish_terminal(
                         diag_run_uid,
                         status="FAILED",
@@ -1763,7 +1913,12 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     bp = bp.model_copy(update={"feasibility": feasibility})
                 bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
                 manager.seeded_upload_ids = seeded
-                manager.request_plan(bp)
+                manager.request_plan(
+                    bp,
+                    telemetry_session=run_ctx.telemetry_session,
+                    literature=run_ctx.literature,
+                    literature_digest=run_ctx.literature_digest,
+                )
                 try:
                     approved = manager.approve(run_uid=diag_run_uid)
                 except TypeError:
@@ -1794,20 +1949,44 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     "source": outcome.get("source"),
                     "feasibility": feasibility.model_dump() if feasibility else None,
                 }
-            finally:
-                _ACTIVE_SESSION.reset(telemetry_token)
 
         if req.async_plan:
+            from invar_agent.llm.errors import redact_secrets
+
             state.research_broadcaster.begin_run(diag_run_uid)
-            state.research_broadcaster.publish({
-                "channel": "activity_log",
-                "event": "activity",
-                "stage": "FEASIBILITY",
-                "step": "planning_started",
-                "message": "Evaluating epistemic feasibility and formalizing model…",
-                "run_uid": diag_run_uid,
-            })
-            asyncio.create_task(_execute_plan_and_dispatch(background=True))
+            state.research_broadcaster.publish(
+                "activity_log",
+                "activity",
+                {
+                    "stage": "FEASIBILITY",
+                    "step": "planning_started",
+                    "message": "Evaluating epistemic feasibility and formalizing model…",
+                },
+                run_uid=diag_run_uid,
+            )
+            task = asyncio.create_task(_execute_plan_and_dispatch(background=True))
+            state.background_tasks.add(task)
+
+            def _on_done(t: asyncio.Task[Any], uid: str = diag_run_uid) -> None:
+                state.background_tasks.discard(t)
+                exc = None if t.cancelled() else t.exception()
+                if t.cancelled() or exc is not None:
+                    state.research_broadcaster.publish_terminal(
+                        uid,
+                        status="FAILED",
+                        epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                        stage="Planning",
+                        error=(
+                            "planning cancelled"
+                            if t.cancelled()
+                            else redact_secrets(
+                                str(exc),
+                                api_key=state.api_key or None,
+                            )[:600]
+                        ),
+                    )
+
+            task.add_done_callback(_on_done)
             return JSONResponse(
                 status_code=202,
                 content={
@@ -1897,22 +2076,6 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         q = broadcaster.subscribe(since_seq=since_seq, run_uid=run_uid)
         initial_seq = broadcaster.seq
         terminal_events = ("research_completed", "research_failed", "terminal_verdict")
-        target_uid = run_uid if run_uid is not None else getattr(broadcaster, "_active_run_uid", None)
-
-        def _synth_research_terminal(uid: str) -> Dict[str, Any]:
-            snap = manager.get_run_snapshot(uid) if hasattr(manager, "get_run_snapshot") else None
-            status_val = (snap or {}).get("status", "DONE") if isinstance(snap, dict) else "DONE"
-            verdict_val = (snap or {}).get("epistemic_verdict", "INCONCLUSIVE_UNVERIFIED") if isinstance(snap, dict) else "INCONCLUSIVE_UNVERIFIED"
-            return {
-                "channel": "accelerator_log",
-                "event": "terminal_verdict",
-                "event_version": "2.0",
-                "run_uid": uid,
-                "stage": "Done",
-                "status": status_val,
-                "epistemic_verdict": verdict_val,
-                "seq": broadcaster.seq,
-            }
 
         def event_generator():
             try:
@@ -1932,21 +2095,22 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                         break
                 if saw_terminal:
                     return
-                # R2-ARCH-003: Symmetric already-terminal check for both scoped and unscoped streams.
-                if target_uid and broadcaster.has_terminal(target_uid):
-                    synth = _synth_research_terminal(target_uid)
-                    body = json.dumps(synth, default=str)
-                    yield f"id: {synth['seq']}\ndata: {body}\n\n"
-                    return
+                if run_uid and broadcaster.has_terminal(run_uid):
+                    term = broadcaster.terminal_payload(run_uid)
+                    if term is not None:
+                        body = json.dumps({**term, "event_version": "2.0"}, default=str)
+                        yield f"id: {term.get('seq', broadcaster.seq)}\ndata: {body}\n\n"
+                        return
                 while True:
                     try:
                         payload = q.get(timeout=RESEARCH_SSE_HEARTBEAT)
                     except queue.Empty:
-                        if target_uid and broadcaster.has_terminal(target_uid):
-                            synth = _synth_research_terminal(target_uid)
-                            body = json.dumps(synth, default=str)
-                            yield f"id: {synth['seq']}\ndata: {body}\n\n"
-                            break
+                        if run_uid and broadcaster.has_terminal(run_uid):
+                            term = broadcaster.terminal_payload(run_uid)
+                            if term is not None:
+                                body = json.dumps({**term, "event_version": "2.0"}, default=str)
+                                yield f"id: {term.get('seq', broadcaster.seq)}\ndata: {body}\n\n"
+                                break
                         yield ": keep-alive ping\n\n"
                         continue
                     seq_id = payload.get("seq", 0)

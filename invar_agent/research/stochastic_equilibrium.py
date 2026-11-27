@@ -414,10 +414,10 @@ class _Roundoff:
         if not isinstance(node,ast.BinOp): raise UnsupportedVerification("RIGOROUS_ROUNDING_BOUND_UNAVAILABLE")
         if isinstance(node.op, ast.Pow):
             exp_int = None
-            if isinstance(node.right, ast.Constant) and type(node.right.value) is int:
-                exp_int = node.right.value
-            elif isinstance(node.right, ast.UnaryOp) and isinstance(node.right.op, ast.USub) and isinstance(node.right.operand, ast.Constant) and type(node.right.operand.value) is int:
-                exp_int = -node.right.operand.value
+            if isinstance(node.right, ast.Constant) and type(node.right.value) in (int, float) and float(node.right.value).is_integer():
+                exp_int = int(node.right.value)
+            elif isinstance(node.right, ast.UnaryOp) and isinstance(node.right.op, ast.USub) and isinstance(node.right.operand, ast.Constant) and type(node.right.operand.value) in (int, float) and float(node.right.operand.value).is_integer():
+                exp_int = -int(node.right.operand.value)
             if exp_int is not None and -16 <= exp_int <= 16:
                 (lo, hi), error = self.expression(node.left, env, depth + 1)
                 if exp_int >= 0:

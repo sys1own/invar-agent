@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class StrictModel(BaseModel):
@@ -194,6 +194,36 @@ class ResearchReference(StrictModel):
     rhs_cross_checks: list[dict[str, object]] = Field(default_factory=list)
 
 
+class OverrideEntry(StrictModel):
+    entry_id: str
+    seq: int = Field(ge=0)
+    kind: Literal["EQUATION", "CONSTANT", "STATE", "STATE_ORDER", "GRID", "UNIT"]
+    target_id: str
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    invalidating: bool
+    reason: Literal[
+        "EQUATION_CHANGED",
+        "DROPPED",
+        "ADDED",
+        "UNIT_CHANGED",
+        "OUTSIDE_CERTIFIED_DOMAIN",
+        "CLAIM_NOT_UNIVERSAL",
+        "STATE_ORDER_CHANGED",
+        "GRID_CHANGED",
+        "NONE",
+    ]
+    at: str
+    actor: Literal["researcher"] = "researcher"
+    previous_ir_digest: str
+
+
+class SourceCertificateRef(StrictModel):
+    run_id: str
+    certificate_blake3: str
+    certificate_verdict: str
+
+
 class CanonicalResearchIR(StrictModel):
     schema_version: Literal["canonical_research_ir.v1"] = "canonical_research_ir.v1"
     ir_id: str
@@ -225,6 +255,20 @@ class CanonicalResearchIR(StrictModel):
     certified_valid_domain: dict[str, Any] | None = None
     negative_constraints: list[dict[str, Any]] = Field(default_factory=list)
     research_import_role: Literal["POSITIVE_EVIDENCE", "NEGATIVE_CONSTRAINT_ONLY", "LEGACY_UNVERIFIED", "USER_MODIFIED_UNVERIFIED"] = "LEGACY_UNVERIFIED"
+    source_certificates: list[SourceCertificateRef] = Field(default_factory=list)
+    ir_verdict: str | None = None
+    override_ledger: list[OverrideEntry] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty(self, handler):
+        data = handler(self)
+        if not self.source_certificates:
+            data.pop("source_certificates", None)
+        if self.ir_verdict is None:
+            data.pop("ir_verdict", None)
+        if not self.override_ledger:
+            data.pop("override_ledger", None)
+        return data
 
     @classmethod
     def from_sci_ir(cls, sealed_or_ir: Any) -> "CanonicalResearchIR":
@@ -238,10 +282,24 @@ class CanonicalResearchIR(StrictModel):
         ir = sealed.ir
         prov = SourceSpan(file="sci_ir.json", location=ir.ir_id, quote=f"SciIR {ir.ir_id}")
 
+        from invar_agent.ir.units import sci_to_builder
+        from .equation_lowerer import FormalGateError
+
         states: list[StateVariableSpec] = []
         consts: list[ExtractedConstant] = []
         for sym in ir.symbols:
-            exp_int = tuple(int(n // d) if d != 0 else 0 for n, d in sym.dimension.exponents)
+            sci_ints: list[int] = []
+            for n, d in sym.dimension.exponents:
+                if d == 0:
+                    sci_ints.append(0)
+                elif n % d != 0:
+                    raise FormalGateError(
+                        "HIN_FRACTIONAL_DIMENSION",
+                        f"Symbol {sym.name!r} has non-integer SI exponent {n}/{d}",
+                    )
+                else:
+                    sci_ints.append(int(n // d))
+            exp_int = tuple(sci_to_builder(sci_ints))
             dim_model = SIDimensionVectorModel(
                 exponents=exp_int,  # type: ignore[arg-type]
                 canonical_unit=sym.dimension.unit_label or "1",

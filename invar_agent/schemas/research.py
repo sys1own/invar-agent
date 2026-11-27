@@ -111,7 +111,9 @@ class FeasibilityAssessment(BaseModel):
     questions: List[str] = Field(default_factory=list)
     missing_fields: List[str] = Field(default_factory=list)
     smt_unsat_core: Optional[List[str]] = None
-    assessed_by: Literal["heuristic", "heuristic_offline", "llm"] = "heuristic_offline"
+    smt_unsat_core_items: List[Dict[str, Any]] = Field(default_factory=list)
+    advisories: List[str] = Field(default_factory=list)
+    assessed_by: Literal["heuristic", "heuristic_offline", "llm", "deterministic_smt"] = "heuristic_offline"
 
     @field_validator("verdict", mode="before")
     @classmethod

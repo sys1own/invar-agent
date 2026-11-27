@@ -74,6 +74,27 @@ def scope_check_and_lower(
             resolved_aliases=resolved_aliases,
         )
 
+    req_reductions = {o.target: getattr(o, "reduction", None) for o in body.observables}
+    resp_reductions = {o["target"]: o.get("reduction") for o in resp.get("observables", [])}
+    if req_reductions != resp_reductions:
+        return ScopeCheckOutcome(
+            ok=False,
+            sci_ir=None,
+            diagnostics=diagnostics
+            + [
+                {
+                    "code": "COMPILER_INVARIANT",
+                    "field": "observables",
+                    "symbol": None,
+                    "message": (
+                        f"Trajectory reduction mismatch between request {req_reductions!r} "
+                        f"and scope-checked response {resp_reductions!r}"
+                    ),
+                }
+            ],
+            resolved_aliases=resolved_aliases,
+        )
+
     prompt_digest = hashlib.blake2b(
         user_prompt.encode("utf-8"), digest_size=32
     ).hexdigest()

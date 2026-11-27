@@ -648,6 +648,9 @@ class _SymbolicKernel:
                 try:
                     value = self.expression(node.value, environment, depth)
                 except ValueError:
+                    # NF-05: Fail closed if the assignment contains an unsupported Call expression
+                    if any(isinstance(sub, ast.Call) for sub in ast.walk(node.value)):
+                        raise ValueError(f"SYMBOLIC_EXPRESSION_UNSUPPORTED: {ast.unparse(node.value)}")
                     continue
                 for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
                     def _assign_target(tgt, val):

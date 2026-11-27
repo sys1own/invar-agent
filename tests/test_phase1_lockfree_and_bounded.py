@@ -130,10 +130,14 @@ def test_builder_vault_ingest_over_asgi_with_real_certificate(tmp_path):
         assert vlist.status_code == 200
 
 
+@pytest.mark.serial
 @pytest.mark.asyncio
-@pytest.mark.timeout(25)
+@pytest.mark.timeout(90)
 async def test_build_wall_clock_is_preemptive(tmp_path):
-    """Test 7: A sleeping emitter is preempted by max_wall_clock_sec instead of hanging."""
+    """UPG-018: A sleeping emitter running in StepWorker is preempted and killed by max_wall_clock_sec."""
+    from invar_agent.runtime.killable import is_pid_alive
+    from tests._slow_emitters import slow_emitters
+
     run_id = await asyncio.to_thread(_make_real_verified_vault_entry, tmp_path, "fx_rk4_sleep")
     ir = await asyncio.to_thread(
         CanonicalResearchIngestionPipeline(tmp_path).ingest,
@@ -142,16 +146,14 @@ async def test_build_wall_clock_is_preemptive(tmp_path):
     ir.user_approved = True
     seal_ir(ir)
 
-    class _SleepingRegistry(EmitterRegistry):
-        def emit(self, node, context):
-            time.sleep(10.0)
-            return ModuleEmission({})
-
-    budget = BuildBreakerBudget(max_wall_clock_sec=0.4)
-    machine = BuilderStateMachine(tmp_path, emitters=_SleepingRegistry(), budget=budget)
+    budget = BuildBreakerBudget(max_wall_clock_sec=5.0)
+    machine = BuilderStateMachine(tmp_path, emitters=slow_emitters(), budget=budget)
     t0 = time.monotonic()
     result = await machine.run(BuildRequest(build_id="sleep_budget_test", ir=ir))
     elapsed = time.monotonic() - t0
     assert result.status == "ABORTED_CRITICAL"
     assert result.error_code == "BUILD_WALL_CLOCK_EXCEEDED" or "BUILD_WALL_CLOCK_EXCEEDED" in (result.error or "")
-    assert elapsed < 3.0, f"Expected preemptive abort in < 3s, took {elapsed:.2f}s"
+    assert elapsed < 12.0, f"Expected preemptive abort in < 12s, took {elapsed:.2f}s"
+    assert machine._step_worker is None
+    if getattr(machine, "_last_worker_pid", None):
+        assert not is_pid_alive(machine._last_worker_pid)

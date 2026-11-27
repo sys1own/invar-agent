@@ -754,7 +754,7 @@ def test_zero_cross_run_commit_bleed_and_katex_ui_and_subscripts(tmp_path):
     assert uid1 != uid2
     bc.publish("accelerator_log", "commit", {"bundle_hash": "deadbeef" * 8}, run_uid=uid1)
     assert mgr.committed_bundles == [] or all(b != "deadbeef" * 8 for b in mgr.committed_bundles)
-    q = bc.subscribe()
+    q = bc.subscribe(run_uid=uid2)
     mgr._thread.join(timeout=30)
     events = []
     while not q.empty():

@@ -469,6 +469,7 @@ def _load_detail(vault: Optional[ResearchVaultManager], run: Dict[str, Any]) -> 
 
 def validate_research_ir(ir, *, positive_import=True):
     from invar_agent import _native
+    from .ingestion.pipeline import compute_certificate_blake3, compute_entry_invalidation, compute_override_entry_id
     from ..research.epistemic import parse_run_certificate
     if ir.blake3_receipt:
         expected = _native.py_compute_certificate_receipt(ir.model_dump_json())
@@ -478,18 +479,60 @@ def validate_research_ir(ir, *, positive_import=True):
     certificates = dict(ir.meaningfulness_certificates)
     if ir.epistemic_verdict is not None and not certificates and ir.meaningfulness_certificate is None:
         raise ValueError("CanonicalResearchIR verdict requires a certificate")
+    single = None
     if ir.meaningfulness_certificate is not None:
         single = parse_run_certificate(ir.meaningfulness_certificate)
-        if ir.epistemic_verdict != single.epistemic_verdict.value: raise ValueError("CanonicalResearchIR verdict differs from certificate")
         if single.run_id in certificates and certificates[single.run_id] != ir.meaningfulness_certificate: raise ValueError("CanonicalResearchIR certificate copies differ")
         certificates[single.run_id] = ir.meaningfulness_certificate
+    source_ref_map = {ref.run_id: ref for ref in getattr(ir, "source_certificates", [])}
     for run_id, raw in certificates.items():
         certificate = parse_run_certificate(raw)
         if certificate.run_id != run_id: raise ValueError("certificate run identity mismatch")
+        if run_id in source_ref_map:
+            expected_cert_hash = compute_certificate_blake3(raw)
+            if not hmac.compare_digest(source_ref_map[run_id].certificate_blake3, expected_cert_hash):
+                raise ValueError("OVERRIDE_LEDGER_TAMPERED: source certificate digest mismatch")
+            if source_ref_map[run_id].certificate_verdict != certificate.epistemic_verdict.value:
+                raise ValueError("OVERRIDE_LEDGER_TAMPERED: source certificate verdict mismatch")
         if hasattr(certificate, "ihcg_anchor") and certificate.epistemic_verdict.value == "INCONCLUSIVE_UNVERIFIED":
             raise ValueError("INCONCLUSIVE_UNVERIFIED cannot be imported as scientific evidence")
         if certificate.epistemic_verdict.value == "VERIFIED_FALSIFICATION" and run_id not in negative_ids:
             raise ValueError("NEGATIVE_CONSTRAINT_ONLY: falsification cannot become a positive law")
+
+    ledger = list(getattr(ir, "override_ledger", []) or [])
+    any_invalidating = False
+    for expected_seq, entry in enumerate(ledger):
+        entry_dict = entry.model_dump(mode="json")
+        if entry.seq != expected_seq:
+            raise ValueError("OVERRIDE_LEDGER_TAMPERED: non-sequential override entry")
+        expected_id = compute_override_entry_id(entry_dict)
+        if not hmac.compare_digest(entry.entry_id, expected_id):
+            raise ValueError("OVERRIDE_LEDGER_TAMPERED: entry digest mismatch")
+        recomputed_inv, _ = compute_entry_invalidation(
+            entry.kind, entry.target_id, entry.before, entry.after, ir
+        )
+        if bool(entry.invalidating) != bool(recomputed_inv):
+            raise ValueError("OVERRIDE_LEDGER_TAMPERED: invalidating flag mismatch")
+        if recomputed_inv:
+            any_invalidating = True
+
+    ir_verdict = getattr(ir, "ir_verdict", None)
+    if any_invalidating:
+        if certificates or ir.meaningfulness_certificate is not None:
+            if ir.epistemic_verdict != "USER_MODIFIED_UNVERIFIED" or ir.research_import_role != "USER_MODIFIED_UNVERIFIED":
+                raise ValueError("OVERRIDE_LEDGER_TAMPERED: invalidating override must downgrade verdict to USER_MODIFIED_UNVERIFIED")
+            if ir_verdict is not None and ir_verdict != "USER_MODIFIED_UNVERIFIED":
+                raise ValueError("OVERRIDE_LEDGER_TAMPERED: ir_verdict must be USER_MODIFIED_UNVERIFIED")
+    elif ir.epistemic_verdict == "USER_MODIFIED_UNVERIFIED":
+        # Legacy or downgraded IR with matching certificate bytes is always admissible (never an upgrade)
+        if ir_verdict is not None and ir_verdict != "USER_MODIFIED_UNVERIFIED":
+            raise ValueError("OVERRIDE_LEDGER_TAMPERED: ir_verdict disagrees with epistemic_verdict")
+    elif single is not None:
+        if ir.epistemic_verdict != single.epistemic_verdict.value:
+            raise ValueError("CanonicalResearchIR verdict differs from certificate")
+        if ir_verdict is not None and ir_verdict != single.epistemic_verdict.value:
+            raise ValueError("CanonicalResearchIR ir_verdict differs from certificate")
+
     if ir.research_import_role == "NEGATIVE_CONSTRAINT_ONLY":
         if ir.equations or ir.constants or ir.pinned_kernel_code or ir.runtime_predicates:
             raise ValueError("NEGATIVE_CONSTRAINT_ONLY: positive evidence is forbidden")

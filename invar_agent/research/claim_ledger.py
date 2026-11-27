@@ -44,6 +44,11 @@ TIME_UNIT_TO_SECONDS: Dict[str, float] = {
     "wk": 7.0 * 86400.0,
     "week": 7.0 * 86400.0,
     "weeks": 7.0 * 86400.0,
+    "mo": 2629746.0,
+    "month": 2629746.0,
+    "months": 2629746.0,
+    "quarter": 7889238.0,
+    "quarters": 7889238.0,
     "yr": 365.25 * 86400.0,
     "yrs": 365.25 * 86400.0,
     "year": 365.25 * 86400.0,
@@ -139,6 +144,16 @@ def extract_claim_ledger(prompt: str) -> ClaimLedger:
     for m_as in _PINNED_ASSIGN_RE.finditer(text):
         sym = m_as.group(1)
         if sym in ledger.intervals or sym.lower() in {"if", "and", "or", "is", "for", "over", "at"}:
+            continue
+        # NF-10: Reject equation fragments preceded/followed by arithmetic operators or inside parenthesised equations
+        pre = text[:m_as.start()].rstrip()
+        post = text[m_as.end():].lstrip()
+        if pre and pre[-1] in "+-*/^":
+            continue
+        if post and post[0] in "+-*/^":
+            continue
+        # Check if inside an unclosed parenthesis (e.g., `(u_c = 1.0 - ...)` or `f(x = 1.0)`)
+        if pre.count("(") > pre.count(")") and ")" in post[:40]:
             continue
         try:
             raw_val = float(m_as.group(2))

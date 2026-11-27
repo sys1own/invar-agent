@@ -30,6 +30,16 @@ pub enum ScientificDomain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TrajectoryReduction {
+    #[serde(rename = "TRAJECTORY_MAX")]
+    Max,
+    #[serde(rename = "TRAJECTORY_MIN")]
+    Min,
+    #[serde(rename = "TRAJECTORY_FINAL")]
+    Final,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SlotRole {
     State,

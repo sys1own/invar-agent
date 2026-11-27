@@ -80,11 +80,37 @@ def test_shbt_frontier_spec_activates_with_registry_assumptions() -> None:
 # ── 2. ARCH-003 SMT Q1 Contradiction Core (T-R5) ────────────────────────────
 
 def test_smt_q1_contradiction_core_refuses_impossible() -> None:
+    from invar_agent.research.claims import ClaimRecord, ClaimRole, ClaimSet, Relation, SpanRef, detect_contradiction
+
     prompt = "Find a scalar mass M such that M > 10 and M < 5 simultaneously."
-    h = _heuristic_verdict(prompt)
-    assert h.verdict == FeasibilityVerdict.REFUSED_IMPOSSIBLE
-    assert h.smt_unsat_core is not None
-    assert len(h.smt_unsat_core) >= 2
+    cs = ClaimSet(
+        question_kind="EXISTENTIAL",
+        records=[
+            ClaimRecord(
+                id="c1",
+                role=ClaimRole.OPERATING_DOMAIN,
+                modality="REQUIREMENT",
+                subject="M",
+                symbol="M",
+                relation=Relation.GT,
+                value="10",
+                span=SpanRef(start=prompt.index("M > 10"), end=prompt.index("M > 10") + 6, quote="M > 10"),
+            ),
+            ClaimRecord(
+                id="c2",
+                role=ClaimRole.OPERATING_DOMAIN,
+                modality="REQUIREMENT",
+                subject="M",
+                symbol="M",
+                relation=Relation.LT,
+                value="5",
+                span=SpanRef(start=prompt.index("M < 5"), end=prompt.index("M < 5") + 5, quote="M < 5"),
+            ),
+        ],
+    )
+    items, _adv = detect_contradiction(cs, prompt=prompt)
+    assert items is not None
+    assert len(items) >= 2
 
 
 # ── 3. ARCH-003 False Claim with Physics Guards -> Mode 1 Falsification ─────

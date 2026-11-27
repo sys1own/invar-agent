@@ -35,6 +35,7 @@ CRITICAL RULES:
 5. Use exact `archetype` from: `ODE_PDE`, `MONTE_CARLO`, `FIXED_POINT`, `PARAM_SWEEP`, `ALGEBRAIC_CLOSURE`.
 6. Use exact `domain` from: `PHYSICS_THERMO`, `BIOCHEM_SYSTEMS`, `CLIMATE_EARTH`, `ECOLOGY_EPIDEM`, `FLUID_CONTINUUM`, `QUANTUM_STATMECH`, `ENGINEERING_CTRL`, `ECON_COMPLEX`.
 7. If conserved stoichiometric pools exist (e.g. `A + B = const`), declare them in `conservation_pools`.
+8. For each symbol's `dimension`, supply `"unit_label"` ONLY (omit `"exponents"` — the compiler computes exact SI exponents in `[M, L, T, I, Theta, N, J]` order from `unit_label`). Use `"1"` for dimensionless quantities.
 
 JSON EXEMPLAR:
 {
@@ -43,11 +44,11 @@ JSON EXEMPLAR:
   "archetype": "ODE_PDE",
   "domain": "BIOCHEM_SYSTEMS",
   "symbols": [
-    {"name": "A", "display_symbol": "A", "role": "STATE", "slot_index": 0, "dimension": {"exponents": [[0,1],[0,1],[0,1],[0,1],[0,1],[0,1],[0,1]], "unit_label": "mol/m^3"}, "initial_or_default": 1.0, "strictly_positive": true, "pool_id": "pool_AB", "description": "Species A"},
-    {"name": "B", "display_symbol": "B", "role": "STATE", "slot_index": 1, "dimension": {"exponents": [[0,1],[0,1],[0,1],[0,1],[0,1],[0,1],[0,1]], "unit_label": "mol/m^3"}, "initial_or_default": 0.0, "strictly_positive": true, "pool_id": "pool_AB", "description": "Species B"},
-    {"name": "k_f", "display_symbol": "k_f", "role": "CONTROL_PARAM", "slot_index": 0, "dimension": {"exponents": [[0,1],[0,1],[-1,1],[0,1],[0,1],[0,1],[0,1]], "unit_label": "1/s"}, "initial_or_default": 0.5, "domain": {"lo": 0.1, "hi": 2.0}, "strictly_positive": true, "description": "Forward rate"},
-    {"name": "k_r", "display_symbol": "k_r", "role": "CONSTANT", "slot_index": 0, "dimension": {"exponents": [[0,1],[0,1],[-1,1],[0,1],[0,1],[0,1],[0,1]], "unit_label": "1/s"}, "initial_or_default": 0.2, "strictly_positive": true, "description": "Reverse rate"},
-    {"name": "ratio_BA", "display_symbol": "B/A", "role": "DERIVED_OBSERVABLE", "slot_index": 0, "dimension": {"exponents": [[0,1],[0,1],[0,1],[0,1],[0,1],[0,1],[0,1]], "unit_label": "1"}, "initial_or_default": 0.0, "description": "Equilibrium ratio"}
+    {"name": "A", "display_symbol": "A", "role": "STATE", "slot_index": 0, "dimension": {"unit_label": "mol/m^3"}, "initial_or_default": 1.0, "strictly_positive": true, "pool_id": "pool_AB", "description": "Species A"},
+    {"name": "B", "display_symbol": "B", "role": "STATE", "slot_index": 1, "dimension": {"unit_label": "mol/m^3"}, "initial_or_default": 0.0, "strictly_positive": true, "pool_id": "pool_AB", "description": "Species B"},
+    {"name": "k_f", "display_symbol": "k_f", "role": "CONTROL_PARAM", "slot_index": 0, "dimension": {"unit_label": "1/s"}, "initial_or_default": 0.5, "domain": {"lo": 0.1, "hi": 2.0}, "strictly_positive": true, "description": "Forward rate"},
+    {"name": "k_r", "display_symbol": "k_r", "role": "CONSTANT", "slot_index": 0, "dimension": {"unit_label": "1/s"}, "initial_or_default": 0.2, "strictly_positive": true, "description": "Reverse rate"},
+    {"name": "ratio_BA", "display_symbol": "B/A", "role": "DERIVED_OBSERVABLE", "slot_index": 0, "dimension": {"unit_label": "1"}, "initial_or_default": 0.0, "description": "Equilibrium ratio"}
   ],
   "conservation_pools": [
     {"pool_id": "pool_AB", "member_states": ["A", "B"], "stoichiometry": [1.0, 1.0], "expected_total": 1.0}

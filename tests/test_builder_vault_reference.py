@@ -95,7 +95,13 @@ def test_coherent_vault_text_ast_units_and_runtime_predicates(tmp_path):
     assert any('trace_max' in guard.assertion for guard in ir.runtime_predicates)
     assert any('telemetry' in guard.assertion for guard in ir.runtime_predicates)
     for item in [*ir.equations, *ir.constants, *ir.runtime_predicates]:
-        assert item.provenance.quote in Path(item.provenance.file).read_text(encoding="utf-8")
+        pfile = item.provenance.file
+        if pfile.startswith("vault:"):
+            _run_id_part, rel_part = pfile[len("vault:"):].split("/", 1)
+            resolved = root / rel_part
+        else:
+            resolved = Path(pfile)
+        assert item.provenance.quote in resolved.read_text(encoding="utf-8")
     approved = pipeline.apply_override(ir, IRReviewOverride(approve=True))
     state = asyncio.run(build_research_instrument(tmp_path, ir=approved, build_id='reference',
         profiles=[BuilderProfile.HYBRID_COMPUTE_LIBRARY, BuilderProfile.INTERACTIVE_WORKBENCH, BuilderProfile.EXECUTABLE_PAPER_AUDIT]))

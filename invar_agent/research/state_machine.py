@@ -1653,7 +1653,13 @@ class ResearchStateMachine:
                  abort_flag: Optional[Callable[[], bool]] = None,
                  workspace_root: Optional[Path] = None,
                  verification_runner: Optional[Callable[..., Any]] = None,
-                 llm_formalizer: Optional[LLMFn] = None):
+                 llm_formalizer: Optional[LLMFn] = None,
+                 preretrieved_literature: Optional[List[Dict[str, Any]]] = None,
+                 literature_digest: Optional[str] = None):
+        self._preretrieved_literature: Optional[List[Dict[str, Any]]] = (
+            list(preretrieved_literature) if preretrieved_literature is not None else None
+        )
+        self._literature_digest: Optional[str] = literature_digest
         self.workspace = Path(workspace)
         self.progress_cb = progress_cb
         self._provider_failure = None
@@ -2166,6 +2172,9 @@ class ResearchStateMachine:
                     state.status = "REFUSED"
                     state.refusal = outcome.get("refusal")
                     return state
+                if "COMPILER_INVARIANT" in str(failure):
+                    healing_terminated = True
+                    break
                 err_fp = compute_healing_error_fingerprint(str(failure), str(used_candidate or ""))
                 seen_error_fingerprints[err_fp] = seen_error_fingerprints.get(err_fp, 0) + 1
                 # Short-circuit only after Tier-2 has had a chance to attempt repair (attempt >= 3),
@@ -2639,7 +2648,16 @@ class ResearchStateMachine:
             ]
             for h in prev_lit:
                 h.setdefault("stage", 1)
-            fresh_lit = await self._literature_search(queries, tag)
+            if stage == 1 and attempt == 1 and self._preretrieved_literature is not None:
+                fresh_lit = list(self._preretrieved_literature)
+                self._record_literature(fresh_lit)
+                await emit("search_log", "literature_reused", {
+                    **tag,
+                    "count": len(fresh_lit),
+                    "literature_digest": self._literature_digest or "",
+                })
+            else:
+                fresh_lit = await self._literature_search(queries, tag)
             merged_lit: List[Dict[str, Any]] = []
             seen_lit: set = set()
             for h in prev_lit + list(fresh_lit or []):
@@ -2908,16 +2926,25 @@ class ResearchStateMachine:
                     noop_bad, noop_reason = is_noop_layer_wrapper(pre_san_unified, stage)
                 if noop_bad:
                     raise ValueError(noop_reason)
-            for contract in contracts:
-                normalized = _reconcile_time_horizon(
-                    {'code_template': unified, 'contracts': [contract.model_dump()]}, bp.research_prompt)
-                expected = normalized['contracts'][0]
-                target = expected['dt'] * expected['steps']
-                if not math.isclose(contract.dt * contract.steps, target, rel_tol=1e-12):
-                    raise ValueError(f'SCIENTIFIC_INTEGRITY: horizon mismatch for {contract.contract_id}')
-                coverage = await asyncio.to_thread(validate_protocol, unified, contract, bp.research_prompt)
-                if coverage:
-                    await emit('accelerator_log', 'phase_coverage', {**tag, 'contract_id': contract.contract_id, 'coverage': coverage})
+            from .planner import program_has_temporal_equations
+            bp_temporal_view = {**bp.model_dump(), "code_template": unified, "unified_module_code": unified}
+            if program_has_temporal_equations(bp_temporal_view):
+                has_compiler_commitment = bool(
+                    getattr(bp, "sciir_commitment_blake3", None)
+                    or (isinstance(bp.ihcg_evidence, dict) and bp.ihcg_evidence.get("sciir_commitment_blake3"))
+                )
+                for contract in contracts:
+                    normalized = _reconcile_time_horizon(
+                        {**bp_temporal_view, "contracts": [contract.model_dump()]}, bp.research_prompt
+                    )
+                    expected = normalized["contracts"][0]
+                    target = expected["dt"] * expected["steps"]
+                    if not math.isclose(contract.dt * contract.steps, target, rel_tol=1e-12):
+                        prefix = "COMPILER_INVARIANT" if has_compiler_commitment else "SCIENTIFIC_INTEGRITY"
+                        raise ValueError(f"{prefix}: horizon mismatch for {contract.contract_id}")
+                    coverage = await asyncio.to_thread(validate_protocol, unified, contract, bp.research_prompt)
+                    if coverage:
+                        await emit("accelerator_log", "phase_coverage", {**tag, "contract_id": contract.contract_id, "coverage": coverage})
             schemes = await asyncio.to_thread(validate_variant_schemes, unified, bp, contracts)
             if schemes:
                 await emit('accelerator_log', 'integration_schemes', {**tag, 'schemes': schemes})

@@ -1,9 +1,9 @@
 """Strict receipt schema and canonical domain-separated Merkle root."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_serializer
 
 from ..his_cache import digest
 from ..ingestion.schemas import StrictModel
@@ -40,6 +40,17 @@ class VerificationReceipt(StrictModel):
     pytest_failed: int
     cabi_compiled: bool
     python_fallback_active: bool
+    evidence: dict[str, Any] | None = None
+    research_parity: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty(self, handler):
+        data = handler(self)
+        if self.evidence is None:
+            data.pop("evidence", None)
+        if self.research_parity is None:
+            data.pop("research_parity", None)
+        return data
 
 
 class BuildReceipt(StrictModel):

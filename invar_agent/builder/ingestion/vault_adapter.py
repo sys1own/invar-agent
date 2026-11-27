@@ -188,7 +188,7 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
         newline = text.find('\n', position)
         if newline >= 0:
             end = min(end, newline)
-        return SourceSpan(file=str(root/filename), location=f'vault:@research:{run_id}:{location}',
+        return SourceSpan(file=f'vault:{run_id}/{filename}', location=f'vault:@research:{run_id}:{location}',
                           quote=text[start:end] or ' ', char_start=start, char_end=end)
 
     try:
@@ -214,10 +214,11 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                     elif equation.kind == 'ALGEBRAIC':
                         raw_equations.append(RawEquation(text=f'{name} = {equation.expression}', provenance=span))
                 init_vec = list(parsed.contracts[-1].initial_state) if parsed.contracts else []
+                from invar_agent.ir.units import sci_to_builder
                 def _unit_from_si_dim(dim_vec):
                     # IHCG si_dim order is [M, L, T, I, Theta, N, J] -> Builder [m, kg, s, A, K, mol, cd]
                     d = list(dim_vec) if len(dim_vec) == 7 else [0] * 7
-                    exps = (d[1], d[0], d[2], d[3], d[4], d[5], d[6])
+                    exps = tuple(int(x) for x in sci_to_builder(d))
                     lbl = "*".join(
                         b + (f"^{p}" if p != 1 else "")
                         for b, p in zip(("m", "kg", "s", "A", "K", "mol", "cd"), exps)
@@ -267,10 +268,11 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                 )
                 dyn_slots = [s for s in graph.slots if s.role == 'DYNAMIC_STATE'] or [s for s in graph.slots if s.role != 'CONTROL_PARAM']
                 for idx_s, s in enumerate(dyn_slots):
+                    b_exps, b_lbl = _unit_from_si_dim(s.si_dim)
                     ir.state_variables.append(StateVariableSpec(
                         symbol=s.symbol, slot_index=idx_s,
                         initial_value=float(init_vec[s.slot_idx]) if s.slot_idx < len(init_vec) else 0.0,
-                        dimension=SIDimensionVectorModel(exponents=tuple(s.si_dim), semantic_tag=s.semantic_tag),
+                        dimension=SIDimensionVectorModel(exponents=b_exps, canonical_unit=b_lbl, semantic_tag=s.semantic_tag),
                         provenance=span,
                     ))
                 if parsed.contracts:
@@ -291,27 +293,9 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
     raw_equations = []
     sources = {}
     def _compact_law_expr(expr):
-        s = str(expr)
-        if len(s) <= 4096:
-            return expr
-        # Collapse nested Piecewise branches to their default/interior branch for compact CSEL/HIN lowering;
-        # the exact bit-identical Python kernel remains preserved in `pinned_kernel_code`.
-        def _unwrap_pw(node):
-            if isinstance(node, sp.Piecewise):
-                for val, cond in reversed(node.args):
-                    if cond == sp.true and val != 0:
-                        return _unwrap_pw(val)
-                for val, _cond in node.args:
-                    if val != 0:
-                        return _unwrap_pw(val)
-                return sp.Integer(0)
-            if node.args:
-                return node.func(*(_unwrap_pw(a) for a in node.args))
-            return node
-        try:
-            return _unwrap_pw(expr)
-        except Exception:
-            return expr
+        if len(str(expr)) > 4096 and expr.has(sp.Piecewise):
+            raise IngestionError('VAULT_REFERENCE_UNSUPPORTED', 'Oversized Piecewise law cannot be silently unwrapped')
+        return expr
 
     for state, expression in laws.items():
         kind, origin, *source_file = recovered['origins'][state]

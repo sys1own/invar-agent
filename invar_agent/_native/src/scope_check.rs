@@ -2,7 +2,7 @@
 //! Provably Injective 4-Tier Alias Resolver (Theorem A.1), and Bidirectional Q^7 SI Checker.
 
 use crate::expr_parser::{parse_expr, RawExpr};
-use crate::sci_ir::{Archetype, BinaryOp, ExprNode, SiDimension, SlotRole, SymbolDecl, UnaryOp};
+use crate::sci_ir::{Archetype, BinaryOp, ExprNode, SiDimension, SlotRole, SymbolDecl, TrajectoryReduction, UnaryOp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -405,6 +405,8 @@ pub struct RawLetDraft {
 pub struct RawEquationDraft {
     pub target: String,
     pub expr_text: String,
+    #[serde(default)]
+    pub reduction: Option<TrajectoryReduction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +457,8 @@ pub struct ResolvedEquation {
     pub target_slot: usize,
     pub expr: ExprNode,
     pub source_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<TrajectoryReduction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,6 +512,33 @@ fn collect_raw_idents(expr: &RawExpr, out: &mut BTreeSet<String>) {
 
 /// Resolve a `RawExpr` in a lexical scope, applying Theorem A.1 alias resolution and
 /// returning `(ExprNode, inferred_si_dim)`.
+type OptDim = Option<[(i32, i32); 7]>;
+
+fn merge_additive_dim(
+    l_dim: OptDim,
+    r_dim: OptDim,
+    check_dimensions: bool,
+    field: &str,
+    msg: &str,
+    diags: &mut Vec<ScopeDiagnostic>,
+) -> OptDim {
+    match (l_dim, r_dim) {
+        (None, None) => None,
+        (Some(d), None) | (None, Some(d)) => Some(d),
+        (Some(ld), Some(rd)) => {
+            if check_dimensions && !dim_eq(&ld, &rd) {
+                diags.push(ScopeDiagnostic {
+                    code: "DIMENSIONAL_INCONSISTENCY".into(),
+                    field: field.into(),
+                    symbol: None,
+                    message: format!("{}: {:?} vs {:?}", msg, ld, rd),
+                });
+            }
+            Some(ld)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_and_check_expr(
     raw: &RawExpr,
@@ -515,14 +546,14 @@ fn lower_and_check_expr(
     archetype: Archetype,
     allow_observables: bool,
     sym_map: &HashMap<String, &SymbolDecl>,
-    let_map: &HashMap<String, (ExprNode, [(i32, i32); 7])>,
+    let_map: &HashMap<String, (ExprNode, OptDim)>,
     resolver: &InjectiveAliasResolver,
     check_dimensions: bool,
     resolved_aliases: &mut BTreeMap<String, String>,
     diags: &mut Vec<ScopeDiagnostic>,
-) -> Option<(ExprNode, [(i32, i32); 7])> {
+) -> Option<(ExprNode, OptDim)> {
     match raw {
-        RawExpr::Const { value } => Some((ExprNode::Const { value: *value }, [(0, 1); 7])),
+        RawExpr::Const { value } => Some((ExprNode::Const { value: *value }, None)),
         RawExpr::Rand {
             dist,
             draw_stream_id,
@@ -541,7 +572,7 @@ fn lower_and_check_expr(
                     dist: *dist,
                     draw_stream_id: *draw_stream_id,
                 },
-                [(0, 1); 7],
+                Some([(0, 1); 7]),
             ))
         }
         RawExpr::Ident { name } => {
@@ -552,7 +583,7 @@ fn lower_and_check_expr(
                         ExprNode::Const {
                             value: std::f64::consts::PI,
                         },
-                        [(0, 1); 7],
+                        None,
                     ));
                 }
                 if name == "e_euler" {
@@ -560,7 +591,7 @@ fn lower_and_check_expr(
                         ExprNode::Const {
                             value: std::f64::consts::E,
                         },
-                        [(0, 1); 7],
+                        None,
                     ));
                 }
             }
@@ -621,7 +652,7 @@ fn lower_and_check_expr(
                         role: decl.role,
                         slot_index: decl.slot_index,
                     },
-                    decl.dimension.exponents,
+                    Some(decl.dimension.exponents),
                 ));
             }
             diags.push(ScopeDiagnostic {
@@ -645,21 +676,25 @@ fn lower_and_check_expr(
                 resolved_aliases,
                 diags,
             )?;
-            let out_dim = match op {
+            let out_dim: OptDim = match op {
                 UnaryOp::Neg | UnaryOp::Abs => a_dim,
-                UnaryOp::Sqrt => dim_scale(&a_dim, Rat::new(1, 2)),
+                UnaryOp::Sqrt => a_dim.map(|d| dim_scale(&d, Rat::new(1, 2))),
                 UnaryOp::Exp | UnaryOp::Log | UnaryOp::Sin | UnaryOp::Cos | UnaryOp::Tanh => {
-                    if check_dimensions && !dim_is_zero(&a_dim) {
-                        diags.push(ScopeDiagnostic {
-                            code: "DIMENSIONAL_INCONSISTENCY".into(),
-                            field: field.into(),
-                            symbol: None,
-                            message: format!("Transcendental {:?} requires dimensionless argument", op),
-                        });
+                    if check_dimensions {
+                        if let Some(d) = a_dim {
+                            if !dim_is_zero(&d) {
+                                diags.push(ScopeDiagnostic {
+                                    code: "DIMENSIONAL_INCONSISTENCY".into(),
+                                    field: field.into(),
+                                    symbol: None,
+                                    message: format!("Transcendental {:?} requires dimensionless argument", op),
+                                });
+                            }
+                        }
                     }
-                    [(0, 1); 7]
+                    Some([(0, 1); 7])
                 }
-                UnaryOp::Step => [(0, 1); 7],
+                UnaryOp::Step => Some([(0, 1); 7]),
             };
             Some((
                 ExprNode::Unary {
@@ -694,42 +729,52 @@ fn lower_and_check_expr(
                 resolved_aliases,
                 diags,
             )?;
-            let out_dim = match op {
+            let out_dim: OptDim = match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Min | BinaryOp::Max => {
-                    if check_dimensions && !dim_eq(&l_dim, &r_dim) {
-                        diags.push(ScopeDiagnostic {
-                            code: "DIMENSIONAL_INCONSISTENCY".into(),
-                            field: field.into(),
-                            symbol: None,
-                            message: format!(
-                                "Binary {:?} operand SI dimensions disagree: {:?} vs {:?}",
-                                op, l_dim, r_dim
-                            ),
-                        });
-                    }
-                    l_dim
+                    merge_additive_dim(
+                        l_dim,
+                        r_dim,
+                        check_dimensions,
+                        field,
+                        &format!("Binary {:?} operand SI dimensions disagree", op),
+                        diags,
+                    )
                 }
-                BinaryOp::Mul => dim_add(&l_dim, &r_dim),
-                BinaryOp::Div => dim_sub(&l_dim, &r_dim),
+                BinaryOp::Mul => match (l_dim, r_dim) {
+                    (None, None) => None,
+                    (Some(ld), None) => Some(ld),
+                    (None, Some(rd)) => Some(rd),
+                    (Some(ld), Some(rd)) => Some(dim_add(&ld, &rd)),
+                },
+                BinaryOp::Div => match (l_dim, r_dim) {
+                    (None, None) => None,
+                    (Some(ld), None) => Some(ld),
+                    (None, Some(rd)) => Some(dim_sub(&[(0, 1); 7], &rd)),
+                    (Some(ld), Some(rd)) => Some(dim_sub(&ld, &rd)),
+                },
                 BinaryOp::Pow => {
-                    if check_dimensions && !dim_is_zero(&r_dim) {
-                        diags.push(ScopeDiagnostic {
-                            code: "DIMENSIONAL_INCONSISTENCY".into(),
-                            field: field.into(),
-                            symbol: None,
-                            message: "Power exponent must be dimensionless".into(),
-                        });
+                    if check_dimensions {
+                        if let Some(rd) = r_dim {
+                            if !dim_is_zero(&rd) {
+                                diags.push(ScopeDiagnostic {
+                                    code: "DIMENSIONAL_INCONSISTENCY".into(),
+                                    field: field.into(),
+                                    symbol: None,
+                                    message: "Power exponent must be dimensionless".into(),
+                                });
+                            }
+                        }
                     }
                     if let ExprNode::Const { value } = r_node {
                         if value.fract() == 0.0 && value.abs() <= 16.0 {
-                            dim_scale(&l_dim, Rat::new(value as i32, 1))
+                            l_dim.map(|ld| dim_scale(&ld, Rat::new(value as i32, 1)))
                         } else if (value * 2.0).fract() == 0.0 && value.abs() <= 16.0 {
-                            dim_scale(&l_dim, Rat::new((value * 2.0) as i32, 2))
+                            l_dim.map(|ld| dim_scale(&ld, Rat::new((value * 2.0) as i32, 2)))
                         } else {
-                            [(0, 1); 7]
+                            Some([(0, 1); 7])
                         }
                     } else {
-                        [(0, 1); 7]
+                        Some([(0, 1); 7])
                     }
                 }
             };
@@ -765,22 +810,22 @@ fn lower_and_check_expr(
                 else_branch, field, archetype, allow_observables, sym_map, let_map, resolver,
                 check_dimensions, resolved_aliases, diags,
             )?;
-            if check_dimensions && !dim_eq(&cl_dim, &cr_dim) {
-                diags.push(ScopeDiagnostic {
-                    code: "DIMENSIONAL_INCONSISTENCY".into(),
-                    field: field.into(),
-                    symbol: None,
-                    message: "if() condition operands have mismatched SI dimensions".into(),
-                });
-            }
-            if check_dimensions && !dim_eq(&t_dim, &e_dim) {
-                diags.push(ScopeDiagnostic {
-                    code: "DIMENSIONAL_INCONSISTENCY".into(),
-                    field: field.into(),
-                    symbol: None,
-                    message: "if() then/else branches have mismatched SI dimensions".into(),
-                });
-            }
+            let _ = merge_additive_dim(
+                cl_dim,
+                cr_dim,
+                check_dimensions,
+                field,
+                "if() condition operands have mismatched SI dimensions",
+                diags,
+            );
+            let branch_dim = merge_additive_dim(
+                t_dim,
+                e_dim,
+                check_dimensions,
+                field,
+                "if() then/else branches have mismatched SI dimensions",
+                diags,
+            );
             Some((
                 ExprNode::IfThenElse {
                     cond_op: *cond_op,
@@ -789,7 +834,7 @@ fn lower_and_check_expr(
                     then_branch: Box::new(tb),
                     else_branch: Box::new(eb),
                 },
-                t_dim,
+                branch_dim,
             ))
         }
     }
@@ -858,8 +903,14 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
     all_declared.extend(let_raw.keys().cloned());
     let resolver = InjectiveAliasResolver::new(&all_declared);
 
-    let mut let_map: HashMap<String, (ExprNode, [(i32, i32); 7])> = HashMap::new();
+    let mut let_map: HashMap<String, (ExprNode, OptDim)> = HashMap::new();
     let mut resolved_lets: Vec<ResolvedLet> = Vec::new();
+    let all_dimensionless = req.symbols.iter().all(|s| dim_is_zero(&s.dimension.exponents));
+    let time_dim: [(i32, i32); 7] = if all_dimensionless {
+        [(0, 1); 7]
+    } else {
+        [(0, 1), (0, 1), (1, 1), (0, 1), (0, 1), (0, 1), (0, 1)]
+    };
 
     match sort_let_dag(&let_deps) {
         Ok(order) => {
@@ -877,11 +928,12 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
                     &mut resolved_aliases,
                     &mut diags,
                 ) {
+                    let concrete_dim = dim.unwrap_or([(0, 1); 7]);
                     let si_dim = draft
                         .dimension
                         .clone()
                         .unwrap_or_else(|| SiDimension {
-                            exponents: dim,
+                            exponents: concrete_dim,
                             unit_label: "1".into(),
                         });
                     let_map.insert(name.clone(), (node.clone(), dim));
@@ -918,6 +970,15 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
             });
             continue;
         };
+        if eq.reduction.is_some() {
+            diags.push(ScopeDiagnostic {
+                code: "REDUCTION_NOT_ALLOWED_IN_DYNAMICS".into(),
+                field: format!("dynamics_or_residuals.{}", eq.target),
+                symbol: Some(eq.target.clone()),
+                message: format!("Dynamics equation target {:?} may not specify a trajectory reduction", eq.target),
+            });
+            continue;
+        }
         if req.archetype == Archetype::OdePde && target_decl.role != SlotRole::State {
             diags.push(ScopeDiagnostic {
                 code: "INVALID_DYNAMICS_TARGET".into(),
@@ -929,7 +990,7 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
         }
         match parse_expr(&eq.expr_text) {
             Ok(ast) => {
-                if let Some((node, _dim)) = lower_and_check_expr(
+                if let Some((node, rhs_dim)) = lower_and_check_expr(
                     &ast,
                     &format!("dynamics_or_residuals.{}", eq.target),
                     req.archetype,
@@ -941,11 +1002,35 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
                     &mut resolved_aliases,
                     &mut diags,
                 ) {
+                    if req.check_dimensions {
+                        let expected_dim = if req.archetype == Archetype::OdePde && target_decl.role == SlotRole::State {
+                            dim_sub(&target_decl.dimension.exponents, &time_dim)
+                        } else {
+                            target_decl.dimension.exponents
+                        };
+                        let is_literal_zero = matches!(node, ExprNode::Const { value } if value == 0.0);
+                        if !is_literal_zero {
+                            if let Some(rd) = rhs_dim {
+                                if !dim_eq(&rd, &expected_dim) {
+                                    diags.push(ScopeDiagnostic {
+                                        code: "DIMENSIONAL_INCONSISTENCY".into(),
+                                        field: format!("dynamics_or_residuals.{}", eq.target),
+                                        symbol: Some(eq.target.clone()),
+                                        message: format!(
+                                            "RHS dimension {:?} does not match target {:?} expected dimension {:?}",
+                                            rd, eq.target, expected_dim
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     resolved_dyn.push(ResolvedEquation {
                         target: target_decl.name.clone(),
                         target_slot: target_decl.slot_index,
                         expr: node,
                         source_text: eq.expr_text.clone(),
+                        reduction: None,
                     });
                 }
             }
@@ -974,7 +1059,7 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
         };
         match parse_expr(&eq.expr_text) {
             Ok(ast) => {
-                if let Some((node, _dim)) = lower_and_check_expr(
+                if let Some((node, rhs_dim)) = lower_and_check_expr(
                     &ast,
                     &format!("observables.{}", eq.target),
                     req.archetype,
@@ -986,11 +1071,30 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
                     &mut resolved_aliases,
                     &mut diags,
                 ) {
+                    if req.check_dimensions {
+                        let is_literal_zero = matches!(node, ExprNode::Const { value } if value == 0.0);
+                        if !is_literal_zero {
+                            if let Some(rd) = rhs_dim {
+                                if !dim_eq(&rd, &target_decl.dimension.exponents) {
+                                    diags.push(ScopeDiagnostic {
+                                        code: "DIMENSIONAL_INCONSISTENCY".into(),
+                                        field: format!("observables.{}", eq.target),
+                                        symbol: Some(eq.target.clone()),
+                                        message: format!(
+                                            "Observable RHS dimension {:?} does not match target {:?} dimension {:?}",
+                                            rd, eq.target, target_decl.dimension.exponents
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     resolved_obs.push(ResolvedEquation {
                         target: target_decl.name.clone(),
                         target_slot: target_decl.slot_index,
                         expr: node,
                         source_text: eq.expr_text.clone(),
+                        reduction: eq.reduction,
                     });
                 }
             }
@@ -1038,7 +1142,17 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
             )
             .ok_or_else(|| "rhs resolution failed".into())
         });
-        if let (Ok((lhs_node, _)), Ok((rhs_node, _))) = (lhs_res, rhs_res) {
+        if let (Ok((lhs_node, lhs_dim)), Ok((rhs_node, rhs_dim))) = (lhs_res, rhs_res) {
+            if req.check_dimensions {
+                let _ = merge_additive_dim(
+                    lhs_dim,
+                    rhs_dim,
+                    true,
+                    &format!("obligations.{}", ob.id),
+                    "Obligation LHS and RHS SI dimensions disagree",
+                    &mut diags,
+                );
+            }
             resolved_obs_list.push(ResolvedObligation {
                 id: ob.id.clone(),
                 quantifier: ob.quantifier.clone(),
@@ -1145,8 +1259,8 @@ mod tests {
                 },
             ],
             let_bindings: vec![],
-            dynamics_or_residuals: vec![RawEquationDraft { target: "x".into(), expr_text: "-obs_y".into() }],
-            observables: vec![RawEquationDraft { target: "obs_y".into(), expr_text: "2*x".into() }],
+            dynamics_or_residuals: vec![RawEquationDraft { target: "x".into(), expr_text: "-obs_y".into(), reduction: None }],
+            observables: vec![RawEquationDraft { target: "obs_y".into(), expr_text: "2*x".into(), reduction: None }],
             obligations: vec![],
             check_dimensions: false,
         };

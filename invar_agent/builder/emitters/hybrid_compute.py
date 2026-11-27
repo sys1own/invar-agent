@@ -387,6 +387,18 @@ def sources(context):
             return '(' + self._print(expression.args[0]) + ').tanh()'
         def _print_Abs(self, expression):
             return '(' + self._print(expression.args[0]) + ').abs()'
+        def _print_Min(self, expression):
+            args = [self._print(a) for a in expression.args]
+            acc = args[0]
+            for nxt in args[1:]:
+                acc = f"({acc}).min({nxt})"
+            return acc
+        def _print_Max(self, expression):
+            args = [self._print(a) for a in expression.args]
+            acc = args[0]
+            for nxt in args[1:]:
+                acc = f"({acc}).max({nxt})"
+            return acc
         def _print_Mul(self, expression):
             numerator, denominator = expression.as_numer_denom()
             if denominator != 1:
@@ -475,12 +487,15 @@ def sources(context):
         rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, b.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * b[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, c.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * c[i]; }}\nrhs(q.as_ptr(), p, t + dt, d.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * (a[i] + 2.0 * b[i] + 2.0 * c[i] + d[i]) / 6.0; }}\n}}\n"
     rust_src += '#[no_mangle]\npub unsafe extern "C" fn invar_jacobian(x: *const f64, p: *const f64, t: f64, out: *mut f64) {\n' + binding_rs + "\n" + "".join(f"*out.add({i*width+j}) = {rust_expr(e)};\n" for i,row in enumerate(jacobian) for j,e in enumerate(row)) + "}\n"
     cargo_toml = f'[package]\nname = "{pkg}_native"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "{pkg}_native"\npath = "lib.rs"\ncrate-type = ["cdylib", "rlib"]\n'
-    from ..export_utils import sanitize_ir_for_export
+    from invar_agent.redact import sanitize_tree
     ir = context.ir
-    metadata = dict(program_kind=program_kind.value, states=names, parameters=parameters, defaults={c.symbol:c.si_value for c in ir.constants}, initial={s.symbol:s.initial_value or 0.0 for s in states},
-        state_definitions={s.symbol:s.model_dump(mode="json") for s in states}, parameter_definitions={c.symbol:c.model_dump(mode="json") for c in ir.constants},
-        dt=ir.default_dt_si_s or .01, steps=ir.default_steps or 100, derivative_backend=backend, observables=observable_names,
-        invariants=[e.equation_id for e in ir.equations if e.role.value=="INVARIANT_CONTRACT"], ir=sanitize_ir_for_export(ir.model_dump(mode="json")))
+    metadata = sanitize_tree(
+        dict(program_kind=program_kind.value, states=names, parameters=parameters, defaults={c.symbol:c.si_value for c in ir.constants}, initial={s.symbol:s.initial_value or 0.0 for s in states},
+            state_definitions={s.symbol:s.model_dump(mode="json") for s in states}, parameter_definitions={c.symbol:c.model_dump(mode="json") for c in ir.constants},
+            dt=ir.default_dt_si_s or .01, steps=ir.default_steps or 100, derivative_backend=backend, observables=observable_names,
+            invariants=[e.equation_id for e in ir.equations if e.role.value=="INVARIANT_CONTRACT"], ir=ir.model_dump(mode="json")),
+        workspace_root=context.overlay,
+    )
     manifest=f'''[build-system]
 requires=["setuptools>=68"]
 build-backend="setuptools.build_meta"
@@ -520,7 +535,14 @@ namespaces=true
     reference = [float(expression.subs(environment)) for expression in expressions]
     result.update(test_sources(pkg, reference))
     if ir.research_reference is not None:
-        result['tests/test_research_parity.py'] += f'''\nfrom {pkg}.research_reference import check_model_reference
+        if ir.epistemic_verdict == "USER_MODIFIED_UNVERIFIED" or getattr(ir, "ir_verdict", None) == "USER_MODIFIED_UNVERIFIED":
+            result['tests/test_research_parity.py'] += f'''\nimport pytest
+@pytest.mark.skip(reason="NOT_APPLICABLE_USER_MODIFIED: pinned research reference does not cover user-modified values")
+def test_pinned_research_reference_and_runtime_guards():
+    pass
+'''
+        else:
+            result['tests/test_research_parity.py'] += f'''\nfrom {pkg}.research_reference import check_model_reference
 from {pkg}.kernel_py import step, rhs
 from {pkg}.sdk import MODEL
 def test_pinned_research_reference_and_runtime_guards():
@@ -593,7 +615,7 @@ def emit(node,context):
         compiler=shutil.which('g++') or shutil.which('clang++')
         binary=b''
         if compiler and not context.python_fallback_active:
-            completed=subprocess.run([compiler,'-O3','-std=c++20','-ffp-contract=off','-shared','-fPIC',str(directory/'kernel.cpp'),'-o',str(directory/'kernel.so')],capture_output=True,text=True,timeout=60)
+            completed=subprocess.run([compiler,'-O3','-std=c++20','-ffp-contract=off',f'-ffile-prefix-map={context.overlay}=.','-shared','-fPIC',str(directory/'kernel.cpp'),'-o',str(directory/'kernel.so')],capture_output=True,text=True,timeout=60)
             if completed.returncode:
                 raise ValueError(completed.stderr)
             binary=(directory/'kernel.so').read_bytes()
@@ -602,7 +624,7 @@ def emit(node,context):
         if rustc and not context.python_fallback_active:
             rs_out = directory / 'kernel_rs.so'
             rs_proc = subprocess.run(
-                [rustc, '--crate-type', 'cdylib', '-C', 'opt-level=3', str(directory / 'lib.rs'), '-o', str(rs_out)],
+                [rustc, '--crate-type', 'cdylib', '-C', 'opt-level=3', '--remap-path-prefix', f'{context.overlay}=.', str(directory / 'lib.rs'), '-o', str(rs_out)],
                 capture_output=True, text=True, timeout=60,
             )
             if rs_proc.returncode != 0:

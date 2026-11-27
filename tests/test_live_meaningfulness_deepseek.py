@@ -154,7 +154,7 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
     events = []
 
     async def progress(channel, payload):
-        broadcaster.publish(channel, payload["event"], payload)
+        broadcaster.publish(channel, payload["event"], payload, run_uid=str(payload.get("run_uid") or "live_ds_run"))
         while not queue.empty():
             event = queue.get_nowait()
             events.append(event)

@@ -129,8 +129,9 @@ class BuilderService:
         return uast
 
     def emit(self, channel, event, data):
-        data = {key: value for key, value in data.items() if key not in {'event', 'channel', 'seq', 'run_uid'}}
-        build_uid = f"builder:{data['build_id']}" if data.get('build_id') else None
+        from ..research.broadcaster import GLOBAL_BUILDER_SCOPE
+        data = {key: value for key, value in data.items() if key not in {'event', 'channel', 'seq', 'run_uid', 'scope'}}
+        build_uid = f"builder:{data['build_id']}" if data.get('build_id') else GLOBAL_BUILDER_SCOPE
         self.server.research_broadcaster.publish(channel, event, {'event_version':'2.0', 'mode':'builder', **data}, run_uid=build_uid)
         if channel == 'log':
             self.server.research_broadcaster.publish('search_log', event, {'event_version':'2.0', 'mode':'builder', **data}, run_uid=build_uid)
@@ -215,8 +216,10 @@ class BuilderService:
                             'fault_fingerprint':record['fault_fingerprint_digest'],'status':'DEGRADED_DETERMINISTIC_FALLBACK'})
                     for module in value['module_statuses']:
                         self.emit('accelerator_log','builder.verification_gate',{'build_id':build_id,'module_id':module,
-                            'status':'VERIFIED','hin_ok':True,'z3_ok':True,'cabi_ok':result.cabi_compiled,
-                            'pytest_exit_code':result.pytest_exit_code,'progress_metric':{'failed_test_count':result.pytest_failed}})
+                            'status':value['module_statuses'][module],'hin_ok':None,'z3_ok':None,
+                            'cabi_ok':(True if (result.cabi_compiled and module == 'mod_sdk') else None),
+                            'pytest_exit_code':(result.pytest_exit_code if module == 'mod_tests' else None),
+                            'progress_metric':{'failed_test_count':result.pytest_failed}})
                     self.save('status', build_id, value)
                     self.emit('log', 'builder.completed' if not result.error else 'builder.failed', {
                         'build_id':build_id, 'status':result.status, 'merkle_root_blake3':result.receipt.get('merkle_root_blake3'),

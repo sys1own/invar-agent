@@ -36,6 +36,9 @@ _EXPORTED_SYMBOLS_LOCK = threading.Lock()
 def _direct_python_executable() -> str:
     """Resolve the direct base CPython executable for stdlib-only C-ABI runner
     subprocesses, avoiding the Windows .venv redirector double-spawn."""
+    from .accel import accel_enabled
+    if not accel_enabled():
+        return sys.executable
     base = getattr(sys, "_base_executable", None)
     if base and base != sys.executable:
         base_path = Path(base)
@@ -509,10 +512,12 @@ class DynamicCABIBridge:
         return hashlib.blake2b(cpp_code.encode(), digest_size=16).hexdigest()
 
     def compile(self, cpp_code: str) -> Path:
+        from .accel import accel_enabled
         key = self.cache_key(cpp_code)
-        cached = self._cache.get(key)
-        if cached and cached.exists():
-            return cached
+        if accel_enabled():
+            cached = self._cache.get(key)
+            if cached and cached.exists():
+                return cached
         cpp_path = (self.workspace / f"kernel_{key}.cpp").resolve()
         so_path = (self.workspace / f"kernel_{key}.so").resolve()
         cpp_path.write_text(cpp_code, encoding="utf-8")
@@ -573,7 +578,9 @@ class DynamicCABIBridge:
         except OSError:
             cache_key = None
 
-        if cache_key is not None:
+        from .accel import accel_enabled
+        use_cache = accel_enabled()
+        if use_cache and cache_key is not None:
             with _EXPORTED_SYMBOLS_LOCK:
                 cached = _EXPORTED_SYMBOLS_CACHE.get(cache_key)
                 if cached is not None:
@@ -588,7 +595,7 @@ class DynamicCABIBridge:
             if len(parts) >= 3 and parts[1] in ("T", "W"):
                 symbols.append(parts[2])
         frozen = tuple(symbols)
-        if cache_key is not None:
+        if use_cache and cache_key is not None:
             with _EXPORTED_SYMBOLS_LOCK:
                 _EXPORTED_SYMBOLS_CACHE[cache_key] = frozen
                 _EXPORTED_SYMBOLS_CACHE.move_to_end(cache_key)

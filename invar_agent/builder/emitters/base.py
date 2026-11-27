@@ -21,21 +21,10 @@ def relativize_provenance_path(raw: str) -> str:
     return text
 
 
-def sanitize_ir_for_export(ir_dict: dict) -> dict:
-    """Return a copy of a serialized IR dict with all absolute host paths relativized."""
-    def _clean(obj):
-        if isinstance(obj, dict):
-            out = {}
-            for k, v in obj.items():
-                if k == "file" and isinstance(v, str):
-                    out[k] = relativize_provenance_path(v)
-                else:
-                    out[k] = _clean(v)
-            return out
-        if isinstance(obj, list):
-            return [_clean(item) for item in obj]
-        return obj
-    return _clean(ir_dict)
+def sanitize_ir_for_export(ir_dict: dict, workspace_root=None) -> dict:
+    """Return a copy of a serialized IR/metadata dict with all absolute host paths recursively stripped."""
+    from invar_agent.redact import sanitize_tree
+    return sanitize_tree(ir_dict, workspace_root=workspace_root)
 
 import sympy as sp
 try:
@@ -68,6 +57,7 @@ class EmitterContext:
 class EmitterRegistry:
     def __init__(self):
         self.emitters = {}
+        self.process_factory: str | None = None
 
     def register(self, identifier, emitter):
         if identifier in self.emitters:

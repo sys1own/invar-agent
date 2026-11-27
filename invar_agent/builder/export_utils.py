@@ -1,15 +1,18 @@
-"""ARCH-012: Verified Builder export trust boundary (allow-list, host-path & secret scan)."""
+"""UPG-014 / ARCH-012: Fail-closed export trust boundary (allow-list, host-path, binary & secret scan)."""
 from __future__ import annotations
 
-import copy
-import re
-import zipfile
+import getpass
+import os
 from pathlib import Path
-from typing import Any
+import re
+from typing import Any, Mapping
+import zipfile
+
+from invar_agent.redact import sanitize_tree
 
 
 class ExportBlockedError(ValueError):
-    """Raised when a Builder export violates trust-boundary or completion invariants."""
+    """Raised when an export violates trust-boundary or completion invariants."""
 
     def __init__(self, code: str, message: str, status_code: int = 409) -> None:
         super().__init__(f"{code}: {message}")
@@ -18,11 +21,12 @@ class ExportBlockedError(ValueError):
         self.status_code = status_code
 
 
-_HOST_PATH_PATTERNS = (
-    re.compile(r"[A-Za-z]:\\(?:Users|Documents and Settings|Program Files|Windows)\\[^\s'\"`]+", re.I),
-    re.compile(r"[A-Za-z]:/(?:Users|Documents and Settings|Program Files|Windows)/[^\s'\"`]+", re.I),
-    re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+/[^\s'\"`]+"),
+_HOST_PATH_NORM_RE = re.compile(
+    r"(?i)(?<![A-Za-z])[A-Z]:[\\/](?![\\/])[^\s'\"`]+"
+    r"|(?<![\w.])/(?:[a-z]/)?(?:Users|home)/[^\s'\"`]+"
+    r"|\bfile://[^\s'\"`]+"
 )
+_UNC_PATH_RAW_RE = re.compile(r"(?<!\\)\\\\[A-Za-z0-9_.$-]+\\[A-Za-z0-9_.$-]+")
 
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
@@ -35,34 +39,18 @@ _EXCLUDED_SEGMENTS = {"__pycache__", ".invar", ".pytest_cache", ".mypy_cache"}
 _EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
-def _relativize_path_str(raw: str) -> str:
-    text = str(raw or "")
-    if not text:
-        return text
-    if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith(("/Users/", "/home/", "/tmp/", "/var/", "/private/")):
-        return Path(text.replace("\\", "/")).name
-    return text
-
-
-def sanitize_ir_for_export(ir_dict: dict[str, Any]) -> dict[str, Any]:
-    """Strip absolute host paths from an IR dict before embedding in exported sdk.py."""
-    out = copy.deepcopy(ir_dict)
-    for list_key in ("uploaded_files", "datasets_attached"):
-        if isinstance(out.get(list_key), list):
-            out[list_key] = [_relativize_path_str(p) for p in out[list_key]]
-    for coll_key in ("constants", "equations", "state_variables", "disambiguation_flags"):
-        items = out.get(coll_key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            prov = item.get("provenance")
-            if isinstance(prov, dict) and "file" in prov:
-                prov["file"] = _relativize_path_str(prov["file"])
-            if "source_file" in item:
-                item["source_file"] = _relativize_path_str(item["source_file"])
-    return out
+def normalise_for_scan(text: str) -> str:
+    """Collapse repeated backslashes and URL-encoded path separators before scanning."""
+    t = re.sub(r"\\{2,}", r"\\", text)
+    t = (
+        t.replace("%5C", "\\")
+        .replace("%5c", "\\")
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%2F", "/")
+        .replace("%2f", "/")
+    )
+    return t
 
 
 def _is_excluded_relpath(rel_posix: str) -> bool:
@@ -76,9 +64,88 @@ def _is_excluded_relpath(rel_posix: str) -> bool:
     return False
 
 
-def scan_archive_for_leaks(archive_path: Path) -> list[str]:
-    """Scan all text members in a zip archive for host paths, secrets, and forbidden bytecode."""
+def _host_literals(workspace_root: Path | None = None) -> tuple[list[str], str | None]:
+    lits: list[str] = []
+    roots: list[Path] = []
+    if workspace_root is not None:
+        try:
+            roots.append(Path(workspace_root).resolve())
+        except Exception:
+            pass
+    try:
+        roots.append(Path.home().resolve())
+    except Exception:
+        pass
+    for r in roots:
+        s = str(r)
+        if len(s) >= 4:
+            lits.append(s.lower())
+            lits.append(s.replace("\\", "/").lower())
+    user: str | None = None
+    try:
+        u = getpass.getuser()
+        if u and len(u) >= 4:
+            user = u.lower()
+    except Exception:
+        pass
+    return list(dict.fromkeys(lits)), user
+
+
+def _scan_text_member(name: str, text: str, literals: list[str], user: str | None) -> list[str]:
     leaks: list[str] = []
+    # 1. UNC check on un-collapsed text (avoids matching LaTeX \\alpha which has no second \)
+    if _UNC_PATH_RAW_RE.search(text):
+        leaks.append(f"HOST_PATH_LEAK:{name}:unc")
+    norm = normalise_for_scan(text)
+    # 2. Drive / POSIX-home / MSYS / WSL / file:// check on normalized text
+    if not leaks and _HOST_PATH_NORM_RE.search(norm):
+        leaks.append(f"HOST_PATH_LEAK:{name}:path")
+    # 3. Literal workspace root / home dir / username segment checks
+    if not leaks:
+        norm_lower = norm.lower()
+        for lit in literals:
+            if lit in norm_lower:
+                leaks.append(f"HOST_PATH_LEAK:{name}:root")
+                break
+    if not leaks and user:
+        if re.search(rf"(?i)(?<=[\\/]){re.escape(user)}(?=[\\/])", norm):
+            leaks.append(f"HOST_PATH_LEAK:{name}:user")
+    # 4. Secrets
+    for pat in _SECRET_PATTERNS:
+        if pat.search(text):
+            leaks.append(f"SECRET_LEAK:{name}")
+            break
+    return leaks
+
+
+def _scan_binary_member(name: str, raw: bytes, literals: list[str], user: str | None) -> list[str]:
+    """Scan printable ASCII and UTF-16LE strings of a binary member for host root/home/user only."""
+    leaks: list[str] = []
+    ascii_chunks = [m.group(0).decode("ascii", errors="ignore") for m in re.finditer(rb"[\x20-\x7e]{4,}", raw)]
+    utf16_chunks: list[str] = []
+    for m in re.finditer(rb"(?:[\x20-\x7e]\x00){4,}", raw):
+        try:
+            utf16_chunks.append(m.group(0).decode("utf-16-le", errors="ignore"))
+        except Exception:
+            pass
+    combined = "\n".join(ascii_chunks + utf16_chunks)
+    if not combined:
+        return leaks
+    norm = normalise_for_scan(combined)
+    norm_lower = norm.lower()
+    for lit in literals:
+        if lit in norm_lower:
+            leaks.append(f"BINARY_HOST_PATH_LEAK:{name}:root")
+            return leaks
+    if user and re.search(rf"(?i)(?<=[\\/]){re.escape(user)}(?=[\\/])", norm):
+        leaks.append(f"BINARY_HOST_PATH_LEAK:{name}:user")
+    return leaks
+
+
+def scan_archive_for_leaks(archive_path: Path, *, workspace_root: Path | None = None) -> list[str]:
+    """Scan all text and binary members in a zip archive for host paths, secrets, and forbidden bytecode."""
+    leaks: list[str] = []
+    literals, user = _host_literals(workspace_root)
     with zipfile.ZipFile(archive_path, "r") as zf:
         for info in zf.infolist():
             name = info.filename
@@ -89,21 +156,51 @@ def scan_archive_for_leaks(archive_path: Path) -> list[str]:
                 continue
             raw = zf.read(name)
             if b"\x00" in raw[:4096]:
-                continue  # skip compiled native binaries (.so / .dll)
+                leaks.extend(_scan_binary_member(name, raw, literals, user))
+                continue
             try:
                 text = raw.decode("utf-8", errors="ignore")
             except Exception:
                 continue
-            for pat in _HOST_PATH_PATTERNS:
-                m = pat.search(text)
-                if m:
-                    leaks.append(f"HOST_PATH_LEAK:{name}:{m.group(0)[:80]}")
-                    break
-            for pat in _SECRET_PATTERNS:
-                if pat.search(text):
-                    leaks.append(f"SECRET_LEAK:{name}")
-                    break
+            leaks.extend(_scan_text_member(name, text, literals, user))
     return leaks
+
+
+def write_scanned_zip(
+    members: Mapping[str, bytes | str | Path],
+    archive_path: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> Path:
+    """Single trust-boundary zip writer used by Builder, Workspace, Vault, and CLI exports."""
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel_name in sorted(members.keys()):
+                rel_posix = rel_name.replace("\\", "/")
+                if _is_excluded_relpath(rel_posix):
+                    continue
+                src = members[rel_name]
+                if isinstance(src, Path):
+                    if src.is_symlink():
+                        raise ExportBlockedError("EXPORT_UNSAFE_SYMLINK", f"Unsafe symlink: {src.name}", status_code=400)
+                    zf.write(src, rel_posix)
+                elif isinstance(src, bytes):
+                    zf.writestr(rel_posix, src)
+                else:
+                    zf.writestr(rel_posix, str(src).encode("utf-8"))
+        leaks = scan_archive_for_leaks(archive_path, workspace_root=workspace_root)
+        if leaks:
+            offending = sorted({item.split(":")[1] for item in leaks if ":" in item})
+            raise ExportBlockedError(
+                "EXPORT_TRUST_BOUNDARY_LEAK",
+                f"Export blocked due to trust-boundary leaks in members: {', '.join(offending[:10])}",
+                status_code=409,
+            )
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    return archive_path
 
 
 def build_verified_export_zip(
@@ -112,15 +209,9 @@ def build_verified_export_zip(
     *,
     build_status: str | None,
     cache_manifest: Any = None,
+    workspace_root: Path | None = None,
 ) -> Path:
-    """Create an allow-listed, receipt-verified, leak-scanned export zip archive.
-
-    Fails closed (deletes any partial zip and raises ExportBlockedError) if:
-    - build_status is not COMPLETED / COMPLETED_WITH_FALLBACKS,
-    - any receipt artifact is missing or tampered,
-    - any symlink exists, or
-    - any archive member contains a host path or secret pattern.
-    """
+    """Create an allow-listed, receipt-verified, leak-scanned export zip archive."""
     if build_status not in {"COMPLETED", "COMPLETED_WITH_FALLBACKS"}:
         raise ExportBlockedError(
             "EXPORT_BUILD_NOT_COMPLETED",
@@ -150,26 +241,14 @@ def build_verified_export_zip(
                 if blake3_file(art_path) != expected_digest:
                     raise ExportBlockedError("EXPORT_DIGEST_MISMATCH", f"Receipt digest mismatch for {rel_artifact}")
 
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in sorted(ws.rglob("*")):
-                if path.is_symlink():
-                    raise ExportBlockedError("EXPORT_UNSAFE_SYMLINK", f"Unsafe symlink: {path.name}", status_code=400)
-                if not path.is_file():
-                    continue
-                rel_posix = path.relative_to(ws).as_posix()
-                if _is_excluded_relpath(rel_posix):
-                    continue
-                zf.write(path, rel_posix)
-        leaks = scan_archive_for_leaks(archive_path)
-        if leaks:
-            raise ExportBlockedError(
-                "EXPORT_TRUST_BOUNDARY_LEAK",
-                "Export blocked due to trust-boundary leaks: " + "; ".join(leaks[:5]),
-                status_code=409,
-            )
-    except Exception:
-        archive_path.unlink(missing_ok=True)
-        raise
-    return archive_path
+    members: dict[str, Path] = {}
+    for path in sorted(ws.rglob("*")):
+        if path.is_symlink():
+            raise ExportBlockedError("EXPORT_UNSAFE_SYMLINK", f"Unsafe symlink: {path.name}", status_code=400)
+        if not path.is_file():
+            continue
+        rel_posix = path.relative_to(ws).as_posix()
+        if _is_excluded_relpath(rel_posix):
+            continue
+        members[rel_posix] = path
+    return write_scanned_zip(members, archive_path, workspace_root=workspace_root or ws)

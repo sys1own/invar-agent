@@ -432,10 +432,15 @@ def test_phase2_shbt_ghost_autonomous_activation_and_builder_lowering():
     assert "sys1own/shbt-sglt" in repos
     assert "sys1own/shbt-exotic" in repos
 
-    # Spectral density half-integer unit & dimensionless aliases
+    # Spectral density half-integer unit & dimensionless aliases (UPG-008: exact rationals in parse_unit, Builder rejects fractional)
+    from fractions import Fraction
+    from invar_agent.builder.ingestion.equation_lowerer import FormalGateError
+    from invar_agent.ir.units import parse_unit
     assert unit_dimension("dimensionless").exponents == (0, 0, 0, 0, 0, 0, 0)
     assert unit_dimension("dB").exponents == (0, 0, 0, 0, 0, 0, 0)
-    assert unit_dimension("m/(1/s)^0.5").exponents[0] == 1
+    assert parse_unit("m/(1/s)^0.5").dim == (Fraction(0), Fraction(1), Fraction(1, 2), Fraction(0), Fraction(0), Fraction(0), Fraction(0))
+    with pytest.raises(FormalGateError, match="HIN_FRACTIONAL_DIMENSION"):
+        unit_dimension("m/(1/s)^0.5")
 
     # SymPy Piecewise & Greek subscript ASCII lowering
     lhs, rel, rhs = equation_parts(clean_math("dtheta_inf_norm/dt = Piecewise((0, theta_inf_norm < 0), (-0.15*theta_inf_norm, True))"))

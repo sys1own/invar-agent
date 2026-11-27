@@ -708,44 +708,45 @@ pub fn reverse_adjoint(
     expr: &CselExpr,
     adjoint: CselExpr,
     grads: &mut HashMap<String, CselExpr>,
-) {
+) -> Result<(), String> {
     if matches!(adjoint, CselExpr::Literal { value: 0.0 }) {
-        return;
+        return Ok(());
     }
     match expr {
-        CselExpr::Literal { .. } => {}
+        CselExpr::Literal { .. } => Ok(()),
         CselExpr::Symbol { name } => {
             let entry = grads.entry(name.clone()).or_insert_with(|| lit(0.0));
             let prev = entry.clone();
             *entry = add(prev, adjoint);
+            Ok(())
         }
         CselExpr::Unary { op, arg } => {
             let next_adj = match op.as_str() {
                 "-" | "neg" => neg(adjoint),
                 _ => adjoint,
             };
-            reverse_adjoint(arg, next_adj, grads);
+            reverse_adjoint(arg, next_adj, grads)
         }
         CselExpr::Binary { op, left, right } => match op.as_str() {
             "+" => {
-                reverse_adjoint(left, adjoint.clone(), grads);
-                reverse_adjoint(right, adjoint, grads);
+                reverse_adjoint(left, adjoint.clone(), grads)?;
+                reverse_adjoint(right, adjoint, grads)
             }
             "-" => {
-                reverse_adjoint(left, adjoint.clone(), grads);
-                reverse_adjoint(right, neg(adjoint), grads);
+                reverse_adjoint(left, adjoint.clone(), grads)?;
+                reverse_adjoint(right, neg(adjoint), grads)
             }
             "*" => {
-                reverse_adjoint(left, mul(adjoint.clone(), *right.clone()), grads);
-                reverse_adjoint(right, mul(adjoint, *left.clone()), grads);
+                reverse_adjoint(left, mul(adjoint.clone(), *right.clone()), grads)?;
+                reverse_adjoint(right, mul(adjoint, *left.clone()), grads)
             }
             "/" => {
                 // d/dl (l / r) = 1 / r ; d/dr (l / r) = -l / r^2
                 let dl = sdiv(adjoint.clone(), *right.clone());
                 let r2 = mul(*right.clone(), *right.clone());
                 let dr = neg(sdiv(mul(adjoint, *left.clone()), r2));
-                reverse_adjoint(left, dl, grads);
-                reverse_adjoint(right, dr, grads);
+                reverse_adjoint(left, dl, grads)?;
+                reverse_adjoint(right, dr, grads)
             }
             "^" | "**" => {
                 if let CselExpr::Literal { value: p } = right.as_ref() {
@@ -754,7 +755,7 @@ pub fn reverse_adjoint(
                         args: vec![*left.clone(), lit(p - 1.0)],
                     };
                     let dl = mul(adjoint, mul(lit(*p), pow_m1));
-                    reverse_adjoint(left, dl, grads);
+                    reverse_adjoint(left, dl, grads)
                 } else {
                     // d/dl (l^r) = r * l^(r-1)
                     let pow_m1 = CselExpr::Call {
@@ -767,15 +768,15 @@ pub fn reverse_adjoint(
                         args: vec![*left.clone(), *right.clone()],
                     };
                     let dr = mul(adjoint, mul(full, call1("safe_log", call1("abs", *left.clone()))));
-                    reverse_adjoint(left, dl, grads);
-                    reverse_adjoint(right, dr, grads);
+                    reverse_adjoint(left, dl, grads)?;
+                    reverse_adjoint(right, dr, grads)
                 }
             }
-            _ => {}
+            _ => Err(format!("ADJOINT_UNSUPPORTED_OPERATOR: {}", op)),
         },
         CselExpr::Call { func, args } => {
             if args.is_empty() {
-                return;
+                return Ok(());
             }
             let a0 = args[0].clone();
             match func.as_str() {
@@ -783,41 +784,41 @@ pub fn reverse_adjoint(
                     let a1 = args[1].clone();
                     let dl = sdiv(adjoint.clone(), a1.clone());
                     let dr = neg(sdiv(mul(adjoint, a0), mul(a1.clone(), a1)));
-                    reverse_adjoint(&args[0], dl, grads);
-                    reverse_adjoint(&args[1], dr, grads);
+                    reverse_adjoint(&args[0], dl, grads)?;
+                    reverse_adjoint(&args[1], dr, grads)
                 }
                 "safe_exp" | "exp" => {
                     let da = mul(adjoint, call1("safe_exp", a0));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_log" | "log" => {
                     let da = sdiv(adjoint, a0);
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "log1p" => {
                     let da = sdiv(adjoint, add(lit(1.0), a0));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "expm1" => {
                     let da = mul(adjoint, call1("safe_exp", a0));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_sqrt" | "sqrt" => {
                     let da = sdiv(adjoint, mul(lit(2.0), call1("safe_sqrt", a0)));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_sin" | "sin" => {
                     let da = mul(adjoint, call1("safe_cos", a0));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_cos" | "cos" => {
                     let da = neg(mul(adjoint, call1("safe_sin", a0)));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_tanh" | "tanh" => {
                     let t = call1("safe_tanh", a0);
                     let da = mul(adjoint, sub(lit(1.0), mul(t.clone(), t)));
-                    reverse_adjoint(&args[0], da, grads);
+                    reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_pow" | "pow" if args.len() >= 2 => {
                     let bin = CselExpr::Binary {
@@ -825,14 +826,40 @@ pub fn reverse_adjoint(
                         left: Box::new(args[0].clone()),
                         right: Box::new(args[1].clone()),
                     };
-                    reverse_adjoint(&bin, adjoint, grads);
+                    reverse_adjoint(&bin, adjoint, grads)
                 }
                 "abs" | "fabs" => {
                     let sgn = CselExpr::Call {
                         func: "where".into(),
                         args: vec![a0, lit(1.0), lit(-1.0)],
                     };
-                    reverse_adjoint(&args[0], mul(adjoint, sgn), grads);
+                    reverse_adjoint(&args[0], mul(adjoint, sgn), grads)
+                }
+                "min" if args.len() >= 2 => {
+                    let diff = sub(args[0].clone(), args[1].clone());
+                    let ga = CselExpr::Call {
+                        func: "where".into(),
+                        args: vec![diff.clone(), lit(0.0), adjoint.clone()],
+                    };
+                    let gb = CselExpr::Call {
+                        func: "where".into(),
+                        args: vec![diff, adjoint, lit(0.0)],
+                    };
+                    reverse_adjoint(&args[0], ga, grads)?;
+                    reverse_adjoint(&args[1], gb, grads)
+                }
+                "max" if args.len() >= 2 => {
+                    let diff = sub(args[1].clone(), args[0].clone());
+                    let ga = CselExpr::Call {
+                        func: "where".into(),
+                        args: vec![diff.clone(), lit(0.0), adjoint.clone()],
+                    };
+                    let gb = CselExpr::Call {
+                        func: "where".into(),
+                        args: vec![diff, adjoint, lit(0.0)],
+                    };
+                    reverse_adjoint(&args[0], ga, grads)?;
+                    reverse_adjoint(&args[1], gb, grads)
                 }
                 "smooth_clamp" if args.len() >= 3 => {
                     // d/dx smooth_clamp(x, a, b) = (b-a) * 10 * sig * (1 - sig)
@@ -847,7 +874,7 @@ pub fn reverse_adjoint(
                         lit(10.0),
                         mul(sub(hi, lo), mul(sig.clone(), sub(lit(1.0), sig))),
                     );
-                    reverse_adjoint(&args[0], mul(adjoint, deriv), grads);
+                    reverse_adjoint(&args[0], mul(adjoint, deriv), grads)
                 }
                 "where" if args.len() >= 3 => {
                     let dt = CselExpr::Call {
@@ -858,10 +885,10 @@ pub fn reverse_adjoint(
                         func: "where".into(),
                         args: vec![a0, lit(0.0), adjoint],
                     };
-                    reverse_adjoint(&args[1], dt, grads);
-                    reverse_adjoint(&args[2], df, grads);
+                    reverse_adjoint(&args[1], dt, grads)?;
+                    reverse_adjoint(&args[2], df, grads)
                 }
-                _ => {}
+                _ => Err(format!("ADJOINT_UNSUPPORTED_FUNCTION: {}", func)),
             }
         }
     }
@@ -968,7 +995,7 @@ pub fn analyze_jacobian_spectrum(
     state_vars: &[String],
     equations: &[(String, CselExpr)],
     env: &HashMap<String, f64>,
-) -> JacobianAnalysisResult {
+) -> Result<JacobianAnalysisResult, String> {
     analyze_jacobian_spectrum_opts(state_vars, equations, env, true)
 }
 
@@ -977,7 +1004,7 @@ pub fn analyze_jacobian_spectrum_opts(
     equations: &[(String, CselExpr)],
     env: &HashMap<String, f64>,
     compute_spectrum: bool,
-) -> JacobianAnalysisResult {
+) -> Result<JacobianAnalysisResult, String> {
     let n = state_vars.len();
     let mut jacobian = vec![vec![0.0; n]; n];
     let mut symbolic_jacobian = vec![vec!["0.0".to_string(); n]; n];
@@ -987,7 +1014,7 @@ pub fn analyze_jacobian_spectrum_opts(
             break;
         }
         let mut grads: HashMap<String, CselExpr> = HashMap::new();
-        reverse_adjoint(expr, lit(1.0), &mut grads);
+        reverse_adjoint(expr, lit(1.0), &mut grads)?;
         for (col, var) in state_vars.iter().enumerate() {
             if let Some(g) = grads.get(var) {
                 symbolic_jacobian[row][col] = csel_to_string(g);
@@ -998,7 +1025,7 @@ pub fn analyze_jacobian_spectrum_opts(
     }
 
     if n == 0 || !compute_spectrum {
-        return JacobianAnalysisResult {
+        return Ok(JacobianAnalysisResult {
             state_vars: state_vars.to_vec(),
             jacobian,
             symbolic_jacobian,
@@ -1007,14 +1034,14 @@ pub fn analyze_jacobian_spectrum_opts(
             spectral_radius: 0.0,
             stiffness_ratio: 1.0,
             recommended_solver: "rk4".into(),
-        };
+        });
     }
 
     let spectrum = compute_bounded_eigenvalues(&jacobian);
     let eigenvalues = match &spectrum {
         Some(eigs) => eigs.clone(),
         None => {
-            return JacobianAnalysisResult {
+            return Ok(JacobianAnalysisResult {
                 state_vars: state_vars.to_vec(),
                 jacobian,
                 symbolic_jacobian,
@@ -1023,7 +1050,7 @@ pub fn analyze_jacobian_spectrum_opts(
                 spectral_radius: 0.0,
                 stiffness_ratio: 1.0,
                 recommended_solver: "rk4".into(),
-            };
+            });
         }
     };
 
@@ -1063,7 +1090,7 @@ pub fn analyze_jacobian_spectrum_opts(
         "rk4".to_string()
     };
 
-    JacobianAnalysisResult {
+    Ok(JacobianAnalysisResult {
         state_vars: state_vars.to_vec(),
         jacobian,
         symbolic_jacobian,
@@ -1072,7 +1099,7 @@ pub fn analyze_jacobian_spectrum_opts(
         spectral_radius,
         stiffness_ratio,
         recommended_solver,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,9 +1146,11 @@ impl PyAdjointHin {
         let state_vars = self.state_vars.clone();
         let equations = self.equations.clone();
 
-        let result = py.allow_threads(move || {
-            analyze_jacobian_spectrum_opts(&state_vars, &equations, &env, compute_spectrum)
-        });
+        let result = py
+            .allow_threads(move || {
+                analyze_jacobian_spectrum_opts(&state_vars, &equations, &env, compute_spectrum)
+            })
+            .map_err(PyValueError::new_err)?;
 
         serde_json::to_string(&result)
             .map_err(|e| PyValueError::new_err(format!("Serialization error: {}", e)))
@@ -1155,7 +1184,8 @@ mod tests {
             &state_vars,
             &[("x".into(), eq_x), ("y".into(), eq_y)],
             &env,
-        );
+        )
+        .unwrap();
         assert!(res.spectral_radius >= 1e6 - 1.0);
         assert!(res.stiffness_ratio >= 1e5);
         assert_eq!(res.recommended_solver, "ros3pr");
@@ -1172,7 +1202,7 @@ mod tests {
                 .iter()
                 .map(|v| (v.clone(), CselExpr::Literal { value: 0.1 }))
                 .collect();
-            let zres = analyze_jacobian_spectrum(&vars, &zero_eqs, &env);
+            let zres = analyze_jacobian_spectrum(&vars, &zero_eqs, &env).unwrap();
             assert_eq!(zres.eigenvalues.len(), n);
             assert_eq!(zres.spectral_radius, 0.0);
 
@@ -1186,12 +1216,12 @@ mod tests {
                     }
                 })
                 .collect();
-            let nres = analyze_jacobian_spectrum(&vars, &nilp_eqs, &env);
+            let nres = analyze_jacobian_spectrum(&vars, &nilp_eqs, &env).unwrap();
             assert_eq!(nres.eigenvalues.len(), n);
             assert_eq!(nres.spectral_radius, 0.0);
 
             // 3. compute_spectrum = false skips Schur entirely
-            let no_spec = analyze_jacobian_spectrum_opts(&vars, &nilp_eqs, &env, false);
+            let no_spec = analyze_jacobian_spectrum_opts(&vars, &nilp_eqs, &env, false).unwrap();
             assert!(no_spec.spectrum.is_none());
             assert!(no_spec.eigenvalues.is_empty());
         }

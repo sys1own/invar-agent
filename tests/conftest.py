@@ -1,11 +1,13 @@
 """Pytest configuration for xdist worker isolation and optional Z3 thread-confinement probing."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any
 
 WORKER = os.environ.get("PYTEST_XDIST_WORKER")
@@ -13,6 +15,28 @@ _SCRATCH: list[Path] = []
 _Z3_PROBE_ORIGINALS: dict[type, Any] = {}
 _Z3_FOREIGN_RELEASES: list[tuple[str, int, str]] = []
 _Z3_INTENTIONAL_RACE_DEFERRED = 0
+
+
+def _write_progress_event(event: str, nodeid: str) -> None:
+    base = os.environ.get("INVAR_TEST_PROGRESS", "").strip()
+    if not base:
+        return
+    suffix = WORKER or "main"
+    path = Path(f"{base}.{suffix}.jsonl")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": event, "nodeid": nodeid, "t": time.time()}) + "\n")
+    except OSError:
+        pass
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _write_progress_event("start", str(nodeid))
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    _write_progress_event("finish", str(nodeid))
 
 
 def record_intentional_z3_race_deferred(delta: int) -> None:

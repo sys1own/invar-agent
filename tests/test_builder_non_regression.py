@@ -73,7 +73,7 @@ def test_legacy_server_still_runs_without_optional_builder_extras(builder_client
 def test_builder_execute_preserves_research_event_replay(builder_client):
     _,plan=prepare_plan(builder_client,profiles=['hybrid_compute_library'])
     broadcaster=builder_client.app.state.builder_service.server.research_broadcaster
-    broadcaster.publish('search_log','research_marker',{'mode':'research','message':'Preserve replay'})
+    broadcaster.publish('search_log','research_marker',{'mode':'research','message':'Preserve replay'},run_uid='res_marker_1')
     response=builder_client.post('/api/v1/builder/execute',json={'plan_id':plan['plan_id']})
     assert response.status_code==202,response.text
     subscription=broadcaster.subscribe()

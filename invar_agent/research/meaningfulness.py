@@ -1936,7 +1936,12 @@ def certify_implementation_fidelity(ihcg: IhcgGraph, uast: Mapping[str, Any], sa
     reports = json.loads(_native.PyHolographicHin(_json(quantities)).verify_equations(_json(arithmetic)))
     dim = reports["all_valid"] and set(equations) == set(ihcg.equations)
     for report in reports["equations"]:
-        expected = ihcg.equations.get(owners[report["equation_name"]])
+        eq_name = owners[report["equation_name"]]
+        expected = ihcg.equations.get(eq_name)
+        raw_expr = str(equations.get(eq_name, "")).strip()
+        # NF-18: Literal-zero RHS (e.g. fixed boundary node dT/dt = 0) is compatible with any dimension.
+        if raw_expr in {"0", "0.0", "-0", "-0.0", "+0", "+0.0"}:
+            continue
         dim = dim and expected is not None and tuple(report["output_dimensions"]) == tuple(int(round(x * dim_scale)) for x in expected.si_dim) and report["output_semantic_tag"] == expected.semantic_tag and not report["dimensional_warnings"]
     parameters = uast.get("parameters", {})
     locked = all(parameters.get(k) == v for k, v in ihcg.control_values.items())

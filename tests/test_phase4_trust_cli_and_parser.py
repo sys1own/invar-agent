@@ -93,6 +93,37 @@ def test_export_has_no_absolute_paths_or_pyc(tmp_path):
         build_verified_export_zip(ws, posix_zip, build_status="COMPLETED")
     assert exc_posix.value.code == "EXPORT_TRUST_BOUNDARY_LEAK"
     assert not posix_zip.exists()
+    (ws / "src" / "pkg" / "leak_posix.py").unlink()
+
+    # UPG-014: Escaped JSON, other drives, MSYS /c/Users, UNC, file://, binary member
+    from invar_agent.builder.export_utils import write_scanned_zip
+    for label, content in [
+        ("escaped_json", '{"file": "C:\\\\\\\\Users\\\\\\\\alice\\\\\\\\spec.md"}'),
+        ("drive_d", "path = 'D:/work/secret/model.tex'"),
+        ("msys", "path = '/c/Users/alice/invar/model.py'"),
+        ("unc", r"path = '\\fileserver\share\data.csv'"),
+        ("file_uri", "href = 'file:///C:/Users/alice/doc.pdf'"),
+    ]:
+        bad_zip = tmp_path / f"leak_{label}.zip"
+        with pytest.raises(ExportBlockedError) as exc_bad:
+            write_scanned_zip({"src/pkg/mod.py": content}, bad_zip, workspace_root=ws)
+        assert exc_bad.value.code == "EXPORT_TRUST_BOUNDARY_LEAK", f"Missed leak form: {label}"
+        assert not bad_zip.exists()
+
+    # Binary member leaking workspace root (UTF-8 and UTF-16LE) must fail closed
+    bin_zip = tmp_path / "leak_bin.zip"
+    bin_payload = b"\x00\x01\x02ELF" + str(ws.resolve()).encode("utf-16-le") + b"\x00\x00"
+    with pytest.raises(ExportBlockedError) as exc_bin:
+        write_scanned_zip({"src/pkg/native/kernel.so": bin_payload}, bin_zip, workspace_root=ws)
+    assert exc_bin.value.code == "EXPORT_TRUST_BOUNDARY_LEAK"
+    assert not bin_zip.exists()
+
+    # Negative cases (must NOT trigger false positives): https://, ratio 1:2, LaTeX \\alpha
+    neg_zip = tmp_path / "neg_clean.zip"
+    neg_content = r"URL = 'https://example.com/a/b'; RATIO = '1:2'; TEX = r'\\alpha + \\beta = 0'"
+    write_scanned_zip({"src/pkg/clean.py": neg_content}, neg_zip, workspace_root=ws)
+    assert neg_zip.is_file()
+    assert scan_archive_for_leaks(neg_zip, workspace_root=ws) == []
 
 
 def test_cli_builder_ingest_approve_plan_execute_export(tmp_path):

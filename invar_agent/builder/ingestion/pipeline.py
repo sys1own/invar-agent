@@ -1,18 +1,223 @@
 """Typed upload/vault ingestion and transactional researcher review."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
+
+import blake3
 
 from .archive_guard import IngestionError, validate_and_unpack_upload
 from .equation_lowerer import (FormalGateError, _native, check_z3, equation_parts,
                                lower_and_verify_equations, normalize_to_si, unit_dimension)
 from .parsers import parse_document
 from .schemas import (CanonicalResearchIR, EquationRole, ExtractedConstant, IngestionRequest, IRReviewOverride,
-                      RawConstant, RawEquation, SIDimensionVectorModel, SourceSpan, StateVariableSpec,
-                      VerificationStatus)
+                      OverrideEntry, RawConstant, RawEquation, SIDimensionVectorModel, SourceCertificateRef,
+                      SourceSpan, StateVariableSpec, VerificationStatus)
 from .vault_adapter import load_vault_bundle
+
+
+def compute_certificate_blake3(raw_cert: dict[str, Any]) -> str:
+    canonical = json.dumps(raw_cert, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return blake3.blake3(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_override_entry_id(entry_dict: dict[str, Any]) -> str:
+    payload = {k: v for k, v in entry_dict.items() if k != "entry_id"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return blake3.blake3(canonical.encode("utf-8")).hexdigest()
+
+
+def _certificates_are_universal_positive(ir: CanonicalResearchIR) -> bool:
+    certs: dict[str, dict[str, Any]] = dict(ir.meaningfulness_certificates)
+    if ir.meaningfulness_certificate is not None:
+        rid = str(ir.meaningfulness_certificate.get("run_id") or "")
+        if rid and rid not in certs:
+            certs[rid] = ir.meaningfulness_certificate
+    if not certs:
+        return False
+    from ...research.epistemic import parse_run_certificate
+    for raw in certs.values():
+        cert = parse_run_certificate(raw)
+        if cert.epistemic_verdict.value != "VERIFIED_DISCOVERY":
+            return False
+        q_mode = None
+        if isinstance(raw, dict):
+            q_mode = raw.get("quantifier_mode")
+            if q_mode is None and isinstance(raw.get("ihcg_anchor"), dict):
+                q_mode = raw["ihcg_anchor"].get("quantifier_mode")
+            obligations = raw.get("obligations") or (raw.get("ihcg_anchor") or {}).get("obligations")
+            if isinstance(obligations, list) and obligations:
+                for ob in obligations:
+                    if isinstance(ob, dict):
+                        oq = str(ob.get("quantifier") or ob.get("quantifier_mode") or "").upper()
+                        if oq and oq != "FORALL":
+                            return False
+        if q_mode is not None and str(q_mode).upper() != "FORALL":
+            return False
+    return True
+
+
+def compute_entry_invalidation(
+    kind: str,
+    target_id: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    ir: CanonicalResearchIR,
+) -> tuple[bool, str]:
+    has_cert = bool(ir.meaningfulness_certificates or ir.meaningfulness_certificate is not None or ir.source_certificates)
+    if kind == "EQUATION":
+        if after is None:
+            return True, "DROPPED"
+        if before is None:
+            return True, "ADDED"
+        return True, "EQUATION_CHANGED"
+    if kind == "UNIT":
+        return True, "UNIT_CHANGED"
+    if kind == "CONSTANT":
+        if after is None:
+            return True, "DROPPED"
+        if before is None:
+            return True, "ADDED"
+        if before.get("dimension") != after.get("dimension") or before.get("raw_unit") != after.get("raw_unit"):
+            return True, "UNIT_CHANGED"
+        if before.get("si_value") != after.get("si_value"):
+            if not has_cert:
+                return False, "NONE"
+            cert_domain = ir.certified_valid_domain if isinstance(ir.certified_valid_domain, dict) else None
+            if not _certificates_are_universal_positive(ir):
+                return True, "CLAIM_NOT_UNIVERSAL"
+            sym = str(after.get("symbol") or before.get("symbol") or target_id)
+            if cert_domain is None or sym not in cert_domain:
+                return True, "OUTSIDE_CERTIFIED_DOMAIN"
+            bounds_pair = cert_domain[sym]
+            if (
+                not isinstance(bounds_pair, (list, tuple))
+                or len(bounds_pair) != 2
+                or not (float(bounds_pair[0]) <= float(after["si_value"]) <= float(bounds_pair[1]))
+            ):
+                return True, "OUTSIDE_CERTIFIED_DOMAIN"
+            return False, "NONE"
+        return False, "NONE"
+    if kind == "STATE":
+        if after is None:
+            return True, "DROPPED"
+        if before is None:
+            return True, "ADDED"
+        if before.get("dimension") != after.get("dimension"):
+            return True, "UNIT_CHANGED"
+        return True, "EQUATION_CHANGED"
+    if kind == "STATE_ORDER":
+        if ir.pinned_kernel_code or ir.research_reference is not None:
+            return True, "STATE_ORDER_CHANGED"
+        return False, "NONE"
+    if kind == "GRID":
+        if has_cert:
+            return True, "GRID_CHANGED"
+        return False, "NONE"
+    return True, "EQUATION_CHANGED"
+
+
+def _eq_snapshot(eq) -> dict[str, Any]:
+    return {
+        "equation_id": eq.equation_id,
+        "canonical_latex": eq.canonical_latex,
+        "sympy_expr": eq.sympy_expr,
+        "role": eq.role.value if hasattr(eq.role, "value") else str(eq.role),
+        "lhs_symbol": eq.lhs_symbol,
+    }
+
+
+def _const_snapshot(c) -> dict[str, Any]:
+    return {
+        "constant_id": c.constant_id,
+        "symbol": c.symbol,
+        "si_value": float(c.si_value),
+        "dimension": c.dimension.model_dump(mode="json"),
+        "raw_unit": c.raw_unit,
+    }
+
+
+def _state_snapshot(s) -> dict[str, Any]:
+    return {
+        "symbol": s.symbol,
+        "initial_value": s.initial_value,
+        "dimension": s.dimension.model_dump(mode="json"),
+    }
+
+
+def diff_ir(
+    before: CanonicalResearchIR,
+    after: CanonicalResearchIR,
+    *,
+    at: str | None = None,
+) -> list[OverrideEntry]:
+    """Single source of truth for override ledger entries between two IR states."""
+    timestamp = at or datetime.now(timezone.utc).isoformat()
+    prev_digest = before.ir_blake3_digest or ""
+    seq_start = len(before.override_ledger)
+    raw_diffs: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]] = []
+
+    before_eqs = {e.equation_id: _eq_snapshot(e) for e in before.equations}
+    after_eqs = {e.equation_id: _eq_snapshot(e) for e in after.equations}
+    for eid in sorted(set(before_eqs) | set(after_eqs)):
+        b_eq, a_eq = before_eqs.get(eid), after_eqs.get(eid)
+        if b_eq != a_eq:
+            raw_diffs.append(("EQUATION", eid, b_eq, a_eq))
+
+    before_consts = {c.symbol: _const_snapshot(c) for c in before.constants}
+    after_consts = {c.symbol: _const_snapshot(c) for c in after.constants}
+    for sym in sorted(set(before_consts) | set(after_consts)):
+        b_c, a_c = before_consts.get(sym), after_consts.get(sym)
+        if b_c != a_c:
+            target_id = (a_c or b_c or {}).get("constant_id") or sym
+            raw_diffs.append(("CONSTANT", str(target_id), b_c, a_c))
+
+    before_states = {s.symbol: _state_snapshot(s) for s in before.state_variables}
+    after_states = {s.symbol: _state_snapshot(s) for s in after.state_variables}
+    for sym in sorted(set(before_states) | set(after_states)):
+        b_s, a_s = before_states.get(sym), after_states.get(sym)
+        if b_s != a_s:
+            raw_diffs.append(("STATE", sym, b_s, a_s))
+
+    before_order = [s.symbol for s in before.state_variables]
+    after_order = [s.symbol for s in after.state_variables]
+    if before_order != after_order and set(before_order) == set(after_order):
+        raw_diffs.append(("STATE_ORDER", "state_variables", {"order": before_order}, {"order": after_order}))
+
+    before_grid = {
+        "time_horizon_si_s": before.time_horizon_si_s,
+        "default_dt_si_s": before.default_dt_si_s,
+        "default_steps": before.default_steps,
+    }
+    after_grid = {
+        "time_horizon_si_s": after.time_horizon_si_s,
+        "default_dt_si_s": after.default_dt_si_s,
+        "default_steps": after.default_steps,
+    }
+    if before_grid != after_grid:
+        raw_diffs.append(("GRID", "grid", before_grid, after_grid))
+
+    entries: list[OverrideEntry] = []
+    for idx, (kind, target_id, b_snap, a_snap) in enumerate(raw_diffs):
+        invalidating, reason = compute_entry_invalidation(kind, target_id, b_snap, a_snap, before)
+        body = {
+            "seq": seq_start + idx,
+            "kind": kind,
+            "target_id": target_id,
+            "before": b_snap,
+            "after": a_snap,
+            "invalidating": invalidating,
+            "reason": reason,
+            "at": timestamp,
+            "actor": "researcher",
+            "previous_ir_digest": prev_digest,
+        }
+        entry_id = compute_override_entry_id(body)
+        entries.append(OverrideEntry(entry_id=entry_id, **body))
+    return entries
 
 
 def seal_ir(ir: CanonicalResearchIR) -> CanonicalResearchIR:
@@ -80,46 +285,25 @@ def apply_ir_override(ir: CanonicalResearchIR, override: IRReviewOverride) -> Ca
             target.canonical_latex = patch.canonical_latex
         if patch.role is not None:
             target.role = patch.role
-    override_invalidates_cert = bool(override.equation_patches)
-    cert_domain = candidate.certified_valid_domain if isinstance(candidate.certified_valid_domain, dict) else None
     for patch in override.constant_patches:
         target = next((c for c in candidate.constants if c.constant_id == patch.constant_id), None)
         if target is None:
             raise FormalGateError("IR_OVERRIDE_INVALID", patch.constant_id)
         if patch.drop:
             candidate.constants.remove(target)
-            override_invalidates_cert = True
             continue
         if patch.si_value is not None:
             target.si_value = patch.si_value
-            if cert_domain is None or target.symbol not in cert_domain:
-                override_invalidates_cert = True
-            else:
-                bounds_pair = cert_domain[target.symbol]
-                if (
-                    not isinstance(bounds_pair, (list, tuple))
-                    or len(bounds_pair) != 2
-                    or not (float(bounds_pair[0]) <= float(patch.si_value) <= float(bounds_pair[1]))
-                ):
-                    override_invalidates_cert = True
         if patch.raw_unit is not None:
             _, unit = normalize_to_si(1, patch.raw_unit)
             target.dimension = unit_dimension(unit)
             target.dimension.canonical_unit = unit
             target.raw_unit = patch.raw_unit
-            override_invalidates_cert = True
         if patch.bounds is not None:
             target.bounds = patch.bounds
         if patch.is_tunable_parameter is not None:
             target.is_tunable_parameter = patch.is_tunable_parameter
         target.verification_status = VerificationStatus.USER_OVERRIDDEN
-    if override_invalidates_cert and (
-        candidate.research_import_role == "POSITIVE_EVIDENCE"
-        or str(candidate.epistemic_verdict or "").startswith("VERIFIED_")
-    ):
-        # ARCH-012 (BUG-020): Override outside certified_valid_domain downgrades certificate role.
-        candidate.research_import_role = "USER_MODIFIED_UNVERIFIED"
-        candidate.epistemic_verdict = "USER_MODIFIED_UNVERIFIED"
     resolved_derived_symbols: set[str] = set()
     for resolution in override.symbol_resolutions:
         sym = resolution.symbol.strip()
@@ -211,6 +395,20 @@ def apply_ir_override(ir: CanonicalResearchIR, override: IRReviewOverride) -> Ca
     if override.approve and (any(not flag.resolved for flag in candidate.disambiguation_flags)
                             or any(not e.hin_homogeneous or e.z3_satisfiable is not True for e in candidate.equations)):
         raise FormalGateError("IR_UNVERIFIED_FLAGGED", "Unresolved flags require review")
+    new_entries = diff_ir(before=ir, after=candidate)
+    if new_entries:
+        candidate.override_ledger.extend(new_entries)
+    if any(entry.invalidating for entry in candidate.override_ledger):
+        if (
+            candidate.research_import_role == "POSITIVE_EVIDENCE"
+            or str(candidate.epistemic_verdict or "").startswith("VERIFIED_")
+            or candidate.meaningfulness_certificates
+            or candidate.meaningfulness_certificate is not None
+            or candidate.source_certificates
+        ):
+            candidate.ir_verdict = "USER_MODIFIED_UNVERIFIED"
+            candidate.epistemic_verdict = "USER_MODIFIED_UNVERIFIED"
+            candidate.research_import_role = "USER_MODIFIED_UNVERIFIED"
     return seal_ir(candidate)
 
 
@@ -270,11 +468,20 @@ class CanonicalResearchIngestionPipeline:
         if ir.meaningfulness_certificates:
             from ...research.epistemic import parse_run_certificate
             certificates = [parse_run_certificate(raw) for raw in ir.meaningfulness_certificates.values()]
+            ir.source_certificates = [
+                SourceCertificateRef(
+                    run_id=rid,
+                    certificate_blake3=compute_certificate_blake3(raw),
+                    certificate_verdict=parse_run_certificate(raw).epistemic_verdict.value,
+                )
+                for rid, raw in sorted(ir.meaningfulness_certificates.items())
+            ]
             if all(c.epistemic_verdict.value in {"VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY"} for c in certificates):
                 ir.research_import_role = "POSITIVE_EVIDENCE"
                 if len(certificates) == 1:
                     ir.meaningfulness_certificate = certificates[0].model_dump(mode="json")
                     ir.epistemic_verdict = certificates[0].epistemic_verdict.value
+                    ir.ir_verdict = certificates[0].epistemic_verdict.value
                     ir.certified_valid_domain = getattr(certificates[0],"certified_valid_domain",None)
         raw_eqs, raw_constants, source_text = [], [], []
         for index, upload in enumerate(request.upload_paths):
@@ -284,8 +491,9 @@ class CanonicalResearchIngestionPipeline:
                 source_text.append(doc.text)
                 if doc.function_signatures:
                     ir.summary += "\nStatic signatures: " + "; ".join(doc.function_signatures)
-                ir.uploaded_files.append(str(path))
-                ir.datasets_attached.extend(doc.datasets)
+                from invar_agent.redact import to_portable_uri
+                ir.uploaded_files.append(to_portable_uri(path, self.workspace_root))
+                ir.datasets_attached.extend(to_portable_uri(d, self.workspace_root) for d in doc.datasets)
                 ir.disambiguation_flags.extend(doc.flags)
                 raw_eqs.extend(doc.equations)
                 raw_constants.extend(doc.constants)

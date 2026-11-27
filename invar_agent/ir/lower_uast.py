@@ -143,7 +143,21 @@ def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = F
         if not raw_op:
             raise ValueError("Missing binary operator in SciIR expression")
         l = _render_expr_to_python(expr.get("lhs") if "lhs" in expr else expr["left"], sym_names, for_ihcg=for_ihcg)
-        r = _render_expr_to_python(expr.get("rhs") if "rhs" in expr else expr["right"], sym_names, for_ihcg=for_ihcg)
+        raw_rhs = expr.get("rhs") if "rhs" in expr else expr["right"]
+        if raw_op in ("pow", "**"):
+            rhs_dict = raw_rhs.model_dump(mode="json") if hasattr(raw_rhs, "model_dump") else raw_rhs
+            if isinstance(rhs_dict, dict) and (rhs_dict.get("kind") in ("const", "literal", "number", "Literal") or ("value" in rhs_dict and rhs_dict.get("kind") is None)):
+                val = float(rhs_dict["value"])
+                if val.is_integer() and abs(val) < (1 << 53):
+                    r = str(int(val))
+                else:
+                    r = _render_expr_to_python(raw_rhs, sym_names, for_ihcg=for_ihcg)
+            elif isinstance(rhs_dict, (int, float)) and not isinstance(rhs_dict, bool) and float(rhs_dict).is_integer() and abs(float(rhs_dict)) < (1 << 53):
+                r = str(int(float(rhs_dict)))
+            else:
+                r = _render_expr_to_python(raw_rhs, sym_names, for_ihcg=for_ihcg)
+        else:
+            r = _render_expr_to_python(raw_rhs, sym_names, for_ihcg=for_ihcg)
         if raw_op in ("min", "max"):
             return f"{raw_op}({l}, {r})"
         op_map = {"add": "+", "sub": "-", "mul": "*", "div": "/", "pow": "**"}
@@ -231,6 +245,47 @@ def emit_python_kernel_from_sciir(ir: SciIR) -> str:
                 f"ARCHETYPE_EQUATION_MISMATCH: archetype={ir.archetype.value} cannot "
                 f"evolve STATE variables {state_names}; derivative equations require ODE_PDE"
             )
+
+    # HOTFIX-C (NF-03): Refuse non-autonomous ODE_PDE expressions referencing INDEPENDENT_VAR
+    # until Sprint 2 autonomization (d t/dt = 1) lands.
+    if ir.archetype.value == "ODE_PDE":
+        indep_names = {s.name for s in symbols_sorted if s.role == SlotRole.INDEPENDENT_VAR}
+        if indep_names:
+            used_indep: set[str] = set()
+
+            def _scan_expr_for_indep(node: Any) -> None:
+                if node is None:
+                    return
+                if isinstance(node, dict):
+                    if node.get("kind") == "sym" and node.get("name") in indep_names:
+                        used_indep.add(str(node["name"]))
+                    for v in node.values():
+                        if isinstance(v, (dict, list)):
+                            _scan_expr_for_indep(v)
+                    return
+                if isinstance(node, list):
+                    for item in node:
+                        _scan_expr_for_indep(item)
+                    return
+                kind = getattr(node, "kind", None)
+                if kind == "sym" and getattr(node, "name", None) in indep_names:
+                    used_indep.add(str(node.name))
+                for attr in ("arg", "lhs", "rhs", "then_branch", "else_branch", "args"):
+                    sub = getattr(node, attr, None)
+                    if sub is not None:
+                        _scan_expr_for_indep(sub)
+
+            for lb in ir.let_bindings:
+                _scan_expr_for_indep(getattr(lb, "expr", None))
+            for eq in ir.dynamics_or_residuals:
+                _scan_expr_for_indep(getattr(eq, "expr", None))
+            for obs in ir.observables:
+                _scan_expr_for_indep(getattr(obs, "expr", None))
+            if used_indep:
+                raise ValueError(
+                    f"NONAUTONOMOUS_TIME_UNSUPPORTED: ODE_PDE references independent variable(s) "
+                    f"{', '.join(sorted(used_indep))}"
+                )
 
     lines: list[str] = ["import math", "", "def simulation_step(buf, dt):"]
     # 1. Read all symbols from their unique contiguous canonical slots (CONTROL_PARAM / CONSTANT read-only)
@@ -370,7 +425,8 @@ def sciir_to_research_blueprint(
             init_v = float(s.initial_or_default or 0.0)
         else:
             v0 = float(s.initial_or_default or 0.0)
-            if s.role == SlotRole.CONSTANT or s.role == SlotRole.CONTROL_PARAM or s.name in pinned_syms or s.name.lower() in pinned_syms:
+            is_pinnable = s.role in (SlotRole.CONSTANT, SlotRole.CONTROL_PARAM)
+            if s.role == SlotRole.CONSTANT or (is_pinnable and (s.name in pinned_syms or s.name.lower() in pinned_syms)) or s.role == SlotRole.CONTROL_PARAM:
                 lo, hi = v0, v0
             else:
                 span = max(1.0, abs(v0) * 1.5)
@@ -412,6 +468,11 @@ def sciir_to_research_blueprint(
         return out
 
     sym_by_name = {s.name: s for s in symbols_sorted}
+    # UPG-008: Neutral time dimension when all declared symbols are strictly dimensionless.
+    all_dimensionless = all(
+        all(n == 0 for n, _d in s.dimension.exponents)
+        for s in symbols_sorted
+    )
     ihcg_equations: dict[str, dict[str, Any]] = {}
     for eq in ir.dynamics_or_residuals:
         s_obj = sym_by_name.get(eq.target)
@@ -422,7 +483,8 @@ def sciir_to_research_blueprint(
         rhs_ihcg = _inline_lets(_render_expr_to_python(eq.expr, sym_names, for_ihcg=True))
         if ir.archetype.value == "ODE_PDE" and s_obj and s_obj.role == SlotRole.STATE:
             eq_dim = list(s_dim)
-            eq_dim[2] = eq_dim[2] - 1  # d/dt has T^-1
+            if not all_dimensionless:
+                eq_dim[2] = eq_dim[2] - 1  # d/dt has T^-1 for dimensional systems
             ihcg_equations[f"d_{eq.target}_dt"] = {
                 "expression": rhs_ihcg,
                 "si_dim": eq_dim,
@@ -448,6 +510,41 @@ def sciir_to_research_blueprint(
     cond_ops_map = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "=="}
     indicator_predicates: dict[str, str] = {}
     for obs in ir.observables:
+        reduction = str(getattr(obs, "reduction", "") or "").upper()
+        if reduction in {"TRAJECTORY_MAX", "TRAJECTORY_MIN"}:
+            obs_expr_kind = getattr(obs.expr, "kind", None)
+            if obs_expr_kind != "sym":
+                raise ValueError(
+                    f"TRAJECTORY_EXPRESSION_UNSUPPORTED: observable {obs.target!r} with {reduction} "
+                    f"requires a direct STATE symbol expression, got kind={obs_expr_kind!r}"
+                )
+            state_name = str(getattr(obs.expr, "name", ""))
+            state_obj = sym_by_name.get(state_name)
+            if state_obj is None or state_obj.role != SlotRole.STATE:
+                raise ValueError(
+                    f"TRAJECTORY_EXPRESSION_UNSUPPORTED: observable {obs.target!r} with {reduction} "
+                    f"must reference a STATE symbol, got {state_name!r}"
+                )
+            state_dim = [
+                (int(n // d) if (d != 0 and n % d == 0) else (n / d if d != 0 else 0))
+                for n, d in state_obj.dimension.exponents
+            ]
+            ihcg_equations[obs.target] = {
+                "expression": state_name,
+                "si_dim": state_dim,
+                "kind": reduction,
+                "state_symbol": state_name,
+            }
+            obs_slot_idx = slot_map.get(obs.target)
+            state_slot_idx = slot_map.get(state_name)
+            if obs_slot_idx is not None:
+                ihcg_slots[obs_slot_idx]["semantic_tag"] = 252 if reduction == "TRAJECTORY_MAX" else 251
+                if state_slot_idx is not None:
+                    initial_state[obs_slot_idx] = initial_state[state_slot_idx]
+            if state_name in domain:
+                domain[obs.target] = list(domain[state_name])
+            continue
+
         if getattr(obs.expr, "kind", None) == "if_then_else":
             e_dict = obs.expr.model_dump(mode="json") if hasattr(obs.expr, "model_dump") else obs.expr
             if isinstance(e_dict, dict) and "cond_op" in e_dict:
@@ -467,6 +564,16 @@ def sciir_to_research_blueprint(
             "si_dim": s_dim,
             "kind": "ALGEBRAIC",
         }
+
+    # Final invariant (HOTFIX-A / NF-01): every MAX/MIN trajectory observable must appear in IHCG with same kind
+    for obs in ir.observables:
+        red = str(getattr(obs, "reduction", "") or "").upper()
+        if red in {"TRAJECTORY_MAX", "TRAJECTORY_MIN"}:
+            eq_entry = ihcg_equations.get(obs.target)
+            if not isinstance(eq_entry, dict) or eq_entry.get("kind") != red:
+                raise ValueError(
+                    f"COMPILER_INVARIANT: observable {obs.target!r} reduction {red} was not preserved in IHCG"
+                )
 
     def _to_state_expr(expr_text: str) -> str:
         out = expr_text

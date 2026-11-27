@@ -54,30 +54,64 @@ class LyapunovBudget:
         return self.b_pass == 0 and self.b_repair == 0 and self.b_exec == 0
 
 
+_CODE_DISPATCH: dict[str, tuple[AbsorbingVerdictState, InconclusiveReasonCode]] = {
+    "PROVIDER_TRANSPORT_FAULT": (AbsorbingVerdictState.INCONCLUSIVE_BUDGET, InconclusiveReasonCode.PROVIDER_TRANSPORT_FAULT),
+    "JACOBIAN_MISMATCH": (AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED, InconclusiveReasonCode.JACOBIAN_MISMATCH),
+    "SOLVER_STIFFNESS_BLOWUP": (AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED, InconclusiveReasonCode.SOLVER_STIFFNESS_BLOWUP),
+    "DIMENSIONAL_INCONSISTENCY": (AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED, InconclusiveReasonCode.DIMENSIONAL_INCONSISTENCY),
+    "KERNEL_COMPILATION_FAULT": (AbsorbingVerdictState.INCONCLUSIVE_BUDGET, InconclusiveReasonCode.KERNEL_COMPILATION_FAULT),
+}
+
+
 def classify_exception_to_reason(exc: BaseException) -> tuple[AbsorbingVerdictState, InconclusiveReasonCode]:
-    """Deterministically lift any runtime exception into a typed absorbing verdict."""
-    msg = f"{type(exc).__name__}: {exc}".lower()
-    if any(k in msg for k in ("timeout", "connection", "502", "503", "504", "429", "rate limit", "httpx")):
+    """Deterministically lift any runtime exception into a typed absorbing verdict (BUG-039)."""
+    import re as _re
+
+    # 1. Exception-type dispatch
+    if isinstance(exc, (TimeoutError, ConnectionError)):
         return (
             AbsorbingVerdictState.INCONCLUSIVE_BUDGET,
             InconclusiveReasonCode.PROVIDER_TRANSPORT_FAULT,
         )
-    if any(k in msg for k in ("jacobian_mismatch", "jacobian mismatch")):
-        return (
-            AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED,
-            InconclusiveReasonCode.JACOBIAN_MISMATCH,
-        )
-    if any(k in msg for k in ("stiff", "blowup", "overflow", "non-finite", "nan", "inf")):
+    if isinstance(exc, OverflowError):
         return (
             AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED,
             InconclusiveReasonCode.SOLVER_STIFFNESS_BLOWUP,
         )
-    if any(k in msg for k in ("dimension", "ambiguous", "scope", "cyclic")):
+    if isinstance(exc, OSError):
+        return (
+            AbsorbingVerdictState.INCONCLUSIVE_BUDGET,
+            InconclusiveReasonCode.UNHANDLED_BOUNDARY_EXCEPTION,
+        )
+
+    # 2. Structured error-code attribute dispatch
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in _CODE_DISPATCH:
+        return _CODE_DISPATCH[code]
+
+    # 3. Exact upper-case token / explicit error-tag dispatch (no substring 'inf'/'nan' matches)
+    raw = str(exc)
+    if _re.search(r"\b(?:TIMEOUT|HTTP_502|HTTP_503|HTTP_504|HTTP_429|RATE_LIMIT|PROVIDER_TRANSPORT_FAULT)\b", raw) or _re.search(r"\b(?:502|503|504|429)\b", raw) or "httpx" in raw.lower() or "rate limit" in raw.lower() or "timed out" in raw.lower():
+        return (
+            AbsorbingVerdictState.INCONCLUSIVE_BUDGET,
+            InconclusiveReasonCode.PROVIDER_TRANSPORT_FAULT,
+        )
+    if _re.search(r"\bJACOBIAN_MISMATCH\b", raw):
+        return (
+            AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED,
+            InconclusiveReasonCode.JACOBIAN_MISMATCH,
+        )
+    if _re.search(r"\b(?:SOLVER_STIFFNESS_BLOWUP|STIFFNESS_BLOWUP|NON_FINITE|NAN|INF)\b", raw):
+        return (
+            AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED,
+            InconclusiveReasonCode.SOLVER_STIFFNESS_BLOWUP,
+        )
+    if _re.search(r"\b(?:DIMENSIONAL_INCONSISTENCY|CYCLIC_LET_DAG|AMBIGUOUS_COLLISION|SI_OR_SEMANTIC_MISMATCH)\b", raw):
         return (
             AbsorbingVerdictState.INCONCLUSIVE_ILL_POSED,
             InconclusiveReasonCode.DIMENSIONAL_INCONSISTENCY,
         )
-    if any(k in msg for k in ("compile", "clang", "gcc", "g++", "kernel")):
+    if _re.search(r"\b(?:KERNEL_COMPILATION_FAULT|CPP_COMPILE_DIAGNOSTIC)\b", raw):
         return (
             AbsorbingVerdictState.INCONCLUSIVE_BUDGET,
             InconclusiveReasonCode.KERNEL_COMPILATION_FAULT,

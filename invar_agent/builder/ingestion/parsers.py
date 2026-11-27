@@ -74,7 +74,8 @@ def expand_latex_newcommands(tex: str, max_depth: int = 8) -> str:
 
 
 def _span(path: str, location: str, quote: str, start=None, end=None) -> SourceSpan:
-    return SourceSpan(file=path, location=location, quote=quote[:2000] or " ",
+    from invar_agent.redact import to_portable_uri
+    return SourceSpan(file=to_portable_uri(path) or Path(str(path)).name or "spec", location=location, quote=quote[:2000] or " ",
                       char_start=start, char_end=end)
 
 

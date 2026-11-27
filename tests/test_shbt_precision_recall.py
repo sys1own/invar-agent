@@ -158,3 +158,71 @@ async def test_shbt_never_overrides_refused_impossible():
         _name, prompt = SHOULD_ACTIVATE_PROMPTS[idx]
         feas = await evaluate_research_feasibility(prompt, llm_complete=_refuse, use_llm=True)
         assert feas.verdict.value == "REFUSED_IMPOSSIBLE"
+
+
+ROUND4_ORDER_INDEPENDENT_CASES = [
+    (
+        "R10a_reversed_enclave_shunt",
+        "Using a 1,800-module Floquet-screened Ni-H LANR array (555.03 W/cell, 3.546 K Kapitza drop) "
+        "to balance a 906.00 kW holographic boundary Landauer debt, shunt entropy into an open "
+        "Stinespring topological dark ledger partitioned by WZW(26, 8, 312) to clamp visible "
+        "erasure dissipation at 4.2 K down to <= 1.01 nW.",
+        True,
+    ),
+    (
+        "R10b_conventional_agn_jet",
+        "Compute the apparent transverse superluminal velocity beta_app of an AGN jet with "
+        "Gamma = 10 and viewing angle theta = 5 degrees.",
+        False,
+    ),
+    (
+        "R10c_perpetual_motion_closed",
+        "Design a closed-system heat engine extracting 100% work from a 300 K reservoir with zero entropy.",
+        False,
+    ),
+    (
+        "R4_biochem_enzyme_cascade",
+        "Simulate a two-step enzyme cascade A -> B -> C with k1 = 0.2/s, k2 = 0.05/s and check B_max <= 0.6.",
+        False,
+    ),
+    (
+        "R5_uv_photolysis_pulse",
+        "Model atmospheric ozone photolysis under a daytime UV step pulse J(t) = J0 for 0 <= t <= 12 h.",
+        False,
+    ),
+    (
+        "R7_1d_heat_rod",
+        "Solve 1D heat conduction along a 1 m copper rod with Dirichlet boundary conditions T(0)=100 C, T(1)=20 C.",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize("name,prompt,expected", ROUND4_ORDER_INDEPENDENT_CASES)
+def test_upg012_round4_routing_cases(name: str, prompt: str, expected: bool):
+    res = resolve_shbt_solvability(prompt, allow_remote_fetch=False)
+    assert res.should_activate is expected, (
+        f"SHBT routing mismatch for {name}: expected {expected}, got {res.should_activate} "
+        f"(concepts={res.matched_concepts})"
+    )
+
+
+def test_upg012_sentence_permutation_invariance():
+    from hypothesis import given, settings, strategies as st
+
+    sentences = [
+        "Clamp visible Landauer sensory erasure dissipation in a 4.2 K cryogenic enclave to <= 1.01 nW.",
+        "Shunt entropy into an open Stinespring topological dark ledger partitioned by WZW(26, 8, 312).",
+        "Balance a 906.00 kW holographic boundary Landauer debt using a 1,800-module Floquet-screened Ni-H LANR array.",
+    ]
+    baseline = resolve_shbt_solvability(" ".join(sentences), allow_remote_fetch=False)
+    assert baseline.should_activate is True
+
+    @given(st.permutations(sentences))
+    @settings(max_examples=12, deadline=None)
+    def _check(perm):
+        res = resolve_shbt_solvability(" ".join(perm), allow_remote_fetch=False)
+        assert res.should_activate == baseline.should_activate
+        assert set(res.matched_concepts) == set(baseline.matched_concepts)
+
+    _check()

@@ -1224,8 +1224,10 @@ class LiteratureSearchClient:
     def _search_oeis(self, query: str, limit: int) -> List[LiteratureResult]:
         url = (f"{OEIS_SEARCH}?q={urllib.parse.quote(query)}&fmt=json")
         data = json.loads(self._fetch_with_backoff(url))
+        rows = data if isinstance(data, list) else (data.get("results") or []) if isinstance(data, dict) else []
+        rows = [r for r in rows if isinstance(r, dict)]
         out: List[LiteratureResult] = []
-        for seq in (data.get("results") or [])[:limit]:
+        for seq in rows[:limit]:
             number = str(seq.get("number") or "")
             name = seq.get("name") or ""
             data_str = seq.get("data") or ""
@@ -1464,3 +1466,94 @@ class LiteratureSearchClient:
             path.write_text(json.dumps(items), encoding="utf-8")
         except Exception:  # noqa: BLE001 - cache is best-effort
             pass
+
+
+LITERATURE_DEADLINE_S = 6.0
+
+
+def compute_literature_digest(items: Sequence[Dict[str, Any]]) -> str:
+    """Canonical BLAKE3 digest of sorted (source, url, title) triples."""
+    import blake3
+
+    triples = sorted(
+        [
+            str((it or {}).get("source") or ""),
+            str((it or {}).get("url") or ""),
+            str((it or {}).get("title") or ""),
+        ]
+        for it in (items or [])
+    )
+    canonical = json.dumps(triples, separators=(",", ":"), ensure_ascii=True)
+    return blake3.blake3(canonical.encode("utf-8")).hexdigest()
+
+
+async def retrieve_before_sealing(
+    question: str,
+    client: Optional[LiteratureSearchClient],
+    *,
+    deadline_s: float = LITERATURE_DEADLINE_S,
+    progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+) -> Tuple[List[Dict[str, Any]], str, str]:
+    """UPG-011: Bounded, thread-safe pre-seal literature retrieval before Pass 1.
+
+    Returns (items, blake3_digest, status in {'OK','EMPTY','DEADLINE','DISABLED','ERROR'}).
+    A deadline or error never fails the run.
+    """
+    import asyncio
+    import inspect
+
+    async def _emit_search(event: str, payload: Dict[str, Any]) -> None:
+        if progress_cb is None:
+            return
+        res = progress_cb("search_log", {"event": event, **payload})
+        if inspect.isawaitable(res):
+            await res
+
+    if client is None or getattr(client, "offline", False):
+        return [], compute_literature_digest([]), "DISABLED"
+
+    await _emit_search("query", {"query": question[:200], "stage": "pre_seal"})
+    # Clone per-call client for thread safety (search() mutates _channel_raw/_channel_errors)
+    eff_timeout = min(float(getattr(client, "timeout", deadline_s) or deadline_s), float(deadline_s))
+    per_call = LiteratureSearchClient(
+        offline=False,
+        timeout=eff_timeout,
+        cache_dir=getattr(client, "cache_dir", None),
+    )
+    if type(client) is not LiteratureSearchClient:
+        # Preserve custom/mocked test client while honoring its search() method
+        per_call = client
+
+    try:
+        raw_hits = await asyncio.wait_for(
+            asyncio.to_thread(per_call.search, question, 5, None, question),
+            timeout=float(deadline_s),
+        )
+    except asyncio.TimeoutError:
+        digest = compute_literature_digest([])
+        await _emit_search("query_done", {"count": 0, "status": "DEADLINE", "literature_digest": digest})
+        return [], digest, "DEADLINE"
+    except Exception as exc:  # noqa: BLE001
+        digest = compute_literature_digest([])
+        await _emit_search("query_done", {"count": 0, "status": "ERROR", "error": str(exc)[:200], "literature_digest": digest})
+        return [], digest, "ERROR"
+
+    import dataclasses as _dc
+
+    items: List[Dict[str, Any]] = []
+    for h in raw_hits or []:
+        if hasattr(h, "to_dict"):
+            d = h.to_dict()
+        elif _dc.is_dataclass(h) and not isinstance(h, type):
+            d = _dc.asdict(h)
+        elif isinstance(h, dict):
+            d = dict(h)
+        else:
+            d = None
+        if d is not None:
+            items.append(d)
+            await _emit_search("paper", {"source": d.get("source"), "title": d.get("title"), "url": d.get("url")})
+    digest = compute_literature_digest(items)
+    status = "OK" if items else "EMPTY"
+    await _emit_search("query_done", {"count": len(items), "status": status, "literature_digest": digest})
+    return items, digest, status

@@ -121,6 +121,7 @@ class RunContext:
     telemetry_session: LLMTelemetrySession
     literature: List[Dict[str, Any]] = field(default_factory=list)
     deadline: Optional[float] = None
+    literature_digest: Optional[str] = None
 
 
 _ACTIVE_RUN_CONTEXT: ContextVar[Optional[RunContext]] = ContextVar(
@@ -138,6 +139,7 @@ def run_context_scope(
     *,
     literature: Optional[List[Dict[str, Any]]] = None,
     deadline: Optional[float] = None,
+    literature_digest: Optional[str] = None,
 ):
     """Create a run-scoped RunContext with an isolated LLMTelemetrySession."""
     with llm_telemetry_scope(run_id=run_uid) as session:
@@ -146,6 +148,7 @@ def run_context_scope(
             telemetry_session=session,
             literature=list(literature or []),
             deadline=deadline,
+            literature_digest=literature_digest,
         )
         token = _ACTIVE_RUN_CONTEXT.set(ctx)
         try:

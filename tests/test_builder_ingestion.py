@@ -397,7 +397,13 @@ def test_real_persisted_vault_zero_tokens(tmp_path, monkeypatch):
     assert ir.state_variables[0].dimension.exponents == (1, 0, 0, 0, 0, 0, 0)
     assert not ir.disambiguation_flags
     for item in [*ir.constants, *ir.equations, *ir.state_variables]:
-        assert item.provenance.quote in Path(item.provenance.file).read_text(encoding="utf-8")
+        pfile = item.provenance.file
+        if pfile.startswith("vault:"):
+            run_id_part, rel_part = pfile[len("vault:"):].split("/", 1)
+            resolved = ResearchVaultManager(tmp_path).run_dir(run_id_part) / rel_part
+        else:
+            resolved = Path(pfile)
+        assert item.provenance.quote in resolved.read_text(encoding="utf-8")
     assert ir.state_variables[0].initial_value == 1
     assert ir.default_dt_si_s == .02 and ir.default_steps == 50
     assert ir.time_horizon_si_s == 1

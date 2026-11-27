@@ -400,51 +400,71 @@ _EXPLICIT_SHBT_RE = re.compile(
     re.I,
 )
 
+@dataclass(frozen=True)
+class Concept:
+    """Order-independent set-based SHBT concept matcher (UPG-012, BUG-017)."""
+    id: str
+    all_of: Tuple[Tuple[re.Pattern[str], ...], ...]
+    scope: str = "document"  # "document" | "line"
+
+    def matches(self, text: str) -> bool:
+        if self.scope == "line":
+            for line in text.splitlines():
+                if all(any(p.search(line) for p in group) for group in self.all_of):
+                    return True
+            return False
+        return all(any(p.search(text) for p in group) for group in self.all_of)
+
+
+def _rx(pat: str) -> re.Pattern[str]:
+    return re.compile(pat, re.I)
+
+
 # Typed SHBT registry concept families (NEVER bare keywords like "warp",
 # "superluminal", "wormhole", "10/33", "1.01 nW", or "Landauer ... debt").
 # Non-opt-in activation requires >= 2 distinct registry concept matches.
-_CONCEPT_FAMILIES: Dict[str, Tuple[Tuple[str, re.Pattern[str]], ...]] = {
+_CONCEPT_FAMILIES: Dict[str, Tuple[Concept, ...]] = {
     "sys1own/shbt-precision": (
-        ("wzw_26_8_312", re.compile(r"\bwzw\b.*\b26\b.*\b8\b.*\b312\b", re.I)),
-        ("stinespring_dark_ledger", re.compile(r"\bstinespring\b.*\b(?:dark\s+ledger|topological\s+partition|bipartite\s+stinespring)\b", re.I)),
-        ("holographic_boundary_debt_906kw", re.compile(r"\b(?:holographic\s+boundary|landauer\s+boundary)\b.*\b906(?:\.0+)?\s*kw\b", re.I)),
+        Concept("wzw_26_8_312", ((_rx(r"\bwzw\b"),), (_rx(r"\b26\b"),), (_rx(r"\b8\b"),), (_rx(r"\b312\b"),)), scope="line"),
+        Concept("stinespring_dark_ledger", ((_rx(r"\bstinespring\b"),), (_rx(r"\bdark[- ]ledger\b"), _rx(r"\btopological\s+partition\b"), _rx(r"\bbipartite\s+stinespring\b"))), scope="document"),
+        Concept("holographic_boundary_debt_906kw", ((_rx(r"\bholographic\s+boundary\b"), _rx(r"\blandauer\s+boundary\b")), (_rx(r"\b906(?:\.0+)?\s*kw\b"),)), scope="line"),
     ),
     "sys1own/shbt-qc": (
-        ("tomita_takesaki_goi", re.compile(r"\b(?:tomita[- ]takesaki|pt[- ]symmetric\s+goi|polariton\s+squeezing)\b", re.I)),
-        ("photonic_312_hexamers", re.compile(r"\b312[- ]channel\s+photonic\b|\b52\s+hexamers\b", re.I)),
+        Concept("tomita_takesaki_goi", ((_rx(r"\btomita[- ]takesaki\b"), _rx(r"\bpt[- ]symmetric\s+goi\b"), _rx(r"\bpolariton\s+squeezing\b")),), scope="line"),
+        Concept("photonic_312_hexamers", ((_rx(r"\b312[- ]channel\s+photonic\b"), _rx(r"\b52\s+hexamers\b")),), scope="line"),
     ),
     "sys1own/shbt-cf": (
-        ("floquet_adler_wiser", re.compile(r"\b(?:floquet[- ]screen\w*|floquet[- ]adler[- ]wiser|adler[- ]wiser\s+dynamic\s+dielectric)\b", re.I)),
-        ("lanr_1800_cells", re.compile(r"\b1,?800[- ](?:module|cell)\b.*\b(?:ni-?h|nickel[- ]hydrogen|lattice[- ]assisted\s+nuclear|lanr)\b", re.I)),
-        ("mgb2_kapitza_enclave", re.compile(r"\b(?:kapitza\b.*\b3\.546\s*k|mgb2\b.*\b(?:11\.79\s*k|39(?:\.0)?\s*k))\b", re.I)),
-        ("lanr_power_ledger", re.compile(r"\b(?:352\.48\s*ev|555\.03\s*w|999,?054(?:\.0+)?\s*w)\b", re.I)),
+        Concept("floquet_adler_wiser", ((_rx(r"\bfloquet[- ]screen\w*\b"), _rx(r"\bfloquet[- ]adler[- ]wiser\b"), _rx(r"\badler[- ]wiser\s+dynamic\s+dielectric\b")),), scope="line"),
+        Concept("lanr_1800_cells", ((_rx(r"\b1,?800[- ](?:module|cell)\b"),), (_rx(r"\bni-?h\b"), _rx(r"\bnickel[- ]hydrogen\b"), _rx(r"\blattice[- ]assisted\s+nuclear\b"), _rx(r"\blanr\b"))), scope="line"),
+        Concept("mgb2_kapitza_enclave", ((_rx(r"\bkapitza\b"), _rx(r"\bmgb2\b")), (_rx(r"\b3\.546\s*k\b"), _rx(r"\b11\.79\s*k\b"), _rx(r"\b39(?:\.0)?\s*k\b"))), scope="line"),
+        Concept("lanr_power_ledger", ((_rx(r"\b352\.48\s*ev\b"), _rx(r"\b555\.03\s*w\b"), _rx(r"\b999,?054(?:\.0+)?\s*w\b")),), scope="line"),
     ),
     "sys1own/shbt-power": (
-        ("p11b_cosb3_8750mw", re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I)),
+        Concept("p11b_cosb3_8750mw", ((_rx(r"\bp-?11b\b"),), (_rx(r"\b8,?750\s*mw\b"), _rx(r"\b7,?832\.903\s*mw\b"), _rx(r"\bcosb3\b"))), scope="line"),
     ),
     "sys1own/shbt-ghost": (
-        ("ghost_seed_ccz4", re.compile(r"\b(?:ghost[- ]seed|topological\s+mass[- ]congestion|m_seed|r_congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz)\b", re.I | re.S)),
-        ("ccz4_shbt_damping", re.compile(r"\bccz4\b.*\b(?:50\.518\s*khz|r_congestion|kappa_1\s*=\s*0\.15|dark[- ]ledger)\b", re.I | re.S)),
+        Concept("ghost_seed_ccz4", ((_rx(r"\bghost[- ]seed\b"), _rx(r"\btopological\s+mass[- ]congestion\b"), _rx(r"\bm_seed\b"), _rx(r"\br_congestion\b")), (_rx(r"\bccz4\b"), _rx(r"\b2\.954\s*e15\b"), _rx(r"\b50\.518\s*khz\b"))), scope="document"),
+        Concept("ccz4_shbt_damping", ((_rx(r"\bccz4\b"),), (_rx(r"\b50\.518\s*khz\b"), _rx(r"\br_congestion\b"), _rx(r"\bkappa_1\s*=\s*0\.15\b"), _rx(r"\bdark[- ]ledger\b"))), scope="document"),
     ),
     "sys1own/shbt-sglt": (
-        ("sglt_tmsv", re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b(?:21\.715\s*db|dark[- ]ledger|ford[- ]roman|ccz4)\b", re.I | re.S)),
+        Concept("sglt_tmsv", ((_rx(r"\btmsv\b"),), (_rx(r"\bsglt\b"), _rx(r"\b21\.715\s*db\b"), _rx(r"\bdark[- ]ledger\b"), _rx(r"\bford[- ]roman\b"), _rx(r"\bccz4\b"))), scope="document"),
     ),
     "sys1own/shbt-exotic": (
-        ("ford_roman_dark_ledger", re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|dual[- ]ledger|heegaard[- ]floer|10/33|23/33)\b", re.I | re.S)),
+        Concept("ford_roman_dark_ledger", ((_rx(r"\bford[- ]roman\b"),), (_rx(r"\bdark[- ]ledger\b"), _rx(r"\bdual[- ]ledger\b"), _rx(r"\bheegaard[- ]floer\b"), _rx(r"\b10/33\b"), _rx(r"\b23/33\b"))), scope="document"),
     ),
     "sys1own/shbt-recon": (
-        ("sram_2112_space_group", re.compile(r"\b2,?112[- ]byte\b.*\b(?:640\s*b|1,?472\s*b|230[- ]space[- ]group)\b", re.I)),
-        ("virasoro_bipartite_stinespring", re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b.*\b(?:10\s*:\s*23|100/1089)\b", re.I)),
+        Concept("sram_2112_space_group", ((_rx(r"\b2,?112[- ]byte\b"),), (_rx(r"\b640\s*b\b"), _rx(r"\b1,?472\s*b\b"), _rx(r"\b230[- ]space[- ]group\b"))), scope="line"),
+        Concept("virasoro_bipartite_stinespring", ((_rx(r"\b45/64\b"), _rx(r"\bbipartite\s+stinespring\b")), (_rx(r"\bvirasoro\b"), _rx(r"\b10\s*:\s*23\b"), _rx(r"\b100/1089\b"))), scope="document"),
     ),
     "sys1own/shbt-warp": (
-        ("mar312_explicit", re.compile(r"\b(?:shbt-)?mar[- ]?312[cx]?\b", re.I)),
-        ("mar312_avionics_teg", re.compile(r"\b(?:mar[- ]?312[cx]?|ew[- ]?312|dec[- ]x)\b.*\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw|25\.00\s*ew)\b", re.I)),
-        ("cryogenic_enclave_surplus", re.compile(r"\b(?:42\.15\s*kw\b.*\b17\.80\s*kw|17\.80\s*kw\s+avionics\b.*\b48\.00\s*kw\s+teg|(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg)\b.*\b(?:33,?104|81,?104|906(?:\.0+)?\s*kw))\b", re.I | re.S)),
+        Concept("mar312_explicit", ((_rx(r"\b(?:shbt-)?mar[- ]?312[cx]?\b"),),), scope="line"),
+        Concept("mar312_avionics_teg", ((_rx(r"\bmar[- ]?312[cx]?\b"), _rx(r"\bew[- ]?312\b"), _rx(r"\bdec[- ]x\b")), (_rx(r"\b42\.15\s*kw\b"), _rx(r"\b17\.80\s*kw\b"), _rx(r"\b48\.00\s*kw\b"), _rx(r"\b25\.00\s*ew\b"))), scope="line"),
+        Concept("cryogenic_enclave_surplus", ((_rx(r"\b42\.15\s*kw\b"), _rx(r"\b17\.80\s*kw\s+avionics\b"), _rx(r"\b48\.00\s*kw\s+teg\b")), (_rx(r"\b17\.80\s*kw\b"), _rx(r"\b48\.00\s*kw\s+teg\b"), _rx(r"\b33,?104\b"), _rx(r"\b81,?104\b"), _rx(r"\b906(?:\.0+)?\s*kw\b"))), scope="document"),
     ),
     "sys1own/shbt-swarm": (
-        ("symplectic_landauer_shunt", re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I)),
-        ("void_loiter_187mw", re.compile(r"\b(?:10\.9989\s*nw|100/1089|187\.75\s*mw)\b.*\b(?:void\s+loiter|stinespring|landauer|dark[- ]sector|cryogenic)\b", re.I)),
-        ("kms_passivity_dark_sector", re.compile(r"\bkms[- ]passiv\w*\b.*\b(?:dark[- ]sector|dark[- ]zpe|void\s+loiter)\b", re.I)),
+        Concept("symplectic_landauer_shunt", ((_rx(r"\bsymplectic\s+(?:landauer\s+)?shunt\b"), _rx(r"\bshunt(?:ing)?\s+entropy\b")), (_rx(r"\bdark[- ]ledger\b"), _rx(r"\bstinespring\b"), _rx(r"\b4\.2\s*k\b"))), scope="line"),
+        Concept("void_loiter_187mw", ((_rx(r"\b10\.9989\s*nw\b"), _rx(r"\b100/1089\b"), _rx(r"\b187\.75\s*mw\b")), (_rx(r"\bvoid\s+loiter\b"), _rx(r"\bstinespring\b"), _rx(r"\blandauer\b"), _rx(r"\bdark[- ]sector\b"), _rx(r"\bcryogenic\b"))), scope="document"),
+        Concept("kms_passivity_dark_sector", ((_rx(r"\bkms[- ]passiv\w*\b"),), (_rx(r"\bdark[- ]sector\b"), _rx(r"\bdark[- ]zpe\b"), _rx(r"\bvoid\s+loiter\b"))), scope="line"),
     ),
 }
 
@@ -600,7 +620,7 @@ def resolve_shbt_solvability(query_or_prompt: str,
         repo_hit = repo.lower() in text_low
         if repo_hit:
             explicit_repo_hit = True
-        concept_hits = [cid for cid, pat in concepts if pat.search(text)]
+        concept_hits = [c.id for c in concepts if c.matches(text)]
         if repo_hit or concept_hits:
             matched_keys.append(repo)
             matched_concepts.extend(concept_hits)

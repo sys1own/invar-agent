@@ -2105,18 +2105,65 @@ def normalize_blueprint_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+TEMPORAL_KINDS = frozenset({
+    "ODE_RHS",
+    "TRAJECTORY_MAX",
+    "TRAJECTORY_MIN",
+    "TRAJECTORY_FINAL",
+    "TRAJECTORY_PEAK_ABS",
+    "TRAJECTORY_PERIOD",
+})
+
+
+def _kernel_reads_dt(code: str) -> bool:
+    """Return True if `simulation_step` reads its second parameter (`dt`). Empty/unparseable code => True."""
+    import ast as _ast
+    if not code or not code.strip():
+        return True
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return True
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == "simulation_step":
+            args = [a.arg for a in node.args.args]
+            if len(args) < 2:
+                return False
+            dt_name = args[1]
+            for child in _ast.walk(node):
+                if isinstance(child, _ast.Name) and child.id == dt_name and isinstance(child.ctx, _ast.Load):
+                    return True
+            return False
+    return False
+
+
+def program_has_temporal_equations(bp: Dict[str, Any]) -> bool:
+    """True iff the blueprint models a temporal evolution (ODE/PDE or trajectory functional)."""
+    pack = bp.get("ihcg_evidence") or {}
+    if isinstance(pack, dict):
+        equations = (pack.get("evidence") or {}).get("equations") or {}
+        if isinstance(equations, dict) and equations:
+            return (
+                any((e or {}).get("kind") in TEMPORAL_KINDS for e in equations.values() if isinstance(e, dict))
+                or pack.get("archetype") == "ODE_PDE"
+            )
+    return _kernel_reads_dt(str(bp.get("unified_module_code") or bp.get("code_template") or ""))
+
+
 _HORIZON_FACTORS = {
     "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
     "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
     "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
     "d": 86400.0, "day": 86400.0, "days": 86400.0,
     "wk": 604800.0, "week": 604800.0, "weeks": 604800.0,
+    "mo": 2629746.0, "month": 2629746.0, "months": 2629746.0,
+    "quarter": 7889238.0, "quarters": 7889238.0,
     "yr": 3.15576e7, "yrs": 3.15576e7, "year": 3.15576e7, "years": 3.15576e7,
 }
 _HORIZON_RE = re.compile(
     r"(?:over|for|across|during|until|horizon(?:\s+of)?|duration(?:\s+of)?|simulate)\s+"
     r"(?:a\s+|the\s+)?(\d+(?:\.\d+)?)[\s-]*"
-    r"(s|secs?|seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|years?|yrs?)\b",
+    r"(s|secs?|seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|mo|quarters?|years?|yrs?)\b",
     re.I,
 )
 _UNIT_DIVISOR_HINTS = {
@@ -2124,6 +2171,8 @@ _UNIT_DIVISOR_HINTS = {
     3600.0: ("3600",),
     86400.0: ("86400",),
     604800.0: ("604800",),
+    2629746.0: ("2629746", "86400"),
+    7889238.0: ("7889238", "86400"),
     3.15576e7: ("3.15576e7", "31557600", "31536000", "3.1536e7", "86400"),
 }
 
@@ -2135,6 +2184,8 @@ def _reconcile_time_horizon(
 ) -> Dict[str, Any]:
     """Ensure ``dt * steps`` uses the same time unit as the kernel's rate constants."""
     if not isinstance(bp_dict, dict) or not question:
+        return bp_dict
+    if not program_has_temporal_equations(bp_dict):
         return bp_dict
     matches = _HORIZON_RE.findall(question)
     if not matches:
@@ -2773,6 +2824,8 @@ async def generate_plan_with_feasibility(question: str,
                                          llm_complete: Optional[Callable[[str], Any]] = None,
                                          fallback: bool = True,
                                          literature: Optional[List[Dict[str, Any]]] = None,
+                                         literature_digest: Optional[str] = None,
+                                         literature_status: str = "OK",
                                          assume_feasible: bool = False,
                                          extra_context: str = "",
                                          progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
@@ -2873,12 +2926,45 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no JSON object"}
         raise RuntimeError("research plan synthesis failed: combined planner returned no JSON object")
     llm_feas = _coerce_feasibility(data.get("feasibility"))
-    # ARCH-003 (T-R5): If SMT Q1 certified a direct contradiction, preserve the UNSAT core refusal.
-    if heuristic.smt_unsat_core and heuristic.verdict == FeasibilityVerdict.REFUSED_IMPOSSIBLE:
-        feasibility = heuristic
+    # UPG-003: Sound, unit-aware, scope-grouped SMT contradiction detection on typed ClaimSet.
+    claim_set_obj = None
+    contradiction_items = None
+    contradiction_advisories: list[str] = []
+    raw_claim_set = data.get("claim_set")
+    if isinstance(raw_claim_set, dict):
+        from .claims import ClaimSet, detect_contradiction
+        try:
+            claim_set_obj = ClaimSet.model_validate(raw_claim_set)
+            contradiction_items, contradiction_advisories = await asyncio.to_thread(
+                detect_contradiction, claim_set_obj, question
+            )
+        except Exception:
+            claim_set_obj = None
+    if contradiction_items:
+        core_strs = [
+            f"{it.quote} => {it.quantity} {it.relation} {it.si_value} {it.si_unit}"
+            for it in contradiction_items
+        ]
+        feasibility = FeasibilityAssessment(
+            verdict=FeasibilityVerdict.REFUSED_IMPOSSIBLE,
+            rationale=(
+                "Direct mathematical contradiction certified by deterministic SMT UNSAT core: "
+                + " AND ".join(core_strs)
+            ),
+            violated_boundary="SMT UNSAT (contradictory joint requirements)",
+            reformulation="Reconcile or separate the contradictory requirement bounds so the feasible set is non-empty.",
+            smt_unsat_core=core_strs,
+            smt_unsat_core_items=[it.model_dump(mode="json") for it in contradiction_items],
+            advisories=contradiction_advisories,
+            assessed_by="deterministic_smt",
+        )
     else:
         # ARCH-011: SHBT activation NEVER overrides or elevates a feasibility refusal.
         feasibility = llm_feas or heuristic
+        if contradiction_advisories and feasibility is not None:
+            feasibility = feasibility.model_copy(
+                update={"advisories": list(feasibility.advisories) + contradiction_advisories}
+            )
     if feasibility.verdict == FeasibilityVerdict.NEEDS_CLARIFICATION:
         return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
     if feasibility.verdict.value.startswith("REFUSED"):
@@ -2902,16 +2988,37 @@ async def generate_plan_with_feasibility(question: str,
             "sciir_staged_synthesis",
             "Running 3-pass StagedSciIRSynthesizer (FrozenSymbolTable -> ModelBody -> ScopeCheck -> Seal)...",
         )
-        synth = StagedSciIRSynthesizer(llm_call=staged_llm_call)
+        synth = StagedSciIRSynthesizer(llm_call=staged_llm_call, check_dimensions=True)
         synth_res = await synth.synthesize(question, grounded_context=grounded_ctx)
         if synth_res.ok and synth_res.sealed is not None:
-            sciir_bp_dict = sciir_to_research_blueprint(
-                synth_res.sealed,
+            if literature_digest:
+                from ..ir.ihcg_bridge import seal_sciir_ihcg
+                from ..ir.schema import AssumptionEntry
+                ir_with_lit = synth_res.sealed.ir.model_copy(
+                    update={
+                        "assumptions_ledger": list(synth_res.sealed.ir.assumptions_ledger)
+                        + [
+                            AssumptionEntry(
+                                id="LITERATURE_DIGEST",
+                                statement=f"blake3:{literature_digest} n={len(literature or [])} status={literature_status}",
+                                source="RETRIEVAL",
+                                falsifiable_impact="Records pre-seal literature context digest",
+                            )
+                        ]
+                    }
+                )
+                sealed_for_bp = seal_sciir_ihcg(ir_with_lit)
+            else:
+                sealed_for_bp = synth_res.sealed
+            sciir_bp_dict = await asyncio.to_thread(
+                sciir_to_research_blueprint,
+                sealed_for_bp,
                 user_prompt=question,
             )
             ledger = extract_claim_ledger(question)
             ihcg_ev = sciir_bp_dict.get("ihcg_evidence", {}).get("evidence", {})
-            fidelity_diags = verify_claim_fidelity(
+            fidelity_diags = await asyncio.to_thread(
+                verify_claim_fidelity,
                 ledger,
                 ihcg_ev.get("obligations") or [],
                 ihcg_ev.get("environmental_assumptions") or [],
@@ -2936,7 +3043,8 @@ async def generate_plan_with_feasibility(question: str,
                     "error": "CLAIM_UNCOVERED: prompt claim thresholds are missing from HYPOTHESIS_TARGET obligations",
                     "diagnostics": [{"code": d.code, "message": d.message} for d in fidelity_diags],
                 }])
-            preflight = compile_and_preflight_blueprint(
+            preflight = await asyncio.to_thread(
+                compile_and_preflight_blueprint,
                 sciir_bp_dict,
                 sciir_bp_dict["ihcg_evidence"],
                 question=question,

@@ -515,6 +515,7 @@
         </section>
       </div>
       <section class="builder-card"><h3>3 · Extraction verification</h3>
+        <div id="builder-evidence-banner" hidden style="background:rgba(245,158,11,0.16);border:1px solid #f59e0b;color:#fbbf24;padding:8px 12px;border-radius:6px;margin-bottom:8px;font-size:13px;"></div>
         <div id="builder-ir-status">Upload a paper, paste a spec, or choose a Research Vault source.</div>
         <div style="overflow:auto"><table class="builder-table"><thead><tr><th>Equation / constant</th><th>Role &amp; checks</th><th>Override</th></tr></thead><tbody id="builder-verification"></tbody></table></div>
         <label for="builder-state-order">State order (comma-separated, required when flagged)</label><input id="builder-state-order" placeholder="e.g. substrate, product">
@@ -1293,32 +1294,48 @@ async function planResearch(text) {
     input.focus();
   }
 }
+function finishResearch(verdict) {
+  if (researchSource) { researchSource.close(); researchSource = null; }
+  setComposerEnabled(true);
+  statusEl.textContent = '';
+  if (input) input.focus();
+}
 async function runResearchDirect(text, feasibility) {
   setComposerEnabled(false);
   statusEl.textContent = 'starting deep research…';
+  let streamingActive = false;
   try {
     const body = {question: text, attached_research_ids: attachedResearchIds(), async_plan: true};
     // Carry the Plan Mode feasibility approval so pre-flight heuristics do
     // not reject an already-approved expert prompt on execution.
     if (feasibility && feasibility.verdict) body.prior_feasibility = feasibility;
-    const data = await api('/api/v1/research/run', {
+    const resp = await fetch('/api/v1/research/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
+    if (!resp.ok) {
+      let detailMsg = resp.statusText || 'unexpected server error';
+      try {
+        const errJson = await resp.json();
+        detailMsg = (errJson && errJson.detail && (errJson.detail.message || errJson.detail)) || errJson.error || detailMsg;
+      } catch {}
+      addMsg('system', `Research could not start (HTTP ${resp.status}). ${String(detailMsg).slice(0, 300)}`);
+      resetResearchStepper();
+      return;
+    }
+    const data = await resp.json();
     const resolvedState = _resolveResearchState(data);
     switch (resolvedState) {
       case 'NEEDS_CLARIFICATION': {
         const qs = data.questions || (data.feasibility && data.feasibility.questions) || [];
         renderClarificationCard(qs, data.feasibility);
         resetResearchStepper();
-        statusEl.textContent = '';
         return;
       }
       case 'REFUSED_IMPOSSIBLE':
       case 'REFUSED_UNSUITABLE': {
         renderResearchRefusal(data.refusal || data.feasibility);
         resetResearchStepper();
-        statusEl.textContent = '';
         return;
       }
       case 'INCONCLUSIVE_UNVERIFIED': {
@@ -1327,7 +1344,6 @@ async function runResearchDirect(text, feasibility) {
           .join('; ');
         addMsg('system', `Research inconclusive (${data.code || 'PLANNING_VALIDATION_FAILED'}): ${diags || data.diagnostics_summary || (data.diagnostics && data.diagnostics.message) || 'formalization did not validate.'}`);
         resetResearchStepper();
-        statusEl.textContent = '';
         return;
       }
       case 'PLANNING':
@@ -1354,23 +1370,23 @@ async function runResearchDirect(text, feasibility) {
             : 'Research run started; streaming live progress…',
           timestamp: new Date().toISOString()
         });
+        streamingActive = true;
         openResearchStream(runUid);
         return;
       }
       default: {
         addMsg('system', `Unexpected research response state: ${resolvedState}`);
         resetResearchStepper();
-        statusEl.textContent = '';
         return;
       }
     }
   } catch (e) {
-    addMsg('system', 'Research run error: ' + e);
+    addMsg('system', `Research could not start. ${String(e).slice(0, 300)}`);
     resetResearchStepper();
-    statusEl.textContent = '';
   } finally {
-    setComposerEnabled(true);
-    input.focus();
+    if (!streamingActive) {
+      finishResearch('IDLE');
+    }
   }
 }
 function _resolveResearchState(data) {
@@ -1722,14 +1738,23 @@ function openResearchStream(expectedRunUid) {
   seenResearchBanners.clear();
   lastSeenResearchSeq = 0;
   if (researchSource) { researchSource.close(); researchSource = null; }
-  researchSource = new EventSource('/api/v1/research/stream');
+  const streamUrl = activeBackendRunUid
+    ? '/api/v1/research/stream?run_uid=' + encodeURIComponent(activeBackendRunUid)
+    : '/api/v1/research/stream';
+  let consecutiveErrors = 0;
+  researchSource = new EventSource(streamUrl);
   researchSource.onerror = () => {
-    // EventSource auto-reconnects; refresh the vault so a dropped connection
-    // never leaves Research Vault (0) after a run finished server-side.
+    consecutiveErrors += 1;
     setDrawerSummary('stream reconnecting…');
     loadVault();
+    if (consecutiveErrors >= 3) {
+      fetch('/api/v1/research/status').catch(() => {});
+      setDrawerSummary('stream disconnected — check status or retry');
+      finishResearch('DISCONNECTED');
+    }
   };
   researchSource.onmessage = (ev) => {
+    consecutiveErrors = 0;
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.mode === 'builder') return;
     if (msg.run_uid && activeBackendRunUid && msg.run_uid !== activeBackendRunUid) return;
@@ -1842,34 +1867,48 @@ function openResearchStream(expectedRunUid) {
       renderResearchCompletion(msg.run_id || '', evVerdict);
       sealActiveRunLogCard();
       loadVault();
-      if (researchSource) { researchSource.close(); researchSource = null; }
+      finishResearch(evVerdict);
     }
     if (msg.event === 'terminal_verdict') {
       const evVerdict = String(msg.epistemic_verdict || msg.status || 'INCONCLUSIVE_UNVERIFIED').toUpperCase();
-      statusEl.textContent = '';
       if (evVerdict === 'NEEDS_CLARIFICATION') {
         const qs = msg.questions || (msg.feasibility && msg.feasibility.questions) || [];
         renderClarificationCard(qs, msg.feasibility);
         resetResearchStepper();
         finishRunLogCard('NEEDS_CLARIFICATION');
         sealActiveRunLogCard();
-        setComposerEnabled(true);
-        if (researchSource) { researchSource.close(); researchSource = null; }
+        finishResearch(evVerdict);
       } else if (evVerdict.startsWith('REFUSED')) {
         renderResearchRefusal(msg.feasibility);
         resetResearchStepper();
         finishRunLogCard(evVerdict);
         sealActiveRunLogCard();
-        setComposerEnabled(true);
-        if (researchSource) { researchSource.close(); researchSource = null; }
-      } else if (evVerdict === 'INCONCLUSIVE_UNVERIFIED' || evVerdict === 'FAILED') {
+        finishResearch(evVerdict);
+      } else if (evVerdict.startsWith('VERIFIED_')) {
+        setStepState('step-report', 'completed');
+        finishRunLogCard(evVerdict);
+        sealActiveRunLogCard();
+        loadVault();
+        finishResearch(evVerdict);
+      } else if (evVerdict === 'COMPUTED_NO_CLAIM') {
+        setStepState('step-report', 'completed');
+        finishRunLogCard('COMPUTED · NO CLAIM TESTED');
+        sealActiveRunLogCard();
+        loadVault();
+        finishResearch(evVerdict);
+      } else if (evVerdict === 'ABORTED') {
+        setStepState('step-report', 'failed');
+        finishRunLogCard('ABORTED');
+        sealActiveRunLogCard();
+        loadVault();
+        finishResearch(evVerdict);
+      } else {
         setStepState('step-report', evVerdict === 'FAILED' ? 'failed' : 'inc');
         finishRunLogCard(evVerdict);
         if (msg.error) addMsg('system', `Research ${evVerdict}: ${String(msg.error).slice(0, 300)}`);
         sealActiveRunLogCard();
         loadVault();
-        setComposerEnabled(true);
-        if (researchSource) { researchSource.close(); researchSource = null; }
+        finishResearch(evVerdict);
       }
     }
     if (msg.event === 'research_failed') {
@@ -1880,7 +1919,7 @@ function openResearchStream(expectedRunUid) {
       renderResearchFailure(msg);
       sealActiveRunLogCard();
       loadVault();  // partial results stay visible in the Explorer
-      if (researchSource) { researchSource.close(); researchSource = null; }
+      finishResearch('FAILED');
     }
     if (msg.event === 'vault_updated') {
       // Vault contents changed on disk — refresh the explorer immediately.
@@ -2059,8 +2098,22 @@ async function builderIngest() {
     document.getElementById('builder-status').textContent='Extraction complete · ready for researcher review';
   } catch(error) {builderError(error);}
 }
+function builderUpdateEvidenceBanner(ir, receipt) {
+  const banner=document.getElementById('builder-evidence-banner');
+  if(!banner) return;
+  const verdict=(receipt&&receipt.verification&&receipt.verification.evidence&&receipt.verification.evidence.ir_verdict)||(ir&&(ir.ir_verdict||ir.epistemic_verdict))||'';
+  if(verdict==='USER_MODIFIED_UNVERIFIED') {
+    const runId=(ir&&((ir.source_certificates&&ir.source_certificates[0]&&ir.source_certificates[0].run_id)||(ir.vault_run_ids&&ir.vault_run_ids[0])))||'source';
+    banner.textContent='User-modified, unverified: certificate from run '+runId+' does not cover these values';
+    banner.hidden=false;
+  } else {
+    banner.hidden=true;
+    banner.textContent='';
+  }
+}
 function builderRenderIR() {
   const ir=builderState.ir,body=document.getElementById('builder-verification');body.replaceChildren();
+  builderUpdateEvidenceBanner(ir, null);
   const flags=ir.disambiguation_flags.filter(flag=>!flag.resolved);
   document.getElementById('builder-ir-status').textContent=ir.source_mode+' · '+ir.equations.length+' equations · '+ir.constants.length+' constants · '+ir.llm_disambiguation_tokens_used+' LLM tokens'+(flags.length?' · Review: '+flags.map(flag=>flag.trigger+' ('+flag.target_symbol_or_eq+')').join(', '):'');
   for(const equation of ir.equations) {const row=document.createElement('tr'),math=document.createElement('td'),checks=document.createElement('td'),edit=document.createElement('td'),input=document.createElement('input');
@@ -2104,6 +2157,7 @@ async function builderExecute() {
     document.getElementById('builder-status').textContent='RUNNING · '+run.build_id;
     const poll=async()=>{try{const status=await builderRequest('/status/'+run.build_id);if(status.status==='RUNNING'){setTimeout(poll,700);return;}
       document.getElementById('builder-status').textContent=status.status+(status.error?' · '+status.error:'');
+      builderUpdateEvidenceBanner(builderState.ir, status.receipt);
       document.getElementById('builder-receipt').textContent=status.receipt?.merkle_root_blake3?'BLAKE3 Merkle root · '+status.receipt.merkle_root_blake3:'';
       for(const wave of status.committed_waves||[])for(const module of wave){const card=Array.from(document.querySelectorAll('.builder-module')).find(card=>card.dataset.module===module);const degraded=(status.fallbacks||[]).some(item=>item.module_id===module);if(card){card.textContent=module+' · '+(degraded?'DEGRADED_DETERMINISTIC_FALLBACK':'COMMITTED');card.classList.add(degraded?'builder-warn':'builder-ok');}}
       const link=document.getElementById('builder-download');link.href='/api/v1/builder/export/'+run.build_id+'.zip';link.hidden=!status.receipt?.merkle_root_blake3;

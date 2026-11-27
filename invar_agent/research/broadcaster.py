@@ -20,6 +20,17 @@ CHANNELS = ("search_log", "goi_stream", "accelerator_log")
 TERMINAL_EVENTS = frozenset({"terminal_verdict", "research_completed", "research_failed"})
 MAX_TRACKED_RUNS = 64
 MAX_EVENTS_PER_RUN = 500
+GLOBAL_BUILDER_SCOPE = "builder:global"
+
+
+def scope_key(run_uid: str) -> str:
+    if not isinstance(run_uid, str) or not run_uid:
+        raise ValueError("RUN_UID_REQUIRED")
+    return run_uid if run_uid.startswith(("research:", "builder:")) else f"research:{run_uid}"
+
+
+def _external_run_uid(sk: str) -> str:
+    return sk[len("research:"):] if sk.startswith("research:") else sk
 
 
 class ResearchEventBroadcaster:
@@ -29,28 +40,54 @@ class ResearchEventBroadcaster:
         self._subscribers: List[Tuple["queue.Queue[Dict[str, Any]]", Optional[str]]] = []
         self._histories: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         self._terminal_emitted: Set[str] = set()
+        self._terminal_payloads: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._seq = 0
-        self._active_run_uid: Optional[str] = None
 
     @property
     def seq(self) -> int:
         """Monotonic event counter."""
         return self._seq
 
-    def has_terminal(self, run_uid: str) -> bool:
+    def begin_run(self, run_uid: str) -> None:
+        """Register a run history bucket without publishing any event."""
+        sk = scope_key(run_uid)
         with self._lock:
-            return run_uid in self._terminal_emitted
+            self._histories.setdefault(sk, [])
+            while len(self._histories) > MAX_TRACKED_RUNS:
+                old_sk, _ = self._histories.popitem(last=False)
+                self._terminal_emitted.discard(old_sk)
+                self._terminal_payloads.pop(old_sk, None)
+
+    def has_terminal(self, run_uid: str) -> bool:
+        if not run_uid:
+            return False
+        sk = scope_key(run_uid)
+        with self._lock:
+            return sk in self._terminal_emitted
+
+    def terminal_payload(self, run_uid: str) -> Optional[Dict[str, Any]]:
+        if not run_uid:
+            return None
+        sk = scope_key(run_uid)
+        with self._lock:
+            payload = self._terminal_payloads.get(sk)
+            return dict(payload) if payload is not None else None
 
     def subscribe(
         self, since_seq: int = 0, run_uid: Optional[str] = None
     ) -> "queue.Queue[Dict[str, Any]]":
         q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1000)
+        sub_scope = scope_key(run_uid) if run_uid is not None else None
         with self._lock:
-            self._subscribers.append((q, run_uid))
-            target_uid = run_uid if run_uid is not None else (self._active_run_uid or "__default__")
-            history = list(self._histories.get(target_uid, ())) if target_uid else []
-            for payload in history[-200:]:
+            self._subscribers.append((q, sub_scope))
+            if sub_scope is not None:
+                history = list(self._histories.get(sub_scope, ()))[-200:]
+            else:
+                merged = [ev for bucket in self._histories.values() for ev in bucket]
+                merged.sort(key=lambda item: int(item.get("seq", 0)))
+                history = merged[-200:]
+            for payload in history:
                 if since_seq > 0 and int(payload.get("seq", 0)) <= since_seq:
                     continue
                 try:
@@ -64,32 +101,31 @@ class ResearchEventBroadcaster:
             self._subscribers = [(sub_q, uid) for sub_q, uid in self._subscribers if sub_q is not q]
 
     def clear_history(self, run_uid: Optional[str] = None) -> None:
-        """Register a new active run_uid without destroying concurrent runs' histories."""
+        """Register a new run_uid bucket or reset all histories when run_uid is None."""
+        if run_uid is not None:
+            self.begin_run(run_uid)
+            return
         with self._lock:
-            if run_uid is not None:
-                self._active_run_uid = run_uid
-                self._histories.setdefault(run_uid, [])
-                while len(self._histories) > MAX_TRACKED_RUNS:
-                    old_uid, _ = self._histories.popitem(last=False)
-                    self._terminal_emitted.discard(old_uid)
-            else:
-                self._histories.clear()
-                self._terminal_emitted.clear()
+            self._histories.clear()
+            self._terminal_emitted.clear()
+            self._terminal_payloads.clear()
 
     def publish(
         self,
         channel: str,
         event: str,
         data: Dict[str, Any],
-        run_uid: Optional[str] = None,
+        *,
+        run_uid: str,
     ) -> Optional[Dict[str, Any]]:
         """Thread-safe fan-out; preserves concurrent runs and enforces exactly-once terminality."""
+        sk = scope_key(run_uid)
+        ext_uid = _external_run_uid(sk)
         with self._lock:
-            eff_uid = run_uid if run_uid is not None else (self._active_run_uid or "__default__")
-            if event in TERMINAL_EVENTS and eff_uid:
-                if eff_uid in self._terminal_emitted:
+            if event in TERMINAL_EVENTS:
+                if sk in self._terminal_emitted:
                     return None
-                self._terminal_emitted.add(eff_uid)
+                self._terminal_emitted.add(sk)
             self._seq += 1
             seq = self._seq
             payload: Dict[str, Any] = {
@@ -98,19 +134,22 @@ class ResearchEventBroadcaster:
                 "event_version": "2.0",
                 "seq": seq,
                 **data,
+                "scope": sk,
+                "run_uid": ext_uid,
             }
-            if eff_uid:
-                payload["run_uid"] = eff_uid
-                bucket = self._histories.setdefault(eff_uid, [])
-                bucket.append(payload)
-                if len(bucket) > MAX_EVENTS_PER_RUN:
-                    del bucket[: len(bucket) - MAX_EVENTS_PER_RUN]
-                while len(self._histories) > MAX_TRACKED_RUNS:
-                    old_uid, _ = self._histories.popitem(last=False)
-                    self._terminal_emitted.discard(old_uid)
+            if event in TERMINAL_EVENTS:
+                self._terminal_payloads[sk] = payload
+            bucket = self._histories.setdefault(sk, [])
+            bucket.append(payload)
+            if len(bucket) > MAX_EVENTS_PER_RUN:
+                del bucket[: len(bucket) - MAX_EVENTS_PER_RUN]
+            while len(self._histories) > MAX_TRACKED_RUNS:
+                old_sk, _ = self._histories.popitem(last=False)
+                self._terminal_emitted.discard(old_sk)
+                self._terminal_payloads.pop(old_sk, None)
             subs = list(self._subscribers)
-        for q, sub_uid in subs:
-            if sub_uid is not None and eff_uid != sub_uid:
+        for q, sub_scope in subs:
+            if sub_scope is not None and sk != sub_scope:
                 continue
             try:
                 q.put_nowait(payload)
@@ -147,8 +186,9 @@ class ResearchEventBroadcaster:
         return self.publish("accelerator_log", "terminal_verdict", data, run_uid=run_uid)
 
     def get_run_history(self, run_uid: str) -> List[Dict[str, Any]]:
+        sk = scope_key(run_uid)
         with self._lock:
-            return list(self._histories.get(run_uid, ()))
+            return list(self._histories.get(sk, ()))
 
 
 class _FutureThreadShim:
@@ -187,6 +227,9 @@ class ResearchRunManager:
         self.search_client = search_client
         self.verification_runner = verification_runner
         self.pending_blueprint: Optional[ResearchBlueprint] = None
+        self._pending_telemetry_session: Any = None
+        self._pending_literature: List[Dict[str, Any]] = []
+        self._pending_literature_digest: Optional[str] = None
         self.active_state: Optional[ResearchRunState] = None
         self.active_run_uid: Optional[str] = None
         self.committed_bundles: List[str] = []
@@ -205,26 +248,39 @@ class ResearchRunManager:
     def allocate_run_uid(self) -> str:
         """Allocate a fresh run_uid BEFORE planning starts (ARCH-006)."""
         uid = uuid.uuid4().hex[:12]
-        self.broadcaster.clear_history(run_uid=uid)
+        self.broadcaster.begin_run(uid)
         return uid
 
     async def _progress(
-        self, channel: str, payload: Dict[str, Any], run_uid: Optional[str] = None
+        self, channel: str, payload: Dict[str, Any], *, run_uid: str
     ) -> None:
         event = payload.pop("event", "log")
         if event == "commit" and payload.get("bundle_hash"):
             bh = str(payload.get("bundle_hash"))
-            if run_uid is None or run_uid == self.active_run_uid:
+            if run_uid == self.active_run_uid:
                 self.committed_bundles.append(bh)
         if event == "checkpoint" and payload.get("bundle_hash"):
             bh = str(payload.get("bundle_hash"))
-            if run_uid is None or run_uid == self.active_run_uid:
+            if run_uid == self.active_run_uid:
                 self.pinned_checkpoints.append(bh)
         self.broadcaster.publish(channel, event, payload, run_uid=run_uid)
 
-    def request_plan(self, blueprint: ResearchBlueprint) -> None:
+    def request_plan(
+        self,
+        blueprint: ResearchBlueprint,
+        *,
+        telemetry_session: Any = None,
+        literature: Optional[List[Dict[str, Any]]] = None,
+        literature_digest: Optional[str] = None,
+    ) -> None:
         """Stage a blueprint awaiting user approval (approve_plan action)."""
         self.pending_blueprint = blueprint
+        if telemetry_session is not None:
+            self._pending_telemetry_session = telemetry_session
+        if literature is not None:
+            self._pending_literature = list(literature)
+        if literature_digest is not None:
+            self._pending_literature_digest = literature_digest
 
     def approve(self, *, run_uid: Optional[str] = None) -> bool:
         with self._lock:
@@ -263,6 +319,12 @@ class ResearchRunManager:
             self.runs[uid] = run_state
             self.active_state = run_state
             seeded = list(getattr(self, "seeded_upload_ids", None) or [])
+            pending_session = self._pending_telemetry_session
+            self._pending_telemetry_session = None
+            pending_lit = list(self._pending_literature)
+            self._pending_literature = []
+            pending_lit_digest = self._pending_literature_digest
+            self._pending_literature_digest = None
 
         async def _scoped_progress(channel: str, payload: Dict[str, Any]) -> None:
             await self._progress(channel, payload, run_uid=uid)
@@ -275,6 +337,8 @@ class ResearchRunManager:
             search_client=self.search_client,
             abort_flag=lambda: run_abort.is_set() or self._abort.is_set(),
             workspace_root=self.workspace_root,
+            preretrieved_literature=pending_lit or None,
+            literature_digest=pending_lit_digest,
             **(
                 {"verification_runner": self.verification_runner}
                 if self.verification_runner is not None
@@ -282,7 +346,17 @@ class ResearchRunManager:
             ),
         )
 
+        import contextvars
+        from ..llm.telemetry import _ACTIVE_SESSION
+        from .formalization import _FORMALIZATION_ATTEMPT_SINK
+
+        ctx = contextvars.copy_context()
+
         def _run() -> None:
+            _FORMALIZATION_ATTEMPT_SINK.set(None)
+            tok = None
+            if pending_session is not None and _ACTIVE_SESSION.get() is None:
+                tok = _ACTIVE_SESSION.set(pending_session)
             loop = asyncio.new_event_loop()
             try:
                 loop.run_until_complete(
@@ -290,8 +364,10 @@ class ResearchRunManager:
                 )
             finally:
                 loop.close()
+                if tok is not None:
+                    _ACTIVE_SESSION.reset(tok)
 
-        fut = self._executor.submit(_run)
+        fut = self._executor.submit(ctx.run, _run)
         with self._lock:
             self._futures[uid] = fut
             self._thread = _FutureThreadShim(fut)  # type: ignore[assignment]

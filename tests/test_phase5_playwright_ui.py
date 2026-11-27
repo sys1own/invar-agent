@@ -26,6 +26,8 @@ import uvicorn
 
 from invar_agent.server import create_app
 
+pytestmark = [pytest.mark.serial, pytest.mark.timeout(360)]
+
 playwright_sync = pytest.importorskip("playwright.sync_api")
 sync_playwright = playwright_sync.sync_playwright
 

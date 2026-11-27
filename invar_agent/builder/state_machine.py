@@ -210,6 +210,14 @@ class BuilderStateMachine:
         if self._running:
             raise RuntimeError("A BuilderStateMachine executes one build at a time")
         self._running = True
+        self._step_worker = None
+        self._last_worker_pid = None
+        factory = getattr(self.emitters, "process_factory", None)
+        if factory:
+            from ..runtime.killable import StepWorker
+            self._step_worker = StepWorker(factory)
+            await asyncio.to_thread(self._step_worker.warm)
+            self._last_worker_pid = self._step_worker.pid
         started = time.monotonic()
         cache = HISCache(self.workspace_root, request.build_id)
         self.root = cache.path.parent
@@ -318,6 +326,12 @@ class BuilderStateMachine:
             await self._event(BuilderStage.ADJOINT_COMMIT_OR_ROLLBACK, event="builder_aborted", error_code=self.state.error_code, error=self.state.error,
                               details=getattr(exc, "details", {}))
         finally:
+            if getattr(self, "_step_worker", None) is not None:
+                try:
+                    self._step_worker.close()
+                except Exception:
+                    pass
+                self._step_worker = None
             self.state.total_llm_tokens_used = self.budget.used_repair_tokens + self.planner.llm_tokens_used
             self._running = False
             self._receipt()
@@ -390,12 +404,33 @@ class BuilderStateMachine:
                         )
                     emission = ModuleEmission({node.target_relpath: result.source})
                 else:
-                    emission = await self._run_bounded(
-                        self.emitters.emit,
-                        node,
-                        EmitterContext(self.ir.model_copy(deep=True), self.uast.model_copy(deep=True), overlay, self.state.python_fallback_active),
-                        label=f"emit:{node.node_id}",
-                    )
+                    ctx_obj = EmitterContext(self.ir.model_copy(deep=True), self.uast.model_copy(deep=True), overlay, self.state.python_fallback_active)
+                    if getattr(self, "_step_worker", None) is not None:
+                        import pickle as _pickle
+                        from ..runtime.killable import StepTimeout
+                        rem = self._remaining_wall_clock()
+                        if rem <= 0.0:
+                            raise BuildFault("BUILD_WALL_CLOCK_EXCEEDED", f"Build wall-clock budget exceeded before emit:{node.node_id}")
+                        try:
+                            raw_res = await asyncio.to_thread(
+                                self._step_worker.run,
+                                "emit",
+                                _pickle.dumps(((node, ctx_obj), {})),
+                                rem,
+                            )
+                            emission = _pickle.loads(raw_res)
+                        except StepTimeout as exc:
+                            raise BuildFault(
+                                "BUILD_WALL_CLOCK_EXCEEDED",
+                                f"Build wall-clock budget exceeded during emit:{node.node_id}",
+                            ) from exc
+                    else:
+                        emission = await self._run_bounded(
+                            self.emitters.emit,
+                            node,
+                            ctx_obj,
+                            label=f"emit:{node.node_id}",
+                        )
                 if emission.python_fallback_active:
                     self.state.python_fallback_active = True
                 for relpath, content in emission.files.items():
@@ -619,12 +654,18 @@ class BuilderStateMachine:
                 cwd=overlay,
                 env=environment,
             )
+            sb_timeout = min(60.0, max(1.0, self._remaining_wall_clock()))
             with attach_os_limits(proc, memory_limit_mb=1024, cpu_time_limit_s=60, active_process_limit=4):
                 try:
-                    stdout_text, stderr_text = proc.communicate(canonical_json(config), timeout=60)
+                    stdout_text, stderr_text = proc.communicate(canonical_json(config), timeout=sb_timeout)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.communicate()
+                    try:
+                        proc.communicate(timeout=3)
+                    except Exception:
+                        pass
+                    if self._remaining_wall_clock() <= 0.0:
+                        raise BuildFault("BUILD_WALL_CLOCK_EXCEEDED", "Sandbox execution exceeded build wall-clock budget")
                     raise BuildFault("OS_OOM_OR_DISK", "Sandbox execution timed out")
             markers = [line[len("INVAR_SANDBOX="):] for line in (stdout_text or "").splitlines() if line.startswith("INVAR_SANDBOX=")]
             if proc.returncode or not markers:
@@ -709,18 +750,29 @@ class BuilderStateMachine:
                     emitted_by = "deterministic_fallback" if entry and entry.verified_status == "FALLBACK_VERIFIED" else "llm_extension_slot" if node and node.kind == "llm_extension_slot" else "deterministic_emitter"
                     artifacts.append(dict(relpath=relpath, module_id=entry.module_id if entry else "unattributed", his_digest=entry.his_digest if entry else "0" * 64,
                         emitted_by=emitted_by, content_blake3=blake3.blake3(path.read_bytes()).hexdigest(), byte_size=path.stat().st_size))
+        verification_payload = dict(python_fallback_active=self.state.python_fallback_active, cabi_compiled=self.state.cabi_compiled,
+            goi_spectral_radius=self._plan.spectral_radius if self._plan else self._goi_rho,
+            hin_homogeneous_equations=sum(e.hin_homogeneous for e in self.ir.equations) if self.ir else 0,
+            hin_total_equations=len(self.ir.equations) if self.ir else 0,
+            z3_contracts_proved=sum(e.z3_satisfiable is True for e in self.ir.equations) if self.ir else 0,
+            z3_contracts_failed=int(self.state.error_code == "Z3_SPEC_UNSAT"),
+            pytest_exit_code=self.state.pytest_exit_code, pytest_passed=self.state.pytest_passed, pytest_failed=self.state.pytest_failed)
+        if self.ir is not None and (getattr(self.ir, "override_ledger", None) or self.ir.epistemic_verdict == "USER_MODIFIED_UNVERIFIED"):
+            ledger = list(getattr(self.ir, "override_ledger", []) or [])
+            verification_payload["evidence"] = {
+                "ir_verdict": getattr(self.ir, "ir_verdict", None) or self.ir.epistemic_verdict,
+                "source_certificate_digests": [ref.certificate_blake3 for ref in (getattr(self.ir, "source_certificates", []) or [])],
+                "override_ledger_digest": digest("invar.override_ledger.v1", [e.model_dump(mode="json") for e in ledger]),
+                "invalidating_entries": sum(1 for e in ledger if e.invalidating),
+            }
+            if self.ir.epistemic_verdict == "USER_MODIFIED_UNVERIFIED" and self.ir.research_reference is not None:
+                verification_payload["research_parity"] = "NOT_APPLICABLE_USER_MODIFIED"
         receipt = dict(schema_version="build_receipt.v1", build_id=self.state.build_id, status=self.state.status,
             project_id=self.uast.project_id if self.uast else "unplanned", canonical_ir_digest=self.ir.ir_blake3_digest if self.ir else "0" * 64,
             uast_digest=digest("invar.builder.uast.v1", self.uast.model_dump(mode="json")) if self.uast else "0" * 64,
             equation_provenance_map={equation.equation_id: digest("invar.source_span.v1", equation.provenance.model_dump(mode="json")) for equation in self.ir.equations} if self.ir else {},
             artifacts=artifacts, fallbacks=self.state.fallbacks,
-            verification=dict(python_fallback_active=self.state.python_fallback_active, cabi_compiled=self.state.cabi_compiled,
-                goi_spectral_radius=self._plan.spectral_radius if self._plan else self._goi_rho,
-                hin_homogeneous_equations=sum(e.hin_homogeneous for e in self.ir.equations) if self.ir else 0,
-                hin_total_equations=len(self.ir.equations) if self.ir else 0,
-                z3_contracts_proved=sum(e.z3_satisfiable is True for e in self.ir.equations) if self.ir else 0,
-                z3_contracts_failed=int(self.state.error_code == "Z3_SPEC_UNSAT"),
-                pytest_exit_code=self.state.pytest_exit_code, pytest_passed=self.state.pytest_passed, pytest_failed=self.state.pytest_failed),
+            verification=verification_payload,
             total_llm_tokens_used=self.state.total_llm_tokens_used)
         receipt = seal_receipt(receipt).model_dump(mode='json')
         self.state.receipt = receipt

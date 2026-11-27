@@ -1,6 +1,6 @@
 """SI reference annotations; roles describe each law used as a stand-alone model.
 
-Order is M,L,T,Theta,I,N,J. Inputs are held controls, outputs are pure derived
+Order is M,L,T,I,Theta,N,J. Inputs are held controls, outputs are pure derived
 observables, and conserved population frequencies are dynamic states. Unspecified
 semantic tags stay real (0); no entropy/probability tag is inferred from LaTeX.
 Only positive physical branches are used for dimensional Pi denominators.
@@ -18,7 +18,7 @@ TIME = (0,0,1,0,0,0,0)
 RATE = (0,0,-1,0,0,0,0)
 VELOCITY = (0,1,-1,0,0,0,0)
 FLUX = (1,0,-3,0,0,0,0)
-TEMPERATURE = (0,0,0,1,0,0,0)
+TEMPERATURE = (0,0,0,0,1,0,0)
 
 # Derivative identities lacking explicit nondimensionalization, generic
 # covariance/payoff units, fractional SI constants and implicit log bases or
@@ -26,10 +26,10 @@ TEMPERATURE = (0,0,0,1,0,0,0)
 ANNOTATIONS = {
     ("fundamental_constants", 0): ("E-m*c**2", "E", {"E": (1,2,-2,0,0,0,0), "m": MASS, "c": VELOCITY}),
     ("fundamental_constants", 1): ("F-G*m1*m2/r**2", "F", {"F": (1,1,-2,0,0,0,0), "G": (-1,3,-2,0,0,0,0), "m1": MASS, "m2": MASS, "r": LENGTH}),
-    ("fundamental_constants", 2): ("q_rad-epsilon*sigma_SB*T**4", "q_rad", {"q_rad": FLUX, "epsilon": ONE, "sigma_SB": (1,0,-3,-4,0,0,0), "T": TEMPERATURE}),
+    ("fundamental_constants", 2): ("q_rad-epsilon*sigma_SB*T**4", "q_rad", {"q_rad": FLUX, "epsilon": ONE, "sigma_SB": (1,0,-3,0,-4,0,0), "T": TEMPERATURE}),
     ("aerospace_entry", 1): ("rho-rho0*exp(-h/H)", "rho", {"rho": (1,-3,0,0,0,0,0), "rho0": (1,-3,0,0,0,0,0), "h": LENGTH, "H": LENGTH}),
     ("relativistic_plasma", 0): ("gamma-1/sqrt(1-v**2/c**2)", "gamma", {"gamma": ONE, "v": VELOCITY, "c": VELOCITY}),
-    ("relativistic_plasma", 1): ("r_L-gamma*m*v/(q*B)", "r_L", {"r_L": LENGTH, "gamma": ONE, "m": MASS, "v": VELOCITY, "q": (0,0,1,0,1,0,0), "B": (1,0,-2,0,-1,0,0)}),
+    ("relativistic_plasma", 1): ("r_L-gamma*m*v/(q*B)", "r_L", {"r_L": LENGTH, "gamma": ONE, "m": MASS, "v": VELOCITY, "q": (0,0,1,1,0,0,0), "B": (1,0,-2,-1,0,0,0)}),
     ("relativistic_plasma", 2): ("F_drag-rho*v**2*C_D*A/2", "F_drag", {"F_drag": (1,1,-2,0,0,0,0), "rho": (1,-3,0,0,0,0,0), "v": VELOCITY, "C_D": ONE, "A": (0,2,0,0,0,0,0)}),
     ("nonlinear_dynamics", 6): ("C-u*delta_t/delta_x", "C", {"C": ONE, "u": VELOCITY, "delta_t": TIME, "delta_x": LENGTH}),
     ("epidemiology_population", 0): ("R0-beta/gamma", "R0", {"R0": ONE, "beta": RATE, "gamma": RATE}),

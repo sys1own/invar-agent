@@ -679,7 +679,7 @@ def test_broadcaster_clear_history_prevents_cross_run_banner_leak():
     from invar_agent.research.broadcaster import ResearchEventBroadcaster
 
     b = ResearchEventBroadcaster()
-    b.publish("accelerator_log", "stage_committed", {"blueprint_id": "hw_triad_poisson_integrator"})
+    b.publish("accelerator_log", "stage_committed", {"blueprint_id": "hw_triad_poisson_integrator"}, run_uid="run_clear_test")
     b.clear_history()
     q = b.subscribe()
     assert q.empty()

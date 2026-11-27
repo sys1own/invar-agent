@@ -40,6 +40,7 @@ manifest-path = "invar_agent/_native/Cargo.toml"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+faulthandler_timeout = 240
 addopts = '-m "not live" --timeout=120 --timeout-method=thread'
 markers = [
     "live: requires a real provider API key (skipped by default)",
