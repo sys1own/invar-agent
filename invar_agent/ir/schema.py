@@ -423,6 +423,28 @@ class SingleSymbolRepairPayload(BaseModel):
     target_name: str
     expr_text: str
 
+    @field_validator("target_kind", mode="before")
+    @classmethod
+    def _normalize_target_kind(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            low = v.strip().lower()
+            aliases = {
+                "observable": "observables",
+                "observables": "observables",
+                "let": "let_binding",
+                "let_binding": "let_binding",
+                "let_bindings": "let_binding",
+                "dynamic": "dynamics_or_residuals",
+                "dynamics": "dynamics_or_residuals",
+                "residual": "dynamics_or_residuals",
+                "residuals": "dynamics_or_residuals",
+                "equation": "dynamics_or_residuals",
+                "equations": "dynamics_or_residuals",
+                "dynamics_or_residuals": "dynamics_or_residuals",
+            }
+            return aliases.get(low, v)
+        return v
+
 
 class SciIR(BaseModel):
     """Canonical Invar-Agent vNext Scientific IR (`invar.sciir.v2`)."""

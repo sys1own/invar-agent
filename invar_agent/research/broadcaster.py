@@ -48,7 +48,7 @@ class ResearchEventBroadcaster:
         q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1000)
         with self._lock:
             self._subscribers.append((q, run_uid))
-            target_uid = run_uid if run_uid is not None else self._active_run_uid
+            target_uid = run_uid if run_uid is not None else (self._active_run_uid or "__default__")
             history = list(self._histories.get(target_uid, ())) if target_uid else []
             for payload in history[-200:]:
                 if since_seq > 0 and int(payload.get("seq", 0)) <= since_seq:
@@ -85,7 +85,7 @@ class ResearchEventBroadcaster:
     ) -> Optional[Dict[str, Any]]:
         """Thread-safe fan-out; preserves concurrent runs and enforces exactly-once terminality."""
         with self._lock:
-            eff_uid = run_uid if run_uid is not None else self._active_run_uid
+            eff_uid = run_uid if run_uid is not None else (self._active_run_uid or "__default__")
             if event in TERMINAL_EVENTS and eff_uid:
                 if eff_uid in self._terminal_emitted:
                     return None
@@ -149,6 +149,22 @@ class ResearchEventBroadcaster:
     def get_run_history(self, run_uid: str) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self._histories.get(run_uid, ()))
+
+
+class _FutureThreadShim:
+    """Thread-like `.join()` / `.is_alive()` adapter over a ThreadPoolExecutor Future."""
+
+    def __init__(self, future: Future) -> None:
+        self._future = future
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        try:
+            self._future.result(timeout=timeout)
+        except Exception:
+            pass
+
+    def is_alive(self) -> bool:
+        return not self._future.done()
 
 
 class ResearchRunManager:
@@ -224,7 +240,8 @@ class ResearchRunManager:
             ):
                 suffix += 1
                 candidate_id = f"{base_id}_{suffix}"
-            bp = bp.model_copy(update={"blueprint_id": candidate_id})
+            bp.blueprint_id = candidate_id
+            self.pending_blueprint = bp
             uid = run_uid or self.allocate_run_uid()
             self._abort.clear()
             run_abort = threading.Event()
@@ -277,6 +294,7 @@ class ResearchRunManager:
         fut = self._executor.submit(_run)
         with self._lock:
             self._futures[uid] = fut
+            self._thread = _FutureThreadShim(fut)  # type: ignore[assignment]
         return True
 
     async def _execute(

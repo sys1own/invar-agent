@@ -363,7 +363,19 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                     except Exception:
                         holds_at_t0 = False
                     if not holds_at_t0:
-                        raise ValueError('Temporal state predicate')
+                        # Keep simple zero-bound positivity guards (e.g. `x >= 0`) when violated by
+                        # a negative initial state so Z3 catches genuine initial-state contradictions.
+                        cmp_node = transformed.body
+                        is_zero_positivity_violation = (
+                            isinstance(cmp_node.left, ast.Name)
+                            and isinstance(cmp_node.ops[0], (ast.GtE, ast.Gt))
+                            and isinstance(cmp_node.comparators[0], ast.Constant)
+                            and isinstance(cmp_node.comparators[0].value, (int, float))
+                            and float(cmp_node.comparators[0].value) == 0.0
+                            and init_env.get(cmp_node.left.id, 0.0) < 0.0
+                        )
+                        if not is_zero_positivity_violation:
+                            raise ValueError('Temporal state predicate')
                 raw_equations.append(RawEquation(text=ast.unparse(ast.fix_missing_locations(transformed)), provenance=span))
             except ValueError:
                 runtime.append(RuntimePredicate(contract_id=contract['contract_id'], assertion=assertion,

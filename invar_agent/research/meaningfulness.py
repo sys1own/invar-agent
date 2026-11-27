@@ -69,12 +69,18 @@ class ContractClass(str, Enum):
 class SlotSpec(StrictModel):
     slot_idx: int = Field(ge=0)
     symbol: str = Field(min_length=1)
-    si_dim: tuple[int, int, int, int, int, int, int]
+    si_dim: tuple[int | float, int | float, int | float, int | float, int | float, int | float, int | float]
     semantic_tag: int = Field(default=0, ge=0, le=255)
     role: Literal["CONTROL_PARAM", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "CONSERVATION_AUX"]
     is_falsification_target: bool = False
     stochastic_role: Literal["UNIFORM", "SEED", "COUNTER", "CHANNEL"] | None = None
     unit_scale: tuple[int,int] = (1,1)
+
+    @field_validator("si_dim", mode="before")
+    @classmethod
+    def _validate_si_dim(cls, value):
+        from ..schemas.research import _validate_rational_si_dim
+        return tuple(_validate_rational_si_dim(value))
 
     @field_validator("unit_scale")
     @classmethod
@@ -128,10 +134,16 @@ class Obligation(StrictModel):
 
 class EquationSpec(StrictModel):
     expression: str
-    si_dim: tuple[int, int, int, int, int, int, int]
+    si_dim: tuple[int | float, int | float, int | float, int | float, int | float, int | float, int | float]
     semantic_tag: int = Field(default=0, ge=0, le=255)
     kind: Literal["ALGEBRAIC", "ODE_RHS", "FIXED_POINT_RESIDUAL", "FIXED_POINT_MAP", "MC_SAMPLE", "TRAJECTORY_MAX", "TRAJECTORY_MIN"] = "ALGEBRAIC"
     state_symbol: str | None = None
+
+    @field_validator("si_dim", mode="before")
+    @classmethod
+    def _validate_eq_si_dim(cls, value):
+        from ..schemas.research import _validate_rational_si_dim
+        return tuple(_validate_rational_si_dim(value))
 
     @model_serializer(mode="wrap")
     def serialize_equation(self, handler):
@@ -1852,7 +1864,15 @@ def certify_implementation_fidelity(ihcg: IhcgGraph, uast: Mapping[str, Any], sa
             continue
         result = json.loads(_native.py_check_algebraic_equivalence(_json(_csel(_parse(expected.expression))), _json(_csel(_parse(equations[name]))), iter_limit=30, node_limit=10000, time_limit_ms=5))
         alg = alg and result["equivalent"]
-    quantities = [{"symbol": s.symbol, "si_dimension": s.si_dim, "interval": ihcg.omega[s.symbol],
+    # R2-ARCH-006: Uniformly scale rational quarter/half-integer SI exponents to exact ints for Rust HIN.
+    dim_scale = 1
+    for dvec in [*(s.si_dim for s in ihcg.slots), *(e.si_dim for e in ihcg.equations.values())]:
+        if any(isinstance(x, float) and not float(x).is_integer() for x in dvec):
+            if any(abs(x * 2.0 - round(x * 2.0)) > 1e-9 for x in dvec):
+                dim_scale = 4
+            elif dim_scale < 2:
+                dim_scale = 2
+    quantities = [{"symbol": s.symbol, "si_dimension": [int(round(x * dim_scale)) for x in s.si_dim], "interval": ihcg.omega[s.symbol],
                    "is_state_variable": s.role == "DYNAMIC_STATE", "semantic_tag": s.semantic_tag} for s in ihcg.slots]
     arithmetic = {}
     owners = {}
@@ -1866,7 +1886,7 @@ def certify_implementation_fidelity(ihcg: IhcgGraph, uast: Mapping[str, Any], sa
     dim = reports["all_valid"] and set(equations) == set(ihcg.equations)
     for report in reports["equations"]:
         expected = ihcg.equations.get(owners[report["equation_name"]])
-        dim = dim and expected is not None and tuple(report["output_dimensions"]) == expected.si_dim and report["output_semantic_tag"] == expected.semantic_tag and not report["dimensional_warnings"]
+        dim = dim and expected is not None and tuple(report["output_dimensions"]) == tuple(int(round(x * dim_scale)) for x in expected.si_dim) and report["output_semantic_tag"] == expected.semantic_tag and not report["dimensional_warnings"]
     parameters = uast.get("parameters", {})
     locked = all(parameters.get(k) == v for k, v in ihcg.control_values.items())
     def failed(reason):

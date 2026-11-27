@@ -423,21 +423,23 @@ _CONCEPT_FAMILIES: Dict[str, Tuple[Tuple[str, re.Pattern[str]], ...]] = {
         ("p11b_cosb3_8750mw", re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I)),
     ),
     "sys1own/shbt-ghost": (
-        ("ghost_seed_ccz4", re.compile(r"\b(?:ghost[- ]seed|topological\s+mass[- ]congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz)\b", re.I | re.S)),
+        ("ghost_seed_ccz4", re.compile(r"\b(?:ghost[- ]seed|topological\s+mass[- ]congestion|m_seed|r_congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz)\b", re.I | re.S)),
+        ("ccz4_shbt_damping", re.compile(r"\bccz4\b.*\b(?:50\.518\s*khz|r_congestion|kappa_1\s*=\s*0\.15|dark[- ]ledger)\b", re.I | re.S)),
     ),
     "sys1own/shbt-sglt": (
-        ("sglt_tmsv", re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b21\.715\s*db\b", re.I)),
+        ("sglt_tmsv", re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b(?:21\.715\s*db|dark[- ]ledger|ford[- ]roman|ccz4)\b", re.I | re.S)),
     ),
     "sys1own/shbt-exotic": (
-        ("ford_roman_dark_ledger", re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|heegaard[- ]floer)\b", re.I)),
+        ("ford_roman_dark_ledger", re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|dual[- ]ledger|heegaard[- ]floer|10/33|23/33)\b", re.I | re.S)),
     ),
     "sys1own/shbt-recon": (
         ("sram_2112_space_group", re.compile(r"\b2,?112[- ]byte\b.*\b(?:640\s*b|1,?472\s*b|230[- ]space[- ]group)\b", re.I)),
         ("virasoro_bipartite_stinespring", re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b.*\b(?:10\s*:\s*23|100/1089)\b", re.I)),
     ),
     "sys1own/shbt-warp": (
+        ("mar312_explicit", re.compile(r"\b(?:shbt-)?mar[- ]?312[cx]?\b", re.I)),
         ("mar312_avionics_teg", re.compile(r"\b(?:mar[- ]?312[cx]?|ew[- ]?312|dec[- ]x)\b.*\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw|25\.00\s*ew)\b", re.I)),
-        ("cryogenic_enclave_surplus", re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg)\b.*\b(?:33,?104|81,?104|906(?:\.0+)?\s*kw)\b", re.I)),
+        ("cryogenic_enclave_surplus", re.compile(r"\b(?:42\.15\s*kw\b.*\b17\.80\s*kw|17\.80\s*kw\s+avionics\b.*\b48\.00\s*kw\s+teg|(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg)\b.*\b(?:33,?104|81,?104|906(?:\.0+)?\s*kw))\b", re.I | re.S)),
     ),
     "sys1own/shbt-swarm": (
         ("symplectic_landauer_shunt", re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I)),

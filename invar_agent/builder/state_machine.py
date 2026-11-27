@@ -157,7 +157,19 @@ def _atomic_json(path, payload):
             output.write(canonical_json(payload))
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        for _attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if path.exists():
+                    try:
+                        os.chmod(path, 0o666)
+                    except OSError:
+                        pass
+                if _attempt == 5:
+                    raise
+                time.sleep(0.02 * (2 ** _attempt))
     finally:
         temporary.unlink(missing_ok=True)
 

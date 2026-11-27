@@ -246,3 +246,31 @@ def test_builder_client_uses_current_server_provider_and_key(builder_client,monk
     prepare_plan(builder_client,profiles=['hybrid_compute_library'])
     assert len(calls)==1
     assert calls[0]['provider']=='deepseek' and calls[0]['api_key']=='test-only-not-a-secret'
+
+
+def test_builder_stream_returns_immediately_for_pre_completed_build(builder_client, tmp_path):
+    """R2-ARCH-003: /api/v1/builder/stream must return in < 2 s for an already-terminal build
+    even when the broadcaster has no prior history for that build_id."""
+    import time as _time
+    import invar_agent.server as server
+
+    build_id = "precompleted_build_001"
+    status_dir = server._STATE.workspace_root / ".invar" / "builder" / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    (status_dir / f"{build_id}.json").write_text(
+        json.dumps({"build_id": build_id, "status": "COMPLETED", "artifacts": []}),
+        encoding="utf-8",
+    )
+    server._STATE.research_broadcaster.clear_history()
+
+    t0 = _time.monotonic()
+    resp = builder_client.get("/api/v1/builder/stream", params={"build_id": build_id})
+    elapsed = _time.monotonic() - t0
+    assert resp.status_code == 200
+    assert elapsed < 2.0, f"/builder/stream took {elapsed:.2f}s (expected < 2s)"
+    events = [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: ")]
+    assert len(events) == 1
+    assert events[0]["event"] == "builder.completed"
+    assert events[0]["status"] == "COMPLETED"
+    assert events[0]["build_id"] == build_id
+    assert events[0]["event_version"] == "2.0"

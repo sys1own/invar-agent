@@ -20,23 +20,51 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="invar-agent", description="Mathematically Verified Autonomous Agent Kernel")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_ingest = sub.add_parser("ingest", help="Ingest a workspace")
+    p_ingest = sub.add_parser("ingest", help="Code-repair kernel: ingest a repository graph")
     p_ingest.add_argument("path", nargs="?", default=".")
 
-    p_plan = sub.add_parser("plan", help="Plan wavefronts for nodes JSON")
+    p_plan = sub.add_parser("plan", help="Code-repair kernel: plan wavefronts for nodes JSON")
     p_plan.add_argument("workspace")
     p_plan.add_argument("nodes_json")
 
-    p_exec = sub.add_parser("execute", help="Execute the 9-stage kernel over nodes JSON")
+    p_exec = sub.add_parser("execute", help="Code-repair kernel: execute the 9-stage kernel over nodes JSON")
     p_exec.add_argument("workspace")
     p_exec.add_argument("nodes_json")
     p_exec.add_argument("--objective", default="")
     p_exec.add_argument("--sandbox-cmd", nargs="*", default=None)
 
-    p_export = sub.add_parser("export", help="Export a curated artifact")
+    p_export = sub.add_parser("export", help="Code-repair kernel: export a curated artifact")
     p_export.add_argument("workspace")
     p_export.add_argument("type", choices=["workspace_zip", "patch_adjoint_bundle", "verification_certificate"])
     p_export.add_argument("--out", default=None)
+
+    p_builder = sub.add_parser("builder", help="Builder Studio: ingest, plan, execute, and export scientific instruments")
+    b_sub = p_builder.add_subparsers(dest="builder_command", required=True)
+
+    pb_ingest = b_sub.add_parser("ingest", help="Ingest uploaded specs and/or verified vault run IDs into a CanonicalResearchIR")
+    pb_ingest.add_argument("workspace", help="Workspace root directory")
+    pb_ingest.add_argument("--upload", dest="uploads", action="append", default=[], help="Spec/data file to ingest (repeatable)")
+    pb_ingest.add_argument("--vault-id", dest="vault_ids", action="append", default=[], help="Verified Research Vault run_id (repeatable)")
+    pb_ingest.add_argument("--title", default="Scientific instrument")
+    pb_ingest.add_argument("--out", default=None, help="Optional path to write CanonicalResearchIR JSON")
+
+    pb_plan = b_sub.add_parser("plan", help="Synthesize a verified Builder UAST & wavefront plan from an approved IR JSON")
+    pb_plan.add_argument("workspace")
+    pb_plan.add_argument("ir_json")
+    pb_plan.add_argument("--goal", default="")
+    pb_plan.add_argument("--profile", dest="profiles", action="append", default=None)
+    pb_plan.add_argument("--out", default=None)
+
+    pb_exec = b_sub.add_parser("execute", help="Execute a planned Builder UAST build in the isolated workspace")
+    pb_exec.add_argument("workspace")
+    pb_exec.add_argument("ir_json")
+    pb_exec.add_argument("plan_json")
+    pb_exec.add_argument("--build-id", default=None)
+
+    pb_export = b_sub.add_parser("export", help="Export a receipt-verified Builder .zip archive for a COMPLETED build")
+    pb_export.add_argument("workspace")
+    pb_export.add_argument("build_id")
+    pb_export.add_argument("--out", default=None)
 
     p_serve = sub.add_parser("serve", help="Launch the web console")
     p_serve.add_argument("workspace", nargs="?", default=None,
@@ -88,6 +116,87 @@ def main(argv: list[str] | None = None) -> int:
         out.write_bytes(artifact.data)
         print(f"wrote {out}")
         return 0
+
+    if args.command == "builder":
+        import asyncio
+        import zipfile
+        from uuid import uuid4
+
+        from invar_agent.builder.his_cache import HISCache, blake3_file
+        from invar_agent.builder.ingestion.pipeline import CanonicalResearchIngestionPipeline
+        from invar_agent.builder.ingestion.schemas import CanonicalResearchIR, IngestionRequest
+        from invar_agent.builder.planner import BuilderPlanner
+        from invar_agent.builder.state_machine import BuilderStateMachine, BuildRequest
+        from invar_agent.builder.uast_models import BuilderProfile, BuilderUAST
+
+        ws = Path(args.workspace).resolve()
+        if args.builder_command == "ingest":
+            pipeline = CanonicalResearchIngestionPipeline(ws)
+            ir = pipeline.ingest(
+                IngestionRequest(
+                    upload_paths=[str(Path(p).resolve()) for p in args.uploads],
+                    vault_run_ids=list(args.vault_ids),
+                    title=args.title,
+                )
+            )
+            payload = ir.model_dump_json(indent=2)
+            if args.out:
+                Path(args.out).write_text(payload, encoding="utf-8")
+            print(payload)
+            return 0
+        if args.builder_command == "plan":
+            ir = CanonicalResearchIR.model_validate_json(Path(args.ir_json).read_text(encoding="utf-8"))
+            profiles = [BuilderProfile(p) for p in args.profiles] if args.profiles else None
+            planner = BuilderPlanner()
+            uast, schedule, arch_spec = planner.plan(ir, build_goal=args.goal, profiles=profiles)
+            plan_obj = {
+                "ir_id": ir.ir_id,
+                "ir_blake3_digest": ir.ir_blake3_digest,
+                "uast": uast.model_dump(mode="json"),
+                "wavefront_schedule": schedule.model_dump(mode="json"),
+                "arch_spec": arch_spec.model_dump(mode="json"),
+            }
+            payload = json.dumps(plan_obj, indent=2)
+            if args.out:
+                Path(args.out).write_text(payload, encoding="utf-8")
+            print(payload)
+            return 0
+        if args.builder_command == "execute":
+            ir = CanonicalResearchIR.model_validate_json(Path(args.ir_json).read_text(encoding="utf-8"))
+            plan_obj = json.loads(Path(args.plan_json).read_text(encoding="utf-8"))
+            uast = BuilderUAST.model_validate(plan_obj["uast"])
+            bid = args.build_id or uuid4().hex[:12]
+            machine = BuilderStateMachine(ws)
+            result = asyncio.run(machine.run(BuildRequest(build_id=bid, ir=ir, uast=uast)))
+            print(result.model_dump_json(indent=2))
+            return 0 if result.status in {"COMPLETED", "COMPLETED_WITH_FALLBACKS"} else 1
+        if args.builder_command == "export":
+            build_dir = ws / ".invar" / "builds" / args.build_id
+            workspace = (build_dir / "workspace").resolve()
+            if not workspace.is_dir():
+                print(json.dumps({"error": "Build workspace not found", "build_id": args.build_id}))
+                return 1
+            cache_manifest = HISCache(ws, args.build_id, workspace).load()
+            if cache_manifest is not None:
+                for entry in cache_manifest.entries.values():
+                    if entry.verified_status not in {"VERIFIED", "FALLBACK_VERIFIED"}:
+                        continue
+                    for rel_art, expected in entry.artifact_digests.items():
+                        art_path = (workspace / rel_art).resolve()
+                        if not art_path.is_file() or blake3_file(art_path) != expected:
+                            print(json.dumps({"error": f"Receipt digest mismatch for {rel_art}"}))
+                            return 1
+            out = Path(args.out) if args.out else Path(f"{args.build_id}.zip")
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in sorted(workspace.rglob("*")):
+                    if p.is_file() and not p.is_symlink():
+                        rel = p.relative_to(workspace).as_posix()
+                        if rel.startswith(".invar/") or "diagnostics/leaf_responses" in rel:
+                            continue
+                        zf.write(p, rel)
+            print(f"wrote {out}")
+            return 0
+        return 2
 
     if args.command == "serve":
         import uvicorn

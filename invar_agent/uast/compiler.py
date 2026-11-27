@@ -296,9 +296,17 @@ def compile_uast_to_python(uast: ResearchComputeUAST) -> CompiledUASTResult:
     ]
 
     # Top-level scalar parameter constants
+    emitted_params: set[str] = set()
     for p in param_vars:
-        val = uast.ontology.quantities[p].default_value
-        parts.append(f"{p} = {repr(float(val))}")
+        q = uast.ontology.quantities[p]
+        val = q.default_value
+        if p.isidentifier() and p not in emitted_params:
+            parts.append(f"{p} = {repr(float(val))}")
+            emitted_params.add(p)
+        sym_alias = getattr(q, "symbol", None)
+        if isinstance(sym_alias, str) and sym_alias.isidentifier() and sym_alias not in emitted_params:
+            parts.append(f"{sym_alias} = {repr(float(val))}")
+            emitted_params.add(sym_alias)
     parts.append("")
 
     # Linear solver helper for ROS3PR / IMEX

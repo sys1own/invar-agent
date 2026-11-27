@@ -143,9 +143,19 @@ class ConstantOverridePatch(StrictModel):
     drop: bool = False
 
 
+class SymbolResolution(StrictModel):
+    symbol: str = Field(min_length=1)
+    role: Literal["FREE_PARAMETER", "DERIVED_BY_EQUATION"]
+    equation_id: str | None = None
+    si_value: float | None = None
+    raw_unit: str | None = None
+    bounds: IntervalBoundModel | None = None
+
+
 class IRReviewOverride(StrictModel):
     equation_patches: list[EquationOverridePatch] = Field(default_factory=list)
     constant_patches: list[ConstantOverridePatch] = Field(default_factory=list)
+    symbol_resolutions: list[SymbolResolution] = Field(default_factory=list)
     state_symbol_order: list[str] | None = None
     time_horizon_si_s: float | None = None
     default_dt_si_s: float | None = None

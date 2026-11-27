@@ -95,6 +95,8 @@ ALLOWED_AST_NODES = (
     ast.IfExp,
     ast.Tuple,
     ast.List,
+    ast.ListComp,
+    ast.comprehension,
     ast.Load,
     ast.Store,
     # Operators
@@ -105,6 +107,11 @@ ALLOWED_AST_NODES = (
     ast.FloorDiv,
     ast.Mod,
     ast.Pow,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+    ast.LShift,
+    ast.RShift,
     ast.UAdd,
     ast.USub,
     ast.Not,
@@ -188,9 +195,19 @@ def validate_kernel_ast_allowlist(
                         imported_math_names.add(alias.asname or alias.name)
 
     # Walk all nodes for structural allow-list & dunder blocking
+    forbidden_call_names: Set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ALLOWED_AST_NODES):
-            violations.append(f"forbidden construct: {type(node).__name__}")
+            if isinstance(node, ast.ClassDef):
+                violations.append(f"forbidden construct: class {node.name}")
+            elif isinstance(node, ast.Try):
+                violations.append("forbidden construct: try/except")
+            elif isinstance(node, ast.With):
+                violations.append("forbidden construct: with")
+            elif isinstance(node, ast.Lambda):
+                violations.append("forbidden construct: lambda")
+            else:
+                violations.append(f"forbidden construct: {type(node).__name__}")
             continue
 
         if isinstance(node, ast.Import):
@@ -200,6 +217,10 @@ def validate_kernel_ast_allowlist(
         elif isinstance(node, ast.ImportFrom):
             if node.module != "math" or (node.level or 0) != 0:
                 violations.append(f"forbidden import: {node.module}")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"eval", "exec", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "breakpoint", "input"}:
+                violations.append(f"forbidden call: {node.func.id}()")
+                forbidden_call_names.add(node.func.id)
         elif isinstance(node, ast.Name):
             if node.id.startswith("__"):
                 violations.append(f"forbidden dunder name: {node.id}")
@@ -214,7 +235,7 @@ def validate_kernel_ast_allowlist(
                 elif owner == "buf":
                     if node.attr not in ALLOWED_BUF_ATTRS:
                         violations.append(
-                            f"unsupported buffer attribute buf.{node.attr} at line {node.lineno}"
+                            f"unsupported buffer attribute buf.{node.attr} at line {node.lineno} (ONLY buf.data[i] and buf.size are supported)"
                         )
                 else:
                     violations.append(f"forbidden attribute owner: {owner}.{node.attr}")
@@ -241,6 +262,7 @@ def validate_kernel_ast_allowlist(
         | {"math"}
         | imported_math_names
         | module_defined
+        | forbidden_call_names
         | set(extra_allowed_names or ())
     )
     for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
@@ -266,7 +288,7 @@ def validate_kernel_ast_allowlist(
     ):
         violations.append("module must define simulation_step(buf, dt)")
 
-    return sorted(set(violations))
+    return list(dict.fromkeys(violations))
 
 
 # -- OS Job Object enforcement on Windows ------------------------------------

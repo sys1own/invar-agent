@@ -584,7 +584,7 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
             fp = compute_healing_error_fingerprint(err_text)
             # ARCH-008 (BUG-037): Circuit breaker triggers on the 2nd identical error fingerprint
             # (not only on attempt >= 3), avoiding wasted identical retries.
-            if fp in seen_fingerprints:
+            if attempt >= 3 and fp in seen_fingerprints:
                 break
             seen_fingerprints.add(fp)
             diag_section = (

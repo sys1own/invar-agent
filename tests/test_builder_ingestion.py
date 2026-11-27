@@ -413,6 +413,8 @@ def test_real_persisted_vault_zero_tokens(tmp_path, monkeypatch):
     invalid_blueprint = json.loads((root / "blueprint.json").read_text(encoding="utf-8"))
     invalid_blueprint["contracts"][0]["initial_state"] = [-1]
     (root / "blueprint.json").write_text(json.dumps(invalid_blueprint, indent=2), encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="real_run", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED")
     with pytest.raises(FormalGateError, match="Z3_SPEC_UNSAT"):
         CanonicalResearchIngestionPipeline(tmp_path, llm_client=NoLLM()).ingest(IngestionRequest(vault_run_ids=["real_run"]))
 

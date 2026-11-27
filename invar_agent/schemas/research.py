@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from fractions import Fraction
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -287,6 +289,45 @@ class FormalizationAssumption(BaseModel):
         return coerced if coerced is not None else value
 
 
+def _validate_rational_si_dim(value: Any) -> List[Union[int, float]]:
+    """R2-ARCH-006: Accept 7 integer or rational quarter/half-integer SI exponents
+    (e.g. -0.5 for diffusive/volatility sqrt(time) scaling). Preserves int for whole numbers."""
+    if value is None:
+        return [0, 0, 0, 0, 0, 0, 0]
+    if not isinstance(value, (list, tuple)) or len(value) != 7:
+        raise ValueError(
+            "SI dimensions must be seven integer or half/quarter-integer exponents "
+            "(e.g. [0, 0, -0.5, 0, 0, 0, 0] for diffusive/volatility 1/sqrt(s) scaling)."
+        )
+    out: List[Union[int, float]] = []
+    for v in value:
+        if isinstance(v, bool):
+            raise ValueError("SI dimension exponents cannot be booleans.")
+        if isinstance(v, int):
+            out.append(v)
+            continue
+        if isinstance(v, Fraction):
+            fval = float(v)
+        elif isinstance(v, float):
+            if not math.isfinite(v):
+                raise ValueError("SI dimension exponents must be finite.")
+            fval = v
+        else:
+            raise ValueError(
+                f"Invalid SI dimension exponent {v!r}; must be an integer or multiple of 0.25 "
+                "(e.g. -0.5 for diffusive/volatility sqrt(time) scaling)."
+            )
+        scaled = fval * 4.0
+        if abs(scaled - round(scaled)) > 1e-9:
+            raise ValueError(
+                f"SI dimension exponent {v!r} must be an integer or multiple of 0.25 "
+                "(declare e.g. -0.5 for a diffusive/volatility-like 1/sqrt(time) scaling)."
+            )
+        q = int(round(scaled))
+        out.append(q // 4 if q % 4 == 0 else q / 4.0)
+    return out
+
+
 class TypedConstant(BaseModel):
     """Immutable typed SI physical or model constant (never required to occupy a mutable simulation slot)."""
 
@@ -295,17 +336,13 @@ class TypedConstant(BaseModel):
     symbol: str = Field(min_length=1)
     value: float = Field(allow_inf_nan=False)
     si_unit: str = ""
-    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    si_dim: List[Union[int, float]] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
     source: AssumptionSource = "LLM_DOMAIN_DEFAULT"
 
     @field_validator("si_dim", mode="before")
     @classmethod
     def _int_dims(cls, value):
-        if value is None:
-            return [0, 0, 0, 0, 0, 0, 0]
-        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
-            raise ValueError("SI dimensions must be seven integer exponents")
-        return list(value)
+        return _validate_rational_si_dim(value)
 
 
 class DerivedExpressionSpec(BaseModel):
@@ -316,17 +353,13 @@ class DerivedExpressionSpec(BaseModel):
     symbol: str = Field(min_length=1)
     expression: str = Field(min_length=1)
     si_unit: str = ""
-    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    si_dim: List[Union[int, float]] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
     promote_to_slot: bool = False
 
     @field_validator("si_dim", mode="before")
     @classmethod
     def _int_dims(cls, value):
-        if value is None:
-            return [0, 0, 0, 0, 0, 0, 0]
-        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
-            raise ValueError("SI dimensions must be seven integer exponents")
-        return list(value)
+        return _validate_rational_si_dim(value)
 
 
 class TypedResearchSlot(BaseModel):
@@ -334,7 +367,7 @@ class TypedResearchSlot(BaseModel):
 
     symbol: str = Field(min_length=1)
     slot_idx: Optional[int] = Field(default=None, ge=0, strict=True)
-    si_dim: List[int] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
+    si_dim: List[Union[int, float]] = Field(default_factory=lambda: [0, 0, 0, 0, 0, 0, 0], min_length=7, max_length=7)
     role: Literal["CONTROL_PARAM", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "CONSERVATION_AUX", "TIME_STEP"]
     semantic_tag: int = Field(default=0, ge=0, le=255)
     unit_scale: tuple[int, int] = (1, 1)
@@ -349,9 +382,7 @@ class TypedResearchSlot(BaseModel):
     @field_validator("si_dim", mode="before")
     @classmethod
     def integer_dimensions(cls, value):
-        if not isinstance(value, (list, tuple)) or any(type(v) is not int for v in value):
-            raise ValueError("SI dimensions must be seven integer exponents")
-        return value
+        return _validate_rational_si_dim(value)
 
 
 class FormalResearchSpec(BaseModel):

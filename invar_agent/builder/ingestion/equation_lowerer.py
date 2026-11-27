@@ -198,7 +198,7 @@ def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
         text,
     )
     ascii_text = re.sub(
-        r"\\(exp|log|sin|cos|alpha|beta|gamma|Gamma|delta|Delta|epsilon|eta|theta|Theta|kappa|lambda|Lambda|mu|nu|xi|pi|Pi|rho|sigma|Sigma|tau|phi|Phi|psi|Psi|omega|Omega)\b",
+        r"\\(exp|log|sin|cos|alpha|beta|gamma|Gamma|delta|Delta|epsilon|eta|theta|Theta|kappa|lambda|Lambda|mu|nu|xi|pi|Pi|rho|sigma|Sigma|tau|phi|Phi|psi|Psi|omega|Omega)(?![A-Za-z])",
         r"\1",
         ascii_text,
     )
@@ -208,9 +208,16 @@ def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
         return latex_expression(latex_text)
     # BUG-016: Allow `lambda` as a valid mathematical symbol name without Python syntax error.
     text = re.sub(r"\blambda\b", "__invar_sym_lambda__", ascii_text)
-    functions = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log,
-                 "sqrt": sp.sqrt, "abs": sp.Abs, "Abs": sp.Abs,
-                 "min": sp.Min, "Min": sp.Min, "max": sp.Max, "Max": sp.Max}
+    functions = {
+        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
+        "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
+        "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+        "exp": sp.exp, "log": sp.log, "ln": sp.log,
+        "sqrt": sp.sqrt, "abs": sp.Abs, "Abs": sp.Abs,
+        "erf": sp.erf, "erfc": sp.erfc,
+        "Phi": lambda x, **_kw: sp.Rational(1, 2) * (1 + sp.erf(x / sp.sqrt(2))),
+        "min": sp.Min, "Min": sp.Min, "max": sp.Max, "Max": sp.Max,
+    }
 
     def convert(node):
         if isinstance(node, ast.Name):
@@ -313,14 +320,19 @@ def to_csel(expr) -> dict:
             if arg != 0:
                 return to_csel(arg)
         return {"kind": "literal", "value": 0.0}
-    names = {sp.log: "log", sp.exp: "exp", sp.sin: "sin", sp.cos: "cos", sp.Abs: "abs"}
+    names = {
+        sp.log: "log", sp.exp: "exp", sp.sin: "sin", sp.cos: "cos", sp.Abs: "abs",
+        sp.tan: "tan", sp.asin: "asin", sp.acos: "acos", sp.atan: "atan",
+        sp.sinh: "sinh", sp.cosh: "cosh", sp.tanh: "tanh",
+        sp.erf: "erf", sp.erfc: "erfc",
+    }
     if expr.func in names:
         return {"kind": "call", "func": names[expr.func], "args": [to_csel(arg) for arg in expr.args]}
     raise ValueError(f"Unsupported CSEL expression: {expr.func}")
 
 
 def _dimension(csel, dimensions):
-    report = json.loads(_native().verify_equation_dimensions_hin(json.dumps(csel), json.dumps(dimensions)))
+    report = json.loads(_native().verify_equation_dimensions_hin(json.dumps(_hin_compatible_csel(csel)), json.dumps(dimensions)))
     return SIDimensionVectorModel(exponents=report["output_dimensions"], semantic_tag=report["output_semantic_tag"])
 
 
@@ -332,6 +344,9 @@ def _hin_compatible_csel(expr):
     expr = {key: _hin_compatible_csel(value) for key, value in expr.items()}
     if expr.get("kind") == "call" and expr.get("func") == "safe_pow":
         return {"kind": "binary", "op": "^", "left": expr["args"][0], "right": expr["args"][1]}
+    if expr.get("kind") == "call" and expr.get("func") in {"erf", "erfc", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh"}:
+        # Dimensionless transcendental special functions: identical dimensional signature to sin(x) (1 -> 1).
+        return {"kind": "call", "func": "sin", "args": expr["args"]}
     return expr
 
 

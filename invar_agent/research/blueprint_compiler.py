@@ -1768,7 +1768,7 @@ def compile_and_preflight_blueprint(
         if sym in domain:
             continue
         slot = next(s for s in selected_slots if s["symbol"] == sym)
-        if slot.get("role") == "CONTROL_PARAM":
+        if slot.get("role") == "CONTROL_PARAM" and sym not in domain:
             if sym in slot_fixed_values:
                 v = slot_fixed_values[sym]
                 domain[sym] = [v, v]
@@ -1868,9 +1868,12 @@ def compile_and_preflight_blueprint(
     if prompt_for_ledger and isinstance(compile_kwargs.get("domain"), dict):
         ledger = extract_claim_ledger(prompt_for_ledger)
         if ledger.pinned_literals:
-            pinned_dom = pin_user_literals_in_domain(ledger, compile_kwargs["domain"])
-            compile_kwargs["domain"] = pinned_dom
-            pack["domain"] = pinned_dom
+            # Never clobber an explicit non-degenerate sweep/boundary domain when quantifier_mode == 'BOUNDARY'
+            # or when the symbol is a swept mechanism parameter.
+            if str(evidence.get("quantifier_mode") or "").upper() != "BOUNDARY":
+                pinned_dom = pin_user_literals_in_domain(ledger, compile_kwargs["domain"])
+                compile_kwargs["domain"] = pinned_dom
+                pack["domain"] = pinned_dom
 
     try:
         graph = m.IhcgCompiler().compile_from_spec(
@@ -1897,38 +1900,23 @@ def compile_and_preflight_blueprint(
     pool_diags = _check_initial_pool_conservation(bp, graph, constants)
     diagnostics.extend(pool_diags)
 
-    # 8b. Non-degenerate mechanism parameter domain check (BUG-024):
-    # Deterministically demote user-fixed zero-width point-domain parameters out of
-    # mechanism_parameters when non-degenerate control parameters exist; never reject
-    # a user-fixed value (e.g. T_hot=600 K) as a degenerate mechanism.
-    non_degen_mps = [mp for mp in graph.mechanism_parameters if graph.omega[mp][1] > graph.omega[mp][0]]
-    if len(non_degen_mps) < len(graph.mechanism_parameters):
-        if non_degen_mps:
-            evidence["mechanism_parameters"] = non_degen_mps
-            compile_kwargs["evidence"] = evidence
-            graph = m.IhcgCompiler().compile_from_spec(
-                compile_kwargs["evidence"],
-                compile_kwargs["domain"],
-                compile_kwargs["archetype"],
-                prompt=question or bp.get("research_prompt") or "",
-            )
-        else:
-            # All parameters are user-fixed (e.g. Carnot T_hot=600 K, T_cold=300 K):
-            # demote to empty mechanism_parameters if another non-degenerate control exists,
-            # otherwise keep for deductive Mode 1 evaluation without failing planning.
-            other_controls = [
-                s.symbol for s in graph.slots
-                if s.role == "CONTROL_PARAM" and graph.omega[s.symbol][1] > graph.omega[s.symbol][0]
-            ]
-            if other_controls:
-                evidence["mechanism_parameters"] = other_controls[:2]
-                compile_kwargs["evidence"] = evidence
-                graph = m.IhcgCompiler().compile_from_spec(
-                    compile_kwargs["evidence"],
-                    compile_kwargs["domain"],
-                    compile_kwargs["archetype"],
-                    prompt=question or bp.get("research_prompt") or "",
-                )
+    # 8b. Non-degenerate mechanism parameter domain check (R2-BUG-003 / BUG-024):
+    # Declared mechanism_parameters must have a non-degenerate sweep interval [lo, hi] with hi > lo;
+    # fixed non-sweep physical constants (not in mechanism_parameters) remain valid with [v, v].
+    for mp in graph.mechanism_parameters:
+        lo_m, hi_m = graph.omega[mp]
+        if not (hi_m > lo_m):
+            diagnostics.append(BlueprintDiagnostic(
+                code="DEGENERATE_MECHANISM_DOMAIN",
+                field=f"domain.{mp}",
+                symbol=mp,
+                message=f"Mechanism parameter {mp!r} has a zero-width point domain [{lo_m}, {hi_m}].",
+                suggested_fix=(
+                    f"Give mechanism_parameter {mp!r} a non-degenerate finite interval [lo, hi] with lo < hi "
+                    f"(e.g. [0.0, {max(1.0, abs(hi_m) * 1.5):.6g}]) if it is a swept mechanism parameter, "
+                    f"or remove {mp!r} from evidence.mechanism_parameters if it is a fixed physical constant."
+                ),
+            ))
 
     # 9. Fast Z3 non-vacuity / non-tautology sanity check.
     #    IMPORTANT: Genuine INFEASIBLE / INFEASIBLE_UNDER_MODEL claims (e.g. Carnot eta >= 0.65)
@@ -1936,11 +1924,12 @@ def compile_and_preflight_blueprint(
     if run_z3_preflight and not diagnostics:
         vacuity = m.classify_contract_vacuity(graph)
         if vacuity.classification in {"VACUOUS", "TAUTOLOGICAL"}:
+            taut_tag = "TAUTOLOGICAL_TARGET (TRIVIAL_DEDUCIBLE_WITHOUT_MODEL): " if vacuity.classification == "TAUTOLOGICAL" else ""
             diagnostics.append(BlueprintDiagnostic(
                 code=f"PREFLIGHT_{vacuity.classification}",
                 field="ihcg_evidence.evidence.obligations",
                 message=(
-                    f"Candidate specification is {vacuity.classification} before sealing "
+                    f"{taut_tag}Candidate specification is {vacuity.classification} before sealing "
                     f"(query_statuses={dict((k, v.status) for k, v in vacuity.queries.items())})."
                 ),
                 suggested_fix="Widen DERIVED_OBSERVABLE domain bounds and ensure environmental_assumptions do not already imply or contradict the domain.",

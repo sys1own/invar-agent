@@ -191,7 +191,7 @@ def shacl_chiasmus_firewall(code: str) -> List[str]:
     if re.search(r"while\s+True\s*:", code) and "break" not in code:
         violations.append("unbounded while True loop without break")
     violations.extend(validate_kernel_ast_allowlist(code, require_simulation_step=False))
-    return sorted(set(violations))
+    return list(dict.fromkeys(violations))
 
 
 def v9_transpiler_violations(code: str) -> List[str]:
@@ -2260,12 +2260,38 @@ class ResearchStateMachine:
                 if state.ihcg is not None:
                     from ..healing.deterministic_ast import assert_sealed_observables
                     is_exec_ihcg_repair = str(base_heal_failure or "").startswith("EXECUTABLE_IHCG_MISMATCH:")
-                    protected = {
+                    # R2-BUG-007: Allow healing to REMOVE an illegal CONTROL_PARAM write from a buggy
+                    # initial draft (restoring purity) while STILL strictly forbidding any addition or
+                    # modification of a CONTROL_PARAM write or sealed DERIVED_OBSERVABLE write.
+                    control_slots = {
+                        state.blueprint.variable_map[s.symbol]
+                        for s in state.ihcg.slots
+                        if s.symbol in state.blueprint.variable_map and s.role == "CONTROL_PARAM"
+                    }
+                    obs_slots = {
                         state.blueprint.variable_map[s.symbol]
                         for s in state.ihcg.slots
                         if s.symbol in state.blueprint.variable_map
-                        and (s.role == "CONTROL_PARAM" or (s.role == "DERIVED_OBSERVABLE" and not is_exec_ihcg_repair))
+                        and s.role == "DERIVED_OBSERVABLE"
+                        and not is_exec_ihcg_repair
                     }
+                    # Check if healed_code has ZERO writes to control_slots (pure!)
+                    def _has_any_slot_write(src: str, slot_set: set[int]) -> bool:
+                        if not slot_set or not src:
+                            return False
+                        try:
+                            t = ast.parse(src)
+                        except SyntaxError:
+                            return True
+                        for n in ast.walk(t):
+                            tgts = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+                            for tg in tgts:
+                                if isinstance(tg, ast.Subscript) and isinstance(tg.slice, ast.Constant) and tg.slice.value in slot_set:
+                                    return True
+                        return False
+                    protected = set(obs_slots)
+                    if _has_any_slot_write(healed_code or "", control_slots):
+                        protected |= control_slots
                     try: assert_sealed_observables(base_heal_code or "", healed_code or "", protected)
                     except ValueError as error:
                         from .epistemic import incomplete_certificate

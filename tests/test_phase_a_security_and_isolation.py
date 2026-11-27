@@ -194,6 +194,7 @@ def test_vault_admission_matrix(tmp_path: Path) -> None:
 # ── 3. BUG-032 Export Guard & ARCH-005 Bearer Auth ──────────────────────────
 
 def test_export_requires_completed_and_bearer_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("invar_agent.server._STATE", None)
     app = create_app(workspace_root=tmp_path)
     client = TestClient(app)
 

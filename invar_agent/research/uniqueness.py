@@ -471,7 +471,11 @@ def check_intra_vault_uniqueness(candidate_cds: CdsTriplet, ihcg: m.IhcgGraph, v
                 return VaultUniquenessAudit(passed=True, vault_class="VALID_COUPLED_EXTENSION", related_run_id=f"@research:{compared_run_id}", lineage_edge="coupled_extension_of")
             return VaultUniquenessAudit(passed=False, failure_reason="ACTIVE_COUPLING_AND_PRIOR_BASELINE_SIGNIFICANCE_REQUIRED")
         # ARCH-003 (BUG-008): A model whose canonical family does not exist in the Vault
-        # is NOVEL_INDEPENDENT and passes; coupling checks apply only when extending a baseline.
+        # is NOVEL_INDEPENDENT if its claim is also distinct from existing vault entries;
+        # if it reuses an existing entry's exact claim_hash over a swapped model without
+        # active coupling + baseline significance, reject as uncoupled model substitution.
+        if any(entry.cds.canonical_claim == candidate_cds.canonical_claim for entry in entries):
+            return VaultUniquenessAudit(passed=False, failure_reason="ACTIVE_COUPLING_AND_PRIOR_BASELINE_SIGNIFICANCE_REQUIRED")
         return VaultUniquenessAudit(passed=True, vault_class="NOVEL_INDEPENDENT")
     return VaultUniquenessAudit(passed=False, failure_reason="PI_DOMAIN_OR_STRICT_STRENGTHENING_UNPROVEN" if unresolved else "NOVELTY_UNPROVEN")
 

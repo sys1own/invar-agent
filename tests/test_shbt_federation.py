@@ -71,16 +71,16 @@ async def test_epistemic_rescue_and_federation_without_shbt_acronym(tmp_path):
     )
     res = resolve_shbt_solvability(frontier_prompt)
     assert res.should_activate is True
-    assert res.verdict_override == "OPTIMAL_DIRECT"
+    assert res.verdict_override is None
     repos = {s.repo for s in res.matched_repos}
     assert {"sys1own/shbt-precision", "sys1own/shbt-cf", "sys1own/shbt-warp", "sys1own/shbt-swarm"}.issubset(repos)
 
-    # Even if an LLM tries to refuse as REFUSED_IMPOSSIBLE, the gate rescues it to OPTIMAL_DIRECT
+    # ARCH-011: SHBT NEVER overrides an explicit REFUSED_IMPOSSIBLE feasibility verdict
     async def mock_refusal_llm(_q: str) -> str:
         return '{"verdict": "REFUSED_IMPOSSIBLE", "rationale": "Sub-Landauer dissipation violates closed-system bound.", "violated_boundary": "Landauer", "reformulation": "Impossible"}'
 
     feas = await evaluate_research_feasibility(frontier_prompt, llm_complete=mock_refusal_llm, use_llm=True)
-    assert feas.verdict.value == "OPTIMAL_DIRECT"
+    assert feas.verdict.value == "REFUSED_IMPOSSIBLE"
 
     # Literature search injects SHBT federation items
     client = LiteratureSearchClient(cache_dir=tmp_path / "cache", offline=True)

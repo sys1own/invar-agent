@@ -17,6 +17,15 @@ from .uast_models import (
 )
 
 
+def blake3_file(path: Path) -> str:
+    """Compute the canonical hex BLAKE3 digest of a file's raw bytes."""
+    hasher = blake3.blake3()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def digest(context: str, payload) -> str:
     return builder_backend().compute_his_digest_v2(context, canonical_json(payload))
 
@@ -112,7 +121,7 @@ def artifacts_match(entry: HISCacheEntry, node, artifact_root: Path) -> bool:
     try:
         for relpath, expected in entry.artifact_digests.items():
             target = artifact_path(artifact_root, relpath)
-            if not target.is_file() or blake3.blake3(target.read_bytes()).hexdigest() != expected:
+            if not target.is_file() or blake3_file(target) != expected:
                 return False
     except (OSError, HISCacheError):
         return False
@@ -164,7 +173,7 @@ class HISCache:
             target = artifact_path(self.artifact_root, relpath)
             if not target.is_file():
                 raise HISCacheError("HIS_CACHE_MISSING_ARTIFACT", relpath)
-            artifacts[relpath] = blake3.blake3(target.read_bytes()).hexdigest()
+            artifacts[relpath] = blake3_file(target)
         interface, body, declared = node_fingerprints(uast)[module_id]
         entry = HISCacheEntry(module_id=module_id, his_digest=interface, body_digest=body, declared_his_digest=declared,
             artifact_digests=artifacts, verified_status="FALLBACK_VERIFIED" if fallback else "VERIFIED")

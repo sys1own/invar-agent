@@ -9,8 +9,8 @@ from .archive_guard import IngestionError, validate_and_unpack_upload
 from .equation_lowerer import (FormalGateError, _native, check_z3, equation_parts,
                                lower_and_verify_equations, normalize_to_si, unit_dimension)
 from .parsers import parse_document
-from .schemas import (CanonicalResearchIR, EquationRole, IngestionRequest, IRReviewOverride,
-                      RawConstant, RawEquation, SIDimensionVectorModel, StateVariableSpec,
+from .schemas import (CanonicalResearchIR, EquationRole, ExtractedConstant, IngestionRequest, IRReviewOverride,
+                      RawConstant, RawEquation, SIDimensionVectorModel, SourceSpan, StateVariableSpec,
                       VerificationStatus)
 from .vault_adapter import load_vault_bundle
 
@@ -99,6 +99,72 @@ def apply_ir_override(ir: CanonicalResearchIR, override: IRReviewOverride) -> Ca
         if patch.is_tunable_parameter is not None:
             target.is_tunable_parameter = patch.is_tunable_parameter
         target.verification_status = VerificationStatus.USER_OVERRIDDEN
+    resolved_derived_symbols: set[str] = set()
+    for resolution in override.symbol_resolutions:
+        sym = resolution.symbol.strip()
+        if resolution.role == "DERIVED_BY_EQUATION":
+            resolved_derived_symbols.add(sym)
+            target_eq = None
+            if resolution.equation_id:
+                target_eq = next((e for e in candidate.equations if e.equation_id == resolution.equation_id), None)
+                if target_eq is None:
+                    raise FormalGateError("IR_OVERRIDE_INVALID", f"Unknown equation_id {resolution.equation_id!r} for symbol {sym!r}")
+            else:
+                target_eq = next(
+                    (e for e in candidate.equations if e.lhs_symbol == sym or e.canonical_latex.strip().startswith(f"{sym} ") or e.canonical_latex.strip().startswith(f"{sym}=")),
+                    None,
+                )
+            if target_eq is not None and not target_eq.lhs_symbol:
+                target_eq.lhs_symbol = sym
+            for flag in candidate.disambiguation_flags:
+                if flag.trigger.value == "UNRESOLVED_SYMBOL" and flag.target_symbol_or_eq == sym:
+                    flag.resolved = True
+                    flag.resolution_note = f"Researcher confirmed {sym} is derived by equation"
+        elif resolution.role == "FREE_PARAMETER":
+            existing_const = next((c for c in candidate.constants if c.symbol == sym), None)
+            if existing_const is not None:
+                existing_const.is_tunable_parameter = True
+                if resolution.si_value is not None:
+                    existing_const.si_value = resolution.si_value
+                if resolution.bounds is not None:
+                    existing_const.bounds = resolution.bounds
+                if resolution.raw_unit is not None:
+                    _, unit = normalize_to_si(1, resolution.raw_unit)
+                    existing_const.dimension = unit_dimension(unit)
+                    existing_const.dimension.canonical_unit = unit
+                    existing_const.raw_unit = resolution.raw_unit
+                existing_const.verification_status = VerificationStatus.USER_OVERRIDDEN
+            else:
+                unit_str = resolution.raw_unit or "1"
+                if resolution.raw_unit:
+                    _, unit_str = normalize_to_si(1, resolution.raw_unit)
+                dim = unit_dimension(unit_str)
+                dim.canonical_unit = unit_str
+                val = float(resolution.si_value) if resolution.si_value is not None else (
+                    0.5 * (resolution.bounds.lower + resolution.bounds.upper)
+                    if resolution.bounds and resolution.bounds.lower is not None and resolution.bounds.upper is not None
+                    else (resolution.bounds.lower if resolution.bounds and resolution.bounds.lower is not None else 1.0)
+                )
+                prov = candidate.equations[0].provenance if candidate.equations else SourceSpan(file="override", location="symbol_resolution", quote=sym)
+                candidate.constants.append(
+                    ExtractedConstant(
+                        constant_id=f"constant:{len(candidate.constants)}",
+                        name=sym,
+                        symbol=sym,
+                        raw_value=str(val),
+                        raw_unit=resolution.raw_unit or "1",
+                        si_value=val,
+                        dimension=dim,
+                        bounds=resolution.bounds,
+                        is_tunable_parameter=True,
+                        verification_status=VerificationStatus.USER_OVERRIDDEN,
+                        provenance=prov,
+                    )
+                )
+            for flag in candidate.disambiguation_flags:
+                if flag.trigger.value == "UNRESOLVED_SYMBOL" and flag.target_symbol_or_eq == sym:
+                    flag.resolved = True
+                    flag.resolution_note = f"Researcher confirmed {sym} is a free/tunable parameter"
     if override.state_symbol_order is not None:
         states = {s.symbol: s for s in candidate.state_variables}
         if len(set(override.state_symbol_order)) != len(states) or set(override.state_symbol_order) != set(states):
@@ -116,6 +182,11 @@ def apply_ir_override(ir: CanonicalResearchIR, override: IRReviewOverride) -> Ca
             setattr(candidate, name, value)
     candidate.user_approved = override.approve
     reverify_ir(candidate)
+    if resolved_derived_symbols:
+        for flag in candidate.disambiguation_flags:
+            if flag.trigger.value == "UNRESOLVED_SYMBOL" and flag.target_symbol_or_eq in resolved_derived_symbols:
+                flag.resolved = True
+                flag.resolution_note = f"Researcher confirmed {flag.target_symbol_or_eq} is derived by equation"
     if override.approve and (any(not flag.resolved for flag in candidate.disambiguation_flags)
                             or any(not e.hin_homogeneous or e.z3_satisfiable is not True for e in candidate.equations)):
         raise FormalGateError("IR_UNVERIFIED_FLAGGED", "Unresolved flags require review")

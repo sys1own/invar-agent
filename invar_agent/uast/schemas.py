@@ -123,6 +123,8 @@ class OntologyAndParameterSpec(BaseModel):
                 if isinstance(v, PhysicalQuantity):
                     norm[sym] = v
                 elif isinstance(v, dict):
+                    if sym == "var_0" and isinstance(v.get("symbol"), str) and v["symbol"].strip():
+                        sym = _sanitize_symbol(v["symbol"])
                     norm[sym] = {**v, "symbol": sym}
                 elif isinstance(v, (int, float)):
                     norm[sym] = {

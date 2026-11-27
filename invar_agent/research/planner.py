@@ -2778,6 +2778,7 @@ async def generate_plan_with_feasibility(question: str,
                                          progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
                                          llm_formalizer: Optional[Callable[[str], Any]] = None,
                                          llm_fast: Optional[Callable[[str], Any]] = None,
+                                         staged_llm_call: Optional[Callable[[List[Dict[str, str]], int, str], Any]] = None,
                                          ) -> Dict[str, Any]:
     """Feasibility and blueprint synthesis, then bounded evidence-only formalization.
 
@@ -2882,6 +2883,87 @@ async def generate_plan_with_feasibility(question: str,
         return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
     if feasibility.verdict.value.startswith("REFUSED"):
         return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
+
+    # R2-ARCH-001 (ARCH-001 / ARCH-002 / ARCH-004 / ARCH-008):
+    # Wire StagedSciIRSynthesizer + ClaimLedger + deterministic kernel emission into live planning
+    # (enabled by default via INVAR_USE_STAGED_SYNTHESIZER=1 whenever staged_llm_call is supplied).
+    import os as _os
+    if staged_llm_call is not None and _os.environ.get("INVAR_USE_STAGED_SYNTHESIZER", "1") != "0":
+        from ..ir.lower_uast import sciir_to_research_blueprint
+        from ..ir.staged_synthesizer import StagedSciIRSynthesizer
+        from .blueprint_compiler import compile_and_preflight_blueprint
+        from .claim_ledger import extract_claim_ledger, verify_claim_fidelity
+        from .formalization import FormalizationError
+
+        grounded_parts = [p for p in (compacted_lit, shbt_res.evidence_markdown if shbt_res.should_activate else "", extra_context) if p]
+        grounded_ctx = "\n\n".join(grounded_parts)
+        await _emit_plan_progress(
+            progress_cb,
+            "sciir_staged_synthesis",
+            "Running 3-pass StagedSciIRSynthesizer (FrozenSymbolTable -> ModelBody -> ScopeCheck -> Seal)...",
+        )
+        synth = StagedSciIRSynthesizer(llm_call=staged_llm_call)
+        synth_res = await synth.synthesize(question, grounded_context=grounded_ctx)
+        if synth_res.ok and synth_res.sealed is not None:
+            sciir_bp_dict = sciir_to_research_blueprint(
+                synth_res.sealed,
+                user_prompt=question,
+            )
+            ledger = extract_claim_ledger(question)
+            ihcg_ev = sciir_bp_dict.get("ihcg_evidence", {}).get("evidence", {})
+            fidelity_diags = verify_claim_fidelity(
+                ledger,
+                ihcg_ev.get("obligations") or [],
+                ihcg_ev.get("environmental_assumptions") or [],
+                sciir_bp_dict.get("ihcg_evidence", {}).get("domain") or {},
+            )
+            if any(getattr(d, "code", "") == "TAUTOLOGICAL_TARGET" for d in fidelity_diags):
+                raise FormalizationError([{
+                    "attempt": 1,
+                    "ok": False,
+                    "error_type": "TautologicalTargetError",
+                    "code": "TAUTOLOGICAL_TARGET",
+                    "error": "TAUTOLOGICAL_TARGET: TRIVIAL_DEDUCIBLE_WITHOUT_MODEL — claim is entailed without model dynamics",
+                    "diagnostics": [{"code": d.code, "message": d.message} for d in fidelity_diags],
+                }])
+            preflight = compile_and_preflight_blueprint(
+                sciir_bp_dict,
+                sciir_bp_dict["ihcg_evidence"],
+                question=question,
+                run_z3_preflight=True,
+            )
+            if any(d.code == "PREFLIGHT_TAUTOLOGICAL" for d in preflight.diagnostics):
+                raise FormalizationError([{
+                    "attempt": 1,
+                    "ok": False,
+                    "error_type": "TautologicalTargetError",
+                    "code": "TAUTOLOGICAL_TARGET",
+                    "error": "TAUTOLOGICAL_TARGET: TRIVIAL_DEDUCIBLE_WITHOUT_MODEL — claim holds tautologically without model dynamics",
+                    "diagnostics": [d.to_dict() for d in preflight.diagnostics],
+                }])
+            if preflight.ok:
+                validated_bp = _parse_planned_blueprint(
+                    {**preflight.compiled_blueprint, "ihcg_evidence": preflight.compiled_ihcg_pack},
+                    question,
+                    require_evidence=True,
+                )
+                return {
+                    "feasibility": feasibility,
+                    "blueprint": validated_bp,
+                    "source": "llm_staged_sciir",
+                    "claim_fidelity_warnings": [str(d) for d in fidelity_diags],
+                }
+            await _emit_plan_progress(
+                progress_cb,
+                "sciir_staged_fallback",
+                f"StagedSciIR preflight diagnostics ({len(preflight.diagnostics)}): {preflight.error_summary()[:300]}",
+            )
+        else:
+            await _emit_plan_progress(
+                progress_cb,
+                "sciir_staged_fallback",
+                f"StagedSciIR synthesis returned {synth_res.reason_code.value}: {str(synth_res.diagnostics[:2])[:300]}",
+            )
     if shbt_res.should_activate and not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
         if True:
                 shbt_prompt = (

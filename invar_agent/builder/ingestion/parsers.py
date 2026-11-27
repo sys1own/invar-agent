@@ -155,8 +155,21 @@ def _text(doc: ParsedDocument, text: str, location: str = "line") -> None:
             doc.constants.append(RawConstant(symbol=assignment[1], value=assignment[2], unit=assignment[3] or "1", provenance=span))
         elif re.fullmatch(r"[A-Za-z_\d\s+*/^().<>=!{}\\-]+", stripped) and re.search(r"[=<>]", stripped):
             doc.equations.append(RawEquation(text=stripped, provenance=span))
-        elif re.search(rf"{NUMBER}\s+(?:1/(?:s|min)|M|mM|cM|cm|mm|m|kg|mol|s|min|K)\b", stripped):
-            _flag(doc, span)
+        else:
+            inline_assigns = list(re.finditer(
+                rf"(?<![A-Za-z0-9_])([A-Za-z_]\w*)\s*=\s*({NUMBER})(?:\s+(1/(?:s|min|hr|day|yr)|s\^-1|m/s|M|mM|uM|nM|cm|mm|m|kg|g|mol|s|min|hr|K|Pa|W|J|V|A|Hz|eV))?(?![A-Za-z0-9_.])",
+                stripped,
+            ))
+            if inline_assigns:
+                for m_as in inline_assigns:
+                    sym_name = m_as.group(1)
+                    if sym_name.lower() in {"if", "is", "at", "in", "for", "and", "or", "by", "to", "of"}:
+                        continue
+                    doc.constants.append(
+                        RawConstant(symbol=sym_name, value=m_as.group(2), unit=m_as.group(3) or "1", provenance=span)
+                    )
+            elif re.search(rf"{NUMBER}\s+(?:1/(?:s|min)|M|mM|cM|cm|mm|m|kg|mol|s|min|K)\b", stripped):
+                _flag(doc, span)
 
 
 def _tex(doc: ParsedDocument, text: str) -> None:

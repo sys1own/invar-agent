@@ -507,6 +507,63 @@ async def _plan_llm_callable(state: ServerState, question: str,
     return resp.content if resp else None
 
 
+def _staged_llm_callable(state: ServerState):
+    """R2-ARCH-001: Strict-JSON staged LLM callable for `StagedSciIRSynthesizer`.
+
+    Uses `DeepSeekChatClient.generate_structured()` when available, with automatic
+    escalation from Tier.FAST (`deepseek-flash`) to Tier.REASONING (`deepseek-v4-pro`)
+    on Pass-2 retries (`thinking=False`).
+    """
+    from invar_agent.config import Tier
+    from invar_agent.llm.clients import get_llm_client
+    from invar_agent.llm.deepseek import DeepSeekChatClient
+    from invar_agent.llm.telemetry import llm_call_context
+
+    pass2_calls = {"n": 0}
+
+    async def _call(messages: List[Dict[str, str]], max_tokens: int, tier: str) -> str:
+        use_tier = Tier.FAST
+        phase = "sciir_pass1" if tier == "fast" and max_tokens > 512 else (
+            "sciir_pass3_micro_repair" if max_tokens <= 512 else "sciir_pass2"
+        )
+        if tier == "reasoning":
+            pass2_calls["n"] += 1
+            # Escalate to Tier.REASONING on Pass-2 retry (fingerprint/parse escalation)
+            if pass2_calls["n"] >= 2:
+                use_tier = Tier.REASONING
+        client = get_llm_client(
+            provider=state.provider,
+            tier=use_tier,
+            api_key=state.api_key or None,
+            override=state.effective_tier_overrides().get(use_tier.value),
+        )
+        if client is None:
+            raise RuntimeError("No LLM client configured for staged SciIR synthesis")
+        with llm_call_context(phase, attempt=max(1, pass2_calls["n"])):
+            if isinstance(client, DeepSeekChatClient):
+                # Production caller of DeepSeekChatClient.generate_structured() (R2-ARCH-001 / ARCH-008)
+                data = await asyncio.to_thread(
+                    client.generate_structured,
+                    None,
+                    messages,
+                    max_tokens=max_tokens,
+                    thinking=False,
+                )
+                return json.dumps(data, ensure_ascii=False)
+            prompt_text = "\n\n".join(
+                f"[{m.get('role', 'user').upper()}]\n{m.get('content', '')}" for m in messages
+            )
+            resp = await asyncio.to_thread(
+                client.complete,
+                prompt_text,
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+            return resp.content if resp else ""
+
+    return _call
+
+
 def create_app(workspace_root: str | Path | None = None, provider: Optional[str] = None) -> FastAPI:
     state = get_state(workspace_root, provider=provider)
     # Auto-migrate legacy research artifacts (research/, checkpoints/,
@@ -716,7 +773,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             raise HTTPException(status_code=400, detail={"error": "no LLM client could be resolved"})
         start = time.perf_counter()
         try:
-            response = client.complete("Reply with exactly: OK", max_tokens=32)
+            from invar_agent.llm.deepseek import DeepSeekChatClient
+            test_kwargs: Dict[str, Any] = {"max_tokens": 32}
+            if isinstance(client, DeepSeekChatClient):
+                test_kwargs["thinking"] = False
+            response = client.complete("Reply with exactly: OK", **test_kwargs)
         except Exception as exc:  # noqa: BLE001
             error = exc if isinstance(exc, LLMProviderError) else LLMProviderError(
                 state.provider, getattr(client, "model", None), upstream_message=str(exc),
@@ -1293,6 +1354,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 req.question,
                 llm_complete=(
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
                 fallback=not has_llm,
                 extra_context=_research_vault_context(req.question, req.attached_research_ids),
                 progress_cb=manager._progress,
@@ -1456,6 +1518,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 req.question,
                 llm_complete=(
                     (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
                 fallback=not has_llm,
                 assume_feasible=assume_feasible,
                 extra_context=direct_ctx,
@@ -1610,7 +1673,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
         manager.seeded_upload_ids = seeded
         manager.request_plan(bp)
-        if not manager.approve(run_uid=diag_run_uid):
+        try:
+            approved = manager.approve(run_uid=diag_run_uid)
+        except TypeError:
+            approved = manager.approve()
+        if not approved:
             state.research_broadcaster.publish_terminal(
                 diag_run_uid,
                 status="FAILED",
@@ -1691,35 +1758,77 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
 
     @app.get("/api/v1/research/stream")
     def api_research_stream(request: Request, run_uid: Optional[str] = None) -> StreamingResponse:
-        state.ensure_research_manager()
+        manager = state.ensure_research_manager()
         raw_last_id = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID") or ""
         try:
             since_seq = int(raw_last_id.strip()) if raw_last_id.strip() else 0
         except ValueError:
             since_seq = 0
-        q = state.research_broadcaster.subscribe(since_seq=since_seq, run_uid=run_uid)
-        initial_seq = state.research_broadcaster.seq
+        broadcaster = state.research_broadcaster
+        q = broadcaster.subscribe(since_seq=since_seq, run_uid=run_uid)
+        initial_seq = broadcaster.seq
         terminal_events = ("research_completed", "research_failed", "terminal_verdict")
+        target_uid = run_uid if run_uid is not None else getattr(broadcaster, "_active_run_uid", None)
+
+        def _synth_research_terminal(uid: str) -> Dict[str, Any]:
+            snap = manager.get_run_snapshot(uid) if hasattr(manager, "get_run_snapshot") else None
+            status_val = (snap or {}).get("status", "DONE") if isinstance(snap, dict) else "DONE"
+            verdict_val = (snap or {}).get("epistemic_verdict", "INCONCLUSIVE_UNVERIFIED") if isinstance(snap, dict) else "INCONCLUSIVE_UNVERIFIED"
+            return {
+                "channel": "accelerator_log",
+                "event": "terminal_verdict",
+                "event_version": "2.0",
+                "run_uid": uid,
+                "stage": "Done",
+                "status": status_val,
+                "epistemic_verdict": verdict_val,
+                "seq": broadcaster.seq,
+            }
 
         def event_generator():
             try:
+                # Drain any immediately queued history events first.
+                saw_terminal = False
+                while True:
+                    try:
+                        payload = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    seq_id = payload.get("seq", 0)
+                    is_terminal_event = payload.get("event") in terminal_events
+                    body = json.dumps({**payload, "event_version": "2.0"}, default=str)
+                    yield f"id: {seq_id}\ndata: {body}\n\n"
+                    if is_terminal_event:
+                        saw_terminal = True
+                        break
+                if saw_terminal:
+                    return
+                # R2-ARCH-003: Symmetric already-terminal check for both scoped and unscoped streams.
+                if target_uid and broadcaster.has_terminal(target_uid):
+                    synth = _synth_research_terminal(target_uid)
+                    body = json.dumps(synth, default=str)
+                    yield f"id: {synth['seq']}\ndata: {body}\n\n"
+                    return
                 while True:
                     try:
                         payload = q.get(timeout=RESEARCH_SSE_HEARTBEAT)
                     except queue.Empty:
+                        if target_uid and broadcaster.has_terminal(target_uid):
+                            synth = _synth_research_terminal(target_uid)
+                            body = json.dumps(synth, default=str)
+                            yield f"id: {synth['seq']}\ndata: {body}\n\n"
+                            break
                         yield ": keep-alive ping\n\n"
                         continue
                     seq_id = payload.get("seq", 0)
                     is_terminal_event = payload.get("event") in terminal_events
-                    # When scoped to a specific run_uid, close after delivering its terminal event
-                    # even if that terminal event was already persisted in history before connect.
                     terminal = is_terminal_event and (run_uid is not None or seq_id > initial_seq)
                     body = json.dumps({**payload, "event_version": "2.0"}, default=str)
                     yield f"id: {seq_id}\ndata: {body}\n\n"
                     if terminal:
                         break
             finally:
-                state.research_broadcaster.unsubscribe(q)
+                broadcaster.unsubscribe(q)
 
         return StreamingResponse(
             event_generator(),

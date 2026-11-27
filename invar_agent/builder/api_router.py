@@ -130,9 +130,10 @@ class BuilderService:
 
     def emit(self, channel, event, data):
         data = {key: value for key, value in data.items() if key not in {'event', 'channel', 'seq', 'run_uid'}}
-        self.server.research_broadcaster.publish(channel, event, {'event_version':'2.0', 'mode':'builder', **data})
+        build_uid = f"builder:{data['build_id']}" if data.get('build_id') else None
+        self.server.research_broadcaster.publish(channel, event, {'event_version':'2.0', 'mode':'builder', **data}, run_uid=build_uid)
         if channel == 'log':
-            self.server.research_broadcaster.publish('search_log', event, {'event_version':'2.0', 'mode':'builder', **data})
+            self.server.research_broadcaster.publish('search_log', event, {'event_version':'2.0', 'mode':'builder', **data}, run_uid=build_uid)
 
     def progress(self, channel, payload):
         original = payload['event']
@@ -407,6 +408,15 @@ def create_builder_router(state):
         cache_manifest = HISCache(state.workspace_root, build_id, workspace).load()
         if cache_manifest is not None:
             from .his_cache import blake3_file
+            for entry in (getattr(cache_manifest, 'entries', None) or {}).values():
+                if getattr(entry, 'verified_status', None) not in {'VERIFIED', 'FALLBACK_VERIFIED'}:
+                    continue
+                for rel_artifact, expected_digest in (getattr(entry, 'artifact_digests', None) or {}).items():
+                    art_path = (workspace / rel_artifact).resolve()
+                    if not art_path.is_file() or not art_path.is_relative_to(workspace):
+                        raise HTTPException(409, f"Export blocked: missing verified artifact {rel_artifact}")
+                    if blake3_file(art_path) != expected_digest:
+                        raise HTTPException(409, f"Export blocked: receipt digest mismatch for {rel_artifact}")
             for receipt in getattr(cache_manifest, 'receipts', None) or []:
                 for rel_artifact, expected_digest in (getattr(receipt, 'output_hashes', None) or {}).items():
                     art_path = (workspace / rel_artifact).resolve()
@@ -420,7 +430,10 @@ def create_builder_router(state):
                 if path.is_symlink():
                     raise HTTPException(400,'Unsafe workspace symlink')
                 if path.is_file():
-                    output.write(path,path.relative_to(workspace).as_posix())
+                    rel_posix = path.relative_to(workspace).as_posix()
+                    if rel_posix.startswith('.invar/') or 'diagnostics/leaf_responses' in rel_posix:
+                        continue
+                    output.write(path, rel_posix)
         def chunks():
             try:
                 with archive.open('rb') as stream:
@@ -504,13 +517,64 @@ def create_builder_router(state):
             identifier(build_id)
         channel='search_log' if channel=='research_log' else channel
         broadcaster=state.research_broadcaster
-        subscription=broadcaster.subscribe()
+        terminal_statuses = {'COMPLETED', 'COMPLETED_WITH_FALLBACKS', 'ABORTED_CRITICAL', 'FAILED'}
+        build_uid = f"builder:{build_id}" if build_id else None
+        subscription=broadcaster.subscribe(run_uid=build_uid)
+
+        def _synth_terminal(st: dict) -> dict:
+            status_val = st.get('status', 'FAILED')
+            evt = 'builder.completed' if status_val in {'COMPLETED', 'COMPLETED_WITH_FALLBACKS'} else 'builder.failed'
+            return {
+                'channel': channel or 'log',
+                'event': evt,
+                'event_version': '2.0',
+                'mode': 'builder',
+                'build_id': build_id,
+                'status': status_val,
+                'seq': broadcaster.seq,
+            }
+
         def events():
             try:
+                saw_terminal = False
+                while True:
+                    try:
+                        payload = subscription.get_nowait()
+                    except queue.Empty:
+                        break
+                    if payload.get('mode')!='builder' or build_id and payload.get('build_id')!=build_id:
+                        continue
+                    job = service.jobs.get(build_id) if build_id else None
+                    if job and payload.get('seq',0) <= job['start_seq']:
+                        continue
+                    if channel and payload['channel']!=channel:
+                        continue
+                    yield 'data: '+json.dumps(payload,default=str)+'\n\n'
+                    if build_id and payload['event'] in {'builder.completed','builder.failed'}:
+                        saw_terminal = True
+                        break
+                if saw_terminal:
+                    return
+                if build_id:
+                    try:
+                        st = service.status(build_id)
+                    except HTTPException:
+                        st = None
+                    if st and st.get('status') in terminal_statuses:
+                        yield 'data: '+json.dumps(_synth_terminal(st),default=str)+'\n\n'
+                        return
                 while True:
                     try:
                         payload=subscription.get(timeout=1)
                     except queue.Empty:
+                        if build_id:
+                            try:
+                                st = service.status(build_id)
+                            except HTTPException:
+                                st = None
+                            if st and st.get('status') in terminal_statuses:
+                                yield 'data: '+json.dumps(_synth_terminal(st),default=str)+'\n\n'
+                                break
                         yield ': keep-alive\n\n'; continue
                     if payload.get('mode')!='builder' or build_id and payload.get('build_id')!=build_id:
                         continue
