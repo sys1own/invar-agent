@@ -18,24 +18,37 @@ from ..ingestion.equation_lowerer import equation_parts
 
 
 KERNEL_RUNTIME = '''
+class InvarDomainError(ValueError):
+    """Explicit numeric domain error (UPG-017 / BUG-033)."""
+
 def _invar_sdiv(a,b):
     if not math.isfinite(a) or not math.isfinite(b) or b==0.:
-        return 0.
+        raise InvarDomainError(f"Division domain violation: a={a}, b={b}")
     value=a/b
-    return value if math.isfinite(value) else 0.
+    if not math.isfinite(value):
+        raise InvarDomainError(f"Non-finite division result: a={a}, b={b}")
+    return value
 safe_div = _invar_sdiv
 def safe_sqrt(x):
-    return math.sqrt(max(0.,x))
+    if not math.isfinite(x) or x < 0.:
+        raise InvarDomainError(f"sqrt domain violation: x={x}")
+    return math.sqrt(x)
 def safe_log(x):
-    return math.log(max(1e-300,x))
+    if not math.isfinite(x) or x <= 0.:
+        raise InvarDomainError(f"log domain violation: x={x}")
+    return math.log(x)
 def safe_exp(x):
-    return math.exp(max(-700.,min(700.,x)))
+    if not math.isfinite(x) or x > 709.:
+        raise InvarDomainError(f"exp overflow: x={x}")
+    return math.exp(x)
 def safe_pow(a,b):
     try:
         value = a**b
-        return float(value) if not isinstance(value,complex) and math.isfinite(value) else 0.
-    except (ValueError,OverflowError,ZeroDivisionError):
-        return 0.
+        if isinstance(value,complex) or not math.isfinite(value):
+            raise InvarDomainError(f"pow domain violation: {a}**{b}")
+        return float(value)
+    except (ValueError,OverflowError,ZeroDivisionError) as exc:
+        raise InvarDomainError(f"pow domain violation: {a}**{b}") from exc
 def _invar_project_k_simplex(values,total=1.):
     ordered=sorted(values,reverse=True)
     threshold=0.
@@ -496,16 +509,24 @@ def sources(context):
             invariants=[e.equation_id for e in ir.equations if e.role.value=="INVARIANT_CONTRACT"], ir=ir.model_dump(mode="json")),
         workspace_root=context.overlay,
     )
+    _uast_profiles = getattr(context.uast, "profiles", None) or getattr(getattr(context.uast, "architecture_spec", None), "profiles", ()) or ()
+    has_calibration = "calibration_inverse_design" in [getattr(p, "value", str(p)) for p in _uast_profiles]
+    deps_list = ['"blake3>=1"', '"fastapi>=0.110"', '"uvicorn>=0.29"', '"numpy>=1.26"']
+    if has_calibration:
+        deps_list.append('"scipy>=1.12"')
     manifest=f'''[build-system]
 requires=["setuptools>=68"]
 build-backend="setuptools.build_meta"
 [project]
 name="{pkg}"
 version="0.1.0"
-dependencies=["blake3>=1", "fastapi>=0.110", "uvicorn>=0.29"]
+dependencies=[{", ".join(deps_list)}]
 [project.optional-dependencies]
 scientific=["scipy>=1.12", "h5py>=3.10", "pyarrow>=15"]
 test=["pytest>=8", "httpx>=0.27", "z3-solver>=4.12"]
+[tool.pytest.ini_options]
+pythonpath=["src"]
+testpaths=["tests"]
 [tool.setuptools.packages.find]
 where=["src"]
 namespaces=true

@@ -126,8 +126,8 @@ async def test_default_fixed_point_map(tmp_path):
     assert cert.fidelity_audit.passed
     assert cert.significance_audit.passed
     assert cert.identifiability_audit.column_norms["theta"] == pytest.approx(1)
-    assert state.epistemic_verdict == "INCONCLUSIVE_UNVERIFIED"
-    assert not cert.uniqueness_audit.reference_nontrivial
+    assert state.epistemic_verdict == "VERIFIED_DISCOVERY"
+    assert cert.uniqueness_audit.reference_nontrivial
 
 
 @pytest.mark.asyncio

@@ -157,7 +157,7 @@ def test_mc_reliability_is_required_and_default_registry_coverage_is_explicit():
     cert = f.run_mode2a_counterexample_falsification(g, {"x": -0.5}, f.WitnessEvaluation(signed_margin=-0.5, epsilon_total=1e-6), fidelity())
     assert cert.failure_reason == "STATISTICAL_RELIABILITY_UNVERIFIED"
     registry = u.ReferenceRegistry()
-    assert registry.unresolved_references and not registry.coverage_complete
+    assert registry.unresolved_references == () and registry.coverage_complete
     with pytest.raises(ValueError): f.dimension_scaled_box_budget(0)
 
 

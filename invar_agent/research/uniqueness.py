@@ -515,6 +515,35 @@ def check_intra_vault_uniqueness(candidate_cds: CdsTriplet, ihcg: m.IhcgGraph, v
     return VaultUniquenessAudit(passed=False, failure_reason="PI_DOMAIN_OR_STRICT_STRENGTHENING_UNPROVEN" if unresolved else "NOVELTY_UNPROVEN")
 
 
+def reference_fingerprint(
+    equations: Sequence[tuple[str, str]],
+    tags: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """NF-07 (BUG-021): Domain-free canonical reference fingerprint, constructed identically
+    for candidates and references (no domain, no initial values).
+
+    Each item in `equations` is `(kind, expression_str)` (e.g. `("ODE_RHS", "sig*(y - x)")`
+    or `("ALGEBRAIC", "E - m*c**2")`).
+    """
+    norm_tags = {
+        sym: {
+            "role": str(meta.get("role", "CONTROL_PARAM")),
+            "si_dim": list(meta.get("si_dim", [0, 0, 0, 0, 0, 0, 0])),
+            "semantic_tag": int(meta.get("semantic_tag", 0)),
+            "unit_scale": [1, 1],
+            "positive": bool(meta.get("positive", str(meta.get("role", "")) != "DYNAMIC_STATE")),
+        }
+        for sym, meta in tags.items()
+    }
+    rows: list[list[str]] = []
+    for kind, expr_str in equations:
+        csel_json = m._json(m._csel(m._parse(expr_str)))
+        canon = _native_canonical([{"expr": csel_json, "symbols": norm_tags}])
+        rows.append([str(kind), canon])
+    rows.sort()
+    return json.dumps(rows, separators=(",", ":"))
+
+
 class ReferenceRegistry:
     """Immutable native fingerprints, with explicit legacy annotation gaps.
 

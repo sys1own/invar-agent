@@ -53,6 +53,19 @@ FALLBACK_EMITTERS = {
 }
 
 
+class SlotOutputSpec(StrictModel):
+    name: str
+    scalar_type: Literal["f64", "i64", "bool", "str", "enum"]
+    enum: list[str] | None = None
+    range: tuple[float, float] | None = None
+
+
+class SlotExample(StrictModel):
+    inputs: dict[str, float | int | str | bool]
+    expected: dict[str, float | int | str | bool]
+    tolerance: float = 1e-9
+
+
 class LLMExtensionSlotRequest(StrictModel):
     slot_id: str = Field(pattern=r"^slot_[a-z][a-z0-9_]*$")
     slot_kind: SlotKind
@@ -60,6 +73,9 @@ class LLMExtensionSlotRequest(StrictModel):
     fallback_emitter_id: Literal["fb_csv_json_adapter", "fb_svg_trajectory_viz", "fb_workflow_glue", "fb_markdown_narrative_doc"]
     input_symbols: list[str] = Field(default_factory=list)
     output_symbols: list[str] = Field(default_factory=list)
+    output_spec: list[SlotOutputSpec] = Field(default_factory=list)
+    postconditions: list[str] = Field(default_factory=list)
+    examples: list[SlotExample] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

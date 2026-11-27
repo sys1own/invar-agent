@@ -413,6 +413,70 @@ def create_builder_router(state):
         service.start(value,build_id)
         return {'build_id':build_id,**schedule.model_dump(mode='json')}
 
+    @router.get('/builds/{build_id}/tree')
+    def build_tree(build_id: str):
+        """UPG-019 (BUG-036): Read-only build workspace file listing."""
+        import blake3 as _b3
+        from ..redact import sanitize_tree
+
+        ws = (service.build_root(build_id) / 'workspace').resolve()
+        if not ws.exists() or not ws.is_dir():
+            raise HTTPException(404, 'Build workspace not found')
+        excluded = {'.invar', 'diagnostics', '__pycache__'}
+        files: list[dict[str, Any]] = []
+        for path in sorted(ws.rglob('*')):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(ws)
+            except ValueError:
+                continue
+            if any(part in excluded for part in rel.parts):
+                continue
+            raw_bytes = path.read_bytes()
+            files.append({
+                'path': rel.as_posix(),
+                'bytes': len(raw_bytes),
+                'blake3': _b3.blake3(raw_bytes).hexdigest(),
+                'emitted_by': 'builder',
+            })
+        return sanitize_tree({'build_id': build_id, 'files': files}, workspace_root=ws)
+
+    @router.get('/builds/{build_id}/file')
+    def build_file(build_id: str, path: str = ''):
+        """UPG-019 (BUG-036): Read-only build workspace file viewer."""
+        from ..redact import sanitize_tree
+
+        ws = (service.build_root(build_id) / 'workspace').resolve()
+        if not ws.exists() or not ws.is_dir():
+            raise HTTPException(404, 'Build workspace not found')
+        raw_p = (path or '').strip().replace('\\', '/')
+        if not raw_p or raw_p.startswith('/') or ':' in raw_p.split('/')[0] or '..' in Path(raw_p).parts:
+            raise HTTPException(400, {'code': 'PATH_OUTSIDE_BUILD', 'message': 'Invalid or outside path'})
+        if any(part in {'.invar', 'diagnostics', '__pycache__'} for part in Path(raw_p).parts):
+            raise HTTPException(400, {'code': 'PATH_OUTSIDE_BUILD', 'message': 'Excluded directory'})
+        candidate = ws / raw_p
+        if candidate.is_symlink():
+            raise HTTPException(400, {'code': 'PATH_OUTSIDE_BUILD', 'message': 'Symlink not allowed'})
+        resolved = candidate.resolve()
+        try:
+            rel = resolved.relative_to(ws)
+        except ValueError as exc:
+            raise HTTPException(400, {'code': 'PATH_OUTSIDE_BUILD', 'message': 'Path escapes build workspace'}) from exc
+        if not resolved.exists() or not resolved.is_file():
+            raise HTTPException(404, 'File not found')
+        size = resolved.stat().st_size
+        if size > 1024 * 1024:
+            raise HTTPException(413, 'File exceeds 1 MiB viewer limit')
+        data = resolved.read_bytes()
+        if b'\x00' in data:
+            raise HTTPException(415, 'Binary file not supported in text viewer')
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise HTTPException(415, 'Non-UTF-8 file not supported in text viewer') from exc
+        return sanitize_tree({'path': rel.as_posix(), 'encoding': 'utf-8', 'content': text}, workspace_root=ws)
+
     @router.get('/export/{build_id}.zip')
     def export(build_id: str):
         from .export_utils import ExportBlockedError, build_verified_export_zip

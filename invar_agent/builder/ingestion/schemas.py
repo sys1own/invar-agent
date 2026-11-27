@@ -34,6 +34,7 @@ class IntervalBoundModel(StrictModel):
 class EquationRole(str, Enum):
     EVOLUTION_LAW = "EVOLUTION_LAW"
     ALGEBRAIC_CLOSURE = "ALGEBRAIC_CLOSURE"
+    IMPLICIT_CLOSURE = "IMPLICIT_CLOSURE"
     INVARIANT_CONTRACT = "INVARIANT_CONTRACT"
     BOUNDARY_CONDITION = "BOUNDARY_CONDITION"
     INITIAL_CONDITION = "INITIAL_CONDITION"
@@ -62,11 +63,19 @@ class ExtractedEquation(StrictModel):
     dimension_rhs: SIDimensionVectorModel | None = None
     hin_homogeneous: bool = False
     z3_satisfiable: bool | None = None
+    smt_scope: Literal["ASSERTED", "NOT_APPLICABLE", "UNSUPPORTED"] | None = None
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED_FLAGGED
     diagnostics: list[str] = Field(default_factory=list)
     provenance: SourceSpan
     supporting_provenance: list[SourceSpan] = Field(default_factory=list)
     disambiguated_by_llm: bool = False
+
+    @model_serializer(mode="wrap")
+    def _omit_default_smt_scope(self, handler):
+        data = handler(self)
+        if self.smt_scope is None:
+            data.pop("smt_scope", None)
+        return data
 
 
 class ExtractedConstant(StrictModel):
@@ -160,7 +169,57 @@ class IRReviewOverride(StrictModel):
     time_horizon_si_s: float | None = None
     default_dt_si_s: float | None = None
     default_steps: int | None = None
+    proposal_decisions: list[dict[str, Any]] = Field(default_factory=list)
     approve: bool = True
+
+
+class ProposedSymbol(StrictModel):
+    name: str
+    role: Literal["STATE", "PARAMETER", "INPUT", "OUTPUT", "DERIVED"]
+    unit: str = "1"
+
+
+class EquationProposal(StrictModel):
+    proposal_kind: Literal["equation_proposal"] = "equation_proposal"
+    latex: str
+    quote_span: str
+    symbols: list[ProposedSymbol] = Field(default_factory=list)
+
+
+class ProposalDecision(StrictModel):
+    flag_id: str
+    accept: bool
+
+
+class RootBracket(StrictModel):
+    symbol: str
+    equation_id: str
+    lo: float
+    hi: float
+    origin: Literal["SOURCE", "USER", "DEFAULT_LEDGERED"] = "DEFAULT_LEDGERED"
+
+
+class RootCertificate(StrictModel):
+    symbol: str
+    equation_id: str
+    root: float
+    residual: float
+    bracket: tuple[float, float]
+    iterations: int
+
+
+class DatasetColumn(StrictModel):
+    name: str
+    symbol: str
+    unit: str = "1"
+    aliases: list[str] = Field(default_factory=list)
+
+
+class DatasetSchema(StrictModel):
+    file: str
+    time_column: str | None = None
+    time_unit: str | None = None
+    columns: list[DatasetColumn] = Field(default_factory=list)
 
 
 class RuntimePredicate(StrictModel):
@@ -258,6 +317,7 @@ class CanonicalResearchIR(StrictModel):
     source_certificates: list[SourceCertificateRef] = Field(default_factory=list)
     ir_verdict: str | None = None
     override_ledger: list[OverrideEntry] = Field(default_factory=list)
+    dataset_schemas: list[DatasetSchema] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
     def _omit_empty(self, handler):
@@ -268,6 +328,8 @@ class CanonicalResearchIR(StrictModel):
             data.pop("ir_verdict", None)
         if not self.override_ledger:
             data.pop("override_ledger", None)
+        if not self.dataset_schemas:
+            data.pop("dataset_schemas", None)
         return data
 
     @classmethod

@@ -18,7 +18,7 @@ The Rust/PyO3 core, Python/Z3 substrate, restricted-Python-to-C++20 compiler and
    - **Monte Carlo (`solvers/mc.rs`)**: Stateless `SplitMix64` CRN, Welford–CGL parallel merge, Maurer–Pontil Empirical Bernstein CI, zero-dependency pure-math Lentz CF Clopper–Pearson (`< 1e-12` vs SciPy), and Vehtari rank-normalized split-`R_hat` & bulk `ESS`.
    - **Fixed-Point & Sweep (`solvers/fixed_point.rs`, `solvers/sweep.rs`)**: Deuflhard affine-invariant damped Newton, central-FD Jacobian cross-check (`JACOBIAN_MISMATCH`), 3-tier stability certification (Routh–Hurwitz, Gershgorin, and continuous Lyapunov `J^T P + P J = -I` Cholesky SPD for non-normal/near-defective Jacobians), parallel Rayon parameter sweeps with adaptive bisection, and algebraic-closure Newton solving.
 4. **Provably Total 6-Absorbing-State FSM, SSE v2.0 & Bespoke Hole Verifier (`total_fsm.py`, `hole_verifier.py`)**: Lexicographic Lyapunov budgets `(b_pass, b_repair, b_exec) <= (2, 2, 2)` and `TotalBoundaryAdapter` lift every boundary fault into a cryptographically committed `VerdictReceipt` (0% HTTP 500/502s). SSE v2.0 streams emit `X-Accel-Buffering: no`, `Cache-Control: no-cache, no-transform`, monotonic `id:` frames with `Last-Event-ID` replay, and 15 s keepalive heartbeats. Any `<5%` bespoke Python hole is statically verified by `hole_verifier.py` (`<= 50 KB`) for AST safety, static loop bounds, and MELL observational purity.
-5. **Deterministic 9-Stage / 8-Gate Engine & Builder Studio Unification**: Once sealed, **the deterministic engine never parses raw natural-language user prompts**. All 8 epistemic gates, Duhem–Quine falsification certifiers, and Builder Studio `CanonicalResearchIR.from_sci_ir` admission checks share the exact same `0x01 || JCS(SciIR)` BLAKE3 commitment and lossless 8-macro-domain bijection.
+5. **Deterministic 9-Stage / 8-Gate Engine & Builder Studio Unification**: Once sealed, **the deterministic engine never parses raw natural-language user prompts**. All 8 epistemic gates, Duhem–Quine falsification certifiers, and Builder Studio `CanonicalResearchIR.from_sci_ir` admission checks share the exact same `0x01 || JCS(SciIR)` BLAKE3 commitment, unified expression AST (`invar.expr.v1`), 6-member `FunctionSpec` registry, 40/40 SI-annotated `ReferenceRegistry`, and 9 vNext scientific domains (including `MATHEMATICS`, mapped to the 8 macro-domains).
 
 | Gate | Requirement |
 |---|---|
@@ -33,7 +33,7 @@ The Rust/PyO3 core, Python/Z3 substrate, restricted-Python-to-C++20 compiler and
 
 Deductive refutation has an explicit activity shortcut after certified model-relative infeasibility; fidelity, purity and reliability still apply. Certified zero-dissipation cancellations can be excluded from activity checks, but hardcoded zero/no-op implementations are not discoveries.
 
-### Four terminal epistemic states
+### Five terminal epistemic outcomes
 
 | Verdict | Meaning |
 |---|---|
@@ -41,6 +41,9 @@ Deductive refutation has an explicit activity shortcut after certified model-rel
 | `VERIFIED_FALSIFICATION` | A sealed hypothesis is refuted within its recorded model/domain by certified deductive or numerical evidence with passed fidelity/reliability guards. |
 | `VERIFIED_BOUNDARY_DISCOVERY` | Uncertainty-separated witnesses, a bounded bracket and a certified valid-domain argument establish a supported boundary. |
 | `INCONCLUSIVE_UNVERIFIED` | Missing, unsupported, unreliable, trivial, duplicate or unresolved evidence; no discovery/refutation is asserted. |
+| `COMPUTED_NO_CLAIM` | Certified numerical computation of requested quantities with purity/fidelity audits when no falsifiable hypothesis was asserted (deliberately outside `EpistemicVerdict`; rejected by Builder evidence admission with `COMPUTED_NO_CLAIM_NOT_EVIDENCE`). |
+
+Set `INVAR_ACCEL_CACHE=0` at runtime to disable lossless acceleration caches (`_EXPORTED_SYMBOLS_CACHE` and `DynamicCABIBridge._cache`) while preserving bit-identical trajectories and receipts.
 
 Operational statuses such as `PARTIAL`, `ERROR` and legacy `VERIFIED` describe workflow progress, not additional scientific verdicts. Feasibility assessments (`OPTIMAL_DIRECT`, `REFORMULATED_SURROGATE`, `REFUSED_IMPOSSIBLE`, `REFUSED_UNSUITABLE`, `NEEDS_CLARIFICATION`) likewise do not certify a hypothesis.
 

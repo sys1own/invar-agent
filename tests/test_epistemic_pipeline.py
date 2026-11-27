@@ -151,7 +151,7 @@ def test_default_reference_annotation_inventory_and_native_coverage():
     assert len(packs) == 14 and sum(len(p["equations"]) for p in packs.values()) == 55
     assert sum(len(p.get("annotated_equation_indices", [])) for p in packs.values()) == len(ANNOTATIONS)
     registry = u.ReferenceRegistry()
-    assert registry.model_hashes and registry.unresolved_references
+    assert registry.model_hashes and not registry.unresolved_references and registry.coverage_complete
     for pack in packs.values():
         for tagged in pack.get("canonical_equations", []):
             assert all(len(tag["si_dim"]) == 7 and tag["role"] in {"CONTROL_PARAM", "DERIVED_OBSERVABLE", "DYNAMIC_STATE"} for tag in tagged["symbols"].values())
