@@ -179,11 +179,11 @@ def test_surgical_llm_healer_resolves_client_with_tier(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _sample_workspace(tmp_path):
-    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     (tmp_path / "test_calc.py").write_text(
-        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
-    )
-    (tmp_path / "conftest.py").write_text("")
+        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n", 
+    encoding="utf-8")
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
     return tmp_path
 
 

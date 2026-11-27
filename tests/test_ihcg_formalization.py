@@ -168,8 +168,8 @@ async def test_three_failed_formalizations_persist_terminal_certificate(response
     result = await machine.plan_and_run(_FORMAL_EXAMPLE_PROMPT)
     assert len(calls) == 3 and result.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
-    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()).failure_reason == 'PLANNING_VALIDATION_FAILED'
-    error = json.loads((directory/'metadata.json').read_text())['planning_error']
+    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8")).failure_reason == 'PLANNING_VALIDATION_FAILED'
+    error = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))['planning_error']
     assert 'attempt 1:' in error and 'attempt 2:' in error and 'attempt 3:' in error
 
 
@@ -184,9 +184,9 @@ def test_symbol_aliases_bind_only_through_explicit_sealed_indices():
 
 def replay_cases():
     root = Path(__file__).parent/'fixtures'
-    run2 = json.loads((root/'live_carnot_shbt_raw_plans.json').read_text())
-    run2['seir'] = json.loads((root/'live_seir_raw_plans.json').read_text())
-    run3 = json.loads((root/'live_run3_raw_plans.json').read_text())
+    run2 = json.loads((root/'live_carnot_shbt_raw_plans.json').read_text(encoding="utf-8"))
+    run2['seir'] = json.loads((root/'live_seir_raw_plans.json').read_text(encoding="utf-8"))
+    run3 = json.loads((root/'live_run3_raw_plans.json').read_text(encoding="utf-8"))
     return [(run,name,index,item['prompt'],response) for run,data in [(2,run2),(3,run3)] for name,item in data.items() for index,response in enumerate(item['responses'])]
 
 
@@ -249,7 +249,7 @@ async def test_identical_failed_requests_never_overwrite_a_previous_run(tmp_path
     assert (directory.parent/second.run_id/'meaningfulness_certificate.json').exists()
 
 
-RUN4 = json.loads((Path(__file__).parent/'fixtures'/'live_run4_raw_plans.json').read_text())
+RUN4 = json.loads((Path(__file__).parent/'fixtures'/'live_run4_raw_plans.json').read_text(encoding="utf-8"))
 
 
 @pytest.mark.asyncio
@@ -270,7 +270,7 @@ async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(n
     assert len(prompts) == 4
     assert state.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
     directory = tmp_path/'.invar'/'research_vault'/state.run_id
-    certificate = parse_run_certificate((directory/'meaningfulness_certificate.json').read_text())
+    certificate = parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8"))
     assert certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
     attempts = certificate.diagnostics['validation_attempts']
     assert len(attempts) == 3
@@ -287,7 +287,7 @@ async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(n
         else: assert any(tok in record['error'] for tok in ('DEGENERATE_MECHANISM_DOMAIN', 'PREFLIGHT_REDUNDANT_CONJUNCTS', 'IHCG_INGEST_REJECTED:'))
         assert record['error_type'] == 'ValueError'
         if index < 2: assert record['error'] in prompts[index+2]
-    metadata = json.loads((directory/'metadata.json').read_text())
+    metadata = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))
     assert metadata['diagnostics'] == certificate.diagnostics
     terminal = next(event for event in events if event['event'] == 'research_completed')
     assert terminal['event_version'] == '2.0'

@@ -489,7 +489,7 @@ class DynamicCABIBridge:
             return cached
         cpp_path = (self.workspace / f"kernel_{key}.cpp").resolve()
         so_path = (self.workspace / f"kernel_{key}.so").resolve()
-        cpp_path.write_text(cpp_code)
+        cpp_path.write_text(cpp_code, encoding="utf-8")
         cmd = [self.compiler, "-O3", "-std=c++20", "-fPIC", "-shared",
                "-Wl,--no-undefined",
                str(cpp_path), "-o", str(so_path)]
@@ -678,7 +678,7 @@ class DynamicCABIBridge:
         run_dir = Path(tempfile.mkdtemp(prefix="invar-kernel-"))
         try:
             runner = run_dir / "runner.py"
-            runner.write_text(_RUNNER_SOURCE)
+            runner.write_text(_RUNNER_SOURCE, encoding="utf-8")
             cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
             mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
             # 64-bit CPython + libstdc++ virtual mappings exceed 256MB even
@@ -773,9 +773,9 @@ class DynamicCABIBridge:
         run_dir = Path(tempfile.mkdtemp(prefix="invar-pykernel-"))
         try:
             kernel_path = run_dir / "kernel.py"
-            kernel_path.write_text(python_code)
+            kernel_path.write_text(python_code, encoding="utf-8")
             runner = run_dir / "runner.py"
-            runner.write_text(_PY_RUNNER_SOURCE)
+            runner.write_text(_PY_RUNNER_SOURCE, encoding="utf-8")
             cpu_limit = max(5, int(math.ceil(timeout_seconds)) + 5)
             mem_bytes = max(256, int(max_memory_mb)) * 1024 * 1024 + 512 * 1024 * 1024
             as_bytes = max(mem_bytes, 2048 * 1024 * 1024)

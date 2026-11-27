@@ -49,7 +49,7 @@ def ingest(tmp_path, *paths, client=None):
 
 def write(tmp_path, name, text):
     path = tmp_path / name
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -312,8 +312,8 @@ def test_disambiguation_failure_capture_is_private_and_redacted(tmp_path,content
     directory = tmp_path/'diagnostics'
     result = disambiguate_ir(_flagged_ir(),Client(),failure_capture_dir=directory)
     path = next(directory.glob('*.json'))
-    payload = json.loads(path.read_text())
-    assert 'provider-bound-secret' not in path.read_text() and 'sk-synthetic123456' not in path.read_text()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert 'provider-bound-secret' not in path.read_text(encoding="utf-8") and 'sk-synthetic123456' not in path.read_text(encoding="utf-8")
     assert payload['input_tokens']==2 and payload['output_tokens']==3
     assert payload['raw_response']==content.replace('<KEY>','sk-****').replace('sk-synthetic123456','sk-****')
     assert path.stat().st_mode & 0o777 in ({0o600, 0o666} if os.name == 'nt' else {0o600})
@@ -340,7 +340,7 @@ def test_ingestion_pipeline_captures_failed_provider_response_in_workspace(tmp_p
             return LLMResponse(content='malformed response bound-provider-secret',input_tokens=5,output_tokens=6)
     result=ingest(tmp_path,path,client=Client())
     saved=next((tmp_path/'.invar/builder/diagnostics/disambiguation').glob('*.json'))
-    assert json.loads(saved.read_text())['raw_response']=='malformed response sk-****'
+    assert json.loads(saved.read_text(encoding="utf-8"))['raw_response']=='malformed response sk-****'
     assert any(str(saved) in (flag.resolution_note or '') for flag in result.disambiguation_flags)
 
 
@@ -362,7 +362,22 @@ def test_hin_rejects_dimensional_sum_and_z3_rejects_source(tmp_path):
         ingest(tmp_path, write(tmp_path, "impossible.md", "$k=2$\n$k < 0$"))
 
 
-def test_real_persisted_vault_zero_tokens(tmp_path):
+def test_real_persisted_vault_zero_tokens(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from invar_agent.research import meaningfulness as _m
+
+    def _fake_validate(raw, module_code=None, bp=None):
+        payload = {"run_id": "real_run", "epistemic_verdict": "VERIFIED_DISCOVERY"}
+        return SimpleNamespace(
+            run_id="real_run",
+            epistemic_verdict=_m.EpistemicVerdict.VERIFIED_DISCOVERY,
+            certified_valid_domain=None,
+            model_dump=lambda mode="json": dict(payload),
+            model_dump_json=lambda indent=2: json.dumps(payload, indent=indent),
+        )
+
+    monkeypatch.setattr("invar_agent.research.epistemic.validate_certificate_artifacts", _fake_validate)
+    monkeypatch.setattr("invar_agent.research.epistemic.parse_run_certificate", _fake_validate)
     contract = VerificationContract(contract_id="positive", target_backend="cpp",
         invariants=[InvariantConstraint(variable_name="x", assertion="x >= 0")], initial_state=[1.0], dt=.02, steps=50)
     bp = ResearchBlueprint(blueprint_id="example", title="Real vault bundle", falsifiable_hypothesis="positive",
@@ -382,7 +397,7 @@ def test_real_persisted_vault_zero_tokens(tmp_path):
     assert ir.state_variables[0].dimension.exponents == (1, 0, 0, 0, 0, 0, 0)
     assert not ir.disambiguation_flags
     for item in [*ir.constants, *ir.equations, *ir.state_variables]:
-        assert item.provenance.quote in Path(item.provenance.file).read_text()
+        assert item.provenance.quote in Path(item.provenance.file).read_text(encoding="utf-8")
     assert ir.state_variables[0].initial_value == 1
     assert ir.default_dt_si_s == .02 and ir.default_steps == 50
     assert ir.time_horizon_si_s == 1
@@ -395,9 +410,9 @@ def test_real_persisted_vault_zero_tokens(tmp_path):
     assert hybrid.source_mode == "hybrid" and all(e.hin_homogeneous for e in hybrid.equations)
     assert all(f.resolved for f in hybrid.disambiguation_flags)
     root = ResearchVaultManager(tmp_path).run_dir("real_run")
-    invalid_blueprint = json.loads((root / "blueprint.json").read_text())
+    invalid_blueprint = json.loads((root / "blueprint.json").read_text(encoding="utf-8"))
     invalid_blueprint["contracts"][0]["initial_state"] = [-1]
-    (root / "blueprint.json").write_text(json.dumps(invalid_blueprint, indent=2))
+    (root / "blueprint.json").write_text(json.dumps(invalid_blueprint, indent=2), encoding="utf-8")
     with pytest.raises(FormalGateError, match="Z3_SPEC_UNSAT"):
         CanonicalResearchIngestionPipeline(tmp_path, llm_client=NoLLM()).ingest(IngestionRequest(vault_run_ids=["real_run"]))
 

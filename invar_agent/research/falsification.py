@@ -122,6 +122,12 @@ def run_mode1_deductive_falsification(ihcg: IhcgGraph, model_eqs: Mapping[str, s
     if model_eqs is not None and ({k: ast.dump(m._parse(v)) for k, v in model_eqs.items()} != {k: ast.dump(m._parse(v)) for k, v in locked.items()}):
         raise ValueError("deductive model must match the sealed IHCG")
     deadline, calls, cache = time.monotonic()+1.5, 0, {}
+    from ..runtime.isolation import run_on_z3_thread
+    return run_on_z3_thread(_run_mode1_locked, ihcg, locked, mode, fidelity, deadline, run_carcara)
+
+
+def _run_mode1_locked(ihcg, locked, mode, fidelity, deadline, run_carcara):
+    calls, cache = 0, {}
     tr = _ExactTranslator(ihcg.omega, False)
     formulas, sources = {}, {}
     try:

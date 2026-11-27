@@ -40,7 +40,7 @@ Symbol & Value & Unit \\
 v & 2e-5 & 1/s \\
 k & 0.025 & 1 \\
 \end{tabular}
-''')
+''', encoding="utf-8")
     dataset=root/'observations.csv'
     rng=np.random.default_rng(7)
     x=.1
@@ -160,7 +160,7 @@ Symbol & Value & Unit \\
 r & 0.3 & 1/s \\
 q & 0.7 & 1/s \\
 \end{tabular}
-''')
+''', encoding="utf-8")
     ir=CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(upload_paths=[str(paper)]))
     for state in ir.state_variables:
         state.initial_value=.2 if state.symbol=='a' else .4
@@ -216,7 +216,7 @@ def test_uploaded_initial_conditions_drive_conservation_build(tmp_path):
 Symbol & Value & Unit \\
 k & 0.1 & 1/s \\
 \end{tabular}
-''')
+''', encoding="utf-8")
     ir = CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(upload_paths=[str(paper)]))
     ir = apply_ir_override(ir, IRReviewOverride(state_symbol_order=['x', 'y'], default_steps=20))
     state = asyncio.run(build_research_instrument(tmp_path, ir=ir,
@@ -241,7 +241,7 @@ assert not predicate({'x': float('inf'), 'y': 0., 'k': .1, 't': 0.})
 def test_cached_receipt_retains_verified_fallback_and_backend(instrument):
     root,previous,_=instrument
     build_root=root.parent
-    ir_json=json.loads((build_root/'canonical_research_ir.json').read_text())
+    ir_json=json.loads((build_root/'canonical_research_ir.json').read_text(encoding="utf-8"))
     ir=CanonicalResearchIR.model_validate(ir_json)
     spec=BuilderArchitectureSpec(project_name='enzyme_lab',profiles=list(BuilderProfile))
     workspace_root=build_root.parents[2]
@@ -261,7 +261,7 @@ Symbol & Value & Unit \\
 v & 2e-5 & 1/s \\
 k & 0.025 & 1 \\
 \end{tabular}
-''')
+''', encoding="utf-8")
     ir=CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(upload_paths=[str(paper)]))
     ir.state_variables[0].initial_value=.1
     ir.state_variables[0].bounds=IntervalBoundModel(lower=0,upper=1)

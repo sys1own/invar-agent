@@ -98,7 +98,7 @@ async def test_overlay_isolation_on_stage6_failure(tmp_path):
     async def progress(channel, payload):
         if payload["stage"] == "SMT_Concolic_Verify" and payload["module_id"] == "mod_sdk":
             workspace = tmp_path / ".invar/builds/isolation/workspace"
-            observed.append((workspace / "pinned.txt").read_text())
+            observed.append((workspace / "pinned.txt").read_text(encoding="utf-8"))
             assert not (workspace / "sdk.py").exists()
             assert (tmp_path / ".invar/builds/isolation/overlays/round_1/mod_sdk/sdk.py").exists()
     client = NoLLM()
@@ -106,7 +106,7 @@ async def test_overlay_isolation_on_stage6_failure(tmp_path):
     state = await machine.run(BuildRequest(build_id="isolation", ir=ir, uast=make_graph(ir)))
     assert state.status == "ABORTED_CRITICAL" and observed == ["verified kernel"]
     workspace = Path(state.workspace)
-    assert (workspace / "pinned.txt").read_text() == "verified kernel" and not (workspace / "sdk.py").exists()
+    assert (workspace / "pinned.txt").read_text(encoding="utf-8") == "verified kernel" and not (workspace / "sdk.py").exists()
     assert state.committed_waves == [["kernel_core"], ["port_core"]] and client.calls == 0
     assert (workspace.parent / "partial_receipt.json").is_file()
     cache = HISCache(tmp_path, "isolation", workspace).load()
@@ -165,7 +165,7 @@ async def test_warm_cache_skips_verified_artifacts_without_llm(tmp_path):
 async def test_empty_ingestion_aborts_with_partial_receipt(tmp_path):
     state = await BuilderStateMachine(tmp_path).run(BuildRequest(build_id="empty"))
     assert state.status == "ABORTED_CRITICAL" and not state.committed_waves
-    receipt = json.loads((tmp_path / ".invar/builds/empty/partial_receipt.json").read_text())
+    receipt = json.loads((tmp_path / ".invar/builds/empty/partial_receipt.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "ABORTED_CRITICAL" and len(receipt["merkle_root_blake3"]) == 64
 
 

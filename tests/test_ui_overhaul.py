@@ -96,7 +96,7 @@ async def test_state_machine_persists_report_and_emits_completed(tmp_path):
     # software root stays clean. The blueprint id is slugified by the schema.
     vault_dir = tmp_path / ".invar" / "research_vault" / "bp_ui"
     assert (vault_dir / "report.md").exists()
-    assert "# Quantitative Research Report" in (vault_dir / "report.md").read_text()
+    assert "# Quantitative Research Report" in (vault_dir / "report.md").read_text(encoding="utf-8")
     assert (vault_dir / "unified_module.py").exists()
     assert (vault_dir / "blueprint.json").exists()
     assert (vault_dir / "metadata.json").exists()
@@ -122,16 +122,16 @@ def create_app_for_test(workspace_root: str):
 
 
 def test_workspace_tree_is_strictly_software_only(tmp_path):
-    (tmp_path / "research_report.md").write_text("# report")
-    (tmp_path / "hello.py").write_text("print('hi')")
+    (tmp_path / "research_report.md").write_text("# report", encoding="utf-8")
+    (tmp_path / "hello.py").write_text("print('hi')", encoding="utf-8")
     scratch = tmp_path / ".invar" / "scratch" / "cabi"
     scratch.mkdir(parents=True)
     (scratch / "kernel_abc.so").write_bytes(b"\x7fELF")
-    (scratch / "kernel_abc.cpp").write_text("// kernel")
+    (scratch / "kernel_abc.cpp").write_text("// kernel", encoding="utf-8")
     (tmp_path / "research" / "cabi").mkdir(parents=True)
     (tmp_path / "research" / "cabi" / "kernel_def.so").write_bytes(b"\x7fELF")
     (tmp_path / "checkpoints" / "mars_entry").mkdir(parents=True)
-    (tmp_path / "checkpoints" / "mars_entry" / "blueprint.json").write_text("{}")
+    (tmp_path / "checkpoints" / "mars_entry" / "blueprint.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build").mkdir()
     (tmp_path / "build" / "out.o").write_bytes(b"obj")
 

@@ -487,6 +487,9 @@ Failures so far: {failures}"""
 
 # -- combined feasibility + blueprint (single Tier-2 call, Task 4 latency fix) --
 
+# AUDIT-PATCH-001a: section "5b. Frozen symbol table" below was added during the deep audit; the
+# output schema previously never requested typed_slots/constants, so the formalizer had no
+# shared symbol table.
 COMBINED_PLAN_PROMPT = """{tools}
 
 ## Task — Epistemic Feasibility Gate & Research Blueprint Planner
@@ -510,12 +513,17 @@ Classify the request into EXACTLY ONE verdict:
   device rather than formally test a hypothesis.
 - REFUSED_UNSUITABLE: subjective/qualitative/historical/clinical/literary tasks
   without falsifiable governing equations, or requiring forbidden sandbox ops.
+- NEEDS_CLARIFICATION: genuinely quantitative/scientific request that is
+  critically under-specified (missing governing equations, units, parameter
+  values, or testable quantitative target) so fabricating numbers would invent
+  user assumptions. Return `blueprint: null` and populate `questions` (2-5
+  specific actionable questions) and `missing_fields` (list of missing items).
 For REFORMULATED_SURROGATE, the "reformulation" field MUST name the exact
 surrogate equations, scaling laws, boundary conditions and observables to
 synthesise (e.g. relativistic Lorentz factor, Larmor-radius magnetic deflection,
 kinetic-energy flux over a scoop cross-section, radiative/ablative thermal
 balance, stopping-range thickness optimisation).
-feasibility object keys: verdict, rationale, violated_boundary, reformulation.
+feasibility object keys: verdict, rationale, violated_boundary, reformulation, questions, missing_fields.
 
 ## Part 2 — blueprint (only if NOT refused)
 Produce ONE falsifiable research blueprint:
@@ -568,6 +576,16 @@ reformulation.
 5. **Named telemetry observables**: variable_map must name every requested
    output with units (e.g. peak_g, peak_alt_km, max_heat_flux_mw_m2,
    total_heat_load_mj_m2) mapped to buffer slots the module writes.
+5b. **Frozen symbol table (MANDATORY)**: the blueprint object MUST also contain
+   `typed_slots`: [{{"symbol", "slot_idx", "si_dim": [7 ints], "role", "bounds": [lo, hi]}}]
+   with one entry for EVERY symbol used by the governing equations, claimed
+   predicate, parameters and observables (role is CONTROL_PARAM, DYNAMIC_STATE or
+   DERIVED_OBSERVABLE; `semantic_tag` omitted; at most 24 entries; immutable
+   numeric constants may instead go in `constants`: {{"name": {{"value", "si_unit",
+   "si_dim"}}}}). Use the user's own symbol names when given. Every variable_map key
+   MUST be one of these `symbol` names bound to the same `slot_idx`, and the
+   contracts and code_template MUST use exactly these indices. A later pass writes
+   formal equations using ONLY these symbols.
 6. **v9_transpiler_friendly code**: code_template uses ONLY the allowed subset
    (pure functions, simulation_step(buf, dt), math.* only, no classes,
    exceptions, dynamic imports, dicts/sets/tuples/comprehensions, strings).
@@ -2730,12 +2748,22 @@ def _coerce_feasibility(data: Any) -> Optional[FeasibilityAssessment]:
         reformulation = ("Reformulate as a falsifiable quantitative question "
                          "with explicit governing equations and measurable "
                          "invariants that a deterministic sandbox can verify.")
+    questions = [str(x).strip() for x in (data.get("questions") or []) if str(x).strip()]
+    missing_fields = [str(x).strip() for x in (data.get("missing_fields") or []) if str(x).strip()]
+    smt_core = data.get("smt_unsat_core")
+    if isinstance(smt_core, list):
+        smt_core = [str(x).strip() for x in smt_core if str(x).strip()] or None
+    else:
+        smt_core = None
     try:
         return FeasibilityAssessment(
             verdict=verdict,
             rationale=truncate_at_sentence(str(data.get("rationale") or ""), 1200) or "LLM assessment",
             violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
             reformulation=reformulation[:600] or None,
+            questions=questions[:8],
+            missing_fields=missing_fields[:12],
+            smt_unsat_core=smt_core,
             assessed_by="llm")
     except Exception:  # noqa: BLE001
         return None
@@ -2844,12 +2872,18 @@ async def generate_plan_with_feasibility(question: str,
                     "planner_error": "combined planner returned no JSON object"}
         raise RuntimeError("research plan synthesis failed: combined planner returned no JSON object")
     llm_feas = _coerce_feasibility(data.get("feasibility"))
-    feasibility = heuristic if shbt_res.should_activate else (llm_feas or heuristic)
-    llm_refused = bool(llm_feas and llm_feas.verdict.startswith("REFUSED"))
-    if feasibility.verdict.startswith("REFUSED") or (shbt_res.should_activate and (llm_refused or not isinstance(data.get("blueprint"), dict))):
-        if shbt_res.should_activate:
-            feasibility = heuristic
-            if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
+    # ARCH-003 (T-R5): If SMT Q1 certified a direct contradiction, preserve the UNSAT core refusal.
+    if heuristic.smt_unsat_core and heuristic.verdict == FeasibilityVerdict.REFUSED_IMPOSSIBLE:
+        feasibility = heuristic
+    else:
+        # ARCH-011: SHBT activation NEVER overrides or elevates a feasibility refusal.
+        feasibility = llm_feas or heuristic
+    if feasibility.verdict == FeasibilityVerdict.NEEDS_CLARIFICATION:
+        return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
+    if feasibility.verdict.value.startswith("REFUSED"):
+        return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
+    if shbt_res.should_activate and not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
+        if True:
                 shbt_prompt = (
                     prompt
                     + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "

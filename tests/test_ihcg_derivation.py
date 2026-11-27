@@ -104,9 +104,9 @@ def test_unit_conversion_is_outward_and_dimension_mismatches_skip_prose_fallback
 
 def saved_evidence_cases():
     root = Path(__file__).parent/'fixtures'
-    run2 = json.loads((root/'live_carnot_shbt_raw_plans.json').read_text())
-    run2['seir'] = json.loads((root/'live_seir_raw_plans.json').read_text())
-    for run,data in [(2,run2),(3,json.loads((root/'live_run3_raw_plans.json').read_text())),(4,json.loads((root/'live_run4_raw_plans.json').read_text()))]:
+    run2 = json.loads((root/'live_carnot_shbt_raw_plans.json').read_text(encoding="utf-8"))
+    run2['seir'] = json.loads((root/'live_seir_raw_plans.json').read_text(encoding="utf-8"))
+    for run,data in [(2,run2),(3,json.loads((root/'live_run3_raw_plans.json').read_text(encoding="utf-8"))),(4,json.loads((root/'live_run4_raw_plans.json').read_text(encoding="utf-8")))]:
         for name,case in data.items():
             core = _extract_json(case['responses'][0])['blueprint'] if run == 4 else None
             for index,response in enumerate(case['responses']):

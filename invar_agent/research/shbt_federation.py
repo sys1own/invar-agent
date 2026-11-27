@@ -390,57 +390,59 @@ SHBT_REPOSITORIES: Dict[str, SHBTDomainSpec] = {
 
 
 # ---------------------------------------------------------------------------
-# Strict Non-Intrusive Solvability Trigger Logic
+# Strict Capability-Based SHBT Routing (ARCH-011 / BUG-010 / BUG-011)
 # ---------------------------------------------------------------------------
 
 _EXPLICIT_SHBT_RE = re.compile(
-    r"\b(?:shbt|sys1own/shbt|dark-os|dark-zpe|shbt-mar|shbt-sten|mar-312x)\b"
+    r"\b(?:shbt|sys1own/shbt(?:-[a-z0-9]+)?|dark-os|dark-zpe|shbt-mar|shbt-sten|mar-312x)\b"
     r"|wzw\s*\(?\s*26\s*,\s*8\s*,\s*312\s*\)?"
     r"|su\(2\)_?26.*so\(10\)_?312",
     re.I,
 )
 
-# Multi-signal frontier triggers: never match ordinary textbook physics!
-_SIGNAL_PATTERNS: Dict[str, Tuple[re.Pattern[str], ...]] = {
+# Typed SHBT registry concept families (NEVER bare keywords like "warp",
+# "superluminal", "wormhole", "10/33", "1.01 nW", or "Landauer ... debt").
+# Non-opt-in activation requires >= 2 distinct registry concept matches.
+_CONCEPT_FAMILIES: Dict[str, Tuple[Tuple[str, re.Pattern[str]], ...]] = {
     "sys1own/shbt-precision": (
-        re.compile(r"\bwzw\b.*\b26\b.*\b8\b.*\b312\b|\b23/33\b|\b10/33\b", re.I),
-        re.compile(r"\bstinespring\b.*\b(?:dark\s+ledger|topological|partition)\b", re.I),
-        re.compile(r"\b(?:landauer|holographic\s+boundary)\b.*\b(?:debt|906(?:\.0+)?\s*kw)\b", re.I),
+        ("wzw_26_8_312", re.compile(r"\bwzw\b.*\b26\b.*\b8\b.*\b312\b", re.I)),
+        ("stinespring_dark_ledger", re.compile(r"\bstinespring\b.*\b(?:dark\s+ledger|topological\s+partition|bipartite\s+stinespring)\b", re.I)),
+        ("holographic_boundary_debt_906kw", re.compile(r"\b(?:holographic\s+boundary|landauer\s+boundary)\b.*\b906(?:\.0+)?\s*kw\b", re.I)),
     ),
     "sys1own/shbt-qc": (
-        re.compile(r"\b(?:tomita[- ]takesaki|modular\s+automorphism|pt[- ]symmetric\s+goi|polariton\s+squeezing)\b", re.I),
-        re.compile(r"\b312[- ]channel\s+photonic\b|\b52\s+hexamers\b", re.I),
+        ("tomita_takesaki_goi", re.compile(r"\b(?:tomita[- ]takesaki|pt[- ]symmetric\s+goi|polariton\s+squeezing)\b", re.I)),
+        ("photonic_312_hexamers", re.compile(r"\b312[- ]channel\s+photonic\b|\b52\s+hexamers\b", re.I)),
     ),
     "sys1own/shbt-cf": (
-        re.compile(r"\b(?:floquet[- ]screen\w*|floquet[- ]adler[- ]wiser|adler[- ]wiser\s+dynamic\s+dielectric)\b", re.I),
-        re.compile(r"\b352\.48\s*ev\b|\b555\.03\s*w\b|\b999,?054(?:\.0+)?\s*w\b", re.I),
-        re.compile(r"\b1,?800[- ](?:module|cell)\b.*\b(?:ni-?h|nickel[- ]hydrogen|lattice[- ]assisted\s+nuclear|lanr)\b", re.I),
-        re.compile(r"\bkapitza\b.*\b3\.546\s*k\b|\bmgb2\b.*\b11\.79\s*k\b", re.I),
+        ("floquet_adler_wiser", re.compile(r"\b(?:floquet[- ]screen\w*|floquet[- ]adler[- ]wiser|adler[- ]wiser\s+dynamic\s+dielectric)\b", re.I)),
+        ("lanr_1800_cells", re.compile(r"\b1,?800[- ](?:module|cell)\b.*\b(?:ni-?h|nickel[- ]hydrogen|lattice[- ]assisted\s+nuclear|lanr)\b", re.I)),
+        ("mgb2_kapitza_enclave", re.compile(r"\b(?:kapitza\b.*\b3\.546\s*k|mgb2\b.*\b(?:11\.79\s*k|39(?:\.0)?\s*k))\b", re.I)),
+        ("lanr_power_ledger", re.compile(r"\b(?:352\.48\s*ev|555\.03\s*w|999,?054(?:\.0+)?\s*w)\b", re.I)),
     ),
     "sys1own/shbt-power": (
-        re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I),
+        ("p11b_cosb3_8750mw", re.compile(r"\bp-?11b\b.*\b(?:8,?750\s*mw|7,?832\.903\s*mw|cosb3)\b", re.I)),
     ),
     "sys1own/shbt-ghost": (
-        re.compile(r"\b(?:ghost[- ]seed|m_seed|r_congestion|topological\s+mass[- ]congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz|94\.20%)\b", re.I | re.S),
+        ("ghost_seed_ccz4", re.compile(r"\b(?:ghost[- ]seed|topological\s+mass[- ]congestion)\b.*\b(?:ccz4|2\.954\s*e15|50\.518\s*khz)\b", re.I | re.S)),
     ),
     "sys1own/shbt-sglt": (
-        re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b(?:21\.715\s*db|10\^-14|minimum[- ]jerk)\b", re.I),
+        ("sglt_tmsv", re.compile(r"\bsglt\b.*\btmsv\b|\btmsv\b.*\b21\.715\s*db\b", re.I)),
     ),
     "sys1own/shbt-exotic": (
-        re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|23/33|heegaard[- ]floer)\b", re.I),
+        ("ford_roman_dark_ledger", re.compile(r"\bford[- ]roman\b.*\b(?:dark[- ]ledger|heegaard[- ]floer)\b", re.I)),
     ),
     "sys1own/shbt-recon": (
-        re.compile(r"\b2,?112[- ]byte\b|\b640\s*b\b.*\b1,?472\s*b\b|\b230[- ]space[- ]group\b", re.I),
-        re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b|\bstinespring\b.*\b(?:10\s*:\s*23|10/33|23/33|100/1089)\b", re.I),
+        ("sram_2112_space_group", re.compile(r"\b2,?112[- ]byte\b.*\b(?:640\s*b|1,?472\s*b|230[- ]space[- ]group)\b", re.I)),
+        ("virasoro_bipartite_stinespring", re.compile(r"\b45/64\b.*\bvirasoro\b|\bbipartite\s+stinespring\b.*\b(?:10\s*:\s*23|100/1089)\b", re.I)),
     ),
     "sys1own/shbt-warp": (
-        re.compile(r"\b(?:warp(?:\s+(?:drive|metric|bubble))?|alcubierre|wormhole|mar[- ]?312[cx]?|ew[- ]?312|superluminal|dec[- ]x)\b", re.I),
-        re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg|33,?104|81,?104|25\.00\s*ew)\b", re.I),
+        ("mar312_avionics_teg", re.compile(r"\b(?:mar[- ]?312[cx]?|ew[- ]?312|dec[- ]x)\b.*\b(?:42\.15\s*kw|17\.80\s*kw|48\.00\s*kw|25\.00\s*ew)\b", re.I)),
+        ("cryogenic_enclave_surplus", re.compile(r"\b(?:42\.15\s*kw|17\.80\s*kw\s+avionics|48\.00\s*kw\s+teg)\b.*\b(?:33,?104|81,?104|906(?:\.0+)?\s*kw)\b", re.I)),
     ),
     "sys1own/shbt-swarm": (
-        re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I),
-        re.compile(r"\b(?:10\.9989\s*nw|1\.01\s*nw|100/1089|187\.75\s*mw)\b", re.I),
-        re.compile(r"\bkms[- ]passiv\w*\b.*\b(?:dark[- ]sector|dark[- ]zpe|void\s+loiter)\b", re.I),
+        ("symplectic_landauer_shunt", re.compile(r"\b(?:symplectic\s+(?:landauer\s+)?shunt|shunt(?:ing)?\s+entropy)\b.*\b(?:dark\s+ledger|stinespring|4\.2\s*k)\b", re.I)),
+        ("void_loiter_187mw", re.compile(r"\b(?:10\.9989\s*nw|100/1089|187\.75\s*mw)\b.*\b(?:void\s+loiter|stinespring|landauer|dark[- ]sector|cryogenic)\b", re.I)),
+        ("kms_passivity_dark_sector", re.compile(r"\bkms[- ]passiv\w*\b.*\b(?:dark[- ]sector|dark[- ]zpe|void\s+loiter)\b", re.I)),
     ),
 }
 
@@ -452,6 +454,8 @@ class SHBTResolution:
     matched_repos: List[SHBTDomainSpec] = field(default_factory=list)
     verdict_override: Optional[str] = None
     evidence_markdown: str = ""
+    matched_concepts: List[str] = field(default_factory=list)
+    registry_assumptions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -567,25 +571,44 @@ def _build_evidence_markdown(specs: Sequence[SHBTDomainSpec], prompt: str = "") 
 
 
 def resolve_shbt_solvability(query_or_prompt: str,
-                             allow_remote_fetch: bool = False) -> SHBTResolution:
-    """Determine whether ``query_or_prompt`` requires SHBT frontier federation.
+                             allow_remote_fetch: bool = False,
+                             *,
+                             enable_shbt: bool = False) -> SHBTResolution:
+    """Capability-based SHBT routing (ARCH-011).
 
-    Returns ``should_activate=False`` for all standard textbook physics,
-    chemistry, biology, engineering, and CS queries.
+    Activates ONLY on:
+    1. Explicit opt-in (`enable_shbt=True`, named `sys1own/shbt-*` repository,
+       or explicit SHBT architecture token), OR
+    2. Concrete multi-signal domain evidence (>= 2 distinct SHBT registry
+       concept families cited in the prompt).
+
+    NEVER activates on bare keywords ("warp", "superluminal", "wormhole",
+    "10/33", "1.01 nW", "Landauer ... debt") and NEVER overrides feasibility
+    refusals (`verdict_override` is always `None`).
     """
     text = (query_or_prompt or "").strip()
     if not text:
         return SHBTResolution(should_activate=False, reason="empty query")
 
     matched_keys: List[str] = []
+    matched_concepts: List[str] = []
     text_low = text.lower()
-    for repo, pats in _SIGNAL_PATTERNS.items():
-        if repo.lower() in text_low or any(p.search(text) for p in pats):
+    explicit_repo_hit = False
+    for repo, concepts in _CONCEPT_FAMILIES.items():
+        repo_hit = repo.lower() in text_low
+        if repo_hit:
+            explicit_repo_hit = True
+        concept_hits = [cid for cid, pat in concepts if pat.search(text)]
+        if repo_hit or concept_hits:
             matched_keys.append(repo)
+            matched_concepts.extend(concept_hits)
 
-    explicit = bool(_EXPLICIT_SHBT_RE.search(text))
-    if not matched_keys and not explicit:
-        return SHBTResolution(should_activate=False, reason="conventional domain; SHBT not required")
+    explicit = bool(enable_shbt or explicit_repo_hit or _EXPLICIT_SHBT_RE.search(text))
+    if not explicit and len(set(matched_concepts)) < 2:
+        return SHBTResolution(
+            should_activate=False,
+            reason="conventional domain; SHBT not required (insufficient registry concept evidence)",
+        )
 
     if explicit and not matched_keys:
         matched_keys = ["sys1own/shbt-precision", "sys1own/shbt-swarm"]
@@ -600,12 +623,35 @@ def resolve_shbt_solvability(query_or_prompt: str,
         for spec in specs[:2]:
             fetch_shbt_repo_readme(spec.repo, timeout=2.0)
 
+    # ARCH-011: Tag registry constants as REGISTRY_ASSUMPTION so they cannot self-certify.
+    assumptions: List[Dict[str, Any]] = []
+    for spec in specs:
+        consts, _eqs, _invs = filter_shbt_spec_for_prompt(spec, text)
+        for c in consts:
+            assumptions.append({
+                "tag": "REGISTRY_ASSUMPTION",
+                "repo": spec.repo,
+                "symbol": c.symbol,
+                "si_value": c.si_value,
+                "si_unit": c.si_unit,
+            })
+
+    md = _build_evidence_markdown(specs, text)
+    if assumptions:
+        md += (
+            "\n\n> **Provenance Note (`REGISTRY_ASSUMPTION`)**: Constants sourced from the SHBT "
+            "registry are axiomatic `REGISTRY_ASSUMPTION` inputs and MUST NOT be counted as "
+            "independent numerical verification of identical requested outputs.\n"
+        )
+
     return SHBTResolution(
         should_activate=True,
         reason=f"Activated SHBT frontier solvability across {len(specs)} repo(s): {', '.join(s.repo for s in specs)}",
         matched_repos=specs,
-        verdict_override="OPTIMAL_DIRECT",
-        evidence_markdown=_build_evidence_markdown(specs, text),
+        verdict_override=None,
+        evidence_markdown=md,
+        matched_concepts=sorted(set(matched_concepts)),
+        registry_assumptions=assumptions,
     )
 
 

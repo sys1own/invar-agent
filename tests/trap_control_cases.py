@@ -47,7 +47,7 @@ async def run_case(tmp_path,bp,expected):
     machine = ResearchStateMachine(tmp_path,workspace_root=tmp_path,progress_cb=record)
     state = await machine.run(bp)
     path = tmp_path/".invar"/"research_vault"/bp.blueprint_id/"meaningfulness_certificate.json"
-    certificate = parse_run_certificate(path.read_text())
+    certificate = parse_run_certificate(path.read_text(encoding="utf-8"))
     assert len(certificate.blake3_receipt) == 64
     if isinstance(certificate,m.MeaningfulnessCertificate): assert m.verify_certificate_receipt(certificate)
     assert certificate == parse_run_certificate(state.meaningfulness_certificate)

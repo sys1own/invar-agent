@@ -11,6 +11,7 @@ DeepSeek thinking mode rejects sampling parameters, so ``temperature`` /
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from types import SimpleNamespace
@@ -308,24 +309,121 @@ class DeepSeekChatClient:
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  max_tokens: int = 4096, temperature: float = 0.0,
-                 thinking: Optional[bool] = None):
+                 thinking: Optional[bool] = None,
+                 json_object: bool = False):
         """Single-turn completion compatible with the LLMClient protocol."""
         messages: List[Dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        content = self.generate(messages, max_tokens=max_tokens, thinking=thinking)
+        if json_object:
+            messages = _ensure_json_keyword_in_system(messages)
+        content = self.generate(
+            messages,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            json_object=json_object,
+        )
         if self._last_response is not None:
             return self._last_response
         return _llm_response(content=content, model=self.model)
 
+    def generate_structured(
+        self,
+        schema: Any,
+        messages: List[Dict[str, str]],
+        *,
+        max_tokens: int = 4096,
+        thinking: Optional[bool] = False,
+    ) -> Any:
+        """ARCH-008: Strict JSON-mode generation validated against a Pydantic schema.
+
+        Always enables `response_format={"type": "json_object"}` (guaranteeing 'json'
+        in the static system prefix), parses strictly without sub-object salvage,
+        and raises typed StructuredOutputError on EMPTY / TRUNCATED / INVALID_JSON / SCHEMA.
+        """
+        safe_msgs = _ensure_json_keyword_in_system(messages)
+        raw = self.generate(
+            safe_msgs,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            json_object=True,
+        )
+        data = parse_strict_json(raw)
+        if schema is None:
+            return data
+        try:
+            return schema.model_validate(data)
+        except Exception as exc:
+            path = ""
+            if hasattr(exc, "errors") and callable(exc.errors):
+                errs = exc.errors()
+                if errs:
+                    path = ".".join(str(p) for p in errs[0].get("loc", ()))
+            raise StructuredOutputError("SCHEMA", str(exc), path=path or None) from exc
+
+
+class StructuredOutputError(ValueError):
+    """Typed structured-JSON failure (ARCH-008 / BUG-022): EMPTY, TRUNCATED, INVALID_JSON, SCHEMA."""
+
+    def __init__(self, code: str, message: str, *, pos: Optional[int] = None, path: Optional[str] = None) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.pos = pos
+        self.path = path
+
+
+def _ensure_json_keyword_in_system(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """DeepSeek requires the word 'json' in the prompt whenever response_format=json_object."""
+    msgs = [dict(m) for m in (messages or [])]
+    if any("json" in str(m.get("content") or "").lower() for m in msgs):
+        return msgs
+    if msgs and msgs[0].get("role") == "system":
+        msgs[0]["content"] = str(msgs[0].get("content") or "") + "\nRespond with a valid JSON object."
+    else:
+        msgs.insert(0, {"role": "system", "content": "Respond with a single valid JSON object."})
+    return msgs
+
+
+def parse_strict_json(raw: str) -> Dict[str, Any]:
+    """Strict JSON parser with ZERO lenient sub-object salvage (BUG-022)."""
+    text = (raw or "").strip()
+    if not text:
+        raise StructuredOutputError("EMPTY", "Model returned an empty or whitespace-only response")
+    # Strip optional markdown code fences ONLY if the entire response is one fenced block
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1]).strip()
+        else:
+            raise StructuredOutputError("TRUNCATED", "Response ended inside an unclosed markdown fence")
+    if not text:
+        raise StructuredOutputError("EMPTY", "Model returned an empty fenced block")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if text.startswith("{") and not text.rstrip().endswith("}"):
+            raise StructuredOutputError("TRUNCATED", f"Truncated JSON object at pos {exc.pos}: {exc.msg}", pos=exc.pos) from exc
+        raise StructuredOutputError("INVALID_JSON", f"Invalid JSON at pos {exc.pos}: {exc.msg}", pos=exc.pos) from exc
+    if not isinstance(parsed, dict):
+        raise StructuredOutputError("INVALID_JSON", f"Expected top-level JSON object, got {type(parsed).__name__}")
+    return parsed
+
 
 def complete(prompt: str, tier: Tier = Tier.FAST, *, api_key: Optional[str] = None,
              system: Optional[str] = None, max_tokens: int = 4096,
-             model: Optional[str] = None, client: Any = None):
+             model: Optional[str] = None, client: Any = None,
+             json_object: bool = False, thinking: Optional[bool] = None):
     """One-shot DeepSeek completion; resolves the model via ``resolve_tier_model``."""
     adapter = DeepSeekChatClient(tier=tier, api_key=api_key, model=model, client=client)
-    return adapter.complete(prompt, system=system, max_tokens=max_tokens)
+    return adapter.complete(
+        prompt,
+        system=system,
+        max_tokens=max_tokens,
+        json_object=json_object,
+        thinking=thinking,
+    )
 
 
 def validate_api_key(api_key: str, base_url: Optional[str] = None,

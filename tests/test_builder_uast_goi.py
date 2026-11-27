@@ -69,7 +69,7 @@ def _checkpoint(root, graph):
         for relpath in target_relpaths(node):
             path = root / relpath
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"verified fixture: {node.node_id}: {relpath}\n")
+            path.write_text(f"verified fixture: {node.node_id}: {relpath}\n", encoding="utf-8")
         cache.record_verified(state, graph, node.node_id)
     cache.save(state)
     return scheduler, cache, cache.load()
@@ -281,7 +281,7 @@ def test_his_cache_persistence_artifact_tamper_and_atomic_failure(tmp_path, grap
     assert HISCache(tmp_path, "missing").load() is None
     assert cache.load().model_dump() == previous.model_dump()
     target = tmp_path / target_relpaths(_node(graph, "mod_sdk"))[0]
-    target.write_text("tampered")
+    target.write_text("tampered", encoding="utf-8")
     plan = scheduler.plan(graph, previous)
     assert set(plan.rebuild_nodes) == {"mod_sdk", "mod_receipt"}
     target.unlink()
@@ -312,7 +312,7 @@ def test_graph_changes_cache_safety_and_empty_graph(tmp_path, graph, research_ir
     wrong_project = previous.model_copy(update={"project_id": "other"})
     with pytest.raises(HISCacheError, match="PROJECT_MISMATCH"):
         scheduler.plan(graph, wrong_project)
-    cache.path.write_text("not json")
+    cache.path.write_text("not json", encoding="utf-8")
     with pytest.raises(HISCacheError, match="HIS_CACHE_INVALID"):
         cache.load()
     empty = BuilderUAST(project_id="empty", canonical_ir_digest="a" * 64, active_profiles=[], nodes=[], edges=[])

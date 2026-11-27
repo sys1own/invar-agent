@@ -62,10 +62,12 @@ def run_workflow(value, stages, lower=None, upper=None):
 
 
 def narrative(ir: CanonicalResearchIR) -> str:
+    from .base import relativize_provenance_path
+
     lines = ["# " + ir.title, "", "## Verified equations"]
-    lines.extend(f"- ${e.canonical_latex}$ — {e.provenance.file}: {e.provenance.location}" for e in ir.equations)
+    lines.extend(f"- ${e.canonical_latex}$ — {relativize_provenance_path(e.provenance.file)}: {e.provenance.location}" for e in ir.equations)
     lines.append("\n## SI constants")
-    lines.extend(f"- {c.symbol} = {c.si_value!r} {c.dimension.canonical_unit} — {c.provenance.file}: {c.provenance.location}" for c in ir.constants)
+    lines.extend(f"- {c.symbol} = {c.si_value!r} {c.dimension.canonical_unit} — {relativize_provenance_path(c.provenance.file)}: {c.provenance.location}" for c in ir.constants)
     return "\n".join(lines) + "\n"
 
 

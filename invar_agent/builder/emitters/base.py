@@ -2,8 +2,40 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def relativize_provenance_path(raw: str) -> str:
+    """Strip absolute host/user prefixes from provenance paths (BUG-043)."""
+    text = str(raw or "").replace("\\", "/")
+    if not text:
+        return ""
+    for marker in (".invar/research_vault/", "uploads/", "src/", "provenance/", "tests/"):
+        idx = text.find(marker)
+        if idx >= 0:
+            return text[idx:]
+    if re.match(r"^[A-Za-z]:/", text) or text.startswith("/"):
+        return Path(text).name
+    return text
+
+
+def sanitize_ir_for_export(ir_dict: dict) -> dict:
+    """Return a copy of a serialized IR dict with all absolute host paths relativized."""
+    def _clean(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if k == "file" and isinstance(v, str):
+                    out[k] = relativize_provenance_path(v)
+                else:
+                    out[k] = _clean(v)
+            return out
+        if isinstance(obj, list):
+            return [_clean(item) for item in obj]
+        return obj
+    return _clean(ir_dict)
 
 import sympy as sp
 try:
@@ -72,18 +104,30 @@ def model(context):
     equations = {item.lhs_symbol: item for item in ir.equations if item.role == EquationRole.EVOLUTION_LAW}
     if not equations:
         alg_eqs = {item.lhs_symbol: item for item in ir.equations if item.role == EquationRole.ALGEBRAIC_CLOSURE and item.lhs_symbol}
-        if alg_eqs and set(alg_eqs) <= set(names):
+        if alg_eqs:
             equations = alg_eqs
-            states = [s for s in states if s.symbol in equations]
+            if set(alg_eqs) <= set(names):
+                states = [s for s in states if s.symbol in equations]
+            else:
+                from ..ingestion.schemas import StateVariableSpec, SIDimensionVectorModel
+                existing = {s.symbol: s for s in states}
+                states = [
+                    existing.get(sym) or StateVariableSpec(
+                        symbol=sym, slot_index=idx, initial_value=0.0,
+                        dimension=SIDimensionVectorModel(), provenance=alg_eqs[sym].provenance,
+                    )
+                    for idx, sym in enumerate(alg_eqs)
+                ]
             names = [s.symbol for s in states]
     if not names or set(names) != set(equations):
         raise ValueError("Every state must have exactly one evolution equation")
     if len(set(names + parameters)) != len(names + parameters):
         raise ValueError("State and parameter symbols must be distinct")
+    declared_syms = set(names + parameters)
     symbols = {name: sp.Symbol(name) for name in names + parameters + ["t"]}
-    closures = {sp.Symbol(item.lhs_symbol): equation_parts(item.canonical_latex)[2] for item in ir.equations
+    closures = {sp.Symbol(item.lhs_symbol): equation_parts(item.canonical_latex, declared_symbols=declared_syms)[2] for item in ir.equations
                 if item.role == EquationRole.ALGEBRAIC_CLOSURE and item.lhs_symbol}
-    expressions = [equation_parts(equations[name].canonical_latex)[2] for name in names]
+    expressions = [equation_parts(equations[name].canonical_latex, declared_symbols=declared_syms)[2] for name in names]
     for _ in range(len(closures) + 1):
         expressions = [expression.xreplace(closures) for expression in expressions]
     if any(expression.free_symbols - set(symbols.values()) for expression in expressions):

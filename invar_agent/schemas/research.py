@@ -86,6 +86,7 @@ class FeasibilityVerdict(str, Enum):
     REFORMULATED_SURROGATE = "REFORMULATED_SURROGATE"
     REFUSED_IMPOSSIBLE = "REFUSED_IMPOSSIBLE"
     REFUSED_UNSUITABLE = "REFUSED_UNSUITABLE"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
 
     @classmethod
     def _missing_(cls, value):
@@ -105,6 +106,9 @@ class FeasibilityAssessment(BaseModel):
     rationale: str
     violated_boundary: Optional[str] = None
     reformulation: Optional[str] = None
+    questions: List[str] = Field(default_factory=list)
+    missing_fields: List[str] = Field(default_factory=list)
+    smt_unsat_core: Optional[List[str]] = None
     assessed_by: Literal["heuristic", "heuristic_offline", "llm"] = "heuristic_offline"
 
     @field_validator("verdict", mode="before")

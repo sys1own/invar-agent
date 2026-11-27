@@ -376,7 +376,7 @@ def test_vault_digest_includes_initial_state_and_variable_map(tmp_path):
         telemetry={"obs_peak_g_gE": 12.59, "obs_max_heat_flux_mw_m2": 1.112},
         target_backend="cpp")
 
-    meta = json.loads((vault.run_dir("mars_entry_probe") / "metadata.json").read_text())
+    meta = json.loads((vault.run_dir("mars_entry_probe") / "metadata.json").read_text(encoding="utf-8"))
     summary = meta["contracts_summary"][0]
     assert summary["contract_id"] == "c1_mars_entry"
     assert summary["dt"] == MARS_DT and summary["steps"] == MARS_STEPS

@@ -96,16 +96,16 @@ def test_fresh_runs_preserve_archives_and_reserve_an_unused_blueprint_id(tmp_pat
 # -- Test 1: legacy migration + strict software file tree ----------------------
 
 def test_legacy_migration_and_clean_file_tree(tmp_path):
-    (tmp_path / "hello.py").write_text("print('hi')")
+    (tmp_path / "hello.py").write_text("print('hi')", encoding="utf-8")
     (tmp_path / "research" / "cabi").mkdir(parents=True)
-    (tmp_path / "research" / "cabi" / "kernel_123.cpp").write_text("// kernel")
+    (tmp_path / "research" / "cabi" / "kernel_123.cpp").write_text("// kernel", encoding="utf-8")
     (tmp_path / "research" / "cabi" / "kernel_stale.so").write_bytes(b"\x7fELF")
     (tmp_path / "research" / "cabi" / "kernel_stale.o").write_bytes(b"obj")
     ckpt = tmp_path / "checkpoints" / "mars_entry"
     ckpt.mkdir(parents=True)
-    (ckpt / "blueprint.json").write_text(_blueprint().model_dump_json())
-    (ckpt / "research_report.md").write_text("# Legacy Mars report\nSutton-Graves.")
-    (tmp_path / "research_report.md").write_text("# Root legacy report")
+    (ckpt / "blueprint.json").write_text(_blueprint().model_dump_json(), encoding="utf-8")
+    (ckpt / "research_report.md").write_text("# Legacy Mars report\nSutton-Graves.", encoding="utf-8")
+    (tmp_path / "research_report.md").write_text("# Root legacy report", encoding="utf-8")
 
     summary = migrate_legacy_research_artifacts(tmp_path)
     assert "mars_entry" in summary["migrated"]

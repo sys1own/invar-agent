@@ -1163,6 +1163,54 @@ def normalize_expression(
     declared = {str(s) for s in declared_symbols if isinstance(s, str)}
 
     cleaned, base_offset, transforms = _strip_surface_wrappers(text)
+    if " if " in cleaned and " else " in cleaned:
+        try:
+            _py_tree = ast.parse(cleaned, mode="eval")
+            _ifexp_changed = False
+
+            class _IfExpLowerer(ast.NodeTransformer):
+                def visit_IfExp(self, node: ast.IfExp):
+                    nonlocal _ifexp_changed
+                    self.generic_visit(node)
+                    if isinstance(node.test, ast.Compare) and len(node.test.ops) == 1 and len(node.test.comparators) == 1:
+                        lhs_s = ast.unparse(node.test.left)
+                        rhs_s = ast.unparse(node.test.comparators[0])
+                        body_s = ast.unparse(node.body)
+                        else_s = ast.unparse(node.orelse)
+                        op = node.test.ops[0]
+                        # a if a > b else b  OR  b if b > a else a -> max(a, b)
+                        if (
+                            (isinstance(op, (ast.Gt, ast.GtE)) and lhs_s == body_s and rhs_s == else_s)
+                            or (isinstance(op, (ast.Lt, ast.LtE)) and rhs_s == body_s and lhs_s == else_s)
+                        ):
+                            _ifexp_changed = True
+                            return ast.Call(func=ast.Name(id="max", ctx=ast.Load()), args=[node.body, node.orelse], keywords=[])
+                        # a if a < b else b  OR  b if b < a else a -> min(a, b)
+                        if (
+                            (isinstance(op, (ast.Lt, ast.LtE)) and lhs_s == body_s and rhs_s == else_s)
+                            or (isinstance(op, (ast.Gt, ast.GtE)) and rhs_s == body_s and lhs_s == else_s)
+                        ):
+                            _ifexp_changed = True
+                            return ast.Call(func=ast.Name(id="min", ctx=ast.Load()), args=[node.body, node.orelse], keywords=[])
+                        # x if x >= 0 else -x -> abs(x)
+                        if (
+                            isinstance(op, (ast.Gt, ast.GtE))
+                            and lhs_s == body_s
+                            and rhs_s in {"0", "0.0"}
+                            and isinstance(node.orelse, ast.UnaryOp)
+                            and isinstance(node.orelse.op, ast.USub)
+                            and ast.unparse(node.orelse.operand) == lhs_s
+                        ):
+                            _ifexp_changed = True
+                            return ast.Call(func=ast.Name(id="abs", ctx=ast.Load()), args=[node.body], keywords=[])
+                    return node
+
+            _lowered_tree = _IfExpLowerer().visit(_py_tree)
+            if _ifexp_changed:
+                cleaned = ast.unparse(ast.fix_missing_locations(_lowered_tree))
+                transforms.append("ifexp_lower")
+        except SyntaxError:
+            pass
     if not cleaned:
         return NormalizedExpr(
             canonical=None,

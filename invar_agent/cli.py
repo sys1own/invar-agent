@@ -10,7 +10,7 @@ from pathlib import Path
 def _load_nodes(path: str):
     from invar_agent.server import _node_from_dict, _patch_from_dict
 
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     nodes = [_node_from_dict(n) for n in data.get("nodes", [])]
     patches = {k: [_patch_from_dict(p) for p in v] for k, v in data.get("patches_by_node", {}).items()}
     return nodes, patches

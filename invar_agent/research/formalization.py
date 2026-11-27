@@ -117,18 +117,28 @@ class FormalizationError(ValueError):
         return out
 
 
-def _encoding_feedback(question, pack):
+def _encoding_feedback(question, pack, blueprint=None):
     evidence = pack.get('evidence', {}) if isinstance(pack, dict) else {}
-    slots = evidence.get('slots', [])
+    # AUDIT-PATCH-003: a raw (uncompiled) pack carries no `evidence.slots`; resolve declared
+    # names from the blueprint / pack namespaces so feedback never reports every symbol as undeclared.
+    slots = evidence.get('slots') or (blueprint or {}).get('typed_slots') or (pack.get('typed_slots') if isinstance(pack, dict) else None) or []
     names = {slot['symbol'] for slot in slots if isinstance(slot, dict) and 'symbol' in slot}
+    compiled = bool(evidence.get('slots'))
     issues = []
     if len(slots) > m.MAX_VARIABLES:
         issues.append(f'at most {m.MAX_VARIABLES} bounded variables are supported; declared {len(slots)} slots')
     domain = pack.get('domain', {}) if isinstance(pack, dict) else {}
-    missing, extra = names - set(domain), set(domain) - names
+    if not names:
+        return issues
+    if not compiled:
+        for source in (blueprint or {}, pack):
+            for space in ('constants', 'derived_expressions'):
+                if isinstance(source.get(space), dict):
+                    names |= set(source[space])
+    missing, extra = (names - set(domain), set(domain) - names) if compiled else (set(), set(domain) - names)
     if missing or extra:
         issues.append(f'missing_domain={sorted(missing)}; undeclared_domain={sorted(extra)}; every slot needs a justified finite domain, including derived outputs')
-    expressions = [(f'environmental_assumptions[{i}]', expression) for i, expression in enumerate(evidence.get('environmental_assumptions', ()))]
+    expressions = [(f'environmental_assumptions[{i}]', expression) for i, expression in enumerate(evidence.get('environmental_assumptions', ())) if isinstance(expression, str)]
     expressions += [(f'obligations[{i}].expression', item['expression']) for i, item in enumerate(evidence.get('obligations', ())) if isinstance(item, dict) and 'expression' in item]
     expressions += [(f'equations[{name!r}].expression', item['expression']) for name, item in evidence.get('equations', {}).items() if isinstance(item, dict) and 'expression' in item]
     for path, expression in expressions:
@@ -428,6 +438,10 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
         'it — NEVER silently weaken, invert, or "fix" a user\'s false claim into a trivially true one!\n'
         'FOUR-NAMESPACE SEPARATION:\n'
         '1. `typed_slots` (from the blueprint; do not restate `slots`): mutable simulation buffer slots ONLY.\n'
+        # AUDIT-PATCH-001b: one shared symbol table between planning and formalization.
+        '   Reuse the blueprint `typed_slots`/`constants` symbol names VERBATIM (never rename or abbreviate them). '
+        'ONLY if the blueprint `typed_slots` array is empty, emit a top-level `typed_slots` array declaring every '
+        'symbol you reference.\n'
         '2. Optional `constants` object (`{"R_gas": {"value": 8.314462618, "si_unit": "J/(mol*K)", "si_dim": [1,2,-2,0,-1,-1,0]}}`): '
         'immutable SI/model constants. Constants are NEVER required to exist in `typed_slots`.\n'
         '3. Optional `derived_expressions` object (`{"delta_p": {"expression": "delta_psi + ...", "si_dim": [...]}}`): '
@@ -544,7 +558,7 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
             return result_bp
         except (ValueError, TypeError, SyntaxError) as error:
             feedback_target = compiled_pack if isinstance(compiled_pack, dict) else pack
-            additional = _encoding_feedback(question, feedback_target) if isinstance(feedback_target, dict) else []
+            additional = _encoding_feedback(question, feedback_target, blueprint) if isinstance(feedback_target, dict) else []
             err_text = str(error)
             if "'COMPILED_FEASIBILITY': 'UNSAT'" in err_text:
                 additional.append(
@@ -568,7 +582,9 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
             if attempt_sink is not None:
                 attempt_sink.append(attempt_record)
             fp = compute_healing_error_fingerprint(err_text)
-            if attempt >= 3 and fp in seen_fingerprints:
+            # ARCH-008 (BUG-037): Circuit breaker triggers on the 2nd identical error fingerprint
+            # (not only on attempt >= 3), avoiding wasted identical retries.
+            if fp in seen_fingerprints:
                 break
             seen_fingerprints.add(fp)
             diag_section = (

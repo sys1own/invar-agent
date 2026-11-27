@@ -133,11 +133,25 @@ class CanonicalResearchIngestionPipeline:
         ir = CanonicalResearchIR(ir_id=uuid4().hex,
             source_mode="hybrid" if request.upload_paths and request.vault_run_ids else "vault" if request.vault_run_ids else "upload",
             title=request.title)
+        positive_bundles = 0
         for run_id in request.vault_run_ids:
             bundle = load_vault_bundle(self.workspace_root, run_id)
             ir.vault_run_ids.append(run_id)
             ir.meaningfulness_certificates.update(bundle.meaningfulness_certificates)
-            ir.negative_constraints.extend(bundle.negative_constraints)
+            if ir.meaningfulness_certificate is None and bundle.meaningfulness_certificate is not None:
+                ir.meaningfulness_certificate = bundle.meaningfulness_certificate
+            if ir.epistemic_verdict is None and bundle.epistemic_verdict is not None:
+                ir.epistemic_verdict = bundle.epistemic_verdict
+            if ir.certified_valid_domain is None and bundle.certified_valid_domain is not None:
+                ir.certified_valid_domain = bundle.certified_valid_domain
+            if bundle.research_import_role == "NEGATIVE_CONSTRAINT_ONLY":
+                ir.negative_constraints.extend(bundle.negative_constraints)
+                if not request.upload_paths and positive_bundles == 0:
+                    ir.research_import_role = "NEGATIVE_CONSTRAINT_ONLY"
+            else:
+                positive_bundles += 1
+                ir.research_import_role = bundle.research_import_role
+                ir.negative_constraints.extend(bundle.negative_constraints)
             ir.equations.extend(bundle.equations)
             ir.constants.extend(bundle.constants)
             ir.state_variables.extend(bundle.state_variables)
@@ -153,8 +167,14 @@ class CanonicalResearchIngestionPipeline:
                 if getattr(ir, name) is None:
                     setattr(ir, name, getattr(bundle, name))
         if ir.negative_constraints and not ir.equations and not request.upload_paths:
-            ir.research_import_role = "NEGATIVE_CONSTRAINT_ONLY"
-            return seal_ir(ir)
+            raise IngestionError(
+                "NEGATIVE_CONSTRAINT_ONLY",
+                f"Vault run(s) {request.vault_run_ids} are VERIFIED_FALSIFICATION (negative constraint only) and cannot be admitted for positive executable profiles",
+                details={
+                    "epistemic_verdict": ir.epistemic_verdict or "VERIFIED_FALSIFICATION",
+                    "research_import_role": "NEGATIVE_CONSTRAINT_ONLY",
+                },
+            )
         if ir.meaningfulness_certificates:
             from ...research.epistemic import parse_run_certificate
             certificates = [parse_run_certificate(raw) for raw in ir.meaningfulness_certificates.values()]

@@ -55,7 +55,7 @@ async def test_deductive_terminal_has_zero_heals_and_receipted_vault_report(tmp_
     assert all(m.meaningfulness_gates(certificate).values())
     vault = ResearchVaultManager(tmp_path)
     path = vault.run_dir(result.blueprint.blueprint_id)/"meaningfulness_certificate.json"
-    assert path.is_file() and parse_run_certificate(path.read_text()) == certificate
+    assert path.is_file() and parse_run_certificate(path.read_text(encoding="utf-8")) == certificate
     assert vault.list_runs()[0]["meaningfulness_certificate"]["blake3_receipt"] == certificate.blake3_receipt
     assert "Trust Boundary (TCB)" in result.report and "stage1/test" in result.report
     assert "Formal conclusions are conditional on the TCB" in result.report

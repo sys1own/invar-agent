@@ -11,18 +11,164 @@ confuses research artifacts with real project files.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
+import os
 import re
 import shutil
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import blake3
 
 from ..schemas.research import ResearchBlueprint
 from .reporter import _unit_for
 
 VAULT_DIRNAME = ".invar"
 VAULT_SUBDIR = "research_vault"
+VAULT_MANIFEST_SCHEMA_VERSION = "invar.vault.manifest.v2"
+VAULT_MANIFEST_DOMAIN = b"invar:vault:manifest:v2:"
+VAULT_ARTIFACT_DOMAIN = b"invar:vault:artifact:v2:"
+REQUIRED_VAULT_ARTIFACTS = (
+    "blueprint.json",
+    "meaningfulness_certificate.json",
+    "metadata.json",
+    "report.md",
+    "unified_module.py",
+)
+
+_VAULT_WRITE_LOCK = threading.RLock()
+
+
+class VaultIntegrityError(ValueError):
+    """Raised when a vault manifest or any persisted artifact fails cryptographic verification."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+def _jcs_bytes(obj: Any) -> bytes:
+    """RFC 8785-compatible canonical UTF-8 JSON encoding."""
+    try:
+        from ..ir.jcs import canonicalize_jcs
+        return canonicalize_jcs(obj)
+    except Exception:
+        return json.dumps(
+            obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+
+
+def _artifact_digest(name: str, data: bytes) -> str:
+    h = blake3.blake3(VAULT_ARTIFACT_DOMAIN)
+    h.update(name.encode("utf-8"))
+    h.update(b":")
+    h.update(data)
+    return h.hexdigest()
+
+
+def _manifest_digest(body: Dict[str, Any]) -> str:
+    clean = {k: v for k, v in body.items() if k != "manifest_digest"}
+    h = blake3.blake3(VAULT_MANIFEST_DOMAIN)
+    h.update(_jcs_bytes(clean))
+    return h.hexdigest()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def write_vault_manifest(
+    directory: Path,
+    *,
+    run_id: str,
+    epistemic_verdict: str,
+    status: str,
+    llm_telemetry: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compute and atomically persist RFC 8785 canonical Vault Manifest v2."""
+    artifacts: Dict[str, str] = {}
+    tracked = list(REQUIRED_VAULT_ARTIFACTS)
+    if (directory / "sci_ir.json").is_file():
+        tracked.append("sci_ir.json")
+    for name in sorted(tracked):
+        art_path = directory / name
+        if art_path.is_file():
+            artifacts[name] = _artifact_digest(name, art_path.read_bytes())
+    manifest: Dict[str, Any] = {
+        "schema_version": VAULT_MANIFEST_SCHEMA_VERSION,
+        "run_id": _safe_run_id(run_id),
+        "epistemic_verdict": str(epistemic_verdict or "INCONCLUSIVE_UNVERIFIED"),
+        "status": str(status or ""),
+        "certificate_digest": artifacts.get("meaningfulness_certificate.json", ""),
+        "artifacts": artifacts,
+        "llm_telemetry": dict(llm_telemetry or {}),
+    }
+    manifest["manifest_digest"] = _manifest_digest(manifest)
+    _atomic_write_text(
+        directory / "manifest.json",
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
+    )
+    return manifest
+
+
+def verify_vault_manifest(directory: Path) -> Dict[str, Any]:
+    """Verify Vault Manifest v2 and EVERY persisted artifact BEFORE parsing any file."""
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise VaultIntegrityError("VAULT_MANIFEST_MISSING", f"Missing manifest.json in {directory.name}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise VaultIntegrityError("VAULT_MANIFEST_INVALID", str(exc)) from exc
+    if not isinstance(manifest, dict):
+        raise VaultIntegrityError("VAULT_MANIFEST_INVALID", "manifest.json must be a JSON object")
+    if manifest.get("schema_version") != VAULT_MANIFEST_SCHEMA_VERSION:
+        raise VaultIntegrityError(
+            "VAULT_MANIFEST_VERSION",
+            f"Unsupported manifest schema: {manifest.get('schema_version')!r}",
+        )
+    expected_digest = str(manifest.get("manifest_digest") or "")
+    actual_digest = _manifest_digest(manifest)
+    if not expected_digest or not hmac.compare_digest(expected_digest, actual_digest):
+        raise VaultIntegrityError("VAULT_MANIFEST_TAMPERED", "manifest.json BLAKE3 digest mismatch")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise VaultIntegrityError("VAULT_MANIFEST_INVALID", "manifest.artifacts must be a mapping")
+    for req in REQUIRED_VAULT_ARTIFACTS:
+        if req not in artifacts:
+            raise VaultIntegrityError("VAULT_ARTIFACT_MISSING", f"Required artifact {req} missing from manifest")
+    for name, expected_art in artifacts.items():
+        if "/" in name or "\\" in name or ".." in name:
+            raise VaultIntegrityError("VAULT_MANIFEST_INVALID", f"Invalid artifact name: {name}")
+        art_path = directory / name
+        if not art_path.is_file():
+            raise VaultIntegrityError("VAULT_ARTIFACT_MISSING", f"Artifact {name} missing on disk")
+        actual_art = _artifact_digest(name, art_path.read_bytes())
+        if not hmac.compare_digest(str(expected_art), actual_art):
+            raise VaultIntegrityError("VAULT_ARTIFACT_TAMPERED", f"Artifact {name} BLAKE3 digest mismatch")
+    cert_digest = str(manifest.get("certificate_digest") or "")
+    if not cert_digest or not hmac.compare_digest(cert_digest, str(artifacts.get("meaningfulness_certificate.json", ""))):
+        raise VaultIntegrityError("VAULT_CERTIFICATE_TAMPERED", "certificate_digest mismatch")
+    return manifest
 
 
 def _safe_run_id(raw: str) -> str:
@@ -191,73 +337,99 @@ class ResearchVaultManager:
                      report_md: str, status: str, telemetry: Optional[Dict[str, Any]] = None,
                      target_backend: str = "",
                      literature_count: Optional[int] = None,
-                     meaningfulness_certificate=None, canonical_signature=None) -> Dict[str, Any]:
-        """Archive one completed research run into the vault."""
+                     meaningfulness_certificate=None, canonical_signature=None,
+                     llm_telemetry: Optional[Dict[str, Any]] = None,
+                     sci_ir: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Archive one completed research run into the vault atomically with Manifest v2."""
         telemetry = dict(telemetry or {})
-        directory = self.run_dir(run_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        certificate_data = None
-        if meaningfulness_certificate is None:
-            from .epistemic import incomplete_certificate
-            meaningfulness_certificate = incomplete_certificate(_safe_run_id(run_id), blueprint.falsifiable_hypothesis, "RUN_NOT_CERTIFIED_AT_ARCHIVE")
-        if meaningfulness_certificate is not None:
-            from .epistemic import parse_run_certificate
-            certificate = parse_run_certificate(meaningfulness_certificate)
-            if certificate.run_id != _safe_run_id(run_id): raise ValueError("certificate run identity mismatch")
-            certificate_data = certificate.model_dump(mode="json")
-            (directory/"meaningfulness_certificate.json").write_text(certificate.model_dump_json(indent=2), encoding="utf-8")
-        module_code = blueprint.unified_module_code or blueprint.code_template or ""
-        evidence_section = _evidence_report_section(blueprint)
-        (directory / "unified_module.py").write_text(module_code, encoding="utf-8")
-        (directory / "report.md").write_text(
-            (report_md or "") + evidence_section, encoding="utf-8")
-        (directory / "blueprint.json").write_text(
-            blueprint.model_dump_json(indent=2), encoding="utf-8")
-        feasibility = blueprint.feasibility
-        verdict = getattr(getattr(feasibility, "verdict", None), "value",
-                          getattr(feasibility, "verdict", "")) if feasibility else ""
-        stages = len(getattr(blueprint, "verified_layers", []) or [])
-        metadata = {
-            "meaningfulness_certificate": certificate_data,
-            "epistemic_verdict": certificate_data["epistemic_verdict"] if certificate_data else "INCONCLUSIVE_UNVERIFIED",
-            "canonical_signature": canonical_signature.model_dump(mode="json") if canonical_signature else None,
-            "run_id": _safe_run_id(run_id),
-            "title": title or blueprint.title,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "verdict": str(verdict or ""),
-            "status": status,
-            "target_backend": target_backend,
-            "stages_completed": stages,
-            "key_metrics": _key_metrics(blueprint, telemetry),
-            "extracted_constants": _extracted_constants(blueprint),
-            "governing_equations": _governing_equations(blueprint),
-            "contracts_summary": _contracts_summary(blueprint),
-            "verified_functions": _verified_functions(module_code),
-            "structured_evidence": _structured_evidence_summary(blueprint),
-            "literature_count": int(literature_count) if literature_count is not None else 0,
-        }
-        self._metadata_path(run_id).write_text(
-            json.dumps(metadata, indent=2, default=str), encoding="utf-8")
-        return metadata
+        llm_tel = dict(llm_telemetry or telemetry.get("llm_telemetry") or {})
+        safe_id = _safe_run_id(run_id)
+        directory = self.run_dir(safe_id)
+        with _VAULT_WRITE_LOCK:
+            directory.mkdir(parents=True, exist_ok=True)
+            certificate_data = None
+            if meaningfulness_certificate is None:
+                from .epistemic import incomplete_certificate
+                meaningfulness_certificate = incomplete_certificate(safe_id, blueprint.falsifiable_hypothesis, "RUN_NOT_CERTIFIED_AT_ARCHIVE")
+            if meaningfulness_certificate is not None:
+                from .epistemic import parse_run_certificate
+                certificate = parse_run_certificate(meaningfulness_certificate)
+                if certificate.run_id != safe_id: raise ValueError("certificate run identity mismatch")
+                certificate_data = certificate.model_dump(mode="json")
+                _atomic_write_text(directory / "meaningfulness_certificate.json", certificate.model_dump_json(indent=2))
+            module_code = blueprint.unified_module_code or blueprint.code_template or ""
+            evidence_section = _evidence_report_section(blueprint)
+            _atomic_write_text(directory / "unified_module.py", module_code)
+            _atomic_write_text(directory / "report.md", (report_md or "") + evidence_section)
+            _atomic_write_text(directory / "blueprint.json", blueprint.model_dump_json(indent=2))
+            if sci_ir is not None:
+                _atomic_write_text(directory / "sci_ir.json", json.dumps(sci_ir, indent=2, default=str))
+            feasibility = blueprint.feasibility
+            verdict = getattr(getattr(feasibility, "verdict", None), "value",
+                              getattr(feasibility, "verdict", "")) if feasibility else ""
+            stages = len(getattr(blueprint, "verified_layers", []) or [])
+            epistemic_verdict = certificate_data["epistemic_verdict"] if certificate_data else "INCONCLUSIVE_UNVERIFIED"
+            metadata = {
+                "meaningfulness_certificate": certificate_data,
+                "epistemic_verdict": epistemic_verdict,
+                "canonical_signature": canonical_signature.model_dump(mode="json") if canonical_signature else None,
+                "run_id": safe_id,
+                "title": title or blueprint.title,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "verdict": str(verdict or ""),
+                "status": status,
+                "target_backend": target_backend,
+                "stages_completed": stages,
+                "key_metrics": _key_metrics(blueprint, telemetry),
+                "extracted_constants": _extracted_constants(blueprint),
+                "governing_equations": _governing_equations(blueprint),
+                "contracts_summary": _contracts_summary(blueprint),
+                "verified_functions": _verified_functions(module_code),
+                "structured_evidence": _structured_evidence_summary(blueprint),
+                "literature_count": int(literature_count) if literature_count is not None else 0,
+                "llm_telemetry": llm_tel,
+            }
+            _atomic_write_text(
+                self._metadata_path(safe_id),
+                json.dumps(metadata, indent=2, default=str),
+            )
+            write_vault_manifest(
+                directory,
+                run_id=safe_id,
+                epistemic_verdict=epistemic_verdict,
+                status=status,
+                llm_telemetry=llm_tel,
+            )
+            return metadata
 
     def mark_status(self, run_id: str, status: str) -> bool:
-        """Update only the status field of an existing vault entry."""
-        path = self._metadata_path(run_id)
-        if not path.is_file():
-            return False
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        if not isinstance(meta, dict):
-            return False
-        meta["status"] = status
-        try:
-            path.write_text(json.dumps(meta, indent=2, default=str),
-                            encoding="utf-8")
-        except OSError:
-            return False
-        return True
+        """Update only the status field of an existing vault entry and re-sign manifest."""
+        safe_id = _safe_run_id(run_id)
+        directory = self.run_dir(safe_id)
+        path = self._metadata_path(safe_id)
+        with _VAULT_WRITE_LOCK:
+            if not path.is_file():
+                return False
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(meta, dict):
+                return False
+            meta["status"] = status
+            try:
+                _atomic_write_text(path, json.dumps(meta, indent=2, default=str))
+                if (directory / "manifest.json").is_file() and (directory / "meaningfulness_certificate.json").is_file():
+                    write_vault_manifest(
+                        directory,
+                        run_id=safe_id,
+                        epistemic_verdict=str(meta.get("epistemic_verdict") or "INCONCLUSIVE_UNVERIFIED"),
+                        status=status,
+                        llm_telemetry=meta.get("llm_telemetry") or {},
+                    )
+            except OSError:
+                return False
+            return True
 
     def recover_orphans(self) -> List[str]:
         """Rebuild metadata for vault dirs that have artifacts but no valid

@@ -13,7 +13,7 @@ from invar_agent.schemas.research import ResearchBlueprint
 
 @pytest.fixture
 def saved_plan():
-    return json.loads((Path(__file__).parent/"fixtures"/"live_carnot_normalized_plan.json").read_text())
+    return json.loads((Path(__file__).parent/"fixtures"/"live_carnot_normalized_plan.json").read_text(encoding="utf-8"))
 
 
 def repaired_plan(saved):

@@ -114,7 +114,7 @@ class BuilderService:
         path = self.root / kind / (identifier(key) + '.json')
         if not path.is_file():
             raise HTTPException(404, kind + ' not found')
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def save(self, kind, key, value):
         _atomic_json(self.root / kind / (identifier(key) + '.json'), value)
@@ -375,7 +375,7 @@ def create_builder_router(state):
         previous = HISCache(state.workspace_root,build_id,old_root/'workspace').load()
         schedule = WavefrontScheduler(old_root/'workspace').plan(uast,previous)
         value['wavefront_schedule'] = schedule.model_dump(mode='json')
-        prior_ir = json.loads((old_root/'canonical_research_ir.json').read_text())
+        prior_ir = json.loads((old_root/'canonical_research_ir.json').read_text(encoding="utf-8"))
         if service.ir(value['ir_id']).ir_blake3_digest != prior_ir['ir_blake3_digest']:
             value['inherited_fallbacks'] = service.status(build_id).get('fallbacks',[])
             next_id = uuid4().hex
@@ -395,12 +395,25 @@ def create_builder_router(state):
     @router.get('/export/{build_id}.zip')
     def export(build_id: str):
         status = service.status(build_id)
-        if status['status']=='RUNNING':
-            raise HTTPException(409,'Build is still running')
+        if status.get('status') not in {'COMPLETED', 'COMPLETED_WITH_FALLBACKS'}:
+            raise HTTPException(
+                409,
+                f"Cannot export build with status {status.get('status')!r}; a completed build is required",
+            )
         root = service.build_root(build_id)
         workspace = (root/'workspace').resolve()
         if not workspace.is_dir() or not workspace.is_relative_to(root.resolve()):
             raise HTTPException(404,'Committed workspace not found')
+        cache_manifest = HISCache(state.workspace_root, build_id, workspace).load()
+        if cache_manifest is not None:
+            from .his_cache import blake3_file
+            for receipt in getattr(cache_manifest, 'receipts', None) or []:
+                for rel_artifact, expected_digest in (getattr(receipt, 'output_hashes', None) or {}).items():
+                    art_path = (workspace / rel_artifact).resolve()
+                    if not art_path.is_file() or not art_path.is_relative_to(workspace):
+                        raise HTTPException(409, f"Export blocked: missing verified artifact {rel_artifact}")
+                    if blake3_file(art_path) != expected_digest:
+                        raise HTTPException(409, f"Export blocked: receipt digest mismatch for {rel_artifact}")
         archive = root / ('export-'+uuid4().hex+'.zip')
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
             for path in sorted(workspace.rglob('*')):

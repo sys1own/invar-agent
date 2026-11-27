@@ -381,7 +381,7 @@ def sources(context):
     scheme = context.ir.research_reference.integration_scheme if context.ir.research_reference else 'rk4'
     runtime = KERNEL_RUNTIME
     if scheme != 'rk4':
-        helper = next(node for node in ast.parse(Path(research_reference.__file__).read_text()).body
+        helper = next(node for node in ast.parse(Path(research_reference.__file__).read_text(encoding="utf-8")).body
                       if isinstance(node,ast.FunctionDef) and node.name=='integrate_rhs')
         runtime = runtime.replace('def step(', 'def step_rk4(')
         runtime += '\n'+ast.unparse(helper).replace('ReferenceError(', 'ValueError(')+'\n'
@@ -472,7 +472,7 @@ namespaces=true
         f"{prefix}/sweep.py":SWEEP,f"{prefix}/serializers.py":SERIALIZERS,
         f"{prefix}/cli.py":f"from {pkg}.sdk import simulate\nif __name__=='__main__':\n    print(simulate().to_dict())\n"}
     if ir.research_reference is not None:
-        tree = ast.parse(Path(research_reference.__file__).read_text())
+        tree = ast.parse(Path(research_reference.__file__).read_text(encoding="utf-8"))
         static_loader = ast.parse('''def _safe_namespace(code):
     if __package__:
         from . import pinned_research
@@ -548,7 +548,7 @@ def emit(node,context):
         directory=context.overlay/prefix
         directory.mkdir(parents=True,exist_ok=True)
         for name in ("kernel.cpp","kernel.h"):
-            (directory/name).write_text(content[f"{prefix}/{name}"])
+            (directory/name).write_text(content[f"{prefix}/{name}"], encoding="utf-8")
         compiler=shutil.which('g++') or shutil.which('clang++')
         binary=b''
         if compiler and not context.python_fallback_active:

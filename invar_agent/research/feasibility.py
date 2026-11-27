@@ -115,21 +115,77 @@ _QUANTITATIVE_HINTS = re.compile(
     r"thermodynamic\w*|kinetic\w*|fluid\w*|acoustic\w*)\b", re.I)
 
 
+def _smt_contradiction_core(question: str) -> Optional[list[str]]:
+    """Detect direct scalar inequality contradictions (e.g. `M > 10` and `M < 5`)
+    and certify emptiness via Z3 SMT Q1 with a minimal UNSAT core."""
+    text = str(question or "")
+    # Extract simple scalar comparisons like "M > 10", "x <= 5.0", "mass >= 10"
+    pat = re.compile(
+        r"\b([A-Za-z][A-Za-z0-9_]{0,24})\s*(<=|>=|<|>|==)\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\b"
+    )
+    grouped: Dict[str, list[tuple[str, float, str]]] = {}
+    for m_obj in pat.finditer(text):
+        sym, op, num_s = m_obj.group(1), m_obj.group(2), m_obj.group(3)
+        if sym.lower() in {"if", "and", "or", "is", "to", "at", "in", "of", "for", "by", "on"}:
+            continue
+        try:
+            val = float(num_s)
+        except ValueError:
+            continue
+        grouped.setdefault(sym, []).append((op, val, f"{sym} {op} {num_s}"))
+    candidates = {sym: clauses for sym, clauses in grouped.items() if len(clauses) >= 2}
+    if not candidates:
+        return None
+    from ..runtime.isolation import run_on_z3_thread
+    import z3
+
+    def _check():
+        for sym, clauses in candidates.items():
+            solver = z3.Solver()
+            solver.set("smt.core.minimize", True)
+            solver.set(timeout=300)
+            var = z3.Real(sym)
+            labels: Dict[str, str] = {}
+            for idx, (op, val, raw) in enumerate(clauses):
+                rv = z3.RealVal(str(val))
+                expr = {
+                    "<": var < rv,
+                    "<=": var <= rv,
+                    ">": var > rv,
+                    ">=": var >= rv,
+                    "==": var == rv,
+                }[op]
+                lbl = z3.Bool(f"$q1_{idx}")
+                labels[str(lbl)] = raw
+                solver.assert_and_track(expr, lbl)
+            if solver.check() == z3.unsat:
+                core = [labels[str(b)] for b in solver.unsat_core() if str(b) in labels]
+                if len(core) >= 2:
+                    return sorted(core)
+        return None
+
+    return run_on_z3_thread(_check)
+
+
 def _heuristic_verdict(question: str) -> FeasibilityAssessment:
     q = question.lower()
-    from .shbt_federation import resolve_shbt_solvability
-    shbt_res = resolve_shbt_solvability(question)
-    if shbt_res.should_activate:
-        repos = ", ".join(s.repo for s in shbt_res.matched_repos)
+    # ARCH-003 (T-R5): Certify direct scalar contradictions via Z3 SMT Q1 UNSAT core
+    # BEFORE any SHBT or surrogate check.
+    smt_core = _smt_contradiction_core(question)
+    if smt_core:
         return FeasibilityAssessment(
-            verdict="OPTIMAL_DIRECT",
-            rationale=(f"Solved via SHBT Frontier Solvability Federation ({repos}): "
-                       "provides exact open-ledger/WZW/LANR/ZPE governing equations and SI constants."),
-            assessed_by="heuristic_offline")
+            verdict="REFUSED_IMPOSSIBLE",
+            rationale=(
+                f"Direct mathematical contradiction certified by SMT Q1 UNSAT core: "
+                f"{' AND '.join(smt_core)} has an empty feasible set."
+            ),
+            violated_boundary="SMT Q1 UNSAT (contradictory scalar constraints)",
+            reformulation="Remove or reconcile the contradictory inequality bounds so the feasible set is non-empty.",
+            smt_unsat_core=smt_core,
+            assessed_by="heuristic_offline",
+        )
     # Impossible: explicit pattern, or conservation + gain co-occurrence.
-    # Note: computational dynamical benchmarks often explain why *explicit*
-    # schemes (RK4/Euler) "violate conservation" — never treat that as an
-    # impossible user demand.
+    # ARCH-011: Impossibility checks ALWAYS run before SHBT (SHBT NEVER overrides refusals).
     is_comp_bench = bool(_COMPUTATIONAL_BENCHMARK_HINTS.search(q))
     for pattern, what in _IMPOSSIBLE_PATTERNS:
         if what == "conservation-law violation" and is_comp_bench:
@@ -155,6 +211,15 @@ def _heuristic_verdict(question: str) -> FeasibilityAssessment:
             reformulation=("Split into two verifiable sub-problems: (1) verify "
                            "conservation/invariant bounds, (2) maximise efficiency "
                            "subject to those bounds."),
+            assessed_by="heuristic_offline")
+    from .shbt_federation import resolve_shbt_solvability
+    shbt_res = resolve_shbt_solvability(question)
+    if shbt_res.should_activate:
+        repos = ", ".join(s.repo for s in shbt_res.matched_repos)
+        return FeasibilityAssessment(
+            verdict="OPTIMAL_DIRECT",
+            rationale=(f"SHBT Frontier Solvability Federation available ({repos}): "
+                       "provides open-ledger/WZW/LANR/ZPE governing equations and REGISTRY_ASSUMPTION constants."),
             assessed_by="heuristic_offline")
     unsuitable = _UNSUITABLE_PATTERNS + ([] if _QUANTITATIVE_HINTS.search(q) else _TASKS_REQUIRING_MODEL)
     for pattern, what in unsuitable:
@@ -257,12 +322,22 @@ def _assessment_from_llm(data: Dict[str, Any]) -> Optional[FeasibilityAssessment
         reformulation = ("Reformulate as a falsifiable quantitative question "
                          "with explicit governing equations and measurable "
                          "invariants that a deterministic sandbox can verify.")
+    questions = [str(x).strip() for x in (data.get("questions") or []) if str(x).strip()]
+    missing_fields = [str(x).strip() for x in (data.get("missing_fields") or []) if str(x).strip()]
+    smt_core = data.get("smt_unsat_core")
+    if isinstance(smt_core, list):
+        smt_core = [str(x).strip() for x in smt_core if str(x).strip()] or None
+    else:
+        smt_core = None
     try:
         return FeasibilityAssessment(
             verdict=verdict,
             rationale=truncate_at_sentence(str(data.get("rationale") or ""), 1200) or "LLM assessment",
             violated_boundary=str(data.get("violated_boundary") or "")[:400] or None,
             reformulation=reformulation[:600] or None,
+            questions=questions[:8],
+            missing_fields=missing_fields[:12],
+            smt_unsat_core=smt_core,
             assessed_by="llm")
     except Exception:  # noqa: BLE001
         return None
@@ -310,22 +385,11 @@ def override_refusal_for_computational_benchmark(
     assessment: FeasibilityAssessment,
 ) -> FeasibilityAssessment:
     """Convert false-positive LLM refusals on dynamical/integrator benchmarks to
-    ``REFORMULATED_SURROGATE`` with symmetric/compatible surrogate guidance."""
+    ``REFORMULATED_SURROGATE`` with symmetric/compatible surrogate guidance.
+
+    ARCH-011: SHBT activation NEVER overrides or elevates a feasibility refusal.
+    """
     verdict_str = str(getattr(assessment.verdict, "value", assessment.verdict) or "").upper()
-    if verdict_str in ("REFUSED_IMPOSSIBLE", "REFUSED_UNSUITABLE"):
-        from .shbt_federation import resolve_shbt_solvability
-        shbt_res = resolve_shbt_solvability(question)
-        if shbt_res.should_activate:
-            repos = ", ".join(s.repo for s in shbt_res.matched_repos)
-            return FeasibilityAssessment(
-                verdict=FeasibilityVerdict.OPTIMAL_DIRECT,
-                rationale=(
-                    f"Rescued via SHBT Frontier Solvability Federation ({repos}): "
-                    "open topological ledger / WZW / LANR / Dark-ZPE axioms provide exact "
-                    "closed-form governing equations and SI constants."
-                ),
-                assessed_by=assessment.assessed_by,
-            )
     if verdict_str == "REFUSED_IMPOSSIBLE" and not _SURROGATE_BENCHMARK_RESCUE_RE.search(str(question or "")):
         refusal_text = f"{assessment.violated_boundary or ''} {assessment.rationale or ''}"
         if _DIRECT_CONTRADICTION_RE.search(refusal_text):

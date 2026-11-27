@@ -215,7 +215,7 @@ def test_falsification_integrates_with_meaningfulness_and_receipt(tmp_path):
     assert m.verify_certificate_receipt(certificate)
     path = tmp_path/"meaningfulness_certificate.json"
     m.write_meaningfulness_certificate(certificate, path)
-    assert m.MeaningfulnessCertificate.model_validate_json(path.read_text()).falsification_certificate.passed
+    assert m.MeaningfulnessCertificate.model_validate_json(path.read_text(encoding="utf-8")).falsification_certificate.passed
     kwargs["fidelity_audit"] = fidelity().model_copy(update={"passed": False, "convergence_passed": False, "failure_reason": "FAILED"})
     with pytest.raises(ValidationError): m.build_meaningfulness_certificate(**kwargs)
 
@@ -251,7 +251,7 @@ def test_vault_loader_accepts_only_matching_receipted_signatures(tmp_path):
     path = directory/"meaningfulness_certificate.json"; m.write_meaningfulness_certificate(certificate, path)
     vault.records = [dict(run_id="prior", canonical_signature=signature.model_dump(mode="json"))]
     assert u.load_verified_vault_entries(vault)[0].run_id == "prior"
-    path.write_text(certificate.model_copy(update={"blake3_receipt": "0"*64}).model_dump_json())
+    path.write_text(certificate.model_copy(update={"blake3_receipt": "0"*64}).model_dump_json(), encoding="utf-8")
     with pytest.raises(ValueError, match="receipt"):
         u.load_verified_vault_entries(vault)
 

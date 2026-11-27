@@ -14,7 +14,7 @@ from invar_agent.schemas.research import ResearchBlueprint
 
 @pytest.fixture
 def replay():
-    return json.loads((Path(__file__).parent/'fixtures'/'live_seir_raw_plans.json').read_text())
+    return json.loads((Path(__file__).parent/'fixtures'/'live_seir_raw_plans.json').read_text(encoding="utf-8"))
 
 
 def corrected_plan(prompt):
@@ -61,8 +61,8 @@ async def test_exact_raw_replay_exhausts_repair_and_persists_certificate(replay,
     assert 4 <= len(calls) <= 6
     assert any('Exact formalization validation error' in c for c in calls)
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
-    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
-    metadata = json.loads((directory/'metadata.json').read_text())
+    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8")) == result.meaningfulness_certificate
+    metadata = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))
     assert 'FORMALIZATION_VALIDATION_FAILED' in metadata['planning_error']
     assert any(e.get('event') == 'research_completed' for e in events)
     assert all(e['event_version'] == '2.0' for e in events)
@@ -117,4 +117,4 @@ async def test_empty_json_plan_is_persisted_not_run(tmp_path):
     result = await machine.plan_and_run('Model x >= 2 with a finite domain')
     assert result.meaningfulness_certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
-    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
+    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8")) == result.meaningfulness_certificate

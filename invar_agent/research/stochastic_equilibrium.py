@@ -335,13 +335,16 @@ class _Roundoff:
             nlo, nhi = float(fn(lo)), float(fn(hi))
             alo, ahi = float(fn(math.nextafter(lo - error, -math.inf))), float(fn(math.nextafter(hi + error, math.inf)))
             return ((nlo, nhi), max(abs(ahi - nlo), abs(nhi - alo)))
+        if isinstance(node, ast.IfExp):
+            (alo, ahi), ea = self.expression(node.body, env, depth + 1)
+            (blo, bhi), eb = self.expression(node.orelse, env, depth + 1)
+            return ((min(alo, blo), max(ahi, bhi)), max(ea, eb))
         if isinstance(node,ast.Call) and ast.unparse(node.func) in {"min","max"}:
-            if len(node.args) != 2 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
-            (alo,ahi),ea = self.expression(node.args[0],env,depth+1)
-            (blo,bhi),eb = self.expression(node.args[1],env,depth+1)
+            if len(node.args) < 2 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
+            evals = [self.expression(arg, env, depth + 1) for arg in node.args]
             if ast.unparse(node.func) == "min":
-                return ((min(alo, blo), min(ahi, bhi)), max(ea, eb))
-            return ((max(alo, blo), max(ahi, bhi)), max(ea, eb))
+                return ((min(iv[0] for iv, _ in evals), min(iv[1] for iv, _ in evals)), max(err for _, err in evals))
+            return ((max(iv[0] for iv, _ in evals), max(iv[1] for iv, _ in evals)), max(err for _, err in evals))
         if isinstance(node,ast.Call) and ast.unparse(node.func) in {"pow","math.pow"}:
             if len(node.args) != 2 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
             exp_node = node.args[1]
@@ -409,14 +412,42 @@ class _Roundoff:
             local = {**self.globals, **dict(zip((a.arg for a in function.args.args),(self.expression(a,env,depth+1) for a in node.args)))}
             return self.body(function.body,local,depth+1)
         if not isinstance(node,ast.BinOp): raise UnsupportedVerification("RIGOROUS_ROUNDING_BOUND_UNAVAILABLE")
-        if isinstance(node.op,ast.Pow) and isinstance(node.right,ast.Constant) and type(node.right.value) is int and 0 <= node.right.value <= 16:
-            (lo,hi),error = self.expression(node.left,env,depth+1)
-            expression = m._parse(f"a**{node.right.value}")
-            nominal = m._iv(expression,{"a":(lo,hi)})
-            actual = m._iv(expression,{"a":(math.nextafter(lo-error,-math.inf),math.nextafter(hi+error,math.inf))})
-            error = math.nextafter(max(abs(actual.lo-nominal.hi),abs(actual.hi-nominal.lo)),math.inf)
-            if not math.isfinite(error+actual.lo+actual.hi): raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
-            return ((nominal.lo,nominal.hi),error)
+        if isinstance(node.op, ast.Pow):
+            exp_int = None
+            if isinstance(node.right, ast.Constant) and type(node.right.value) is int:
+                exp_int = node.right.value
+            elif isinstance(node.right, ast.UnaryOp) and isinstance(node.right.op, ast.USub) and isinstance(node.right.operand, ast.Constant) and type(node.right.operand.value) is int:
+                exp_int = -node.right.operand.value
+            if exp_int is not None and -16 <= exp_int <= 16:
+                (lo, hi), error = self.expression(node.left, env, depth + 1)
+                if exp_int >= 0:
+                    expression = m._parse(f"a**{exp_int}")
+                    nominal = m._iv(expression, {"a": (lo, hi)})
+                    actual = m._iv(expression, {"a": (math.nextafter(lo - error, -math.inf), math.nextafter(hi + error, math.inf))})
+                    error = math.nextafter(max(abs(actual.lo - nominal.hi), abs(actual.hi - nominal.lo)), math.inf)
+                    if not math.isfinite(error + actual.lo + actual.hi): raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
+                    return ((nominal.lo, nominal.hi), error)
+                # BUG-028: Negative integer power (e.g. rational saturation (1 + h*y)**-1)
+                # with proven non-zero denominator separation.
+                pos_k = -exp_int
+                if pos_k == 1:
+                    denom_nom_lo, denom_nom_hi = lo, hi
+                    denom_err = error
+                else:
+                    denom_nom = m._iv(m._parse(f"a**{pos_k}"), {"a": (lo, hi)})
+                    denom_nom_lo, denom_nom_hi = denom_nom.lo, denom_nom.hi
+                    denom_act = m._iv(m._parse(f"a**{pos_k}"), {"a": (math.nextafter(lo - error, -math.inf), math.nextafter(hi + error, math.inf))})
+                    denom_err = math.nextafter(max(abs(denom_act.lo - denom_nom_lo), abs(denom_act.hi - denom_nom_hi)), math.inf)
+                minimum = min(abs(denom_nom_lo), abs(denom_nom_hi)) if not (denom_nom_lo <= 0.0 <= denom_nom_hi) else 0.0
+                if minimum - denom_err <= self.minimum_divisor:
+                    raise UnsupportedVerification("ROUNDING_DENOMINATOR_NOT_SEPARATED")
+                u = sys.float_info.epsilon
+                inv_nom = m._iv(m._parse("1/b"), {"b": (denom_nom_lo, denom_nom_hi)})
+                inv_err = (denom_err / minimum) / (minimum - denom_err) + u / (minimum - denom_err) / (1 - u)
+                inv_err = math.nextafter(inv_err * (1 + 128 * u) + 128 * math.ulp(0.0), math.inf)
+                if not math.isfinite(inv_err + inv_nom.lo + inv_nom.hi):
+                    raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
+                return ((inv_nom.lo, inv_nom.hi), inv_err)
         a,ea = self.expression(node.left,env,depth); b,eb = self.expression(node.right,env,depth)
         if not all(map(math.isfinite, (*a, ea, *b, eb))):
             if isinstance(node.op, ast.Div):

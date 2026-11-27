@@ -365,8 +365,11 @@ def derive_ihcg_evidence(question, blueprint, raw):
     if len(selected) != len(slots):
         audit['unreferenced_slots'] = [slot for slot in slots if slot['symbol'] not in references]
     evidence['slots'] = selected
-    if assumptions_ledger:
-        evidence['assumptions_ledger'] = assumptions_ledger
+    # AUDIT-PATCH-002: NOTE entries are non-executable provenance; the sealed IhcgGraph
+    # schema rejects them (mirrors blueprint_compiler.compile_and_preflight_blueprint).
+    sealed_ledger = [entry for entry in assumptions_ledger if entry.get('kind') != 'NOTE']
+    if sealed_ledger:
+        evidence['assumptions_ledger'] = sealed_ledger
     if 'control_values' in evidence:
         evidence['control_values'] = {name: value for name, value in evidence['control_values'].items() if name in references}
     pack['domain'] = {name: bounds for name, bounds in raw_domain.items() if name in references}

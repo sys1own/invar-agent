@@ -270,7 +270,7 @@ def test_certificate_seal_eighth_gate_strict_schema_and_persistence(tmp_path):
     assert len(m.meaningfulness_gates(certificate)) == 8 and all(m.meaningfulness_gates(certificate).values())
     path = tmp_path/"meaningfulness_certificate.json"
     m.write_meaningfulness_certificate(certificate, path)
-    restored = m.MeaningfulnessCertificate.model_validate_json(path.read_text())
+    restored = m.MeaningfulnessCertificate.model_validate_json(path.read_text(encoding="utf-8"))
     assert restored.nontriviality_audit.passed and m.verify_certificate_receipt(restored)
     assert not m.verify_certificate_receipt(certificate.model_copy(update={"run_id": "changed"}))
     with pytest.raises(ValidationError):

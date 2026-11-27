@@ -13,7 +13,15 @@ def generate(output):
     lines=['# Reproducibility report',MODEL['ir']['title'],MODEL['ir']['summary'],'## Equations']
     for equation in MODEL['ir']['equations']:
         source=equation['provenance']
-        lines.append(equation['canonical_latex']+' — '+source['file']+': '+source['location'])
+        src_file=str(source.get('file','')).replace('\\\\','/')
+        for marker in ('.invar/research_vault/','uploads/','src/','provenance/'):
+            if marker in src_file:
+                src_file=src_file[src_file.index(marker):]
+                break
+        else:
+            if (len(src_file)>=2 and src_file[1]==':') or src_file.startswith('/'):
+                src_file=Path(src_file).name
+        lines.append(equation['canonical_latex']+' — '+src_file+': '+source['location'])
     lines.append('## Constants (SI)')
     for name,value in run.parameters.items():
         lines.append(name+' = '+str(value)+' '+MODEL['parameter_definitions'][name]['dimension']['canonical_unit'])

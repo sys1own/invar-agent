@@ -56,17 +56,17 @@ def _hits(n: int):
 def test_clear_workspace_preserves_vault_and_cleans_codebase(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     (ws / "src").mkdir(parents=True)
-    (ws / "src" / "main.rs").write_text("fn main() {}")
-    (ws / ".gitignore").write_text("*.pyc\n")
+    (ws / "src" / "main.rs").write_text("fn main() {}", encoding="utf-8")
+    (ws / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
     (ws / "cpp_core").mkdir()
-    (ws / "cpp_core" / "kernel.cpp").write_text("int main(){return 0;}")
+    (ws / "cpp_core" / "kernel.cpp").write_text("int main(){return 0;}", encoding="utf-8")
     (ws / "tests").mkdir()
-    (ws / "tests" / "test_parity.py").write_text("def test_x(): pass")
-    (ws / "hello.py").write_text("print('hi')")
+    (ws / "tests" / "test_parity.py").write_text("def test_x(): pass", encoding="utf-8")
+    (ws / "hello.py").write_text("print('hi')", encoding="utf-8")
     vault_run = ws / ".invar" / "research_vault" / "test_run"
     vault_run.mkdir(parents=True)
-    (vault_run / "report.md").write_text("# report")
-    (vault_run / "metadata.json").write_text(json.dumps({"run_id": "test_run"}))
+    (vault_run / "report.md").write_text("# report", encoding="utf-8")
+    (vault_run / "metadata.json").write_text(json.dumps({"run_id": "test_run"}), encoding="utf-8")
     scratch = ws / ".invar" / "scratch" / "cabi"
     scratch.mkdir(parents=True)
     (scratch / "temp.o").write_bytes(b"\x00")
@@ -83,10 +83,10 @@ def test_clear_workspace_preserves_vault_and_cleans_codebase(tmp_path, monkeypat
 
     for gone in ("src", "cpp_core", "tests", "hello.py"):
         assert not (ws / gone).exists(), gone
-    assert (ws / ".gitignore").read_text() == "*.pyc\n"
+    assert (ws / ".gitignore").read_text(encoding="utf-8") == "*.pyc\n"
     assert not (ws / ".invar" / "scratch").exists()
-    assert (vault_run / "report.md").read_text() == "# report"
-    assert json.loads((vault_run / "metadata.json").read_text())["run_id"] == "test_run"
+    assert (vault_run / "report.md").read_text(encoding="utf-8") == "# report"
+    assert json.loads((vault_run / "metadata.json").read_text(encoding="utf-8"))["run_id"] == "test_run"
 
     files = client.get("/api/files").json()
     assert files.get("entries", files if isinstance(files, list) else []) == [] or \
@@ -110,12 +110,12 @@ def test_project_workspace_defaults_to_isolated_workspace(tmp_path, monkeypatch)
 def test_workspace_clear_rejects_repository_markers(tmp_path, monkeypatch, marker):
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "keep.txt").write_text("keep")
+    (ws / "keep.txt").write_text("keep", encoding="utf-8")
     target = ws / marker
     if marker in {".git", "invar_agent"}:
         target.mkdir()
     else:
-        target.write_text("marker")
+        target.write_text("marker", encoding="utf-8")
 
     monkeypatch.setattr(server, "_STATE", None)
     client = TestClient(server.create_app(str(ws)))
@@ -124,7 +124,7 @@ def test_workspace_clear_rejects_repository_markers(tmp_path, monkeypatch, marke
     assert resp.status_code == 400
     assert "SecurityError: Cannot clear workspace. Target directory contains " \
            "invar-agent repository source files." in resp.json()["detail"]
-    assert (ws / "keep.txt").read_text() == "keep"
+    assert (ws / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert target.exists()
 
 
@@ -185,7 +185,7 @@ def test_literature_count_propagation_in_state_machine(tmp_path):
 
     meta_path = tmp_path / ".invar" / "research_vault" / "lit_count_run" / "metadata.json"
     assert meta_path.is_file()
-    assert json.loads(meta_path.read_text())["literature_count"] == 4
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["literature_count"] == 4
 
 
 def test_ui_dom_stepper_elements():

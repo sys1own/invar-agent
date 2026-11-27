@@ -497,8 +497,11 @@ async def _plan_llm_callable(state: ServerState, question: str,
     from invar_agent.llm.deepseek import DeepSeekChatClient
     kwargs: Dict[str, Any] = {}
     if isinstance(client, DeepSeekChatClient):
-        # Thinking mode would consume the whole planning budget on reasoning.
+        # Thinking mode would consume the whole planning budget on reasoning;
+        # always use strict JSON mode for planning/formalization (ARCH-008 / BUG-022).
         kwargs["thinking"] = False
+        if "json" in (question or "").lower():
+            kwargs["json_object"] = True
     resp = await asyncio.to_thread(client.complete, question,
                                    max_tokens=max_tokens, temperature=0.2, **kwargs)
     return resp.content if resp else None
@@ -515,6 +518,23 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
     except Exception:  # noqa: BLE001 - migration must never block startup
         pass
     app = FastAPI(title="invar-agent Web Console", version="0.1.0")
+
+    @app.middleware("http")
+    async def _optional_bearer_auth(request: Request, call_next):
+        """Enforce bearer/header token on state-changing endpoints when INVAR_API_TOKEN is set (ARCH-005)."""
+        expected_token = os.environ.get("INVAR_API_TOKEN", "").strip()
+        if expected_token and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            import hmac as _hmac
+            auth_hdr = request.headers.get("authorization") or ""
+            bearer = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+            alt = (request.headers.get("x-invar-token") or "").strip()
+            provided = bearer or alt
+            if not provided or not _hmac.compare_digest(provided, expected_token):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required: invalid or missing bearer token"},
+                )
+        return await call_next(request)
     builder_service = None
     try:
         from invar_agent.builder.api_router import BuilderUploadLimit, create_builder_router
@@ -1421,10 +1441,16 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             _research_vault_context(req.question, req.attached_research_ids)
             if req.attached_research_ids else ""
         )
-        diag_run_uid = f"run-{_uuid.uuid4().hex[:12]}"
+        # ARCH-006: Allocate run_uid BEFORE planning starts so every outcome emits
+        # exactly one terminal SSE v2.0 event scoped to this run_uid.
+        diag_run_uid = manager.allocate_run_uid()
         attempt_sink: list[dict[str, Any]] = []
         sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
         diag_dir: Optional[Path] = None
+
+        async def _scoped_plan_progress(channel: str, payload: dict[str, Any]) -> None:
+            await manager._progress(channel, payload, run_uid=diag_run_uid)
+
         try:
             outcome = await generate_plan_with_feasibility(
                 req.question,
@@ -1433,11 +1459,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 fallback=not has_llm,
                 assume_feasible=assume_feasible,
                 extra_context=direct_ctx,
-                progress_cb=manager._progress,
+                progress_cb=_scoped_plan_progress,
             )
         except (FormalizationError, ValueError) as exc:
             from invar_agent.research.epistemic import incomplete_certificate
-            from invar_agent.research.vault import ResearchVaultManager
+            from invar_agent.research.vault import ResearchVaultManager, write_vault_manifest
 
             if isinstance(exc, FormalizationError):
                 attempts_to_save = attempt_sink or list(exc.validation_attempts)
@@ -1468,6 +1494,11 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             (vault_dir / "meaningfulness_certificate.json").write_text(
                 certificate.model_dump_json(indent=2), encoding="utf-8"
             )
+            (vault_dir / "blueprint.json").write_text(
+                json.dumps({"blueprint_id": diag_run_uid, "research_prompt": req.question}, indent=2),
+                encoding="utf-8",
+            )
+            (vault_dir / "unified_module.py").write_text("", encoding="utf-8")
             (vault_dir / "report.md").write_text(
                 f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
                 encoding="utf-8",
@@ -1476,11 +1507,26 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 json.dumps(dict(
                     run_id=diag_run_uid,
                     status="INCONCLUSIVE_UNVERIFIED",
+                    epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
                     failure_reason="PLANNING_VALIDATION_FAILED",
                     planning_error=detail["message"],
                     diagnostics=detail,
                 )),
                 encoding="utf-8",
+            )
+            write_vault_manifest(
+                vault_dir,
+                run_id=diag_run_uid,
+                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                status="INCONCLUSIVE_UNVERIFIED",
+            )
+            state.research_broadcaster.publish_terminal(
+                diag_run_uid,
+                status="INCONCLUSIVE_UNVERIFIED",
+                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                stage="Planning",
+                error=detail["message"],
+                extra={"code": "PLANNING_VALIDATION_FAILED"},
             )
             return {
                 "status": "inconclusive",
@@ -1491,6 +1537,16 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                 "diagnostics": detail,
             }
         except Exception as exc:  # noqa: BLE001
+            from invar_agent.ir.total_fsm import TotalBoundaryAdapter
+            lifted = TotalBoundaryAdapter.lift_sync_error(exc)
+            state.research_broadcaster.publish_terminal(
+                diag_run_uid,
+                status="FAILED",
+                epistemic_verdict=lifted.get("terminal_state", "INCONCLUSIVE_UNVERIFIED"),
+                stage="Planning",
+                error=str(exc),
+                receipt=lifted,
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"research plan synthesis failed: {str(exc)}")
@@ -1504,11 +1560,48 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     extra_secrets=[state.api_key] if state.api_key else (),
                 )
         feasibility = outcome["feasibility"]
-        if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
-            return {"status": "refused", "started": False, "blueprint": None,
-                    "feasibility": feasibility.model_dump()}
+        if feasibility is not None:
+            verdict_upper = str(feasibility.verdict.value).upper()
+            if verdict_upper == "NEEDS_CLARIFICATION":
+                state.research_broadcaster.publish_terminal(
+                    diag_run_uid,
+                    status="NEEDS_CLARIFICATION",
+                    epistemic_verdict="NEEDS_CLARIFICATION",
+                    stage="Feasibility",
+                    extra={
+                        "questions": list(getattr(feasibility, "questions", None) or []),
+                        "missing_fields": list(getattr(feasibility, "missing_fields", None) or []),
+                    },
+                )
+                return {
+                    "status": "needs_clarification",
+                    "started": False,
+                    "blueprint": None,
+                    "run_uid": diag_run_uid,
+                    "feasibility": feasibility.model_dump(),
+                    "questions": list(getattr(feasibility, "questions", None) or []),
+                    "missing_fields": list(getattr(feasibility, "missing_fields", None) or []),
+                }
+            if verdict_upper.startswith("REFUSED"):
+                state.research_broadcaster.publish_terminal(
+                    diag_run_uid,
+                    status=verdict_upper,
+                    epistemic_verdict=verdict_upper,
+                    stage="Feasibility",
+                    extra={"feasibility": feasibility.model_dump()},
+                )
+                return {"status": "refused", "started": False, "blueprint": None,
+                        "run_uid": diag_run_uid,
+                        "feasibility": feasibility.model_dump()}
         blueprint_dict = outcome["blueprint"]
         if not blueprint_dict:
+            state.research_broadcaster.publish_terminal(
+                diag_run_uid,
+                status="FAILED",
+                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                stage="Planning",
+                error="research plan synthesis returned no blueprint",
+            )
             raise HTTPException(status_code=502,
                                 detail="research plan synthesis returned no blueprint")
         bp = ResearchBlueprint.model_validate(blueprint_dict)
@@ -1517,19 +1610,40 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
         manager.seeded_upload_ids = seeded
         manager.request_plan(bp)
-        if not manager.approve():
+        if not manager.approve(run_uid=diag_run_uid):
+            state.research_broadcaster.publish_terminal(
+                diag_run_uid,
+                status="FAILED",
+                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                stage="Approval",
+                error="could not start research run",
+            )
             raise HTTPException(status_code=409, detail="could not start research run")
         return {"status": "running", "started": True, "blueprint_id": bp.blueprint_id,
-                "run_uid": manager.active_run_uid,
+                "run_uid": diag_run_uid,
                 "source": outcome.get("source"),
                 "feasibility": feasibility.model_dump() if feasibility else None}
 
     @app.post("/api/v1/research/action")
     def api_research_action(req: ResearchActionRequest) -> dict[str, Any]:
+        from invar_agent.runtime.isolation import validate_kernel_ast_allowlist
+
+        def _validate_client_blueprint(raw_bp: dict[str, Any]) -> ResearchBlueprint:
+            bp_obj = parse_blueprint(raw_bp)
+            for code_field in (bp_obj.code_template, bp_obj.unified_module_code):
+                if code_field and str(code_field).strip():
+                    violations = validate_kernel_ast_allowlist(str(code_field), require_simulation_step=True)
+                    if violations:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"Client blueprint code failed AST allow-list: {'; '.join(violations)}",
+                        )
+            return bp_obj
+
         manager = state.ensure_research_manager()
         if req.action == "approve_plan":
             if req.blueprint is not None:
-                manager.edit(parse_blueprint(req.blueprint))
+                manager.edit(_validate_client_blueprint(req.blueprint))
             ok = manager.approve()
             if not ok:
                 raise HTTPException(status_code=409, detail="no pending research plan to approve")
@@ -1537,7 +1651,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         if req.action == "edit_plan":
             if req.blueprint is None:
                 raise HTTPException(status_code=400, detail="edit_plan requires a blueprint")
-            manager.edit(parse_blueprint(req.blueprint))
+            manager.edit(_validate_client_blueprint(req.blueprint))
             return {"status": "edited"}
         if req.action == "abort":
             manager.abort()
@@ -1576,37 +1690,33 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
         }
 
     @app.get("/api/v1/research/stream")
-    def api_research_stream(request: Request) -> StreamingResponse:
-        manager = state.ensure_research_manager()
+    def api_research_stream(request: Request, run_uid: Optional[str] = None) -> StreamingResponse:
+        state.ensure_research_manager()
         raw_last_id = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID") or ""
         try:
             since_seq = int(raw_last_id.strip()) if raw_last_id.strip() else 0
         except ValueError:
             since_seq = 0
-        q = state.research_broadcaster.subscribe(since_seq=since_seq)
-        # Sequence watermark: replayed history (seq <= watermark) must never
-        # close the stream; only fresh terminal events do.
+        q = state.research_broadcaster.subscribe(since_seq=since_seq, run_uid=run_uid)
         initial_seq = state.research_broadcaster.seq
         terminal_events = ("research_completed", "research_failed", "terminal_verdict")
 
         def event_generator():
-            # Sync generator (same pattern as /api/agent/stream): the broadcaster
-            # publishes from the research worker thread into a thread-safe queue.
             try:
                 while True:
                     try:
                         payload = q.get(timeout=RESEARCH_SSE_HEARTBEAT)
                     except queue.Empty:
-                        # SSE v2.0 15s keepalive comment: prevents nginx/proxy/browser idle drops.
                         yield ": keep-alive ping\n\n"
                         continue
                     seq_id = payload.get("seq", 0)
-                    terminal = (payload.get("event") in terminal_events
-                                and seq_id > initial_seq)
+                    is_terminal_event = payload.get("event") in terminal_events
+                    # When scoped to a specific run_uid, close after delivering its terminal event
+                    # even if that terminal event was already persisted in history before connect.
+                    terminal = is_terminal_event and (run_uid is not None or seq_id > initial_seq)
                     body = json.dumps({**payload, "event_version": "2.0"}, default=str)
                     yield f"id: {seq_id}\ndata: {body}\n\n"
                     if terminal:
-                        # Graceful close after flushing the absorbing terminal verdict.
                         break
             finally:
                 state.research_broadcaster.unsubscribe(q)

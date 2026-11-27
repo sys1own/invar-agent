@@ -1188,6 +1188,39 @@ def compile_and_preflight_blueprint(
     )
     fe_diags.extend(typed_diags)
 
+    # ARCH-001 (BUG-004): Normalize evidence["equations"] through the exact same
+    # expr_frontend as derived_expressions and obligations so variadic min/max,
+    # math.fabs, conditionals, and unicode operators have 100% parity everywhere.
+    eqs_map = evidence.get("equations")
+    if isinstance(eqs_map, dict):
+        for eq_sym, eq_spec in eqs_map.items():
+            if isinstance(eq_spec, dict) and isinstance(eq_spec.get("expression"), str):
+                res = _fe_normalize(
+                    eq_spec["expression"],
+                    declared_symbols=all_declared,
+                    domain=domain_preview,
+                    si_dims=slot_dims_map,
+                    quantifier_mode=q_mode,
+                )
+                if res.ok and res.canonical is not None:
+                    if res.canonical != eq_spec["expression"] or res.transforms:
+                        _fe_record_transform(f"equations.{eq_sym}.expression", eq_spec["expression"], res.transforms)
+                        eq_spec["expression"] = res.canonical
+                    fe_binder_assumptions.extend(res.binder_assumptions)
+                else:
+                    for ed in res.diagnostics:
+                        fe_diags.append(BlueprintDiagnostic(
+                            code=ed.code,
+                            field=f"equations.{eq_sym}.expression",
+                            symbol=eq_sym,
+                            message=ed.message,
+                            original=ed.original,
+                            column=ed.column,
+                            offending_token=ed.offending_token,
+                            hint=ed.hint,
+                            suggested_fix=ed.hint,
+                        ))
+
     # Normalize derived_expressions via front end (non-blocking here so unreferenced
     # blueprint helpers never block compilation; referenced ones are checked in _resolve_derived_topological).
     derived_fe_errors: Dict[str, List[BlueprintDiagnostic]] = {}
@@ -1826,6 +1859,19 @@ def compile_and_preflight_blueprint(
 
     # 7. Compile candidate IhcgGraph (strict structural validation without prose blocking).
     compile_kwargs = {k: v for k, v in pack.items() if k not in {"extensions", "execution", "notes"}}
+    # 7. Compile and validate IHCG structure.
+    # ARCH-002 (BUG-026): Pin user-fixed prompt literals (e.g. T_hot=600 K, gamma=0.1/day)
+    # to exact point domains so the LLM can never silently widen them.
+    from .claim_ledger import extract_claim_ledger, pin_user_literals_in_domain
+
+    prompt_for_ledger = question or bp.get("research_prompt") or ""
+    if prompt_for_ledger and isinstance(compile_kwargs.get("domain"), dict):
+        ledger = extract_claim_ledger(prompt_for_ledger)
+        if ledger.pinned_literals:
+            pinned_dom = pin_user_literals_in_domain(ledger, compile_kwargs["domain"])
+            compile_kwargs["domain"] = pinned_dom
+            pack["domain"] = pinned_dom
+
     try:
         graph = m.IhcgCompiler().compile_from_spec(
             compile_kwargs["evidence"],
@@ -1851,17 +1897,38 @@ def compile_and_preflight_blueprint(
     pool_diags = _check_initial_pool_conservation(bp, graph, constants)
     diagnostics.extend(pool_diags)
 
-    # 8b. Non-degenerate mechanism parameter domain check (catch point-domain mechanisms before sealing).
-    for mp in graph.mechanism_parameters:
-        lo_m, hi_m = graph.omega[mp]
-        if not (hi_m > lo_m):
-            diagnostics.append(BlueprintDiagnostic(
-                code="DEGENERATE_MECHANISM_DOMAIN",
-                field=f"domain.{mp}",
-                symbol=mp,
-                message=f"Mechanism parameter {mp!r} has a zero-width point domain [{lo_m}, {hi_m}].",
-                suggested_fix=f"Give mechanism_parameter {mp!r} a non-degenerate finite interval [lo, hi] with lo < hi (e.g. [0.0, {max(1.0, abs(hi_m) * 1.5):.6g}]) so sensitivity and null-baseline separation are well-defined.",
-            ))
+    # 8b. Non-degenerate mechanism parameter domain check (BUG-024):
+    # Deterministically demote user-fixed zero-width point-domain parameters out of
+    # mechanism_parameters when non-degenerate control parameters exist; never reject
+    # a user-fixed value (e.g. T_hot=600 K) as a degenerate mechanism.
+    non_degen_mps = [mp for mp in graph.mechanism_parameters if graph.omega[mp][1] > graph.omega[mp][0]]
+    if len(non_degen_mps) < len(graph.mechanism_parameters):
+        if non_degen_mps:
+            evidence["mechanism_parameters"] = non_degen_mps
+            compile_kwargs["evidence"] = evidence
+            graph = m.IhcgCompiler().compile_from_spec(
+                compile_kwargs["evidence"],
+                compile_kwargs["domain"],
+                compile_kwargs["archetype"],
+                prompt=question or bp.get("research_prompt") or "",
+            )
+        else:
+            # All parameters are user-fixed (e.g. Carnot T_hot=600 K, T_cold=300 K):
+            # demote to empty mechanism_parameters if another non-degenerate control exists,
+            # otherwise keep for deductive Mode 1 evaluation without failing planning.
+            other_controls = [
+                s.symbol for s in graph.slots
+                if s.role == "CONTROL_PARAM" and graph.omega[s.symbol][1] > graph.omega[s.symbol][0]
+            ]
+            if other_controls:
+                evidence["mechanism_parameters"] = other_controls[:2]
+                compile_kwargs["evidence"] = evidence
+                graph = m.IhcgCompiler().compile_from_spec(
+                    compile_kwargs["evidence"],
+                    compile_kwargs["domain"],
+                    compile_kwargs["archetype"],
+                    prompt=question or bp.get("research_prompt") or "",
+                )
 
     # 9. Fast Z3 non-vacuity / non-tautology sanity check.
     #    IMPORTANT: Genuine INFEASIBLE / INFEASIBLE_UNDER_MODEL claims (e.g. Carnot eta >= 0.65)
@@ -1879,12 +1946,38 @@ def compile_and_preflight_blueprint(
                 suggested_fix="Widen DERIVED_OBSERVABLE domain bounds and ensure environmental_assumptions do not already imply or contradict the domain.",
             ))
         elif vacuity.redundant_conjuncts:
-            diagnostics.append(BlueprintDiagnostic(
-                code="PREFLIGHT_REDUNDANT_CONJUNCTS",
-                field="ihcg_evidence.evidence.obligations",
-                message=f"Redundant conjuncts detected in obligations: {vacuity.redundant_conjuncts}.",
-                suggested_fix="Remove redundant HYPOTHESIS_TARGET clauses already implied by domain/environment or other obligations.",
-            ))
+            # BUG-025: Deterministically prune strictly redundant conjuncts when at least
+            # one non-redundant HYPOTHESIS_TARGET remains, rather than aborting planning.
+            redundant_ids = set(str(r) for r in vacuity.redundant_conjuncts)
+            raw_obs = list(evidence.get("obligations") or [])
+            pruned_obs = [
+                ob for idx_o, ob in enumerate(raw_obs)
+                if not (
+                    isinstance(ob, dict)
+                    and ob.get("obligation_class") == "HYPOTHESIS_TARGET"
+                    and (str(ob.get("id", "")) in redundant_ids or str(idx_o) in redundant_ids)
+                )
+            ]
+            has_hyp = any(
+                isinstance(ob, dict) and ob.get("obligation_class") == "HYPOTHESIS_TARGET"
+                for ob in pruned_obs
+            )
+            if has_hyp and len(pruned_obs) < len(raw_obs):
+                evidence["obligations"] = pruned_obs
+                compile_kwargs["evidence"] = evidence
+                graph = m.IhcgCompiler().compile_from_spec(
+                    compile_kwargs["evidence"],
+                    compile_kwargs["domain"],
+                    compile_kwargs["archetype"],
+                    prompt=question or bp.get("research_prompt") or "",
+                )
+            else:
+                diagnostics.append(BlueprintDiagnostic(
+                    code="PREFLIGHT_REDUNDANT_CONJUNCTS",
+                    field="ihcg_evidence.evidence.obligations",
+                    message=f"Redundant conjuncts detected in obligations: {vacuity.redundant_conjuncts}.",
+                    suggested_fix="Remove redundant HYPOTHESIS_TARGET clauses already implied by domain/environment or other obligations.",
+                ))
 
     bp["variable_map"] = variable_map
     bp["assumptions_ledger"] = assumptions_ledger

@@ -17,9 +17,9 @@ from invar_agent.server import create_app
 
 
 def _sample_workspace(tmp_path):
-    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
-    (tmp_path / "test_calc.py").write_text("from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n")
-    (tmp_path / "conftest.py").write_text("")
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "test_calc.py").write_text("from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n", encoding="utf-8")
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
     return tmp_path
 
 
@@ -81,7 +81,7 @@ def test_workspace_ingest_and_execute(client):
     report = exec_resp.json()
     assert report["nodes_total"] == 1
     assert report["nodes_committed"] == 1
-    assert "def sub" in (ws / "calc.py").read_text()
+    assert "def sub" in (ws / "calc.py").read_text(encoding="utf-8")
 
 
 def test_overlay_rollback_endpoint(client):

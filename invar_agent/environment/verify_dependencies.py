@@ -53,14 +53,14 @@ class DependencyGraphAuditor:
             return False
         try:
             if path.suffix == ".json":
-                json.loads(path.read_text())
+                json.loads(path.read_text(encoding="utf-8"))
                 return True
             if path.name == "Cargo.lock":
                 # Cargo.lock is TOML.
-                tomllib.loads(path.read_text())
+                tomllib.loads(path.read_text(encoding="utf-8"))
                 return True
             # requirements.txt: one requirement per line.
-            for line in path.read_text().splitlines():
+            for line in path.read_text(encoding="utf-8").splitlines():
                 s = line.strip()
                 if not s or s.startswith("#"):
                     continue
@@ -76,7 +76,7 @@ class DependencyGraphAuditor:
         if not path.exists():
             return []
         try:
-            data = tomllib.loads(path.read_text())
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             return []
         deps = data.get("project", {}).get("dependencies", [])

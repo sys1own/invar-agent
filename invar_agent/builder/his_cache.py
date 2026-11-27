@@ -136,7 +136,7 @@ class HISCache:
         if not self.path.exists():
             return None
         try:
-            state = HISCacheState.model_validate_json(self.path.read_text())
+            state = HISCacheState.model_validate_json(self.path.read_text(encoding="utf-8"))
             if state.build_id != self.build_id or Path(state.artifact_root).resolve() != self.artifact_root:
                 raise ValueError("Cache belongs to another build or artifact root")
             return state

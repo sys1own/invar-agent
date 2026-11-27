@@ -122,9 +122,12 @@ def _equivalent(lhs, rhs, *, dynamic_symbols=()):
                 else: raise UnsupportedVerification("SYMBOLIC_IDENTITY_DAG_OPERATOR_UNSUPPORTED")
                 memo[value] = result
                 return result
-            solver = z3.SolverFor("QF_NRA"); solver.set(timeout=500,rlimit=2_000_000)
-            solver.add(term(lhs) != term(rhs))
-            return solver.check() == z3.unsat
+            from ..runtime.isolation import run_on_z3_thread
+            def _z3_check_1():
+                solver = z3.SolverFor("QF_NRA"); solver.set(timeout=500,rlimit=2_000_000)
+                solver.add(term(lhs) != term(rhs))
+                return solver.check() == z3.unsat
+            return run_on_z3_thread(_z3_check_1)
     result = json.loads(_native.py_check_algebraic_equivalence(
         m._json(_proof_expression(lhs)), m._json(_proof_expression(rhs)),
         iter_limit=30, node_limit=20000, time_limit_ms=100))
@@ -152,10 +155,13 @@ def _equivalent(lhs, rhs, *, dynamic_symbols=()):
                 return self.atom(node)
             return self.generic_visit(node)
     left,right = Atomize().visit(left),Atomize().visit(right)
-    translator = m._Translator({name:(-1,1) for name in reserved},False)
-    solver = z3.SolverFor("QF_NRA"); solver.set(timeout=100,rlimit=1_000_000)
-    solver.add(translator.term(left) != translator.term(right))
-    return solver.check() == z3.unsat
+    from ..runtime.isolation import run_on_z3_thread
+    def _z3_check_2():
+        translator = m._Translator({name:(-1,1) for name in reserved},False)
+        solver = z3.SolverFor("QF_NRA"); solver.set(timeout=100,rlimit=1_000_000)
+        solver.add(translator.term(left) != translator.term(right))
+        return solver.check() == z3.unsat
+    return run_on_z3_thread(_z3_check_2)
 
 
 def _point_value(expression, values):
@@ -432,19 +438,79 @@ class _Kernel:
         }
         if temporal_slots or aux_tracker_slots:
             proof_tree = ast.parse(self.proof_code)
+            # BUG-007 (ARCH-004): Track local aliases of temporal/aux slots so
+            # `peak = buf.data[7]; if I_new > peak: peak = I_new; buf.data[7] = peak`,
+            # `peak = max(peak, I_new)`, and `peak = I_new if I_new > peak else peak`
+            # all normalize and certify cleanly without PIECEWISE_KERNEL_BINDING_UNSUPPORTED.
+            tracked_slots = set(temporal_slots) | set(aux_tracker_slots)
+            local_aliases: dict[str, int] = {}
+            for stmt in ast.walk(proof_tree):
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Subscript)
+                    and isinstance(stmt.value.slice, ast.Constant)
+                    and type(stmt.value.slice.value) is int
+                    and isinstance(stmt.value.value, ast.Attribute)
+                    and stmt.value.value.attr == "data"
+                    and isinstance(stmt.value.value.value, ast.Name)
+                    and stmt.value.value.value.id == "buf"
+                    and stmt.value.slice.value in tracked_slots
+                ):
+                    local_aliases[stmt.targets[0].id] = stmt.value.slice.value
+
             class _RunningExtremumNormalizer(ast.NodeTransformer):
+                def _slot_idx_for(self, target_node: ast.AST) -> int | None:
+                    if (
+                        isinstance(target_node, ast.Subscript)
+                        and isinstance(target_node.value, ast.Attribute)
+                        and target_node.value.attr == "data"
+                        and isinstance(target_node.slice, ast.Constant)
+                        and type(target_node.slice.value) is int
+                        and target_node.slice.value in tracked_slots
+                    ):
+                        return target_node.slice.value
+                    if isinstance(target_node, ast.Name) and target_node.id in local_aliases:
+                        return local_aliases[target_node.id]
+                    return None
+
+                def visit_Assign(self, node: ast.Assign):
+                    self.generic_visit(node)
+                    if len(node.targets) == 1:
+                        slot_idx = self._slot_idx_for(node.targets[0])
+                        if slot_idx is not None:
+                            kind = temporal_slots.get(slot_idx)
+                            tgt_src = ast.unparse(node.targets[0])
+                            if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and len(node.value.args) == 2:
+                                fn = node.value.func.id
+                                if (fn == "max" and kind in {"TRAJECTORY_MAX", None}) or (fn == "min" and kind in {"TRAJECTORY_MIN", None}):
+                                    a0, a1 = ast.unparse(node.value.args[0]), ast.unparse(node.value.args[1])
+                                    if a0 == tgt_src and a1 != tgt_src:
+                                        return ast.copy_location(ast.Assign(targets=node.targets, value=node.value.args[1]), node)
+                                    if a1 == tgt_src and a0 != tgt_src:
+                                        return ast.copy_location(ast.Assign(targets=node.targets, value=node.value.args[0]), node)
+                            if isinstance(node.value, ast.IfExp) and isinstance(node.value.test, ast.Compare) and len(node.value.test.ops) == 1 and len(node.value.test.comparators) == 1:
+                                lhs_s, rhs_s = ast.unparse(node.value.test.left), ast.unparse(node.value.test.comparators[0])
+                                body_s, orelse_s = ast.unparse(node.value.body), ast.unparse(node.value.orelse)
+                                op = node.value.test.ops[0]
+                                if orelse_s == tgt_src and body_s != tgt_src:
+                                    is_max = kind in {"TRAJECTORY_MAX", None} and ((lhs_s == body_s and rhs_s == tgt_src and isinstance(op, (ast.Gt, ast.GtE))) or (lhs_s == tgt_src and rhs_s == body_s and isinstance(op, (ast.Lt, ast.LtE))))
+                                    is_min = kind in {"TRAJECTORY_MIN", None} and ((lhs_s == body_s and rhs_s == tgt_src and isinstance(op, (ast.Lt, ast.LtE))) or (lhs_s == tgt_src and rhs_s == body_s and isinstance(op, (ast.Gt, ast.GtE))))
+                                    if is_max or is_min:
+                                        return ast.copy_location(ast.Assign(targets=node.targets, value=node.value.body), node)
+                    return node
+
                 def visit_If(self, node):
                     self.generic_visit(node)
-                    if (not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
-                            and len(node.body[0].targets) == 1
-                            and isinstance(node.body[0].targets[0], ast.Subscript)
+                    if (not node.orelse and len(node.body) in (1, 2)
+                            and all(isinstance(s, ast.Assign) and len(s.targets) == 1 for s in node.body)
                             and isinstance(node.test, ast.Compare) and len(node.test.ops) == 1
                             and len(node.test.comparators) == 1):
                         tgt = node.body[0].targets[0]
-                        if (isinstance(tgt.value, ast.Attribute) and tgt.value.attr == "data"
-                                and isinstance(tgt.slice, ast.Constant) and type(tgt.slice.value) is int
-                                and (tgt.slice.value in temporal_slots or tgt.slice.value in aux_tracker_slots)):
-                            kind = temporal_slots.get(tgt.slice.value)
+                        slot_idx = self._slot_idx_for(tgt)
+                        if slot_idx is not None:
+                            kind = temporal_slots.get(slot_idx)
                             tgt_src = ast.unparse(tgt)
                             val_src = ast.unparse(node.body[0].value)
                             lhs_src = ast.unparse(node.test.left)
@@ -459,7 +525,7 @@ class _Kernel:
                                 or (lhs_src == tgt_src and rhs_src == val_src and isinstance(op, (ast.Gt, ast.GtE)))
                             )
                             if (is_max or is_min) and tgt_src != val_src:
-                                return node.body[0]
+                                return node.body
                     # Skip pure NaN/overflow finiteness-flag guards on local variables
                     # (e.g. `if x != x: finite = 0.0` or `if x > 1e300: finite = 0.0`).
                     if (not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
@@ -529,13 +595,16 @@ class _Kernel:
             class BindOutputs(ast.NodeTransformer):
                 def visit_Name(self,node):
                     return m._parse(_expression(expected[node.id])) if node.id in expected else node
-            translator = _ExactTranslator(self.graph.omega,False)
-            solver = z3.Solver(); solver.set(timeout=1500)
-            for name,(lo,hi) in self.graph.omega.items():
-                solver.add(translator.formula(m._parse(f"{lo!r} <= {name} <= {hi!r}")))
-            clauses = [BindOutputs().visit(m._parse(e.expression)) for e in self.constraints.values()]
-            solver.add(z3.Not(z3.And(*(translator.formula(n) for n in clauses))))
-            if solver.check() != z3.unsat:
+            from ..runtime.isolation import run_on_z3_thread
+            def _z3_check_3():
+                translator = _ExactTranslator(self.graph.omega,False)
+                solver = z3.Solver(); solver.set(timeout=1500)
+                for name,(lo,hi) in self.graph.omega.items():
+                    solver.add(translator.formula(m._parse(f"{lo!r} <= {name} <= {hi!r}")))
+                clauses = [BindOutputs().visit(m._parse(e.expression)) for e in self.constraints.values()]
+                solver.add(z3.Not(z3.And(*(translator.formula(n) for n in clauses))))
+                return solver.check() == z3.unsat
+            if not run_on_z3_thread(_z3_check_3):
                 raise UnsupportedVerification("PHYSICAL_MODEL_CONSTRAINT_NOT_PRESERVED")
         locked_const_subs = {
             sp.Symbol(s.symbol): sp.Rational(str(self.graph.omega[s.symbol][0]))

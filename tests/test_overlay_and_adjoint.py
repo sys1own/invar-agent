@@ -23,9 +23,9 @@ def _node(node_id="n1", write_set=("calc.py",)):
 
 
 def _workspace(tmp_path):
-    (tmp_path / "calc.py").write_text("def add(a, b)\n    return a + b\n")
-    (tmp_path / "util.py").write_text("def mul(a, b):\n    return a * b\n")
-    (tmp_path / "extra.py").write_text("VALUE = 1\n")
+    (tmp_path / "calc.py").write_text("def add(a, b)\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "util.py").write_text("def mul(a, b):\n    return a * b\n", encoding="utf-8")
+    (tmp_path / "extra.py").write_text("VALUE = 1\n", encoding="utf-8")
 
 
 def test_three_sequential_patches_staged_disk_untouched(tmp_path):
@@ -49,8 +49,8 @@ def test_three_sequential_patches_staged_disk_untouched(tmp_path):
     assert len(staged) == 3
     assert "div" in staged["util.py"]
     # Live disk untouched.
-    assert "div" not in (tmp_path / "util.py").read_text()
-    assert (tmp_path / "extra.py").read_text() == "VALUE = 1\n"
+    assert "div" not in (tmp_path / "util.py").read_text(encoding="utf-8")
+    assert (tmp_path / "extra.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
 def test_rollback_via_adjoint_restores_bit_for_bit(tmp_path):
@@ -79,8 +79,8 @@ def test_rollback_via_adjoint_restores_bit_for_bit(tmp_path):
     digest_post = manager.compute_post_boundary(tx.tx_id)
     assert digest_post == digest_pre
     # Disk was never touched at any point.
-    assert (tmp_path / "calc.py").read_text() == "def add(a, b)\n    return a + b\n"
-    assert not (tmp_path / "NEW").exists() and "NEW = True" not in (tmp_path / "extra.py").read_text()
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == "def add(a, b)\n    return a + b\n"
+    assert not (tmp_path / "NEW").exists() and "NEW = True" not in (tmp_path / "extra.py").read_text(encoding="utf-8")
 
 
 def test_three_way_ast_merger_concurrent_functions():

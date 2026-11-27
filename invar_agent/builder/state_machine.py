@@ -40,7 +40,7 @@ from .uast_models import BuilderArchitectureSpec, BuilderProfile, BuilderUAST, I
 from .wavefront_scheduler import WavefrontScheduler
 
 
-_FORMAL_LOCK = threading.RLock()
+from ..runtime.isolation import Z3_GLOBAL_LOCK as _FORMAL_LOCK
 
 
 def _verify_ir(ir):
@@ -222,7 +222,7 @@ class BuilderStateMachine:
             self.ir = ir
             ir_file = self.root / "canonical_research_ir.json"
             ir_json = ir.model_dump(mode="json")
-            if ir_file.exists() and json.loads(ir_file.read_text()) != ir_json:
+            if ir_file.exists() and json.loads(ir_file.read_text(encoding="utf-8")) != ir_json:
                 raise BuildFault("IR_IMMUTABLE_CONFLICT", "Use a new build ID for a different research IR")
             if not ir_file.exists():
                 _atomic_json(ir_file, ir_json)
@@ -257,7 +257,7 @@ class BuilderStateMachine:
             self._plan = plan
             prior_receipt = self.root / 'build_receipt.json'
             if previous and prior_receipt.is_file():
-                prior = json.loads(prior_receipt.read_text())
+                prior = json.loads(prior_receipt.read_text(encoding="utf-8"))
                 if seal_receipt(prior).merkle_root_blake3 == prior.get('merkle_root_blake3') and prior['canonical_ir_digest'] == ir.ir_blake3_digest:
                     self.state.fallbacks = [record.copy() for record in prior['fallbacks'] if record['module_id'] in plan.cached_nodes]
                     if 'mod_sdk' in plan.cached_nodes:
@@ -376,7 +376,7 @@ class BuilderStateMachine:
                     hin_violation_count=int(code.startswith("HIN_")), z3_violation_count=int(code.startswith("Z3_")),
                     failed_test_count=getattr(exc, "details", {}).get("failed_test_count", 0), warning_count=0)
                 primary = node.target_relpath if slot else next((path for path in emission.files if path.endswith(".py") and not Path(path).name.startswith("test_")), None) if emission else None
-                source = (overlay / primary).read_text() if primary and (overlay / primary).exists() else ""
+                source = (overlay / primary).read_text(encoding="utf-8") if primary and (overlay / primary).exists() else ""
                 try:
                     syntax_digest = ast.dump(ast.parse(source), include_attributes=False)
                 except SyntaxError:
@@ -448,20 +448,20 @@ class BuilderStateMachine:
             if not relpath.endswith(".py"):
                 continue
             path = artifact_path(overlay, relpath)
-            source = self.healer.tier0(path.read_text(), node.kind if node.kind != "interface_port" else "module").source
+            source = self.healer.tier0(path.read_text(encoding="utf-8"), node.kind if node.kind != "interface_port" else "module").source
             tree = ast.parse(source)
             validate_source_capabilities(tree, leaf=node.kind == "llm_extension_slot", relpath=relpath)
-            path.write_text(source)
+            path.write_text(source, encoding="utf-8")
         if node.kind == "llm_extension_slot" and node.target_relpath.endswith(".py"):
-            tree = ast.parse((overlay / node.target_relpath).read_text())
+            tree = ast.parse((overlay / node.target_relpath).read_text(encoding="utf-8"))
             port = self._port(node)
             function = next((item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == port.port_name), None)
             if function is None or [arg.arg for arg in function.args.args] != [field.name for field in port.inputs] or function.args.vararg or function.args.kwarg or function.args.kwonlyargs or function.args.posonlyargs:
                 raise BuildFault("HIS_CONTRACT_DRIFT", "Frozen function signature drift")
 
     def _formal(self, node):
-        with _FORMAL_LOCK:
-            self._formal_locked(node)
+        from ..runtime.isolation import run_on_z3_thread
+        run_on_z3_thread(self._formal_locked, node)
 
     def _formal_locked(self, node):
         _verify_ir(self.ir)
@@ -546,14 +546,32 @@ class BuilderStateMachine:
             environment.update(HOME=str(overlay), TMPDIR=sandbox_tmp_str, TMP=sandbox_tmp_str, TEMP=sandbox_tmp_str,
                 PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
                 PYTHONPATH=os.pathsep.join([str(overlay), str(overlay / "src")]), OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
+            from ..runtime.isolation import attach_os_limits
+
+            environment["PYTHONUTF8"] = "1"
             config = dict(root=str(overlay), primary=node.target_relpath if node.kind == "llm_extension_slot" else emission.port_file, port=port.model_dump(mode="json") if port else None,
                 cases=cases, imports=[path for path in emission.files if path.endswith(".py") and not Path(path).name.startswith("test_")],
                 pytest_paths=[] if concolic else emission.pytest_paths, libraries=libraries)
-            process = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).with_name("_sandbox.py"))], input=canonical_json(config),
-                capture_output=True, text=True, cwd=overlay, env=environment, timeout=60)
-            markers = [line[len("INVAR_SANDBOX="):] for line in process.stdout.splitlines() if line.startswith("INVAR_SANDBOX=")]
-            if process.returncode or not markers:
-                raise BuildFault("OS_OOM_OR_DISK" if process.returncode == -9 else "SLOT_RUNTIME_LOGIC_ERROR", process.stderr[-4000:] or "Sandbox produced no result")
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-B", str(Path(__file__).with_name("_sandbox.py"))],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                cwd=overlay,
+                env=environment,
+            )
+            with attach_os_limits(proc, memory_limit_mb=1024, cpu_time_limit_s=60, active_process_limit=4):
+                try:
+                    stdout_text, stderr_text = proc.communicate(canonical_json(config), timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    raise BuildFault("OS_OOM_OR_DISK", "Sandbox execution timed out")
+            markers = [line[len("INVAR_SANDBOX="):] for line in (stdout_text or "").splitlines() if line.startswith("INVAR_SANDBOX=")]
+            if proc.returncode or not markers:
+                raise BuildFault("OS_OOM_OR_DISK" if proc.returncode == -9 else "SLOT_RUNTIME_LOGIC_ERROR", (stderr_text or "")[-4000:] or "Sandbox produced no result")
             result = json.loads(markers[-1])
             with self._telemetry_lock:
                 self.state.unloaded_handles += result["unloaded_handles"]

@@ -212,7 +212,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("INVAR_CONFIG_PATH", str(tmp_path / "invar-config.json"))
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     monkeypatch.setattr(server, "_STATE", None)
     app = create_app(str(ws))
     return TestClient(app)
@@ -272,7 +272,7 @@ def test_api_config_deepseek_valid_key_stores_tier_overrides(client, monkeypatch
     assert "sk-good" not in json.dumps(data)
     cfg_path = Path(os.environ["INVAR_CONFIG_PATH"])
     assert cfg_path.exists()
-    assert "sk-good" not in cfg_path.read_text()
+    assert "sk-good" not in cfg_path.read_text(encoding="utf-8")
 
 
 def test_api_config_validates_all_providers(client, monkeypatch):

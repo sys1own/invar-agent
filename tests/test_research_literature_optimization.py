@@ -411,7 +411,7 @@ def test_planner_prompts_request_concise_2_to_4_term_queries():
     from invar_agent.research.planner import PLANNER_PROMPT
     import invar_agent.research.planner as planner_mod
     prompts = [PLANNER_PROMPT]
-    src = Path(planner_mod.__file__).read_text()
+    src = Path(planner_mod.__file__).read_text(encoding="utf-8")
     # Both planner prompt variants demand concise keyword queries, never sentences.
     assert "2-4 terms" in src
     assert "NEVER full sentences" in src or "no full sentences" in src

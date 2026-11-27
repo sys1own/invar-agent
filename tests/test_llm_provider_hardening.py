@@ -76,7 +76,7 @@ def _models_client(handler):
 def app_client(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     server._STATE = None
     tc = TestClient(create_app(str(ws)))
     yield tc
@@ -442,7 +442,7 @@ def test_api_saved_config_survives_server_restart(tmp_path, monkeypatch):
     cfg = tmp_path / "config.json"
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (ws / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
 
     def handler(request):
         return httpx.Response(200, json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]})
@@ -456,8 +456,8 @@ def test_api_saved_config_survives_server_restart(tmp_path, monkeypatch):
     resp = first.post("/api/config", json={"provider": "deepseek", "api_key": SK_SECRET,
                                            "tier_overrides": {"reasoning": "deepseek-v4-pro"}})
     assert resp.status_code == 200
-    raw = json.loads(cfg.read_text())
-    assert raw["provider"] == "deepseek" and SK_SECRET not in cfg.read_text()
+    raw = json.loads(cfg.read_text(encoding="utf-8"))
+    assert raw["provider"] == "deepseek" and SK_SECRET not in cfg.read_text(encoding="utf-8")
     assert raw["tier_models"]["deepseek"] == {"reasoning": "deepseek-v4-pro"}
 
     # New process state, no env keys: provider + overrides come from the file.

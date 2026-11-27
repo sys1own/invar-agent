@@ -124,7 +124,7 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
     workspace = Path.home()/".invar-live-tests"/"meaningfulness"/f"{scenario}-{uuid.uuid4().hex}"
     assert not workspace.resolve().is_relative_to(Path(__file__).resolve().parents[1])
     workspace.mkdir(parents=True)
-    (workspace/"prompt.txt").write_text(prompt)
+    (workspace/"prompt.txt").write_text(prompt, encoding="utf-8")
     usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cache_hit_tokens": 0}
     clients = {}
     for tier in (Tier.REASONING, Tier.FAST):
@@ -173,9 +173,9 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
         assert isinstance(machine.verification_runner, DefaultVerificationRunner)
         state = await machine.plan_and_run(prompt)
         if hasattr(machine,"planner_result"):
-            (workspace/"planner_result.json").write_text(json.dumps(machine.planner_result, default=str, indent=2))
+            (workspace/"planner_result.json").write_text(json.dumps(machine.planner_result, default=str, indent=2), encoding="utf-8")
         run_dir = ResearchVaultManager(workspace).run_dir(state.blueprint.blueprint_id if state.blueprint else state.run_id)
-        certificate = parse_run_certificate((run_dir/"meaningfulness_certificate.json").read_text())
+        certificate = parse_run_certificate((run_dir/"meaningfulness_certificate.json").read_text(encoding="utf-8"))
         assert certificate == parse_run_certificate(state.meaningfulness_certificate)
         assert isinstance(certificate, m.MeaningfulnessCertificate), certificate.model_dump_json(indent=2)
         assert m.verify_certificate_receipt(certificate)
@@ -189,7 +189,7 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
             assert audit.preserved_steps + audit.projected_steps + audit.stabilized_steps == audit.total_steps
             assert 0 <= audit.enforcement_ratio <= 1
         assert certificate.purity_audit.passed and certificate.purity_audit.enforcement_ratio == 0
-        assert "| Enforcement ratio |" in (run_dir/"report.md").read_text()
+        assert "| Enforcement ratio |" in (run_dir/"report.md").read_text(encoding="utf-8")
         rho = certificate.fidelity_audit.convergence_reliability_ratio
         if certificate.ihcg_anchor.archetype in {"ODE_PDE", "PARAM_SWEEP"}: assert rho is not None
         if rho is not None: assert rho <= 1.0
@@ -229,5 +229,5 @@ async def test_live_meaningfulness_deepseek(scenario, prompt, expected, monkeypa
             models={tier.value: client.model for tier, client in clients.items()},
         )
         line = json.dumps(summary, sort_keys=True)
-        (workspace/"summary.json").write_text(line+"\n")
+        (workspace/"summary.json").write_text(line+"\n", encoding="utf-8")
         print("LIVE_MEANINGFULNESS "+line, flush=True)

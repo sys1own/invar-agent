@@ -44,7 +44,8 @@ TIER_MODEL_PREFERENCES: Dict[str, Dict[str, list]] = {
     "openrouter": {"fast": ["openrouter/auto"], "reasoning": ["openrouter/auto"]},
 }
 
-# Retired DeepSeek model IDs — never valid, kept only so tests can assert their absence.
+# Legacy DeepSeek model aliases — still accepted by the API (silently routed to
+# deepseek-flash), kept here so default-config tests verify we target the current IDs.
 RETIRED_DEEPSEEK_MODELS = frozenset({"deepseek-chat", "deepseek-reasoner"})
 
 # Expected API-key prefixes, used only for soft mismatch warnings.

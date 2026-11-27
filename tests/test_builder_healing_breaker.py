@@ -71,11 +71,11 @@ def test_leaf_response_contract_fences_and_private_redacted_capture(tmp_path, fe
     capture=next(tmp_path.glob('*.json'))
     if os.name != "nt":
         assert capture.stat().st_mode & 0o777 == 0o600
-    assert json.loads(capture.read_text())['raw_response'].startswith('```')
+    assert json.loads(capture.read_text(encoding="utf-8"))['raw_response'].startswith('```')
     client=Client()
     client.complete=lambda *args,**kwargs: LLMResponse(content=client.api_key, input_tokens=0, output_tokens=0)
     HealingController(client,diagnostics_dir=tmp_path).tier2("",node,port,graph,"",BuildBreakerBudget())
-    assert all(client.api_key not in path.read_text() for path in tmp_path.glob('*.json'))
+    assert all(client.api_key not in path.read_text(encoding="utf-8") for path in tmp_path.glob('*.json'))
 
 
 def test_leaf_truncated_fence_is_not_silently_accepted():
@@ -145,7 +145,7 @@ async def test_duplicate_fault_fingerprint_triggers_fallback(tmp_path):
     assert state.fallbacks[0]["trip_reason"].startswith("DUPLICATE_FAULT_FINGERPRINT")
     assert state.fallbacks[0]["fallback_verified"]
     assert not list((Path(state.workspace).parent / "overlays").rglob("slot_custom_viz"))
-    assert "def render_svg" in next(Path(state.workspace).rglob("slot_custom_viz.py")).read_text()
+    assert "def render_svg" in next(Path(state.workspace).rglob("slot_custom_viz.py")).read_text(encoding="utf-8")
     assert state.total_llm_tokens_used == 26
 
 

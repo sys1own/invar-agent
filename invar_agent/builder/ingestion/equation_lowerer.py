@@ -37,6 +37,20 @@ def unit_dimension(unit: str) -> SIDimensionVectorModel:
                "T": "kg/(s^2*A)", "Hz": "1/s", "N": "kg*m/s^2", "C": "A*s",
                "V": "kg*m^2/(s^3*A)", "L": "m^3", "rad": "1", "Morgan": "1",
                "fraction": "1", "dimensionless": "1", "unitless": "1", "units": "1", "dB": "1", "bit": "1", "bp": "1", "kg/kg": "1"}
+    unit = (unit or "1").strip()
+    # ARCH-009 (BUG-018): Normalize Unicode superscripts and middle-dots in compound units
+    # such as `W/(m²·K)`, `m·s⁻¹`, `J/(kg·K)`, `F/m²`.
+    unit = (
+        unit.replace("·", "*")
+        .replace("⋅", "*")
+        .replace("×", "*")
+        .replace("−", "-")
+        .replace("²", "**2")
+        .replace("³", "**3")
+        .replace("⁻¹", "**-1")
+        .replace("⁻²", "**-2")
+        .replace("⁻³", "**-3")
+    )
     bases = {name: tuple(int(i == index) for i in range(7))
              for index, name in enumerate(("m", "kg", "s", "A", "K", "mol", "cd"))}
     for name, expanded in aliases.items():
@@ -129,19 +143,41 @@ def classify_equation(text: str) -> EquationRole:
         return EquationRole.INVARIANT_CONTRACT
     if re.search(r"\([^,]+,\s*t\)|partial.?Omega", text):
         return EquationRole.BOUNDARY_CONDITION
-    if re.match(r"\s*\w+\((?:0|t_?0)\)\s*=|\s*\w+_0\s*=", text):
+    # BUG-036: Only treat `\w+_0 = <number>` as INITIAL_CONDITION; algebraic formulas
+    # like `P_0 = 1 / (sum + ...)` are ALGEBRAIC_CLOSURE, not initial conditions!
+    if re.match(r"\s*\w+\((?:0|t_?0)\)\s*=", text) or re.fullmatch(rf"\s*\w+_0\s*=\s*{NUMBER}\s*", text):
         return EquationRole.INITIAL_CONDITION
     if re.fullmatch(rf"\s*[A-Za-z_]\w*\s*=\s*{NUMBER}\s*", text):
         return EquationRole.PARAMETER_TABLE
     return EquationRole.ALGEBRAIC_CLOSURE
 
 
-def parse_expression(text: str):
-    """Parse ASCII through a whitelist, never sympify/eval uploaded expressions."""
+def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
+    """Parse ASCII through a whitelist, never sympify/eval uploaded expressions.
+
+    ARCH-009 (BUG-016): Strict Symbol Identity — any identifier in `declared_symbols`
+    (including `e`, `E`, `pi`, `I`, `S`, `N`, `lambda`, `gamma`) ALWAYS binds to a user
+    `sp.Symbol`, NEVER silently substituted with `sp.E`/`sp.pi`/`sp.I`.
+    """
     if len(text) > 8192:
         raise ValueError("Equation size limit exceeded")
+    declared = set(declared_symbols or ())
     text = text.replace("\\cdot", "*")
     latex_text = text
+
+    def _restore_declared(expr):
+        if not declared:
+            return expr
+        subs = {}
+        if "e" in declared and expr.has(sp.E):
+            subs[sp.E] = sp.Symbol("e")
+        if "E" in declared and expr.has(sp.E):
+            subs[sp.E] = sp.Symbol("E")
+        if "pi" in declared and expr.has(sp.pi):
+            subs[sp.pi] = sp.Symbol("pi")
+        if "I" in declared and expr.has(sp.I):
+            subs[sp.I] = sp.Symbol("I")
+        return expr.xreplace(subs) if subs else expr
 
     def latex_expression(source):
         try:
@@ -152,8 +188,9 @@ def parse_expression(text: str):
             raise ValueError(f"Unparseable LaTeX expression: {exc}") from exc
         if not isinstance(result, sp.Basic):
             raise ValueError("Ambiguous LaTeX expression")
-        return result.xreplace({symbol:sp.Symbol(re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}',r'\1_\2',str(symbol)))
+        result = result.xreplace({symbol:sp.Symbol(re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}',r'\1_\2',str(symbol)))
                                 for symbol in result.free_symbols})
+        return _restore_declared(result)
 
     ascii_text = re.sub(
         r'\\?([A-Za-z]\w*)_\{([A-Za-z0-9_,]+)\}',
@@ -169,14 +206,18 @@ def parse_expression(text: str):
     ascii_text = re.sub(r"10\^\{([+-]?\d+)\}", r"10**(\1)", ascii_text)
     if "\\" in ascii_text or "{" in ascii_text:
         return latex_expression(latex_text)
-    text = ascii_text
+    # BUG-016: Allow `lambda` as a valid mathematical symbol name without Python syntax error.
+    text = re.sub(r"\blambda\b", "__invar_sym_lambda__", ascii_text)
     functions = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log,
                  "sqrt": sp.sqrt, "abs": sp.Abs, "Abs": sp.Abs,
                  "min": sp.Min, "Min": sp.Min, "max": sp.Max, "Max": sp.Max}
 
     def convert(node):
         if isinstance(node, ast.Name):
-            return {"pi": sp.pi, "e": sp.E, "True": sp.true, "False": sp.false}.get(node.id, sp.Symbol(node.id))
+            name = "lambda" if node.id == "__invar_sym_lambda__" else node.id
+            if name in declared:
+                return sp.Symbol(name)
+            return {"pi": sp.pi, "e": sp.E, "True": sp.true, "False": sp.false}.get(name, sp.Symbol(name))
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             return sp.true if node.value else sp.false
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
@@ -222,7 +263,7 @@ def parse_expression(text: str):
     return convert(tree.body)
 
 
-def equation_parts(text: str):
+def equation_parts(text: str, *, declared_symbols: set[str] | None = None):
     parts = re.split(r"(<=|>=|==|=|<|>)", text, maxsplit=1)
     if len(parts) != 3:
         raise ValueError("Equation requires a relation")
@@ -232,9 +273,14 @@ def equation_parts(text: str):
     left = re.sub(r"\\dot\{([A-Za-z_]\w*)\}", r"\1", left)
     left = re.sub(r"\\frac\{d\s*([A-Za-z_]\w*)\}\{d\s*t\}", r"\1", left)
     left = re.sub(r"([A-Za-z_]\w*)\((?:0|t_?0)\)", r"\1", left)
-    left = re.sub(r"([A-Za-z_]\w*)_0\b", r"\1", left)
+    if re.fullmatch(rf"\s*{NUMBER}\s*", right.strip()):
+        left = re.sub(r"([A-Za-z_]\w*)_0\b", r"\1", left)
     left = re.sub(r"([A-Za-z_]\w*)_\{?n\s*\+\s*1\}?", r"\1", left)
-    return parse_expression(left.strip()), relation, parse_expression(right.strip())
+    return (
+        parse_expression(left.strip(), declared_symbols=declared_symbols),
+        relation,
+        parse_expression(right.strip(), declared_symbols=declared_symbols),
+    )
 
 
 def to_csel(expr) -> dict:
@@ -303,6 +349,11 @@ def _z3(expr):
 
 
 def check_z3(ir: CanonicalResearchIR) -> None:
+    from invar_agent.runtime.isolation import run_on_z3_thread
+    run_on_z3_thread(_check_z3_locked, ir)
+
+
+def _check_z3_locked(ir: CanonicalResearchIR) -> None:
     solver = z3.Solver()
     solver.set(timeout=2000)
     const_vals = {}
@@ -367,7 +418,7 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
     defined = {c.symbol for c in constants} | set(metadata.get("state_symbols", []))
     for equation in equations:
         try:
-            left, _, right = equation_parts(equation.canonical_latex)
+            left, _, right = equation_parts(equation.canonical_latex, declared_symbols=defined)
             equation.lhs_symbol = str(left) if isinstance(left, sp.Symbol) else None
             equation.referenced_symbols = sorted(str(symbol) for symbol in left.free_symbols | right.free_symbols)
             if equation.lhs_symbol and equation.role in (EquationRole.EVOLUTION_LAW, EquationRole.ALGEBRAIC_CLOSURE, EquationRole.INITIAL_CONDITION):
@@ -387,6 +438,78 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
             defined.add(parameter.symbol)
     dimensions = {c.symbol: c.dimension.model_dump() for c in constants}
     dimensions.update(metadata.get("symbol_dimensions", {}))
+    # ARCH-009 (BUG-018): Jointly infer SI dimensions for ODE states AND algebraic closures
+    # from declared parameter units via linear dimensional system rather than defaulting to [0]*7.
+    unknown_syms = [
+        eq.lhs_symbol for eq in equations
+        if eq.role in (EquationRole.EVOLUTION_LAW, EquationRole.ALGEBRAIC_CLOSURE)
+        and eq.lhs_symbol and eq.lhs_symbol not in dimensions
+    ]
+    # Deduplicate preserving order
+    unknown_syms = list(dict.fromkeys(unknown_syms))
+    if unknown_syms:
+        dim_vars = {name: [sp.Symbol(f"_sdim_{idx}_{ax}") for ax in range(7)] for idx, name in enumerate(unknown_syms)}
+        known_dims = {name: list(val.get("exponents", (0,) * 7)) for name, val in dimensions.items()}
+        known_dims["t"] = [0, 0, 1, 0, 0, 0, 0]
+        dim_constraints = []
+
+        def _expr_dim(ex):
+            if ex.is_Number or ex in (sp.pi, sp.E):
+                return [0] * 7
+            if isinstance(ex, sp.Symbol):
+                s = str(ex)
+                return known_dims.get(s, dim_vars.get(s, [0] * 7))
+            if isinstance(ex, sp.Add):
+                parts = [_expr_dim(a) for a in ex.args]
+                for part in parts[1:]:
+                    dim_constraints.extend(a - b for a, b in zip(parts[0], part))
+                return parts[0]
+            if isinstance(ex, sp.Mul):
+                parts = [_expr_dim(a) for a in ex.args]
+                return [sum(p[ax] for p in parts) for ax in range(7)]
+            if isinstance(ex, sp.Pow) and ex.exp.is_Rational:
+                base_d = _expr_dim(ex.base)
+                return [v * ex.exp for v in base_d]
+            if ex.func in (sp.sin, sp.cos, sp.exp, sp.log):
+                inner = _expr_dim(ex.args[0])
+                dim_constraints.extend(inner)
+                return [0] * 7
+            if ex.func == sp.Abs:
+                return _expr_dim(ex.args[0])
+            return [0] * 7
+
+        for eq in equations:
+            if eq.role in (EquationRole.EVOLUTION_LAW, EquationRole.ALGEBRAIC_CLOSURE) and eq.lhs_symbol in dim_vars:
+                try:
+                    _l, _, _r = equation_parts(eq.canonical_latex, declared_symbols=defined)
+                    rhs_d = _expr_dim(_r)
+                    if eq.role == EquationRole.EVOLUTION_LAW:
+                        dim_constraints.extend(
+                            a - b - c for a, b, c in zip(dim_vars[eq.lhs_symbol], known_dims["t"], rhs_d)
+                        )
+                    else:
+                        dim_constraints.extend(
+                            a - c for a, c in zip(dim_vars[eq.lhs_symbol], rhs_d)
+                        )
+                except Exception:
+                    pass
+        all_v = [v for vec in dim_vars.values() for v in vec]
+        if dim_constraints and all_v:
+            sol_set = sp.linsolve(dim_constraints, all_v)
+            if sol_set and sol_set is not sp.EmptySet:
+                vals = list(next(iter(sol_set)))
+                free_map = {sym: 0 for v in vals for sym in v.free_symbols}
+                vals = [v.subs(free_map) for v in vals]
+                for idx, name in enumerate(unknown_syms):
+                    exps = vals[idx * 7 : (idx + 1) * 7]
+                    if all(v.is_Integer for v in exps):
+                        p = tuple(int(v) for v in exps)
+                        unit_lbl = "*".join(
+                            b + (f"^{pw}" if pw != 1 else "")
+                            for b, pw in zip(("m", "kg", "s", "A", "K", "mol", "cd"), p)
+                            if pw
+                        ) or "1"
+                        dimensions[name] = SIDimensionVectorModel(exponents=p, canonical_unit=unit_lbl).model_dump()
     for sym in metadata.get("state_symbols", []):
         dimensions.setdefault(sym, SIDimensionVectorModel().model_dump())
     for equation in equations:
@@ -405,7 +528,7 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
             and str(getattr(equation.provenance, "location", "") or "").startswith("vault:")
         )
         try:
-            left, _, right = equation_parts(equation.canonical_latex)
+            left, _, right = equation_parts(equation.canonical_latex, declared_symbols=defined)
             csel = to_csel(right)
             lhs = to_csel(left)
             if equation.role == EquationRole.EVOLUTION_LAW:
@@ -423,7 +546,7 @@ def lower_and_verify_equations(raw_eqs: list[RawEquation], raw_constants: list[R
             if equation.lhs_symbol not in dimensions and equation.lhs_symbol:
                 dimensions[equation.lhs_symbol] = rhs_dim.model_dump()
             lhs_dim = _dimension(lhs, dimensions)
-            if equation.role == EquationRole.INVARIANT_CONTRACT and right.is_number:
+            if equation.role in (EquationRole.INVARIANT_CONTRACT, EquationRole.INITIAL_CONDITION) and right.is_number:
                 rhs_dim = lhs_dim.model_copy(deep=True)
             if lhs_dim.exponents != rhs_dim.exponents and right != 0:
                 if is_vault_law:

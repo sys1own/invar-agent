@@ -25,7 +25,7 @@ from . import meaningfulness as m
 from .extractor import ReferenceRegistry as LEGACY_REFERENCE_REGISTRY, parse_equation
 
 
-VaultClass = Literal["NOVEL_FIRST_IN_VAULT", "EXACT_ALGEBRAIC_DUPLICATE", "VALID_DOMAIN_EXTENSION", "VALID_BOUND_SHARPENING", "VALID_COUPLED_EXTENSION", "VALID_REFUTATION_OF_PRIOR"]
+VaultClass = Literal["NOVEL_FIRST_IN_VAULT", "NOVEL_INDEPENDENT", "EXACT_ALGEBRAIC_DUPLICATE", "VALID_DOMAIN_EXTENSION", "VALID_BOUND_SHARPENING", "VALID_COUPLED_EXTENSION", "VALID_REFUTATION_OF_PRIOR"]
 
 
 class CanonicalizationError(ValueError):
@@ -466,9 +466,13 @@ def check_intra_vault_uniqueness(candidate_cds: CdsTriplet, ihcg: m.IhcgGraph, v
         rank = {"VALID_REFUTATION_OF_PRIOR": 0, "VALID_BOUND_SHARPENING": 1, "VALID_DOMAIN_EXTENSION": 2}
         return min(admissions, key=lambda a: (rank[a.vault_class], a.related_run_id))
     if all(entry.cds.model_hash != candidate_cds.model_hash for entry in entries):
-        if active_audit and active_audit.coupling_passed and significance_audit and significance_audit.passed and compared_run_id in {e.run_id for e in entries}:
-            return VaultUniquenessAudit(passed=True, vault_class="VALID_COUPLED_EXTENSION", related_run_id=f"@research:{compared_run_id}", lineage_edge="coupled_extension_of")
-        return VaultUniquenessAudit(passed=False, failure_reason="ACTIVE_COUPLING_AND_PRIOR_BASELINE_SIGNIFICANCE_REQUIRED")
+        if compared_run_id is not None and compared_run_id in {e.run_id for e in entries}:
+            if active_audit and active_audit.coupling_passed and significance_audit and significance_audit.passed:
+                return VaultUniquenessAudit(passed=True, vault_class="VALID_COUPLED_EXTENSION", related_run_id=f"@research:{compared_run_id}", lineage_edge="coupled_extension_of")
+            return VaultUniquenessAudit(passed=False, failure_reason="ACTIVE_COUPLING_AND_PRIOR_BASELINE_SIGNIFICANCE_REQUIRED")
+        # ARCH-003 (BUG-008): A model whose canonical family does not exist in the Vault
+        # is NOVEL_INDEPENDENT and passes; coupling checks apply only when extending a baseline.
+        return VaultUniquenessAudit(passed=True, vault_class="NOVEL_INDEPENDENT")
     return VaultUniquenessAudit(passed=False, failure_reason="PI_DOMAIN_OR_STRICT_STRENGTHENING_UNPROVEN" if unresolved else "NOVELTY_UNPROVEN")
 
 
@@ -550,7 +554,9 @@ def load_verified_vault_entries(vault) -> tuple[VaultEntry, ...]:
         if blueprint_path.is_file():
             from ..schemas.research import ResearchBlueprint
             from .epistemic import compile_blueprint_ihcg
-            blueprint = ResearchBlueprint.model_validate_json(blueprint_path.read_text())
+            # AUDIT-PATCH-006: vault blueprints are UTF-8; cp1252 decoding poisoned every later
+            # run on Windows once any verified entry contained non-ASCII text.
+            blueprint = ResearchBlueprint.model_validate_json(blueprint_path.read_text(encoding="utf-8"))
             pack = blueprint.ihcg_evidence or {}
             if any(s.get("unit_scale",[1,1]) != [1,1] for e in [pack,*pack.get("extensions",())] for s in e.get("evidence",{}).get("slots",())):
                 graph = compile_blueprint_ihcg(blueprint,stage=cds.stage_count)

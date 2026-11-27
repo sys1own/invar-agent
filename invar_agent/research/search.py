@@ -1450,7 +1450,7 @@ class LiteratureSearchClient:
         if path is None or not path.exists():
             return []
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             return [LiteratureResult(**item) for item in data]
         except Exception:  # noqa: BLE001 - corrupt cache is a miss
             return []
@@ -1461,6 +1461,6 @@ class LiteratureSearchClient:
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(items))
+            path.write_text(json.dumps(items), encoding="utf-8")
         except Exception:  # noqa: BLE001 - cache is best-effort
             pass

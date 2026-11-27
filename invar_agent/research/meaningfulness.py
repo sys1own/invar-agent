@@ -336,7 +336,7 @@ class UniquenessAudit(StrictModel):
     cds_model_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     cds_claim_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     cds_full_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    vault_class: Literal["NOVEL_FIRST_IN_VAULT", "EXACT_ALGEBRAIC_DUPLICATE", "VALID_DOMAIN_EXTENSION", "VALID_BOUND_SHARPENING", "VALID_COUPLED_EXTENSION", "VALID_REFUTATION_OF_PRIOR"] | None
+    vault_class: Literal["NOVEL_FIRST_IN_VAULT", "NOVEL_INDEPENDENT", "EXACT_ALGEBRAIC_DUPLICATE", "VALID_DOMAIN_EXTENSION", "VALID_BOUND_SHARPENING", "VALID_COUPLED_EXTENSION", "VALID_REFUTATION_OF_PRIOR"] | None
     related_run_id: str | None = None
     reference_nontrivial: bool
     shbt_open_boundary_closure: bool = False
@@ -490,6 +490,7 @@ class MeaningfulnessCertificate(StrictModel):
     trust_boundary_version: Literal["invar.tcb.phase2a.native-libm16.v1"] = TRUST_BOUNDARY_VERSION
     uast_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     assumptions_ledger: tuple[FormalizationAssumptionRecord, ...] = ()
+    failure_reason: str | None = None
     blake3_receipt: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_serializer(mode="wrap")
@@ -497,6 +498,7 @@ class MeaningfulnessCertificate(StrictModel):
         data = handler(self)
         if data.get("certified_valid_domain") is None: data.pop("certified_valid_domain",None)
         if not self.assumptions_ledger: data.pop("assumptions_ledger", None)
+        if data.get("failure_reason") is None: data.pop("failure_reason", None)
         return data
 
     @model_validator(mode="after")
@@ -1215,34 +1217,38 @@ def _solve_query(expression: str, domain: Mapping[str, Sequence[float]], *, witn
     node = Fixed().visit(node)
     degree = _degree(node)
     if degree <= 1 or not prefer_linear_outer and degree <= 6 and len(_variables(node)) <= 8:
+        from ..runtime.isolation import Z3_GLOBAL_LOCK
         tier = "QF_LRA" if degree <= 1 else "QF_NRA"
-        tr = _Translator(box, False)
-        formula = tr.formula(node)
-        solver = z3.SolverFor(tier)
-        remaining = max(0, int((deadline-time.monotonic())*1000))
-        if remaining:
-            solver.set(timeout=min(500 if tier == "QF_LRA" else 1200, remaining), rlimit=1_000_000 if tier == "QF_LRA" else 5_000_000)
-            solver.add(*tr.constraints, formula)
-            answer = solver.check()
-            if answer == z3.unsat: return QueryResult(status="UNSAT", z3_tier_used=tier)
-            if answer == z3.sat:
-                model = solver.model()
-                return QueryResult(status="SAT", z3_tier_used=tier, witness=_model_point(model, tr.vars), exact_model=str(model))
+        with Z3_GLOBAL_LOCK:
+            tr = _Translator(box, False)
+            formula = tr.formula(node)
+            solver = z3.SolverFor(tier)
+            remaining = max(0, int((deadline-time.monotonic())*1000))
+            if remaining:
+                solver.set(timeout=min(500 if tier == "QF_LRA" else 1200, remaining), rlimit=1_000_000 if tier == "QF_LRA" else 5_000_000)
+                solver.add(*tr.constraints, formula)
+                answer = solver.check()
+                if answer == z3.unsat: return QueryResult(status="UNSAT", z3_tier_used=tier)
+                if answer == z3.sat:
+                    model = solver.model()
+                    return QueryResult(status="SAT", z3_tier_used=tier, witness=_model_point(model, tr.vars), exact_model=str(model))
     queue, evaluated, unresolved = [box], 0, False
     outer_deadline = deadline - (min(0.3, timeout_ms/2000) if witness else 0)
+    from ..runtime.isolation import Z3_GLOBAL_LOCK
     while queue and evaluated < max_boxes and time.monotonic() < outer_deadline:
         current = queue.pop(); evaluated += 1
         candidate = None
         try:
-            tr = _Translator(current, True); formula = tr.formula(node)
-            solver = z3.SolverFor("QF_LRA")
-            solver.set(timeout=max(1, min(100, int((outer_deadline-time.monotonic())*1000))), rlimit=1_000_000)
-            solver.add(*tr.constraints, formula); answer = solver.check()
-            if answer == z3.unsat: continue
-            if answer == z3.sat:
-                candidate = _model_point(solver.model(), tr.vars)
-                if _truth(node, {s: (x, x) for s, x in candidate.items()}) is True:
-                    return QueryResult(status="SAT", z3_tier_used="MCCORMICK_QF_LRA", witness=candidate, boxes_evaluated=evaluated)
+            with Z3_GLOBAL_LOCK:
+                tr = _Translator(current, True); formula = tr.formula(node)
+                solver = z3.SolverFor("QF_LRA")
+                solver.set(timeout=max(1, min(100, int((outer_deadline-time.monotonic())*1000))), rlimit=1_000_000)
+                solver.add(*tr.constraints, formula); answer = solver.check()
+                if answer == z3.unsat: continue
+                if answer == z3.sat:
+                    candidate = _model_point(solver.model(), tr.vars)
+            if candidate is not None and _truth(node, {s: (x, x) for s, x in candidate.items()}) is True:
+                return QueryResult(status="SAT", z3_tier_used="MCCORMICK_QF_LRA", witness=candidate, boxes_evaluated=evaluated)
         except (ValueError, OverflowError, ZeroDivisionError):
             pass
         if not current: unresolved = True; continue
@@ -1264,6 +1270,23 @@ def _solve_query(expression: str, domain: Mapping[str, Sequence[float]], *, witn
 def solve_query(expression: str, domain: Mapping[str, Sequence[float]], *, witness: bool = False,
                 timeout_ms: int = SMT_TIMEOUT_MS, max_boxes: int = MAX_BOXES, _deadline: float | None = None,
                 prefer_linear_outer: bool = False) -> QueryResult:
+    from ..runtime.isolation import run_on_z3_thread
+
+    return run_on_z3_thread(
+        _solve_query_entry,
+        expression,
+        domain,
+        witness=witness,
+        timeout_ms=timeout_ms,
+        max_boxes=max_boxes,
+        _deadline=_deadline,
+        prefer_linear_outer=prefer_linear_outer,
+    )
+
+
+def _solve_query_entry(expression: str, domain: Mapping[str, Sequence[float]], *, witness: bool = False,
+                       timeout_ms: int = SMT_TIMEOUT_MS, max_boxes: int = MAX_BOXES, _deadline: float | None = None,
+                       prefer_linear_outer: bool = False) -> QueryResult:
     """Run a shared 1500 ms cooperative budget, including native witness work.
 
     Parsing, one native call, solver teardown and OS scheduling are not preemptible.
@@ -1514,7 +1537,25 @@ def verify_entailment_lock(ihcg: IhcgGraph, compiled_contracts: Sequence[str]) -
     queries = {o.id: solve_query(_and([*base, f"not ({o.expression})"]), ihcg.omega, _deadline=deadline,
         prefer_linear_outer=affine_compiled and _degree(_parse(o.expression)) > 1) for o in ihcg.obligations}
     feasibility = solve_query(_and(base), ihcg.omega, witness=True, _deadline=deadline)
-    locked = all(q.status == "UNSAT" for q in queries.values()) and feasibility.status == "SAT"
+    entailed = all(q.status == "UNSAT" for q in queries.values())
+    # ARCH-003 (BUG-003): Decouple Q_model from Q_claim.
+    # If env ∧ compiled_contracts is UNSAT ONLY because a physically false claim conflicts
+    # with environmental physics bounds (while env alone is SAT and compiled_contracts alone
+    # is SAT over omega), allow Mode 1 deductive falsification rather than rejecting at ingest.
+    model_vs_claim_falsifiable = False
+    if entailed and feasibility.status == "UNSAT" and ihcg.environmental_assumptions and compiled_contracts:
+        env_sat = solve_query(_and(ihcg.environmental_assumptions), ihcg.omega, witness=True, _deadline=deadline)
+        contracts_sat = solve_query(_and(compiled_contracts), ihcg.omega, witness=True, _deadline=deadline)
+        if env_sat.status == "SAT" and contracts_sat.status == "SAT":
+            # Verify contracts genuinely entail obligations even without env contradiction
+            direct_entailed = all(
+                solve_query(_and([*compiled_contracts, f"not ({o.expression})"]), ihcg.omega, _deadline=deadline).status == "UNSAT"
+                for o in ihcg.obligations
+                if o.obligation_class == "HYPOTHESIS_TARGET"
+            )
+            if direct_entailed:
+                model_vs_claim_falsifiable = True
+    locked = entailed and (feasibility.status == "SAT" or model_vs_claim_falsifiable)
     queries["COMPILED_FEASIBILITY"] = feasibility
     return EntailmentAudit(entailment_locked=locked, queries=queries,
                            z3_tier_used=_worst_tier(list(queries.values())),
@@ -2092,6 +2133,21 @@ def build_meaningfulness_certificate(*, run_id: str, verdict: EpistemicVerdict, 
     anchor = IhcgAnchor(ihcg_digest=ihcg.h_ihcg, stage_chain_digests=ihcg.stage_chain_digests, quantifier_mode=ihcg.quantifier_mode,
                         archetype=ihcg.archetype, prompt_obligation_quotes=tuple({"quote": o.prompt_quote, "csel": o.expression, "class": o.obligation_class} for o in ihcg.obligations),
                         assumptions_ledger=ihcg.assumptions_ledger)
+    # ARCH-003 (BUG-008): Every non-verified certificate MUST carry a non-null machine-readable failure_reason.
+    derived_failure_reason: str | None = None
+    if verdict == EpistemicVerdict.INCONCLUSIVE_UNVERIFIED:
+        gate_reasons = [
+            checked.failure_reason if not checked.passed else None,
+            purity_audit.failure_reason if not purity_audit.passed else None,
+            fidelity_audit.failure_reason if not fidelity_audit.passed else None,
+            (getattr(identifiability_audit, "failure_reason", None) or "IDENTIFIABILITY_FAILED") if not getattr(identifiability_audit, "coupling_passed", True) else None,
+            (significance_audit.failure_reason if significance_audit and not significance_audit.passed else None),
+            (falsification_certificate.failure_reason if falsification_certificate and falsification_certificate.epistemic_verdict != EpistemicVerdict.VERIFIED_FALSIFICATION else None),
+            (boundary_certificate.failure_reason if boundary_certificate and boundary_certificate.epistemic_verdict != EpistemicVerdict.VERIFIED_BOUNDARY_DISCOVERY else None),
+            (f"UNIQUENESS_FAILED:{uniqueness_audit.vault_class or 'UNCLASSIFIED'}" if not uniqueness_audit.passed else None),
+            (f"CONTRACT_AUDIT_FAILED:{contract_audit.classification}" if not (contract_audit.entailment_locked and contract_audit.classification == "NON_TRIVIAL") else None),
+        ]
+        derived_failure_reason = next((r for r in gate_reasons if r), "UNSPECIFIED_GATE_FAILURE")
     certificate = MeaningfulnessCertificate(run_id=run_id, epistemic_verdict=verdict, ihcg_anchor=anchor, contract_audit=contract_audit,
         nontriviality_audit=checked, purity_audit=purity_audit, fidelity_audit=fidelity_audit, identifiability_audit=identifiability_audit,
         significance_audit=significance_audit, falsification_certificate=falsification_certificate, boundary_certificate=boundary_certificate,
@@ -2101,7 +2157,8 @@ def build_meaningfulness_certificate(*, run_id: str, verdict: EpistemicVerdict, 
         relative_effect_size=significance_audit.relative_effect_size if significance_audit else None,
         domain_compression_bits=significance_audit.domain_compression_bits if significance_audit else None,
         z3_tier_used=_worst_tier([*checked.contract_audit.queries.values(), QueryResult(status="UNKNOWN", z3_tier_used=contract_audit.z3_logic_tier)]),
-        uast_digest=uast_digest, assumptions_ledger=ihcg.assumptions_ledger, blake3_receipt="0"*64)
+        uast_digest=uast_digest, assumptions_ledger=ihcg.assumptions_ledger,
+        failure_reason=derived_failure_reason, blake3_receipt="0"*64)
     receipt = _native.py_compute_certificate_receipt(certificate.model_dump_json())
     return certificate.model_copy(update={"blake3_receipt": receipt})
 

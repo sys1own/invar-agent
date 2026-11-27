@@ -124,9 +124,9 @@ async def test_stalled_provider_persists_terminal_inconclusive(streaming,monkeyp
     assert state.meaningfulness_certificate.failure_reason == "LLM_PROVIDER_RETRIES_EXHAUSTED"
     run_id = state.run_id if planning else state.blueprint.blueprint_id
     path = tmp_path/".invar"/"research_vault"/run_id/"meaningfulness_certificate.json"
-    certificate = parse_run_certificate(path.read_text())
+    certificate = parse_run_certificate(path.read_text(encoding="utf-8"))
     assert certificate == state.meaningfulness_certificate
-    tampered = json.loads(path.read_text())
+    tampered = json.loads(path.read_text(encoding="utf-8"))
     tampered["failure_reason"] = "changed"
     with pytest.raises(ValueError,match="receipt mismatch"): parse_run_certificate(tampered)
     assert len(sdk.streams) == 9 and all(stream.closed for stream in sdk.streams)

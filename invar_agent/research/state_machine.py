@@ -178,7 +178,9 @@ class ResearchPlanningFailure:
 
 
 def shacl_chiasmus_firewall(code: str) -> List[str]:
-    """Tier-0 SHACL/Chiasmus firewall: rejects unsafe imports/calls/unbounded loops."""
+    """Tier-0 SHACL/Chiasmus firewall: strict AST allow-list + legacy regex guard."""
+    from ..runtime.isolation import validate_kernel_ast_allowlist
+
     violations: List[str] = []
     for mod in FORBIDDEN_IMPORTS:
         if re.search(rf"^\s*(import|from)\s+{re.escape(mod)}\b", code, re.M):
@@ -186,59 +188,17 @@ def shacl_chiasmus_firewall(code: str) -> List[str]:
     for name in FORBIDDEN_CALLS:
         if re.search(rf"\b{name}\s*\(", code):
             violations.append(f"forbidden call: {name}()")
-    # Unbounded loops: `while True` without break is rejected.
     if re.search(r"while\s+True\s*:", code) and "break" not in code:
         violations.append("unbounded while True loop without break")
-    return violations
+    violations.extend(validate_kernel_ast_allowlist(code, require_simulation_step=False))
+    return sorted(set(violations))
 
 
 def v9_transpiler_violations(code: str) -> List[str]:
-    """AST-level v9_transpiler_friendly compliance check (PreWrite_Guard)."""
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as exc:
-        return [f"syntax error: {exc.msg} (line {exc.lineno})"]
-    out: List[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'buf' and node.attr not in {'data', 'size'}:
-            out.append(f"unsupported buffer attribute buf.{node.attr} at line {node.lineno}: {BUFFER_API}")
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".")[0] not in ALLOWED_IMPORTS:
-                    out.append(f"forbidden import: {alias.name}")
-        elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] not in ALLOWED_IMPORTS:
-                out.append(f"forbidden import: {node.module}")
-        elif isinstance(node, ast.ClassDef):
-            out.append("forbidden construct: class")
-        elif isinstance(node, (ast.Try, ast.With, ast.AsyncWith)):
-            out.append(f"forbidden construct: {type(node).__name__.lower()}")
-        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
-            out.append("forbidden construct: yield")
-        elif isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor)):
-            out.append("forbidden construct: async/await")
-        elif isinstance(node, ast.Lambda):
-            out.append("forbidden construct: lambda")
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            out.append("forbidden construct: global/nonlocal")
-        elif isinstance(node, ast.Dict):
-            out.append("unsupported construct: dict literal "
-                       "(not supported by the C++ emitter)")
-        elif isinstance(node, (ast.Set, ast.DictComp, ast.SetComp,
-                               ast.GeneratorExp)):
-            out.append(f"forbidden construct: {type(node).__name__}")
-        elif isinstance(node, ast.While) and isinstance(node.test, ast.Constant) \
-                and node.test.value is True \
-                and not any(isinstance(n, ast.Break) for n in ast.walk(node)):
-            out.append("unbounded while True loop without break")
-    for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
-        for inner in ast.walk(fn):
-            if inner is not fn and isinstance(inner, ast.FunctionDef):
-                out.append(f"forbidden construct: nested function {inner.name}")
-    if not any(isinstance(n, ast.FunctionDef) and n.name == "simulation_step"
-               for n in tree.body):
-        out.append("module must define simulation_step(buf, dt)")
-    return sorted(set(out))
+    """AST-level v9_transpiler_friendly compliance check (PreWrite_Guard allow-list)."""
+    from ..runtime.isolation import validate_kernel_ast_allowlist
+
+    return validate_kernel_ast_allowlist(code, require_simulation_step=True)
 
 
 def _goi_wavefront_plan(blueprint: ResearchBlueprint) -> Dict[str, Any]:
@@ -2906,7 +2866,7 @@ class ResearchStateMachine:
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Overlay_Mutate"})
         scratch = self.overlay_dir / f"round_{round_idx}"
         scratch.mkdir(parents=True, exist_ok=True)
-        (scratch / "unified_module.py").write_text(unified)
+        (scratch / "unified_module.py").write_text(unified, encoding="utf-8")
         await emit("accelerator_log", "overlay", {**tag, "path": str(scratch),
                                                    "module_hash": code_hash(unified),
                                                    "lines": unified.count("\n")})
@@ -2973,32 +2933,17 @@ class ResearchStateMachine:
             return {"status": "error", "result_status": "ERROR",
                     "failure": "PreWrite_Guard: " + "; ".join(violations),
                     "candidate_code": candidate_code, "contracts": contracts}
-        # 1-step Python smoke execution in PreWrite_Guard to catch UnboundLocalError/NameError
+        # 1-step Python smoke execution in an OS-isolated child process (ARCH-005: zero in-process exec)
         try:
-            _smoke_ns: Dict[str, Any] = {}
-            exec(compile(unified, "<prewrite_smoke>", "exec"), _smoke_ns)
-            _smoke_fn = _smoke_ns.get("simulation_step")
-            if callable(_smoke_fn):
-                _max_idx = max(
-                    [int(m) for m in re.findall(r"buf\.data\[(\d+)\]", unified)] + [31]
-                )
-                _smoke_buf = _BufView([0.5] * min(4096, _max_idx + 1))
-                _smoke_steps = 0
-                _smoke_t0 = time.perf_counter()
+            from ..runtime.isolation import run_isolated_kernel_smoke
 
-                def _smoke_trace(frame, event, arg):
-                    nonlocal _smoke_steps
-                    _smoke_steps += 1
-                    if _smoke_steps > 25_000_000 or ((_smoke_steps & 4095) == 0 and (time.perf_counter() - _smoke_t0) > 6.0):
-                        raise TimeoutError("python_smoke exceeded safety step/time budget (possible infinite loop)")
-                    return _smoke_trace
-
-                _old_trace = sys.gettrace()
-                sys.settrace(_smoke_trace)
-                try:
-                    _smoke_fn(_smoke_buf, 0.01)
-                finally:
-                    sys.settrace(_old_trace)
+            await asyncio.to_thread(
+                run_isolated_kernel_smoke,
+                unified,
+                dt=0.01,
+                timeout_s=8.0,
+                validate_ast=True,
+            )
         except Exception as exc:  # noqa: BLE001
             await emit("accelerator_log", "guard_reject", {**tag, "violations": [f"python_smoke: {type(exc).__name__}: {exc}"]})
             self._rollback_overlay(scratch)
@@ -4189,8 +4134,8 @@ class ResearchStateMachine:
         root = self.workspace / "checkpoints" / bp.blueprint_id
         root.mkdir(parents=True, exist_ok=True)
         module = bp.unified_module_code or ""
-        (root / f"stage_{stage}_unified_module.py").write_text(module)
-        (root / "blueprint.json").write_text(bp.model_dump_json(indent=2))
+        (root / f"stage_{stage}_unified_module.py").write_text(module, encoding="utf-8")
+        (root / "blueprint.json").write_text(bp.model_dump_json(indent=2), encoding="utf-8")
         return str(root)
 
 

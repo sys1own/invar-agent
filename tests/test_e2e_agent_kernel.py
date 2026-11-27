@@ -12,9 +12,9 @@ from invar_agent.core.agent import VerifiedAutonomousAgent
 
 def _workspace(tmp_path, broken_calc=True):
     (tmp_path / "calc.py").write_text(
-        "def add(a, b)\n    return a + b\n" if broken_calc else "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n"
-    )
-    (tmp_path / "util.py").write_text("def mul(a, b):\n    return a * b\n")
+        "def add(a, b)\n    return a + b\n" if broken_calc else "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n", 
+    encoding="utf-8")
+    (tmp_path / "util.py").write_text("def mul(a, b):\n    return a * b\n", encoding="utf-8")
     (tmp_path / "test_calc.py").write_text(textwrap.dedent("""\
         from calc import add, sub
 
@@ -23,14 +23,14 @@ def _workspace(tmp_path, broken_calc=True):
 
         def test_sub():
             assert sub(5, 3) == 2
-        """))
+        """), encoding="utf-8")
     (tmp_path / "test_util.py").write_text(textwrap.dedent("""\
         from util import mul
 
         def test_mul():
             assert mul(2, 3) == 6
-        """))
-    (tmp_path / "conftest.py").write_text("")
+        """), encoding="utf-8")
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
 
 
 def _node(node_id, write_path, read_path, gen, symbol, contract=None, out_port=None, in_port=None):
@@ -93,9 +93,9 @@ def test_full_nine_stage_cycle_with_tier0_heal(tmp_path):
     # Tier-0 reflex healed the missing-colon fault.
     assert report.nodes_healed >= 1
 
-    calc = (tmp_path / "calc.py").read_text()
+    calc = (tmp_path / "calc.py").read_text(encoding="utf-8")
     assert "def add(a, b):" in calc and "def sub(a, b):" in calc
-    util = (tmp_path / "util.py").read_text()
+    util = (tmp_path / "util.py").read_text(encoding="utf-8")
     assert "def div(a, b):" in util
 
     # All nine stages appear in the trace.
@@ -118,7 +118,7 @@ def test_unrecoverable_smt_violation_rolls_back_cleanly(tmp_path):
         file_path="calc.py", operation="CREATE_FILE",
         replacement_code="def discount(price, discount):\n    return price - discount\n",
     )
-    before = (tmp_path / "calc.py").read_text()
+    before = (tmp_path / "calc.py").read_text(encoding="utf-8")
 
     report = agent.run_until_verified(
         "attempt unsound discount",
@@ -133,4 +133,4 @@ def test_unrecoverable_smt_violation_rolls_back_cleanly(tmp_path):
     assert result.rolled_back and not result.committed
     assert result.shield_report is not None and not result.shield_report.passed
     # Zero residual disk diff.
-    assert (tmp_path / "calc.py").read_text() == before
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == before

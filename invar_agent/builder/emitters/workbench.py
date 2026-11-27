@@ -6,8 +6,10 @@ APP = '''import json
 import itertools
 import math
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse, HTMLResponse
+from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import run_in_threadpool
 from ..sdk import MODEL, SimulationConfig, simulate
 from ..sweep import sweep
@@ -15,13 +17,22 @@ from ..serializers import to_csv, to_json
 
 app=FastAPI(title='Scientific Workbench')
 
+
+class SweepRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    grid: Dict[str, List[float]] = {}
+    config: Optional[Dict[str, Any]] = None
+    method: str = 'grid'
+    samples: int = 16
+
+
 @app.get('/api/schema')
 def schema():
     return MODEL
 
 @app.get('/')
 def index():
-    return HTMLResponse((Path(__file__).parent/'static'/'index.html').read_text())
+    return HTMLResponse((Path(__file__).parent/'static'/'index.html').read_text(encoding='utf-8'))
 
 async def execute(payload):
     try:
@@ -34,9 +45,9 @@ async def simulation(payload: dict):
     return (await execute(payload)).to_dict()
 
 @app.post('/api/sweep')
-async def parameter_sweep(payload: dict):
+async def parameter_sweep(payload: SweepRequest):
     try:
-        return await run_in_threadpool(sweep,payload.get('grid',{}),payload.get('config'),payload.get('method','grid'),payload.get('samples',16))
+        return await run_in_threadpool(sweep,payload.grid,payload.config,payload.method,payload.samples)
     except (ValueError,TypeError) as error:
         raise HTTPException(422,str(error)) from error
 

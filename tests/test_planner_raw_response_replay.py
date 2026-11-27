@@ -14,7 +14,7 @@ from invar_agent.research.state_machine import ResearchStateMachine
 
 @pytest.fixture
 def replies():
-    return json.loads((Path(__file__).parent/'fixtures'/'live_carnot_shbt_raw_plans.json').read_text())
+    return json.loads((Path(__file__).parent/'fixtures'/'live_carnot_shbt_raw_plans.json').read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize('scenario',['carnot','shbt'])
@@ -55,8 +55,8 @@ async def test_raw_validation_failures_repair_once_then_persist(replies,scenario
     assert result.meaningfulness_certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
     assert 'Exact formalization validation error' in calls[2]
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
-    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text()) == result.meaningfulness_certificate
-    diagnostic = json.loads((directory/'metadata.json').read_text())['planning_error']
+    assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8")) == result.meaningfulness_certificate
+    diagnostic = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))['planning_error']
     assert ('UNRESOLVED_SYMBOL' if scenario in {'carnot', 'shbt'} else 'INVALID_EXPRESSION') in diagnostic or ('missing typed slots' if scenario == 'carnot' else 'mechanism_parameters') in diagnostic
     assert any(e.get('event') == 'research_completed' for e in events)
     tampered = result.meaningfulness_certificate.model_dump(mode='json')

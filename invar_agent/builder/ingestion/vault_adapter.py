@@ -121,33 +121,58 @@ class _ScalarContract(ast.NodeTransformer):
 
 
 def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
+    from invar_agent.research.vault import VaultIntegrityError, verify_vault_manifest
+
     manager = ResearchVaultManager(Path(workspace_root))
     if not run_id or manager.run_dir(run_id).name != run_id:
         raise IngestionError("VAULT_INVALID_RUN_ID", run_id)
     root = manager.run_dir(run_id)
+    # ARCH-007: Verify manifest and every persisted artifact digest BEFORE parsing any file.
+    if (root / "manifest.json").is_file():
+        try:
+            verify_vault_manifest(root)
+        except VaultIntegrityError as error:
+            raise IngestionError(error.code, error.message) from error
     try:
-        texts = {name: (root/name).read_text() for name in ('metadata.json','blueprint.json','unified_module.py','report.md')}
+        texts = {name: (root/name).read_text(encoding='utf-8') for name in ('metadata.json','blueprint.json','unified_module.py','report.md')}
         metadata, blueprint = json.loads(texts['metadata.json']), json.loads(texts['blueprint.json'])
     except (OSError, ValueError) as error:
         raise IngestionError('VAULT_BUNDLE_INVALID', str(error)) from error
-    raw_certificate = metadata.get('meaningfulness_certificate')
     certificate_path = root/'meaningfulness_certificate.json'
-    if certificate_path.exists(): raw_certificate = json.loads(certificate_path.read_text())
+    if not certificate_path.is_file():
+        raise IngestionError(
+            'VAULT_CERTIFICATE_MISSING',
+            f"Vault entry {run_id!r} is missing meaningfulness_certificate.json",
+        )
+    try:
+        raw_certificate = json.loads(certificate_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as error:
+        raise IngestionError('VAULT_CERTIFICATE_INVALID', str(error)) from error
+    # If manifest.json was absent (pre-v2 vault), still verify metadata certificate consistency
+    # and require full certificate artifact binding.
     certificates = {}
     certified_valid_domain = None
-    if raw_certificate is not None:
+    try:
         from ...research.epistemic import validate_certificate_artifacts
         certificate = validate_certificate_artifacts(raw_certificate, texts['unified_module.py'], blueprint)
-        certified_valid_domain = getattr(certificate,'certified_valid_domain',None)
-        if certificate.run_id != run_id: raise IngestionError('VAULT_CERTIFICATE_MISMATCH', run_id)
-        certificates[run_id] = certificate.model_dump(mode='json')
-        if certificate.epistemic_verdict.value == 'VERIFIED_FALSIFICATION':
-            return CanonicalResearchIR(ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
-                title=metadata.get('title') or run_id, meaningfulness_certificates=certificates,
-                meaningfulness_certificate=certificates[run_id], epistemic_verdict='VERIFIED_FALSIFICATION', certified_valid_domain=certified_valid_domain,
-                research_import_role='NEGATIVE_CONSTRAINT_ONLY', negative_constraints=[{'run_id': run_id, 'certificate': certificates[run_id]}])
-        if hasattr(certificate, 'ihcg_anchor') and certificate.epistemic_verdict.value == 'INCONCLUSIVE_UNVERIFIED':
-            raise IngestionError('INCONCLUSIVE_UNVERIFIED', run_id)
+    except ValueError as error:
+        raise IngestionError('VAULT_CERTIFICATE_INVALID', str(error)) from error
+    certified_valid_domain = getattr(certificate, 'certified_valid_domain', None)
+    if certificate.run_id != run_id:
+        raise IngestionError('VAULT_CERTIFICATE_MISMATCH', run_id)
+    certificates[run_id] = certificate.model_dump(mode='json')
+    verdict_val = certificate.epistemic_verdict.value
+    if verdict_val == 'VERIFIED_FALSIFICATION':
+        return CanonicalResearchIR(ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
+            title=metadata.get('title') or run_id, meaningfulness_certificates=certificates,
+            meaningfulness_certificate=certificates[run_id], epistemic_verdict='VERIFIED_FALSIFICATION', certified_valid_domain=certified_valid_domain,
+            research_import_role='NEGATIVE_CONSTRAINT_ONLY', negative_constraints=[{'run_id': run_id, 'certificate': certificates[run_id]}])
+    if verdict_val not in {'VERIFIED_DISCOVERY', 'VERIFIED_BOUNDARY_DISCOVERY'}:
+        raise IngestionError(
+            'INCONCLUSIVE_UNVERIFIED',
+            f"Vault entry {run_id!r} cannot be admitted with verdict {verdict_val!r}",
+            details={'epistemic_verdict': verdict_val, 'failure_reason': getattr(certificate, 'failure_reason', None)},
+        )
 
     def provenance(filename, location, needle=''):
         text = texts[filename]
@@ -184,17 +209,32 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                     elif equation.kind == 'ALGEBRAIC':
                         raw_equations.append(RawEquation(text=f'{name} = {equation.expression}', provenance=span))
                 init_vec = list(parsed.contracts[-1].initial_state) if parsed.contracts else []
+                def _unit_from_si_dim(dim_vec):
+                    # IHCG si_dim order is [M, L, T, I, Theta, N, J] -> Builder [m, kg, s, A, K, mol, cd]
+                    d = list(dim_vec) if len(dim_vec) == 7 else [0] * 7
+                    exps = (d[1], d[0], d[2], d[3], d[4], d[5], d[6])
+                    lbl = "*".join(
+                        b + (f"^{p}" if p != 1 else "")
+                        for b, p in zip(("m", "kg", "s", "A", "K", "mol", "cd"), exps)
+                        if p
+                    ) or "1"
+                    return exps, lbl
+
                 constants = [
                     RawConstant(
                         symbol=s.symbol,
                         value=str(init_vec[s.slot_idx] if s.slot_idx < len(init_vec) else 0.0),
-                        unit='1',
+                        unit=_unit_from_si_dim(s.si_dim)[1],
                         provenance=span,
                     )
                     for s in graph.slots if s.role == 'CONTROL_PARAM'
                 ]
                 sym_dims = {
-                    s.symbol: SIDimensionVectorModel(exponents=tuple(s.si_dim), semantic_tag=s.semantic_tag).model_dump()
+                    s.symbol: SIDimensionVectorModel(
+                        exponents=_unit_from_si_dim(s.si_dim)[0],
+                        canonical_unit=_unit_from_si_dim(s.si_dim)[1],
+                        semantic_tag=s.semantic_tag,
+                    ).model_dump()
                     for s in graph.slots
                 }
                 state_syms = [s.symbol for s in graph.slots if s.role != 'CONTROL_PARAM']
@@ -308,6 +348,22 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
                 names = {node.id for node in ast.walk(transformed) if isinstance(node, ast.Name)}
                 if names - set(slots) or not isinstance(transformed.body, ast.Compare) or len(transformed.body.ops) != 1:
                     raise ValueError('Non-scalar predicate')
+                # ARCH-009 (BUG-020): Contract invariants on dynamic state variables that do NOT
+                # hold at t=0 (e.g. `x(T) > 2` with `x(0) = 1`, or `I_max > 0.15`) are FINAL/MAX/MIN
+                # temporal predicates, NOT t=0 constraints. Route them to RuntimePredicate so Z3
+                # never contradicts initial_state; keep ALWAYS invariants that hold at t=0.
+                if names & set(laws):
+                    init_env = {
+                        sym: float(contract['initial_state'][slots[sym]])
+                        for sym in names
+                        if sym in slots and slots[sym] < len(contract['initial_state'])
+                    }
+                    try:
+                        holds_at_t0 = bool(eval(compile(ast.fix_missing_locations(transformed), '<t0_check>', 'eval'), {'__builtins__': {}}, init_env))
+                    except Exception:
+                        holds_at_t0 = False
+                    if not holds_at_t0:
+                        raise ValueError('Temporal state predicate')
                 raw_equations.append(RawEquation(text=ast.unparse(ast.fix_missing_locations(transformed)), provenance=span))
             except ValueError:
                 runtime.append(RuntimePredicate(contract_id=contract['contract_id'], assertion=assertion,
@@ -318,6 +374,9 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
         equation.supporting_provenance = sources.get(equation.lhs_symbol, [])
     ir = CanonicalResearchIR(ir_id=f'vault:{run_id}', source_mode='vault', vault_run_ids=[run_id],
         meaningfulness_certificates=certificates,
+        meaningfulness_certificate=certificates[run_id],
+        epistemic_verdict=verdict_val,
+        research_import_role='POSITIVE_EVIDENCE',
         certified_valid_domain=certified_valid_domain,
         title=metadata.get('title') or blueprint.get('title') or run_id, summary=texts['report.md'][:2000],
         equations=equations, constants=constants, pinned_kernel_code=texts['unified_module.py'],

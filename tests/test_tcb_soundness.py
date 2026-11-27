@@ -18,7 +18,7 @@ from invar_agent.research import uniqueness as u
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT/"invar_agent/_native/src/csel_egraph.rs").read_text()
+SOURCE = (ROOT/"invar_agent/_native/src/csel_egraph.rs").read_text(encoding="utf-8")
 RULE_SOURCE = SOURCE.split("fn verification_rules()",1)[1].split("fn absolute_power_exponent",1)[0]
 RULES = re.findall(r'rewrite!\("([^"\n]+)"; "([^"\n]+)" => "([^"\n]+)"',RULE_SOURCE)
 
