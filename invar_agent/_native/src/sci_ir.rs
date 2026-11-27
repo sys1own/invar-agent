@@ -27,6 +27,16 @@ pub enum ScientificDomain {
     QuantumStatmech,
     EngineeringCtrl,
     EconComplex,
+    Mathematics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EquationSemantics {
+    Derivative,
+    Residual,
+    Map,
+    Assign,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -165,6 +175,7 @@ pub enum CondOp {
     Gt,
     Ge,
     Eq,
+    Ne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +191,8 @@ pub enum RandDist {
 pub enum ExprNode {
     Const {
         value: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exact: Option<String>,
     },
     Sym {
         name: String,
@@ -194,6 +207,10 @@ pub enum ExprNode {
         op: BinaryOp,
         lhs: Box<ExprNode>,
         rhs: Box<ExprNode>,
+    },
+    Call {
+        func: String,
+        args: Vec<ExprNode>,
     },
     IfThenElse {
         cond_op: CondOp,
@@ -211,7 +228,7 @@ pub enum ExprNode {
 impl ExprNode {
     pub fn validate_finite(&self) -> Result<(), String> {
         match self {
-            ExprNode::Const { value } => {
+            ExprNode::Const { value, .. } => {
                 if !value.is_finite() {
                     return Err("Non-finite constant in ExprNode".into());
                 }
@@ -222,6 +239,12 @@ impl ExprNode {
             ExprNode::Binary { lhs, rhs, .. } => {
                 lhs.validate_finite()?;
                 rhs.validate_finite()
+            }
+            ExprNode::Call { args, .. } => {
+                for a in args {
+                    a.validate_finite()?;
+                }
+                Ok(())
             }
             ExprNode::IfThenElse {
                 lhs,
@@ -257,6 +280,8 @@ pub struct EquationSpec {
     pub source_text: String,
     #[serde(default)]
     pub reduction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<EquationSemantics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +295,8 @@ pub struct ObligationSpec {
     pub tolerance: f64,
     pub epistemic_origin: String,
     pub source_text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

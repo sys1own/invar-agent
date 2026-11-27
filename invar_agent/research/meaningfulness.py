@@ -153,6 +153,19 @@ class EquationSpec(StrictModel):
         return data
 
 
+class ForcingSegment(StrictModel):
+    """Exact-rational time segment for piecewise-constant time forcing (UPG-006 / NF-04)."""
+    t_start: str
+    t_end: str
+    values: dict[str, str]
+
+
+class ForcingSchedule(StrictModel):
+    """Contiguous, ordered time-forcing schedule covering the integration horizon."""
+    symbols: tuple[str, ...]
+    segments: tuple[ForcingSegment, ...]
+
+
 class IhcgGraph(StrictModel):
     slots: tuple[SlotSpec, ...]
     equations: dict[str, EquationSpec]
@@ -168,6 +181,9 @@ class IhcgGraph(StrictModel):
     perturbation_target: bool = False
     mc_difference_bounds: tuple[float, float] | None = None
     assumptions_ledger: tuple[FormalizationAssumptionRecord, ...] = ()
+    forcing_schedule: ForcingSchedule | None = None
+    claim_bounds: Bounds | None = None
+    claimless: bool = False
     h_ihcg: str = ""
 
     @model_serializer(mode="wrap")
@@ -175,7 +191,21 @@ class IhcgGraph(StrictModel):
         data = handler(self)
         if not self.assumptions_ledger:
             data.pop("assumptions_ledger", None)
+        if self.forcing_schedule is None:
+            data.pop("forcing_schedule", None)
+        if self.claim_bounds is None:
+            data.pop("claim_bounds", None)
+        if not self.claimless:
+            data.pop("claimless", None)
         return data
+
+    def effective_claim_bounds(self) -> Bounds:
+        """NF-09: Return Ω_claim (claim_bounds overrides omega per-symbol when set)."""
+        if not self.claim_bounds:
+            return dict(self.omega)
+        merged = dict(self.omega)
+        merged.update(self.claim_bounds)
+        return merged
 
     def assert_sealed(self) -> None:
         if not hmac.compare_digest(self.h_ihcg, _native.py_compute_ihcg_digest(self.model_dump_json())):
@@ -884,6 +914,54 @@ def _expand(node: ast.AST) -> ast.AST:
     return Substitute().visit(ast.parse(templates[name], mode="eval").body)
 
 
+def _narrow_box_for_test(test: ast.AST, box: Bounds) -> tuple[Bounds, Bounds]:
+    """Soundly narrow variable bounds for `then` and `else` branches of simple comparisons / conjunctions."""
+    t_box, e_box = dict(box), dict(box)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        for sub in test.values:
+            sub_t, _ = _narrow_box_for_test(sub, t_box)
+            t_box = sub_t
+        return t_box, e_box
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1):
+        return t_box, e_box
+    lhs, op, rhs = test.left, test.ops[0], test.comparators[0]
+    def _const(n):
+        if isinstance(n, ast.Constant) and type(n.value) in (int, float):
+            return float(n.value)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant) and type(n.operand.value) in (int, float):
+            return -float(n.operand.value)
+        return None
+    name, val, flip = None, None, False
+    if isinstance(lhs, ast.Name) and lhs.id in box and _const(rhs) is not None:
+        name, val = lhs.id, _const(rhs)
+    elif isinstance(rhs, ast.Name) and rhs.id in box and _const(lhs) is not None:
+        name, val, flip = rhs.id, _const(lhs), True
+    else:
+        return t_box, e_box
+    lo, hi = box[name]
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return t_box, e_box
+    is_gt = (isinstance(op, (ast.Gt, ast.GtE)) and not flip) or (isinstance(op, (ast.Lt, ast.LtE)) and flip)
+    is_lt = (isinstance(op, (ast.Lt, ast.LtE)) and not flip) or (isinstance(op, (ast.Gt, ast.GtE)) and flip)
+    if is_gt:
+        strict = isinstance(op, ast.Gt) if not flip else isinstance(op, ast.Lt)
+        t_lo = max(lo, math.nextafter(val, math.inf) if strict else val)
+        if t_lo <= hi:
+            t_box[name] = (t_lo, hi)
+        e_hi = min(hi, val)
+        if lo <= e_hi:
+            e_box[name] = (lo, e_hi)
+    elif is_lt:
+        strict = isinstance(op, ast.Lt) if not flip else isinstance(op, ast.Gt)
+        t_hi = min(hi, math.nextafter(val, -math.inf) if strict else val)
+        if lo <= t_hi:
+            t_box[name] = (lo, t_hi)
+        e_lo = max(lo, val)
+        if e_lo <= hi:
+            e_box[name] = (e_lo, hi)
+    return t_box, e_box
+
+
 def _iv(node: ast.AST, box: Bounds) -> _IV:
     _check_query_deadline()
     if isinstance(node, ast.Constant) and type(node.value) in (int, float):
@@ -927,7 +1005,8 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
             return _iv(node.body, box)
         if cond_val is False:
             return _iv(node.orelse, box)
-        t_iv, e_iv = _iv(node.body, box), _iv(node.orelse, box)
+        t_box, e_box = _narrow_box_for_test(node.test, box)
+        t_iv, e_iv = _iv(node.body, t_box), _iv(node.orelse, e_box)
         return _IV(min(t_iv.lo, e_iv.lo), max(t_iv.hi, e_iv.hi))
     if isinstance(node, ast.Call):
         if node.func.id == "kl_term":
@@ -950,6 +1029,34 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
         if name == "tanh":
             a = args[0]
             return _IV(math.nextafter(math.tanh(a.lo), -math.inf), math.nextafter(math.tanh(a.hi), math.inf))
+        if name == "log10":
+            a = args[0]
+            if a.lo <= 0.0:
+                raise _DomainError("LOG10_NONPOSITIVE_DOMAIN")
+            return _IV(math.nextafter(math.log10(a.lo), -math.inf), math.nextafter(math.log10(a.hi), math.inf))
+        if name == "tan":
+            a = args[0]
+            if (a.hi - a.lo) >= 3.14159:
+                raise _DomainError("TAN_POLE_IN_DOMAIN")
+            c = _trig(a, True)
+            if c.lo <= 0.0 <= c.hi:
+                raise _DomainError("TAN_POLE_IN_DOMAIN")
+            t_lo = math.sin(a.lo) / math.cos(a.lo)
+            t_hi = math.sin(a.hi) / math.cos(a.hi)
+            return _IV(math.nextafter(min(t_lo, t_hi), -math.inf), math.nextafter(max(t_lo, t_hi), math.inf))
+        if name == "sinh":
+            a = args[0]
+            if max(abs(a.lo), abs(a.hi)) > 709.0:
+                raise _DomainError("SINH_OVERFLOW")
+            return _IV(math.nextafter(math.sinh(a.lo), -math.inf), math.nextafter(math.sinh(a.hi), math.inf))
+        if name == "cosh":
+            a = args[0]
+            if max(abs(a.lo), abs(a.hi)) > 709.0:
+                raise _DomainError("COSH_OVERFLOW")
+            if a.lo <= 0.0 <= a.hi:
+                return _IV(1.0, math.nextafter(max(math.cosh(a.lo), math.cosh(a.hi)), math.inf))
+            c1, c2 = math.cosh(a.lo), math.cosh(a.hi)
+            return _IV(math.nextafter(min(c1, c2), -math.inf), math.nextafter(max(c1, c2), math.inf))
         if name == "rand_uniform01":
             return _IV(0.0, 1.0)
         if name == "rand_normal01":
@@ -1071,7 +1178,26 @@ class _Translator:
                 return out
             return self.term(_parse(f"exp(({ast.unparse(node.right)}) * log({ast.unparse(node.left)}))"))
         if isinstance(node, ast.IfExp):
-            return z3.If(self.formula(node.test), self.term(node.body), self.term(node.orelse))
+            cond = self.formula(node.test)
+            t_box, e_box = _narrow_box_for_test(node.test, self.box)
+            orig_box = self.box
+            n0 = len(self.constraints)
+            self.box = t_box
+            try:
+                t_term = self.term(node.body)
+            finally:
+                self.box = orig_box
+            t_added = self.constraints[n0:]
+            self.constraints = self.constraints[:n0] + [z3.Implies(cond, c) for c in t_added]
+            n1 = len(self.constraints)
+            self.box = e_box
+            try:
+                e_term = self.term(node.orelse)
+            finally:
+                self.box = orig_box
+            e_added = self.constraints[n1:]
+            self.constraints = self.constraints[:n1] + [z3.Implies(z3.Not(cond), c) for c in e_added]
+            return z3.If(cond, t_term, e_term)
         if isinstance(node, ast.Call):
             if node.func.id == "kl_term":
                 p = _iv(node.args[0], self.box)
@@ -1097,13 +1223,36 @@ class _Translator:
         def function(x):
             if name == "reciprocal": return _IV(1) / x
             if name == "tanh": return _IV(math.nextafter(math.tanh(x.lo), -math.inf), math.nextafter(math.tanh(x.hi), math.inf))
+            if name == "log10":
+                if x.lo <= 0.0: raise _DomainError("LOG10_NONPOSITIVE_DOMAIN")
+                return _IV(math.nextafter(math.log10(x.lo), -math.inf), math.nextafter(math.log10(x.hi), math.inf))
+            if name == "tan":
+                if (x.hi - x.lo) >= 3.14159: raise _DomainError("TAN_POLE_IN_DOMAIN")
+                c = _trig(x, True)
+                if c.lo <= 0.0 <= c.hi: raise _DomainError("TAN_POLE_IN_DOMAIN")
+                t_lo, t_hi = math.sin(x.lo) / math.cos(x.lo), math.sin(x.hi) / math.cos(x.hi)
+                return _IV(math.nextafter(min(t_lo, t_hi), -math.inf), math.nextafter(max(t_lo, t_hi), math.inf))
+            if name == "sinh":
+                if max(abs(x.lo), abs(x.hi)) > 709.0: raise _DomainError("SINH_OVERFLOW")
+                return _IV(math.nextafter(math.sinh(x.lo), -math.inf), math.nextafter(math.sinh(x.hi), math.inf))
+            if name == "cosh":
+                if max(abs(x.lo), abs(x.hi)) > 709.0: raise _DomainError("COSH_OVERFLOW")
+                if x.lo <= 0.0 <= x.hi: return _IV(1.0, math.nextafter(max(math.cosh(x.lo), math.cosh(x.hi)), math.inf))
+                c1, c2 = math.cosh(x.lo), math.cosh(x.hi)
+                return _IV(math.nextafter(min(c1, c2), -math.inf), math.nextafter(max(c1, c2), math.inf))
             return _trig(x, name == "cos") if name in {"sin", "cos"} else x.op(name)
         def derivative(x):
             if name == "exp": return x.op("exp")
             if name == "log": return _IV(1) / x
+            if name == "log10": return _IV(1) / (x * _IV(math.log(10.0)))
             if name == "sqrt": return _IV(0.5) / x.op("sqrt")
             if name == "sin": return _trig(x, True)
             if name == "cos": return -_trig(x, False)
+            if name == "tan":
+                t = function(x)
+                return _IV(1.0, 1.0) + (t * t)
+            if name == "sinh": return function(_IV(x.lo, x.hi)) if False else _IV(1.0 if x.lo <= 0.0 <= x.hi else min(math.cosh(x.lo), math.cosh(x.hi)), max(math.cosh(x.lo), math.cosh(x.hi)))
+            if name == "cosh": return _IV(math.sinh(x.lo), math.sinh(x.hi))
             if name == "tanh":
                 t = function(x)
                 t2 = t * t
@@ -1378,9 +1527,10 @@ def _classify(
     deadline = time.monotonic() + min(10.0, (SMT_TIMEOUT_MS / 1000) * max(1, len(claims)))
     base = _and(ihcg.environmental_assumptions)
     hypothesis = _and(claims)
+    claim_box = ihcg.effective_claim_bounds()
     queries = {}
     def query(name, clauses, witness=True):
-        queries[name] = solve_query(_and(clauses), ihcg.omega, witness=witness, _deadline=deadline)
+        queries[name] = solve_query(_and(clauses), claim_box, witness=witness, _deadline=deadline)
     query("Q1", [base]); query("Q2", [base, hypothesis]); query("Q3", [base, f"not ({hypothesis})"])
     redundant = []
     for i, claim in enumerate(claims):

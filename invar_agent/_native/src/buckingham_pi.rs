@@ -803,10 +803,7 @@ pub(crate) fn canonical_system(
             })
             .collect();
     }
-    let mut best: Option<String> = None;
-    for mut order in orders {
-        // Positive domain-proven references precede potentially zero states.
-        order.sort_by_key(|s| !symbols[s].positive);
+    let eval_order = |order: &[String]| -> Result<String> {
         let n = order.len();
         let dimensions = (0..7)
             .map(|i| {
@@ -828,7 +825,8 @@ pub(crate) fn canonical_system(
         let mut variables = BTreeMap::new();
         let mut pi_symbols = BTreeMap::new();
         for (i, &f) in free.iter().enumerate() {
-            if basis[i][f] != Rational::ONE && !symbols[&order[f]].positive {
+            let coeff_ok = basis[i][f] == Rational::ONE || basis[i][f] == Rational::new(-1, 1)?;
+            if !coeff_ok && !symbols[&order[f]].positive {
                 return Err(
                     "primitive rational-power Pi groups require a positive free quantity".into(),
                 );
@@ -877,8 +875,6 @@ pub(crate) fn canonical_system(
                 symbols: pi_symbols.clone(),
             });
         }
-        // Attach the residual dimension to its equation before sorting, rather
-        // than allowing equations of different physical type to exchange tags.
         let mut equations = Vec::new();
         for ((eq, dimension), exact) in reduced.iter().zip(equation_dimensions).zip(exact) {
             let canon = canonicalize_dimensionless_system(std::slice::from_ref(eq), 64)?;
@@ -893,14 +889,83 @@ pub(crate) fn canonical_system(
                 t
             })
             .collect();
-        let candidate =
-            serde_json::to_string(&(tags, basis, equations)).map_err(|e| e.to_string())?;
-        if best.as_ref().map_or(true, |b| candidate < *b) {
-            best = Some(candidate);
+        serde_json::to_string(&(tags, basis, equations)).map_err(|e| e.to_string())
+    };
+
+    let mut best: Option<String> = None;
+    let mut last_err: Option<String> = None;
+    for mut order in orders {
+        // Positive domain-proven references precede potentially zero states.
+        order.sort_by_key(|s| !symbols[s].positive);
+        match eval_order(&order) {
+            Ok(candidate) => {
+                if best.as_ref().map_or(true, |b| candidate < *b) {
+                    best = Some(candidate);
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
         }
     }
+    // NF-08(b): If greedy pivot choice failed on signed states, enumerate subsets of positive symbols
+    // as leading pivot candidates and pick the lexicographically smallest valid canonical form.
+    if best.is_none() {
+        let pos_syms: Vec<String> = symbols
+            .iter()
+            .filter(|(_, s)| s.positive)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let nonpos_syms: Vec<String> = symbols
+            .iter()
+            .filter(|(_, s)| !s.positive)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !pos_syms.is_empty() && pos_syms.len() <= 10 {
+            fn gen_subsets(
+                items: &[String],
+                k: usize,
+                start: usize,
+                cur: &mut Vec<String>,
+                out: &mut Vec<Vec<String>>,
+            ) {
+                if cur.len() == k {
+                    out.push(cur.clone());
+                    return;
+                }
+                for idx in start..items.len() {
+                    cur.push(items[idx].clone());
+                    gen_subsets(items, k, idx + 1, cur, out);
+                    cur.pop();
+                }
+            }
+            let max_k = pos_syms.len().min(7);
+            for k in 1..=max_k {
+                let mut subsets = Vec::new();
+                gen_subsets(&pos_syms, k, 0, &mut Vec::new(), &mut subsets);
+                for sub in subsets {
+                    let mut order = sub;
+                    for p in &pos_syms {
+                        if !order.contains(p) {
+                            order.push(p.clone());
+                        }
+                    }
+                    order.extend(nonpos_syms.iter().cloned());
+                    if let Ok(candidate) = eval_order(&order) {
+                        if best.as_ref().map_or(true, |b| candidate < *b) {
+                            best = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let canonical_system = match best {
+        Some(b) => b,
+        None => return Err(last_err.unwrap_or_else(|| "dimensional reduction failed".into())),
+    };
     Ok(AlphaCanonicalResult {
-        canonical_system: best.unwrap_or_else(|| "[]".into()),
+        canonical_system,
         saturated: true,
         branches_explored: count,
     })

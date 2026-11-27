@@ -494,6 +494,8 @@ def validate_research_ir(ir, *, positive_import=True):
                 raise ValueError("OVERRIDE_LEDGER_TAMPERED: source certificate digest mismatch")
             if source_ref_map[run_id].certificate_verdict != certificate.epistemic_verdict.value:
                 raise ValueError("OVERRIDE_LEDGER_TAMPERED: source certificate verdict mismatch")
+        if certificate.epistemic_verdict.value == "COMPUTED_NO_CLAIM":
+            raise ValueError("COMPUTED_NO_CLAIM_NOT_EVIDENCE: computation without claim cannot be imported as verified evidence")
         if hasattr(certificate, "ihcg_anchor") and certificate.epistemic_verdict.value == "INCONCLUSIVE_UNVERIFIED":
             raise ValueError("INCONCLUSIVE_UNVERIFIED cannot be imported as scientific evidence")
         if certificate.epistemic_verdict.value == "VERIFIED_FALSIFICATION" and run_id not in negative_ids:
@@ -591,6 +593,8 @@ def compile_research_build_packet(prompt: str, research_runs: List[Dict[str, Any
             from ..research.epistemic import validate_certificate_artifacts
             certificate = validate_certificate_artifacts(raw_certificate, detail.get("unified_module_code") or "", detail.get("blueprint") or {})
             if certificate.run_id != run_id: raise ValueError("certificate run identity mismatch")
+            if certificate.epistemic_verdict.value == "COMPUTED_NO_CLAIM":
+                raise ValueError("COMPUTED_NO_CLAIM_NOT_EVIDENCE: computation without claim cannot be imported as verified evidence")
             if hasattr(certificate, "ihcg_anchor") and certificate.epistemic_verdict.value == "INCONCLUSIVE_UNVERIFIED":
                 raise ValueError("INCONCLUSIVE_UNVERIFIED cannot be imported as scientific evidence")
             if certificate.epistemic_verdict.value == "VERIFIED_FALSIFICATION":

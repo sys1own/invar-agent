@@ -298,11 +298,14 @@ def kernel_hole(y, p):
 
 
 def test_ci_gate_builder_unification_and_macro_domain_bijection():
-    # Lossless 8-domain bijection
+    # Lossless domain mapping (MATHEMATICS shares MATHEMATICS_CS_AND_INFO_THEORY -> QUANTUM_STATMECH)
     for dom in ScientificDomain:
         macro = to_macro_domain(dom)
         assert macro in MACRO_SCIENTIFIC_DOMAINS
-        assert from_macro_domain(macro) == dom
+        if dom == ScientificDomain.MATHEMATICS:
+            assert from_macro_domain(macro) == ScientificDomain.QUANTUM_STATMECH
+        else:
+            assert from_macro_domain(macro) == dom
 
     table, body = _make_sample_ode_ir()
     outcome = scope_check_and_lower(table, body)

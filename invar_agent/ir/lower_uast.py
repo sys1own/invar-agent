@@ -176,14 +176,14 @@ def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = F
             return f"(1.0 if ({args[0]}) >= 0.0 else 0.0)"
         if fn in ("min", "max") and len(args) >= 2:
             return lower_nary_binary_tree(fn, args)
-        math_fns = {"exp", "log", "sqrt", "sin", "cos", "tan", "tanh", "sinh", "cosh", "fabs", "floor", "ceil"}
+        math_fns = {"exp", "log", "log10", "sqrt", "sin", "cos", "tan", "tanh", "sinh", "cosh", "fabs", "floor", "ceil"}
         if fn in math_fns:
             return f"{fn}({', '.join(args)})" if for_ihcg else f"math.{fn}({', '.join(args)})"
         if fn in FUNCTION_REGISTRY:
             return f"{fn}({', '.join(args)})"
         raise ValueError(f"Unsupported SciIR function call: {fn!r}")
     if kind in ("if_then_else", "IfThenElse"):
-        cond_ops = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "=="}
+        cond_ops = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "==", "ne": "!="}
         if "cond_op" in expr:
             cop = cond_ops.get(str(expr["cond_op"]), "<=")
             lhs = _render_expr_to_python(expr["lhs"], sym_names, for_ihcg=for_ihcg)
@@ -212,11 +212,183 @@ def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = F
 
 
 def _substitute_state_vars(expr_str: str, replacements: dict[str, str]) -> str:
-    import re as _re
+    """UPG-006: Capture-free AST substitution replacing regex word substitution."""
+    import ast as _ast
+
     if not replacements:
         return expr_str
-    pattern = _re.compile(r"\b(" + "|".join(_re.escape(k) for k in sorted(replacements, key=len, reverse=True)) + r")\b")
-    return pattern.sub(lambda m: f"({replacements[m.group(1)]})", expr_str)
+    try:
+        tree = _ast.parse(expr_str, mode="eval")
+        parsed_repls = {k: _ast.parse(v, mode="eval").body for k, v in replacements.items()}
+    except SyntaxError:
+        import re as _re
+        pattern = _re.compile(
+            r"\b(" + "|".join(_re.escape(k) for k in sorted(replacements, key=len, reverse=True)) + r")\b"
+        )
+        return pattern.sub(lambda m: f"({replacements[m.group(1)]})", expr_str)
+
+    import copy as _copy
+
+    class _Sub(_ast.NodeTransformer):
+        def visit_Name(self, node: _ast.Name) -> _ast.AST:
+            if node.id in parsed_repls:
+                return _copy.deepcopy(parsed_repls[node.id])
+            return node
+
+    out = _Sub().visit(tree)
+    _ast.fix_missing_locations(out)
+    return _ast.unparse(out.body)
+
+
+def compile_time_forcing_schedule(
+    expr_str: str,
+    t_symbol: str,
+    t_start: float,
+    t_end: float,
+    *,
+    state_symbols: Optional[set[str]] = None,
+    param_prefix: str = "u__",
+) -> tuple[str, Optional["ForcingSchedule"], dict[str, tuple[float, float]]]:
+    """UPG-006 / NF-04: Lower time-only `Cond`s in an ODE expression into a smooth
+    `ForcingSchedule` over compiler-owned `CONTROL_PARAM` slots `u__0`, `u__1`, ...
+
+    If any `Cond` predicate references a state symbol, raises
+    `ValueError("PIECEWISE_STATE_DEPENDENT_UNSUPPORTED")`.
+    """
+    import ast as _ast
+    from fractions import Fraction
+    from invar_agent.research.meaningfulness import ForcingSchedule, ForcingSegment
+
+    tree = _ast.parse(expr_str, mode="eval")
+    conds: list[_ast.IfExp] = [n for n in _ast.walk(tree) if isinstance(n, _ast.IfExp)]
+    if not conds:
+        return expr_str, None, {}
+
+    state_set = set(state_symbols or ())
+
+    def _free_names(node: _ast.AST) -> set[str]:
+        return {n.id for n in _ast.walk(node) if isinstance(n, _ast.Name)}
+
+    def _const_frac(node: _ast.AST) -> Optional[Fraction]:
+        if isinstance(node, _ast.Constant) and type(node.value) in (int, float):
+            return Fraction(str(node.value))
+        if isinstance(node, _ast.UnaryOp) and isinstance(node.op, _ast.USub) and isinstance(node.operand, _ast.Constant) and type(node.operand.value) in (int, float):
+            return -Fraction(str(node.operand.value))
+        return None
+
+    def _extract_t_breakpoints(test: _ast.AST, bps: set[Fraction]) -> None:
+        names = _free_names(test)
+        if names & state_set:
+            raise ValueError(
+                f"PIECEWISE_STATE_DEPENDENT_UNSUPPORTED: conditional predicate references state symbol(s) {sorted(names & state_set)}"
+            )
+        if not names <= {t_symbol}:
+            raise ValueError(
+                f"PIECEWISE_STATE_DEPENDENT_UNSUPPORTED: conditional predicate references non-time symbol(s) {sorted(names - {t_symbol})}"
+            )
+        if isinstance(test, _ast.BoolOp):
+            for v in test.values:
+                _extract_t_breakpoints(v, bps)
+            return
+        if isinstance(test, _ast.UnaryOp) and isinstance(test.op, _ast.Not):
+            _extract_t_breakpoints(test.operand, bps)
+            return
+        if isinstance(test, _ast.Compare):
+            operands = [test.left, *test.comparators]
+            for a, b in zip(operands, operands[1:]):
+                if isinstance(a, _ast.Name) and a.id == t_symbol and _const_frac(b) is not None:
+                    bps.add(_const_frac(b))  # type: ignore[arg-type]
+                elif isinstance(b, _ast.Name) and b.id == t_symbol and _const_frac(a) is not None:
+                    bps.add(_const_frac(a))  # type: ignore[arg-type]
+                else:
+                    raise ValueError(f"PIECEWISE_STATE_DEPENDENT_UNSUPPORTED: non-linear time predicate {_ast.unparse(test)}")
+            return
+        raise ValueError(f"PIECEWISE_STATE_DEPENDENT_UNSUPPORTED: unsupported predicate {_ast.unparse(test)}")
+
+    def _eval_pred_at(test: _ast.AST, t_val: Fraction) -> bool:
+        if isinstance(test, _ast.BoolOp):
+            vals = [_eval_pred_at(v, t_val) for v in test.values]
+            return all(vals) if isinstance(test.op, _ast.And) else any(vals)
+        if isinstance(test, _ast.UnaryOp) and isinstance(test.op, _ast.Not):
+            return not _eval_pred_at(test.operand, t_val)
+        if isinstance(test, _ast.Compare):
+            operands = [test.left, *test.comparators]
+            for a, op, b in zip(operands, test.ops, operands[1:]):
+                av = t_val if (isinstance(a, _ast.Name) and a.id == t_symbol) else _const_frac(a)
+                bv = t_val if (isinstance(b, _ast.Name) and b.id == t_symbol) else _const_frac(b)
+                if av is None or bv is None:
+                    raise ValueError("PIECEWISE_STATE_DEPENDENT_UNSUPPORTED")
+                ok = (
+                    (av < bv) if isinstance(op, _ast.Lt)
+                    else (av <= bv) if isinstance(op, _ast.LtE)
+                    else (av > bv) if isinstance(op, _ast.Gt)
+                    else (av >= bv) if isinstance(op, _ast.GtE)
+                    else (av == bv) if isinstance(op, _ast.Eq)
+                    else (av != bv)
+                )
+                if not ok:
+                    return False
+            return True
+        raise ValueError("PIECEWISE_STATE_DEPENDENT_UNSUPPORTED")
+
+    t0_f = Fraction(str(t_start))
+    t1_f = Fraction(str(t_end))
+    breakpoints: set[Fraction] = {t0_f, t1_f}
+    slot_for_cond: dict[str, tuple[str, _ast.IfExp]] = {}
+    counter = 0
+
+    class _Replacer(_ast.NodeTransformer):
+        def visit_IfExp(self, node: _ast.IfExp) -> _ast.AST:
+            nonlocal counter
+            _extract_t_breakpoints(node.test, breakpoints)
+            b_val = _const_frac(node.body)
+            e_val = _const_frac(node.orelse)
+            if b_val is None or e_val is None:
+                raise ValueError(
+                    f"PIECEWISE_STATE_DEPENDENT_UNSUPPORTED: time forcing branches must be constants in {_ast.unparse(node)}"
+                )
+            key = _ast.unparse(node)
+            if key not in slot_for_cond:
+                sname = f"{param_prefix}{counter}"
+                counter += 1
+                slot_for_cond[key] = (sname, node)
+            sname = slot_for_cond[key][0]
+            return _ast.copy_location(_ast.Name(id=sname, ctx=_ast.Load()), node)
+
+    new_tree = _Replacer().visit(tree)
+    _ast.fix_missing_locations(new_tree)
+    sorted_bps = sorted(bp for bp in breakpoints if t0_f <= bp <= t1_f)
+    if sorted_bps[0] != t0_f:
+        sorted_bps.insert(0, t0_f)
+    if sorted_bps[-1] != t1_f:
+        sorted_bps.append(t1_f)
+
+    symbols_ordered = [slot_for_cond[k][0] for k in slot_for_cond]
+    segments: list[ForcingSegment] = []
+    domains: dict[str, tuple[float, float]] = {}
+    for a, b in zip(sorted_bps, sorted_bps[1:]):
+        if a >= b:
+            continue
+        mid = (a + b) / 2
+        vals: dict[str, str] = {}
+        for _key, (sname, cnode) in slot_for_cond.items():
+            chosen = _const_frac(cnode.body) if _eval_pred_at(cnode.test, mid) else _const_frac(cnode.orelse)
+            assert chosen is not None
+            vals[sname] = f"{chosen.numerator}/{chosen.denominator}" if chosen.denominator != 1 else str(chosen.numerator)
+            fv = float(chosen)
+            if sname not in domains:
+                domains[sname] = (fv, fv)
+            else:
+                domains[sname] = (min(domains[sname][0], fv), max(domains[sname][1], fv))
+        segments.append(
+            ForcingSegment(
+                t_start=f"{a.numerator}/{a.denominator}" if a.denominator != 1 else str(a.numerator),
+                t_end=f"{b.numerator}/{b.denominator}" if b.denominator != 1 else str(b.numerator),
+                values=vals,
+            )
+        )
+    sched = ForcingSchedule(symbols=tuple(symbols_ordered), segments=tuple(segments))
+    return _ast.unparse(new_tree.body), sched, domains
 
 
 def emit_python_kernel_from_sciir(ir: SciIR) -> str:
@@ -246,10 +418,11 @@ def emit_python_kernel_from_sciir(ir: SciIR) -> str:
                 f"evolve STATE variables {state_names}; derivative equations require ODE_PDE"
             )
 
-    # HOTFIX-C (NF-03): Refuse non-autonomous ODE_PDE expressions referencing INDEPENDENT_VAR
-    # until Sprint 2 autonomization (d t/dt = 1) lands.
+    # UPG-006 / NF-03: ODE autonomization (`d t/dt = 1`) for non-autonomous ODE_PDE models.
+    clock_syms: list[Any] = []
     if ir.archetype.value == "ODE_PDE":
-        indep_names = {s.name for s in symbols_sorted if s.role == SlotRole.INDEPENDENT_VAR}
+        indep_syms = [s for s in symbols_sorted if s.role == SlotRole.INDEPENDENT_VAR]
+        indep_names = {s.name for s in indep_syms}
         if indep_names:
             used_indep: set[str] = set()
 
@@ -281,11 +454,7 @@ def emit_python_kernel_from_sciir(ir: SciIR) -> str:
                 _scan_expr_for_indep(getattr(eq, "expr", None))
             for obs in ir.observables:
                 _scan_expr_for_indep(getattr(obs, "expr", None))
-            if used_indep:
-                raise ValueError(
-                    f"NONAUTONOMOUS_TIME_UNSUPPORTED: ODE_PDE references independent variable(s) "
-                    f"{', '.join(sorted(used_indep))}"
-                )
+            clock_syms = [s for s in indep_syms if s.name in used_indep]
 
     lines: list[str] = ["import math", "", "def simulation_step(buf, dt):"]
     # 1. Read all symbols from their unique contiguous canonical slots (CONTROL_PARAM / CONSTANT read-only)
@@ -301,31 +470,36 @@ def emit_python_kernel_from_sciir(ir: SciIR) -> str:
         let_map[lb.name] = inlined
         let_exprs.append((lb.name, rhs))
 
-    # 2. Emit dynamics (genuine RK4 for ODE_PDE) or algebraic updates
-    if state_syms and ir.archetype.value == "ODE_PDE":
+    # 2. Emit dynamics (genuine RK4 for ODE_PDE, including autonomized clock states d t/dt = 1) or algebraic updates
+    rk4_syms = list(state_syms) + list(clock_syms)
+    clock_name_set = {s.name for s in clock_syms}
+    if rk4_syms and ir.archetype.value == "ODE_PDE":
         raw_rhs: dict[str, str] = {}
-        for s in state_syms:
-            eq = state_eqs.get(s.name)
-            base_rhs = _render_expr_to_python(eq.expr, sym_names) if eq else "0.0"
-            raw_rhs[s.name] = _substitute_state_vars(base_rhs, let_map)
+        for s in rk4_syms:
+            if s.name in clock_name_set:
+                raw_rhs[s.name] = "1.0"
+            else:
+                eq = state_eqs.get(s.name)
+                base_rhs = _render_expr_to_python(eq.expr, sym_names) if eq else "0.0"
+                raw_rhs[s.name] = _substitute_state_vars(base_rhs, let_map)
 
         # Stage 1: k1 = f(y)
-        for s in state_syms:
+        for s in rk4_syms:
             lines.append(f"    _k1_{s.name} = {raw_rhs[s.name]}")
         # Stage 2: k2 = f(y + (dt / 2) * k1)
-        sub2 = {s.name: f"{s.name} + (dt / 2) * _k1_{s.name}" for s in state_syms}
-        for s in state_syms:
+        sub2 = {s.name: f"{s.name} + (dt / 2) * _k1_{s.name}" for s in rk4_syms}
+        for s in rk4_syms:
             lines.append(f"    _k2_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub2)}")
         # Stage 3: k3 = f(y + (dt / 2) * k2)
-        sub3 = {s.name: f"{s.name} + (dt / 2) * _k2_{s.name}" for s in state_syms}
-        for s in state_syms:
+        sub3 = {s.name: f"{s.name} + (dt / 2) * _k2_{s.name}" for s in rk4_syms}
+        for s in rk4_syms:
             lines.append(f"    _k3_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub3)}")
         # Stage 4: k4 = f(y + dt * k3)
-        sub4 = {s.name: f"{s.name} + dt * _k3_{s.name}" for s in state_syms}
-        for s in state_syms:
+        sub4 = {s.name: f"{s.name} + dt * _k3_{s.name}" for s in rk4_syms}
+        for s in rk4_syms:
             lines.append(f"    _k4_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub4)}")
         # Combine RK4 update
-        for s in state_syms:
+        for s in rk4_syms:
             lines.append(
                 f"    {s.name} = {s.name} + dt * (_k1_{s.name} + 2 * _k2_{s.name} + 2 * _k3_{s.name} + _k4_{s.name}) / 6"
             )

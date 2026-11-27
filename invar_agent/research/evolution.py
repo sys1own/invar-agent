@@ -437,6 +437,8 @@ def _apply_dual_math(name, arguments, sp):
         return _Dual(ev, ev * derivs[0])
     if name == 'log' and len(duals) == 1:
         return _Dual(sp.log(vals[0]), derivs[0] / vals[0])
+    if name == 'log10' and len(duals) == 1:
+        return _Dual(sp.log(vals[0], 10), derivs[0] / (vals[0] * sp.log(10)))
     if name == 'sqrt' and len(duals) == 1:
         sv = sp.sqrt(vals[0])
         return _Dual(sv, derivs[0] / (2 * sv))
@@ -444,6 +446,16 @@ def _apply_dual_math(name, arguments, sp):
         return _Dual(sp.sin(vals[0]), sp.cos(vals[0]) * derivs[0])
     if name == 'cos' and len(duals) == 1:
         return _Dual(sp.cos(vals[0]), -sp.sin(vals[0]) * derivs[0])
+    if name == 'tan' and len(duals) == 1:
+        tv = sp.tan(vals[0])
+        return _Dual(tv, (1 + tv ** 2) * derivs[0])
+    if name == 'tanh' and len(duals) == 1:
+        tv = sp.tanh(vals[0])
+        return _Dual(tv, (1 - tv ** 2) * derivs[0])
+    if name == 'sinh' and len(duals) == 1:
+        return _Dual(sp.sinh(vals[0]), sp.cosh(vals[0]) * derivs[0])
+    if name == 'cosh' and len(duals) == 1:
+        return _Dual(sp.cosh(vals[0]), sp.sinh(vals[0]) * derivs[0])
     if name in {'abs', 'fabs'} and len(duals) == 1:
         u, du = vals[0], derivs[0]
         abs_u = sp.Abs(u) if (isinstance(u, (int, float)) or getattr(u, 'is_Number', False)) else sp.Abs(u, evaluate=False)
@@ -625,7 +637,7 @@ class _SymbolicKernel:
                         return dl.__pow__(dr, sp)
                     return _Dual(dl.val ** dr.val, (dl.val ** dr.val) * (dr.val * dl.deriv / dl.val + sp.log(dl.val) * dr.deriv))
                 return left ** right
-            if name in {'_invar_sdiv', '_sdiv', 'sdiv', 'safe_div', 'div_eps', 'logistic_sigmoid', 'sigmoid', 'clamp', 'clip', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'fabs', 'min', 'max'}:
+            if name in {'_invar_sdiv', '_sdiv', 'sdiv', 'safe_div', 'div_eps', 'logistic_sigmoid', 'sigmoid', 'clamp', 'clip', 'sin', 'cos', 'tan', 'tanh', 'sinh', 'cosh', 'exp', 'log', 'log10', 'sqrt', 'abs', 'fabs', 'min', 'max'}:
                 return _apply_dual_math(name, arguments, sp)
             function = environment.get(('function', name), self.functions.get(name))
             if function is not None:

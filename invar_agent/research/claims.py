@@ -280,3 +280,439 @@ def detect_contradiction(
             advisories.append(f"CONTRADICTION_SOLVER_UNKNOWN:{key[1]}")
 
     return None, advisories
+
+
+# ---------------------------------------------------------------------------
+# UPG-002 Full (Sprint 2): Quantitative clause scanner, role admissibility,
+# coverage & strength verification, obligation classification, COMPUTED_NO_CLAIM
+# ---------------------------------------------------------------------------
+
+import ast as _ast
+import copy as _copy
+import hmac as _hmac
+import json as _json
+import re as _re
+from typing import Any as _Any, Mapping as _Mapping, Sequence as _Sequence
+
+_QUANT_PHRASE_RE = _re.compile(
+    r"(?:<=|>=|<|>|==|≤|≥|"
+    r"\b(?:never\s+exceeds?|exceeds?|at\s+least|at\s+most|no\s+more\s+than|"
+    r"less\s+than|greater\s+than|below|above|under|over)\b)",
+    _re.IGNORECASE,
+)
+_NUM_TOKEN_RE = _re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+class QuantitativeClause(_Strict):
+    start: int
+    end: int
+    comparator: str
+    number_text: str
+    quote: str
+
+
+def scan_quantitative_clauses(prompt: str) -> list[QuantitativeClause]:
+    """UPG-002 step 3: Scan prompt for comparator tokens/phrases within 40 chars of a number.
+
+    The left side may be any arbitrary expression (e.g. `V_c^2 / (V_c^2 + 1.0) <= 1.05`
+    or `never exceeds 1.25 V`). Used strictly for coverage and repair, never to block prose.
+    """
+    if not prompt:
+        return []
+    clauses: list[QuantitativeClause] = []
+    for m_cmp in _QUANT_PHRASE_RE.finditer(prompt):
+        win_start = max(0, m_cmp.start() - 40)
+        win_end = min(len(prompt), m_cmp.end() + 40)
+        after = prompt[m_cmp.end():win_end]
+        m_num = _NUM_TOKEN_RE.search(after)
+        if m_num is not None:
+            num_end = m_cmp.end() + m_num.end()
+            quote_start = max(0, m_cmp.start() - 24)
+            quote_end = min(len(prompt), num_end + 12)
+            clauses.append(
+                QuantitativeClause(
+                    start=m_cmp.start(),
+                    end=num_end,
+                    comparator=m_cmp.group(0),
+                    number_text=m_num.group(0),
+                    quote=prompt[quote_start:quote_end].strip(),
+                )
+            )
+    return clauses
+
+
+def enforce_role_admissibility(
+    claims: ClaimSet,
+    symbol_roles: _Mapping[str, str],
+) -> tuple[ClaimSet, list[dict[str, _Any]]]:
+    """UPG-002 / §2.2 anti-gaming: Out/In/Cfg role admissibility.
+
+    Any ClaimRecord with a comparison (`relation != NONE`) whose bound symbol is an
+    Output (`STATE`, `DYNAMIC_STATE`, `DERIVED_OBSERVABLE`, `OBSERVABLE`) cannot be
+    downgraded to `OPERATING_DOMAIN` or `SIMULATION_SETTING`; escalate it to `HYPOTHESIS`
+    and record `ROLE_ESCALATED`.
+    """
+    out_roles = {"STATE", "DYNAMIC_STATE", "DERIVED_OBSERVABLE", "OBSERVABLE"}
+    updated: list[ClaimRecord] = []
+    ledger: list[dict[str, _Any]] = []
+    for rec in claims.records:
+        sym = rec.symbol or rec.subject
+        srole = symbol_roles.get(sym, "")
+        if (
+            rec.relation != Relation.NONE
+            and srole in out_roles
+            and rec.role in (ClaimRole.OPERATING_DOMAIN, ClaimRole.SIMULATION_SETTING)
+        ):
+            updated.append(rec.model_copy(update={"role": ClaimRole.HYPOTHESIS}))
+            ledger.append({
+                "code": "ROLE_ESCALATED",
+                "claim_id": rec.id,
+                "symbol": sym,
+                "from_role": rec.role.value,
+                "to_role": ClaimRole.HYPOTHESIS.value,
+            })
+        else:
+            updated.append(rec)
+    return claims.model_copy(update={"records": updated}), ledger
+
+
+def _parse_obligation_bound(expr: str) -> Optional[tuple[str, str, Fraction]]:
+    """Extract simple `(symbol, op_str, exact_rational)` from a comparison obligation."""
+    try:
+        tree = _ast.parse(expr, mode="eval").body
+    except SyntaxError:
+        return None
+    if not (isinstance(tree, _ast.Compare) and len(tree.ops) == 1 and len(tree.comparators) == 1):
+        return None
+    op_map = {
+        _ast.Lt: "<", _ast.LtE: "<=", _ast.Gt: ">", _ast.GtE: ">=", _ast.Eq: "==", _ast.NotEq: "!=",
+    }
+    flip_map = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+    op_s = op_map.get(type(tree.ops[0]))
+    if not op_s:
+        return None
+
+    def _const(n: _ast.AST) -> Optional[Fraction]:
+        if isinstance(n, _ast.Constant) and type(n.value) in (int, float):
+            return Fraction(str(n.value))
+        if isinstance(n, _ast.UnaryOp) and isinstance(n.op, _ast.USub) and isinstance(n.operand, _ast.Constant) and type(n.operand.value) in (int, float):
+            return -Fraction(str(n.operand.value))
+        return None
+
+    if isinstance(tree.left, _ast.Name) and _const(tree.comparators[0]) is not None:
+        return (tree.left.id, op_s, _const(tree.comparators[0]))  # type: ignore[return-value]
+    if isinstance(tree.comparators[0], _ast.Name) and _const(tree.left) is not None:
+        return (tree.comparators[0].id, flip_map[op_s], _const(tree.left))  # type: ignore[return-value]
+    return None
+
+
+def check_claim_coverage_and_strength(
+    prompt: str,
+    claims: ClaimSet,
+    obligations: _Sequence[_Mapping[str, _Any]],
+    *,
+    temporal_reductions: _Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, _Any]], list[dict[str, _Any]]]:
+    """UPG-002 anti-gaming: check clause coverage, exact rational `CLAIM_WEAKENED`,
+    and `CLAIM_TEMPORAL_SCOPE_UNBOUND`. Returns `(diagnostics, synthesized_obligations)`.
+    """
+    diags: list[dict[str, _Any]] = []
+    synthesized: list[dict[str, _Any]] = []
+    t_reds = temporal_reductions or {}
+
+    # 1. Clause span coverage
+    clauses = scan_quantitative_clauses(prompt)
+    for cl in clauses:
+        covered = any(
+            not (r.span.end <= cl.start or r.span.start >= cl.end)
+            for r in claims.records
+        )
+        if not covered:
+            diags.append({
+                "code": "CLAIM_UNCOVERED",
+                "message": f"Quantitative clause {cl.quote!r} is not covered by any ClaimRecord span.",
+                "span": {"start": cl.start, "end": cl.end},
+            })
+
+    # 2. Per-HYPOTHESIS obligation matching + exact rational CLAIM_WEAKENED + temporal scope check
+    for rec in claims.records:
+        if rec.role != ClaimRole.HYPOTHESIS:
+            continue
+        matched_obs = [
+            ob for ob in obligations
+            if rec.id in (ob.get("claim_ids") or ())
+        ]
+        if not matched_obs:
+            # Attempt deterministic synthesis when fully typed
+            if rec.symbol and rec.relation not in (Relation.NONE, Relation.IN) and rec.value is not None:
+                val_si = Fraction(rec.value)
+                if rec.unit and rec.unit.strip():
+                    try:
+                        val_si = parse_unit(rec.unit).to_si_rational(val_si)
+                    except UnitError:
+                        pass
+                expr_s = f"{rec.symbol} {rec.relation.value} {float(val_si)!r}"
+                synthesized.append({
+                    "id": f"synth_{rec.id}",
+                    "obligation_class": "HYPOTHESIS_TARGET",
+                    "expression": expr_s,
+                    "claim_ids": [rec.id],
+                })
+            else:
+                diags.append({
+                    "code": "CLAIM_UNFORMALIZED",
+                    "claim_id": rec.id,
+                    "message": f"HYPOTHESIS claim {rec.id!r} ({rec.span.quote!r}) has no obligation and is not fully typed.",
+                })
+            continue
+
+        # Temporal scope binding check
+        if rec.time_scope in ("ALWAYS", "EVENTUALLY"):
+            bound_sym = rec.symbol or ""
+            if bound_sym and bound_sym not in t_reds:
+                # Check if any matched obligation references a symbol with a trajectory reduction
+                has_red = any(
+                    any(ts in str(ob.get("expression", "")) for ts in t_reds)
+                    for ob in matched_obs
+                )
+                if not has_red:
+                    diags.append({
+                        "code": "CLAIM_TEMPORAL_SCOPE_UNBOUND",
+                        "claim_id": rec.id,
+                        "message": f"Claim {rec.id!r} has time_scope={rec.time_scope} without a trajectory reduction observable.",
+                    })
+
+        # Exact rational CLAIM_WEAKENED check
+        if rec.value is not None and rec.relation in (Relation.LT, Relation.LE, Relation.GT, Relation.GE):
+            claimed_si = Fraction(rec.value)
+            if rec.unit and rec.unit.strip():
+                try:
+                    claimed_si = parse_unit(rec.unit).to_si_rational(claimed_si)
+                except UnitError:
+                    pass
+            for ob in matched_obs:
+                parsed = _parse_obligation_bound(str(ob.get("expression", "")))
+                if parsed is None:
+                    continue
+                _sym, ob_op, ob_val = parsed
+                weakened = False
+                if rec.relation in (Relation.LE, Relation.LT) and ob_op in ("<=", "<"):
+                    if ob_val > claimed_si or (rec.relation == Relation.LT and ob_op == "<=" and ob_val == claimed_si):
+                        weakened = True
+                elif rec.relation in (Relation.GE, Relation.GT) and ob_op in (">=", ">"):
+                    if ob_val < claimed_si or (rec.relation == Relation.GT and ob_op == ">=" and ob_val == claimed_si):
+                        weakened = True
+                elif (rec.relation in (Relation.LE, Relation.LT) and ob_op in (">=", ">")) or (
+                    rec.relation in (Relation.GE, Relation.GT) and ob_op in ("<=", "<")
+                ):
+                    weakened = True
+                if weakened:
+                    diags.append({
+                        "code": "CLAIM_WEAKENED",
+                        "claim_id": rec.id,
+                        "claimed_si": f"{claimed_si.numerator}/{claimed_si.denominator}",
+                        "obligation_si": f"{ob_val.numerator}/{ob_val.denominator}",
+                        "message": f"Obligation {ob.get('expression')!r} weakens claimed bound {rec.relation.value} {claimed_si}.",
+                    })
+    return diags, synthesized
+
+
+def _inline_ast_fixed_point(
+    expr_str: str,
+    algebraic_defs: _Mapping[str, str],
+    max_iters: int = 16,
+) -> Optional[str]:
+    """Inline algebraic observables & lets to a fixed point on the AST; return None on cycle."""
+    try:
+        tree = _ast.parse(expr_str, mode="eval").body
+        def_asts = {k: _ast.parse(v, mode="eval").body for k, v in algebraic_defs.items()}
+    except SyntaxError:
+        return expr_str
+
+    for _ in range(max_iters):
+        changed = False
+
+        class _Inline(_ast.NodeTransformer):
+            def visit_Name(self, node: _ast.Name) -> _ast.AST:
+                nonlocal changed
+                if node.id in def_asts:
+                    changed = True
+                    return _copy.deepcopy(def_asts[node.id])
+                return node
+
+        tree = _Inline().visit(tree)
+        _ast.fix_missing_locations(tree)
+        if not changed:
+            return _ast.unparse(tree)
+    return None  # Cycle detected
+
+
+def classify_obligations(
+    obligations: _Sequence[_Mapping[str, _Any]],
+    algebraic_defs: _Mapping[str, str],
+    env_assumptions: _Sequence[str],
+    claim_box: _Mapping[str, tuple[float, float]],
+    *,
+    conservation_pools: set[str] | None = None,
+) -> dict[str, _Any]:
+    """UPG-002 obligation classification & auxiliary pruning before preflight/ingest.
+
+    Returns:
+      {
+        "hypothesis_obligations": [...],
+        "conservation_guards": [...],
+        "diagnostic_assertions": [...],
+        "pruned_auxiliary": [...],
+        "classifications": {ob_id: ObligationClass.value},
+        "abort_tautological": bool,
+      }
+    """
+    import sympy as sp
+    from invar_agent.research import meaningfulness as m
+
+    pools = conservation_pools or set()
+    hyp_obs: list[dict[str, _Any]] = []
+    guards: list[dict[str, _Any]] = []
+    diag_asserts: list[dict[str, _Any]] = []
+    pruned: list[dict[str, _Any]] = []
+    classes: dict[str, str] = {}
+
+    env_expr = m._and(env_assumptions) if env_assumptions else "True"
+
+    for idx, raw_ob in enumerate(obligations):
+        ob = dict(raw_ob)
+        ob_id = str(ob.get("id") or f"ob_{idx}")
+        expr_str = str(ob.get("expression") or "").strip()
+        claim_ids = list(ob.get("claim_ids") or [])
+
+        inlined = _inline_ast_fixed_point(expr_str, algebraic_defs)
+        if inlined is None:
+            cls = ObligationClass.UNDECIDED
+        else:
+            # (a) Exact symbolic identity check (cancel / trigsimp)
+            is_identity = False
+            try:
+                node = m._parse(inlined)
+                if isinstance(node, _ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], _ast.Eq):
+                    lhs_s = sp.sympify(_ast.unparse(node.left), rational=True)
+                    rhs_s = sp.sympify(_ast.unparse(node.comparators[0]), rational=True)
+                    diff = sp.cancel(lhs_s - rhs_s)
+                    if diff == 0 or sp.trigsimp(diff) == 0:
+                        is_identity = True
+            except Exception:
+                is_identity = False
+
+            if is_identity:
+                cls = ObligationClass.DEFINITIONAL
+            else:
+                # (b)/(c)/(d) Z3 check on inlined expression over claim_box
+                try:
+                    free_vars = m._variables(m._parse(inlined))
+                    if env_assumptions:
+                        free_vars |= m._variables(m._parse(env_expr))
+                    box = dict(claim_box)
+                    for fv in free_vars:
+                        if fv not in box:
+                            box[fv] = (-1e6, 1e6)
+                    q_expr = m._and([env_expr, f"not ({inlined})"]) if env_assumptions else f"not ({inlined})"
+                    res = m.solve_query(q_expr, box, witness=False, timeout_ms=500)
+                    if res.status == "UNSAT":
+                        cls = ObligationClass.DOMAIN_ENTAILED
+                    elif res.status == "SAT":
+                        cls = ObligationClass.NONTRIVIAL
+                    else:
+                        cls = ObligationClass.UNDECIDED
+                except Exception:
+                    cls = ObligationClass.UNDECIDED
+
+        classes[ob_id] = cls.value
+        if not claim_ids:
+            # Auxiliary obligation
+            if cls in (ObligationClass.DEFINITIONAL, ObligationClass.DOMAIN_ENTAILED):
+                pruned.append({
+                    "code": "PRUNED_AUXILIARY_OBLIGATION",
+                    "id": ob_id,
+                    "expression": expr_str,
+                    "classification": cls.value,
+                })
+            elif ob.get("pool_id") in pools or ob.get("obligation_class") == "CONSERVATION_GUARD":
+                guards.append(ob)
+            else:
+                diag_asserts.append(ob)
+        else:
+            hyp_obs.append(ob)
+
+    # Abort TAUTOLOGICAL_TARGET iff EVERY hypothesis obligation is DEFINITIONAL or DOMAIN_ENTAILED
+    abort_taut = bool(hyp_obs) and all(
+        classes[str(ob.get("id") or f"ob_{i}")] in (ObligationClass.DEFINITIONAL.value, ObligationClass.DOMAIN_ENTAILED.value)
+        for i, ob in enumerate(hyp_obs)
+        if str(ob.get("id") or f"ob_{i}") in classes
+    )
+    return {
+        "hypothesis_obligations": hyp_obs,
+        "conservation_guards": guards,
+        "diagnostic_assertions": diag_asserts,
+        "pruned_auxiliary": pruned,
+        "classifications": classes,
+        "abort_tautological": abort_taut,
+    }
+
+
+# ---------------------------------------------------------------------------
+# COMPUTED_NO_CLAIM (deliberately NOT a member of EpistemicVerdict)
+# ---------------------------------------------------------------------------
+
+class ComputedVerdict(str, Enum):
+    COMPUTED_NO_CLAIM = "COMPUTED_NO_CLAIM"
+
+
+class ComputedQuantity(_Strict):
+    name: str
+    expression: str
+    unit: str
+    value: float
+    lo: float
+    hi: float
+    epsilon_total: float = Field(ge=0.0)
+    method: Literal[
+        "ALGEBRAIC_INTERVAL",
+        "ODE_GCI",
+        "TRAJECTORY_FUNCTIONAL",
+        "FIXED_POINT_KRAWCZYK",
+        "MC_EMPIRICAL_BERNSTEIN",
+    ]
+    claim_ids: tuple[str, ...] = ()
+
+
+class ComputationCertificate(_Strict):
+    schema_version: Literal["computation_no_claim.v1"] = "computation_no_claim.v1"
+    run_id: str
+    epistemic_verdict: ComputedVerdict = ComputedVerdict.COMPUTED_NO_CLAIM
+    ihcg_digest: str
+    uast_digest: str
+    purity_audit: _Any
+    fidelity_audits: dict[str, _Any] = Field(default_factory=dict)
+    quantities: tuple[ComputedQuantity, ...]
+    claim_set_digest: str
+    assumptions_ledger: tuple[_Any, ...] = ()
+    blake3_receipt: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def seal_computation_certificate(cert: ComputationCertificate) -> ComputationCertificate:
+    from invar_agent import _native
+
+    unsigned = cert.model_copy(update={"blake3_receipt": "0" * 64})
+    receipt = _native.py_compute_certificate_receipt(
+        _json.dumps(unsigned.model_dump(mode="json"), allow_nan=False)
+    )
+    return unsigned.model_copy(update={"blake3_receipt": receipt})
+
+
+def verify_computation_certificate(cert: ComputationCertificate) -> bool:
+    from invar_agent import _native
+
+    unsigned = cert.model_copy(update={"blake3_receipt": "0" * 64})
+    expected = _native.py_compute_certificate_receipt(
+        _json.dumps(unsigned.model_dump(mode="json"), allow_nan=False)
+    )
+    return _hmac.compare_digest(cert.blake3_receipt, expected)

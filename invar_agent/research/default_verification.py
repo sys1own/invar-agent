@@ -733,11 +733,70 @@ class _Kernel:
             initial.append(0.0)
         self._compile(code,already_instrumented=True)
         cpp = self.compiled[code]
-        try:
-            result = self.machine.bridge.run(cpp, initial, dt, steps, timeout_seconds=min(2.0,self.contract.timeout_seconds),trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ()) if cpp else self.machine.bridge.run_python(code, initial, dt, steps, timeout_seconds=2.0,trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ())
-        except KernelExecutionError as error:
-            if not error.compile_error: raise UnsupportedVerification("EXECUTABLE_SANDBOX_FAILED") from error
-            result = self.machine.bridge.run_python(code, initial, dt, steps, timeout_seconds=2.0,trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ())
+        if self.graph.forcing_schedule is not None and self.graph.forcing_schedule.segments:
+            from fractions import Fraction
+            sched = self.graph.forcing_schedule
+            dt_frac = Fraction(str(dt))
+            seg_steps_list: list[tuple[int, dict[str, float]]] = []
+            total_seg_steps = 0
+            for seg in sched.segments:
+                dur = Fraction(seg.t_end) - Fraction(seg.t_start)
+                ratio = dur / dt_frac
+                if ratio.denominator != 1 or ratio.numerator <= 0 or (ratio.numerator % 2 != 0):
+                    raise UnsupportedVerification(
+                        f"SEGMENT_GRID_UNALIGNED: segment [{seg.t_start}, {seg.t_end}] has {ratio} steps at dt={dt}"
+                    )
+                n_seg = int(ratio.numerator)
+                total_seg_steps += n_seg
+                seg_vals = {sym: float(Fraction(val_s)) for sym, val_s in seg.values.items()}
+                seg_steps_list.append((n_seg, seg_vals))
+            if total_seg_steps > 65536:
+                raise UnsupportedVerification("VERIFICATION_GRID_BUDGET_EXCEEDED")
+            cur_state = list(initial)
+            all_trace_vals: list[list[float]] = []
+            last_diag = {"projected_steps": 0, "stabilized_steps": 0}
+            for n_seg, seg_vals in seg_steps_list:
+                for sym, fv in seg_vals.items():
+                    if sym in self.slots:
+                        cur_state[self.slots[sym]] = fv
+                try:
+                    seg_res = (
+                        self.machine.bridge.run(
+                            cpp, cur_state, dt, n_seg,
+                            timeout_seconds=min(2.0, self.contract.timeout_seconds),
+                            trace_slots=(index, *[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else (),
+                        )
+                        if cpp
+                        else self.machine.bridge.run_python(
+                            code, cur_state, dt, n_seg,
+                            timeout_seconds=2.0,
+                            trace_slots=(index, *[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else (),
+                        )
+                    )
+                except KernelExecutionError as error:
+                    if not error.compile_error:
+                        raise UnsupportedVerification("EXECUTABLE_SANDBOX_FAILED") from error
+                    seg_res = self.machine.bridge.run_python(
+                        code, cur_state, dt, n_seg,
+                        timeout_seconds=2.0,
+                        trace_slots=(index, *[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else (),
+                    )
+                if not seg_res.get("finite"):
+                    raise UnsupportedVerification("NONFINITE_EXECUTABLE_RESULT")
+                cur_state = list(seg_res["state"])
+                if trace and seg_res.get("trace_values"):
+                    all_trace_vals.extend(seg_res["trace_values"])
+                d = seg_res.get("diag") or {}
+                last_diag["projected_steps"] = int(last_diag.get("projected_steps", 0)) + int(d.get("projected_steps", 0))
+                last_diag["stabilized_steps"] = int(last_diag.get("stabilized_steps", 0)) + int(d.get("stabilized_steps", 0))
+            result = {"finite": True, "state": cur_state, "trace_values": all_trace_vals, "diag": last_diag}
+            steps = total_seg_steps
+        else:
+            try:
+                result = self.machine.bridge.run(cpp, initial, dt, steps, timeout_seconds=min(2.0,self.contract.timeout_seconds),trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ()) if cpp else self.machine.bridge.run_python(code, initial, dt, steps, timeout_seconds=2.0,trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ())
+            except KernelExecutionError as error:
+                if not error.compile_error: raise UnsupportedVerification("EXECUTABLE_SANDBOX_FAILED") from error
+                result = self.machine.bridge.run_python(code, initial, dt, steps, timeout_seconds=2.0,trace_slots=(index,*[self.slots[e.state_symbol] for e in self.temporal.values()]) if trace else ())
         if not result.get("finite"): raise UnsupportedVerification("NONFINITE_EXECUTABLE_RESULT")
         audit = purity_audit_from_diag(result["diag"], domain_tag=f"stage{self.state.research_stage}/default", static_purity_passed=True)
         if audit.projected_steps or audit.stabilized_steps: raise UnsupportedVerification("RUNTIME_ENFORCEMENT")

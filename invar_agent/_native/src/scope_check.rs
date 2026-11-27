@@ -553,7 +553,7 @@ fn lower_and_check_expr(
     diags: &mut Vec<ScopeDiagnostic>,
 ) -> Option<(ExprNode, OptDim)> {
     match raw {
-        RawExpr::Const { value } => Some((ExprNode::Const { value: *value }, None)),
+        RawExpr::Const { value } => Some((ExprNode::Const { value: *value, exact: None }, None)),
         RawExpr::Rand {
             dist,
             draw_stream_id,
@@ -582,6 +582,7 @@ fn lower_and_check_expr(
                     return Some((
                         ExprNode::Const {
                             value: std::f64::consts::PI,
+                            exact: None,
                         },
                         None,
                     ));
@@ -590,6 +591,7 @@ fn lower_and_check_expr(
                     return Some((
                         ExprNode::Const {
                             value: std::f64::consts::E,
+                            exact: None,
                         },
                         None,
                     ));
@@ -765,7 +767,7 @@ fn lower_and_check_expr(
                             }
                         }
                     }
-                    if let ExprNode::Const { value } = r_node {
+                    if let ExprNode::Const { value, .. } = r_node {
                         if value.fract() == 0.0 && value.abs() <= 16.0 {
                             l_dim.map(|ld| dim_scale(&ld, Rat::new(value as i32, 1)))
                         } else if (value * 2.0).fract() == 0.0 && value.abs() <= 16.0 {
@@ -1008,7 +1010,7 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
                         } else {
                             target_decl.dimension.exponents
                         };
-                        let is_literal_zero = matches!(node, ExprNode::Const { value } if value == 0.0);
+                        let is_literal_zero = matches!(node, ExprNode::Const { value, .. } if value == 0.0);
                         if !is_literal_zero {
                             if let Some(rd) = rhs_dim {
                                 if !dim_eq(&rd, &expected_dim) {
@@ -1072,7 +1074,7 @@ pub fn check_scope_and_lower(req: &ScopeCheckRequest) -> ScopeCheckResponse {
                     &mut diags,
                 ) {
                     if req.check_dimensions {
-                        let is_literal_zero = matches!(node, ExprNode::Const { value } if value == 0.0);
+                        let is_literal_zero = matches!(node, ExprNode::Const { value, .. } if value == 0.0);
                         if !is_literal_zero {
                             if let Some(rd) = rhs_dim {
                                 if !dim_eq(&rd, &target_decl.dimension.exponents) {

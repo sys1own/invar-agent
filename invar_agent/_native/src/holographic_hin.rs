@@ -644,6 +644,9 @@ impl CselExpr {
                     "safe_div" => safe_div(a0, a1),
                     "safe_sqrt" | "sqrt" => safe_sqrt(a0),
                     "safe_log" | "log" => safe_log(a0),
+                    "log10" => safe_log(a0) / std::f64::consts::LN_10,
+                    "sinh" => a0.sinh(),
+                    "cosh" => a0.cosh(),
                     "safe_exp" | "exp" => safe_exp(a0),
                     "safe_pow" | "pow" => safe_pow(a0, a1),
                     "safe_sin" | "sin" => a0.sin(),
@@ -1109,7 +1112,7 @@ impl HolographicHinArena {
                         true,
                         p0.bound.safe_exp(),
                     ),
-                    "safe_log" | "log" | "log1p" => (
+                    "safe_log" | "log" | "log10" | "log1p" | "sinh" | "cosh" | "safe_tan" | "tan" => (
                         SIDimensionVector::dimensionless(),
                         true,
                         p0.bound.safe_log(),

@@ -772,7 +772,7 @@ class _Parser:
 
     def parse(self) -> ast.AST:
         self._try_quantifier_prefix()
-        node = self._parse_implies()
+        node = self._parse_ternary()
         if self._cur().kind != "EOF":
             tok = self._cur()
             raise _ParseError(
@@ -782,6 +782,26 @@ class _Parser:
                 hint="Write a single formal expression over declared symbols; move prose explanations to notes[].",
             )
         return node
+
+    # Precedence 0 (lowest): Ternary conditional `a if cond else b` (UPG-006)
+    def _parse_ternary(self) -> ast.AST:
+        self._check_budget()
+        body = self._parse_implies()
+        if self._match_kw("if"):
+            self.depth += 1
+            try:
+                test = self._parse_implies()
+                if not self._match_kw("else"):
+                    raise _ParseError(
+                        "EXPECTED_ELSE",
+                        "Expected 'else' in conditional expression.",
+                        self._cur(),
+                    )
+                orelse = self._parse_ternary()
+            finally:
+                self.depth -= 1
+            return ast.IfExp(test=test, body=body, orelse=orelse)
+        return body
 
     # Precedence 1 (lowest): Implication -> (right-associative)
     def _parse_implies(self) -> ast.AST:

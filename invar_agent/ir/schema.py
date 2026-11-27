@@ -10,7 +10,7 @@ import math
 from enum import Enum
 from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 
 class Archetype(str, Enum):
@@ -30,9 +30,11 @@ class ScientificDomain(str, Enum):
     QUANTUM_STATMECH = "QUANTUM_STATMECH"
     ENGINEERING_CTRL = "ENGINEERING_CTRL"
     ECON_COMPLEX = "ECON_COMPLEX"
+    MATHEMATICS = "MATHEMATICS"
 
 
-# Lossless bijection with `invar_agent.research.extractor.MACRO_SCIENTIFIC_DOMAINS`
+# Lossless mapping to `invar_agent.research.extractor.MACRO_SCIENTIFIC_DOMAINS`
+# (MATHEMATICS shares MATHEMATICS_CS_AND_INFO_THEORY; QUANTUM_STATMECH wins explicitly on reverse map).
 _VNEXT_TO_MACRO: dict[ScientificDomain, str] = {
     ScientificDomain.PHYSICS_THERMO: "PHYSICAL_SCIENCES_AND_ENG",
     ScientificDomain.BIOCHEM_SYSTEMS: "LIFE_SCIENCES_AND_BIOMEDICINE",
@@ -42,10 +44,13 @@ _VNEXT_TO_MACRO: dict[ScientificDomain, str] = {
     ScientificDomain.QUANTUM_STATMECH: "MATHEMATICS_CS_AND_INFO_THEORY",
     ScientificDomain.ENGINEERING_CTRL: "STATISTICS_AND_CAUSAL_INFERENCE",
     ScientificDomain.ECON_COMPLEX: "ECONOMICS_AND_GAME_THEORY",
+    ScientificDomain.MATHEMATICS: "MATHEMATICS_CS_AND_INFO_THEORY",
 }
 
 _MACRO_TO_VNEXT: dict[str, ScientificDomain] = {
-    v: k for k, v in _VNEXT_TO_MACRO.items()
+    v: k
+    for k, v in _VNEXT_TO_MACRO.items()
+    if k != ScientificDomain.MATHEMATICS
 }
 
 
@@ -244,6 +249,13 @@ class LetBinding(BaseModel):
     source_text: str = ""
 
 
+class EquationSemantics(str, Enum):
+    DERIVATIVE = "DERIVATIVE"
+    RESIDUAL = "RESIDUAL"
+    MAP = "MAP"
+    ASSIGN = "ASSIGN"
+
+
 class EquationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -252,6 +264,14 @@ class EquationSpec(BaseModel):
     expr: ExprNode
     source_text: str = ""
     reduction: Optional[Literal["TRAJECTORY_MAX", "TRAJECTORY_MIN", "TRAJECTORY_FINAL"]] = None
+    semantics: Optional[EquationSemantics] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_default_semantics(self, handler):
+        data = handler(self)
+        if self.semantics is None:
+            data.pop("semantics", None)
+        return data
 
 
 class ObligationSpec(BaseModel):
@@ -265,6 +285,14 @@ class ObligationSpec(BaseModel):
     tolerance: float = 1e-6
     epistemic_origin: str = "USER_PROMPT"
     source_text: str = ""
+    claim_ids: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_claim_ids(self, handler):
+        data = handler(self)
+        if not self.claim_ids:
+            data.pop("claim_ids", None)
+        return data
 
     @field_validator("tolerance")
     @classmethod
@@ -513,3 +541,95 @@ class SciIR(BaseModel):
 
 # Unified IR alias shared by Research Mode and Builder Studio
 CanonicalResearchIR = SciIR
+
+
+def _expr_has_rand(node: Any) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, dict):
+        if node.get("kind") == "rand":
+            return True
+        return any(_expr_has_rand(v) for v in node.values() if isinstance(v, (dict, list)))
+    if isinstance(node, list):
+        return any(_expr_has_rand(x) for x in node)
+    if getattr(node, "kind", None) == "rand":
+        return True
+    for attr in ("arg", "lhs", "rhs", "then_branch", "else_branch", "args"):
+        sub = getattr(node, attr, None)
+        if sub is not None and _expr_has_rand(sub):
+            return True
+    return False
+
+
+def derive_archetype(
+    ir: SciIR,
+    requested_analysis: Literal["TIME_EVOLUTION", "EQUILIBRIUM", "SWEEP", "MONTE_CARLO", "ALGEBRAIC"] = "TIME_EVOLUTION",
+) -> tuple[Archetype, list[Any]]:
+    """UPG-004: Structurally derive canonical Archetype from equations & semantics (first match wins)."""
+    from .diagnostics import Diagnostic
+
+    diags: list[Diagnostic] = []
+    all_eqs = [*ir.dynamics_or_residuals, *ir.observables]
+
+    # 1. Any rand node => MONTE_CARLO
+    if any(_expr_has_rand(getattr(eq, "expr", None)) for eq in all_eqs) or any(
+        _expr_has_rand(getattr(lb, "expr", None)) for lb in ir.let_bindings
+    ):
+        if ir.archetype != Archetype.MONTE_CARLO:
+            diags.append(
+                Diagnostic(
+                    code="ARCHETYPE_PROMOTION",
+                    field="archetype",
+                    message=f"{ir.archetype.value} -> MONTE_CARLO because stochastic rand node present",
+                )
+            )
+        return Archetype.MONTE_CARLO, diags
+
+    sems = [getattr(eq, "semantics", None) for eq in ir.dynamics_or_residuals]
+    has_deriv = any(s == EquationSemantics.DERIVATIVE for s in sems)
+    has_res_or_map = any(s in (EquationSemantics.RESIDUAL, EquationSemantics.MAP) for s in sems)
+    all_assign = bool(sems) and all(s == EquationSemantics.ASSIGN for s in sems)
+
+    # 2. Any DERIVATIVE
+    if has_deriv:
+        target = Archetype.FIXED_POINT if requested_analysis == "EQUILIBRIUM" else Archetype.ODE_PDE
+        if ir.archetype != target:
+            diags.append(
+                Diagnostic(
+                    code="ARCHETYPE_PROMOTION",
+                    field="archetype",
+                    message=f"{ir.archetype.value} -> {target.value} because DERIVATIVE equations with requested_analysis={requested_analysis}",
+                )
+            )
+        return target, diags
+
+    # 3. Any RESIDUAL or MAP => FIXED_POINT
+    if has_res_or_map:
+        if ir.archetype != Archetype.FIXED_POINT:
+            diags.append(
+                Diagnostic(
+                    code="ARCHETYPE_PROMOTION",
+                    field="archetype",
+                    message=f"{ir.archetype.value} -> FIXED_POINT because RESIDUAL/MAP equations present",
+                )
+            )
+        return Archetype.FIXED_POINT, diags
+
+    # 4. All ASSIGN => keep PARAM_SWEEP / ALGEBRAIC_CLOSURE
+    if all_assign:
+        target = ir.archetype if ir.archetype in (Archetype.PARAM_SWEEP, Archetype.ALGEBRAIC_CLOSURE) else Archetype.ALGEBRAIC_CLOSURE
+        return target, diags
+
+    # 5. Semantics absent
+    if ir.archetype in (Archetype.ODE_PDE, Archetype.FIXED_POINT):
+        return ir.archetype, diags
+    state_names = {s.name for s in ir.symbols if s.role == SlotRole.STATE}
+    if any(eq.target in state_names for eq in ir.dynamics_or_residuals):
+        diags.append(
+            Diagnostic(
+                code="EQUATION_SEMANTICS_REQUIRED",
+                field="dynamics_or_residuals",
+                message="STATE target has an equation without explicit semantics (DERIVATIVE/RESIDUAL/MAP/ASSIGN).",
+            )
+        )
+    return ir.archetype, diags

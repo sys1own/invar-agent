@@ -16,7 +16,9 @@ mod buckingham_pi;
 mod csel_egraph;
 mod deterministic_healer;
 mod egraph_healer;
+mod expr_ast;
 mod expr_parser;
+mod functions;
 mod goi_matrix;
 mod goi_solver;
 mod goi_wavefront;
@@ -101,6 +103,35 @@ fn py_domain_commit_raw(py: Python<'_>, domain_byte: u8, raw_bytes: &[u8]) -> Py
 fn py_parse_sci_expr(py: Python<'_>, expr: &str) -> PyResult<String> {
     py.allow_threads(|| expr_parser::parse_expr(expr).and_then(epistemic_json))
         .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_expr_parse(py: Python<'_>, text: &str, dialect: &str) -> PyResult<String> {
+    py.allow_threads(|| expr_ast::parse_expr_v1(text, dialect).and_then(epistemic_json))
+        .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_expr_canonicalize(py: Python<'_>, expr_json: &str) -> PyResult<String> {
+    py.allow_threads(|| {
+        let e: expr_ast::Expr = serde_json::from_str(expr_json).map_err(|e| e.to_string())?;
+        epistemic_json(expr_ast::canonicalize(e))
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_expr_render(py: Python<'_>, expr_json: &str, dialect: &str) -> PyResult<String> {
+    py.allow_threads(|| {
+        let e: expr_ast::Expr = serde_json::from_str(expr_json).map_err(|e| e.to_string())?;
+        expr_ast::render_expr(&e, dialect)
+    })
+    .map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn py_function_registry_spec() -> PyResult<String> {
+    functions::registry_json().map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -505,6 +536,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_domain_commit_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_domain_commit_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_sci_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(py_expr_parse, m)?)?;
+    m.add_function(wrap_pyfunction!(py_expr_canonicalize, m)?)?;
+    m.add_function(wrap_pyfunction!(py_expr_render, m)?)?;
+    m.add_function(wrap_pyfunction!(py_function_registry_spec, m)?)?;
     m.add_function(wrap_pyfunction!(py_scope_check_sci_ir, m)?)?;
     m.add_function(wrap_pyfunction!(py_compile_sciir_cpp20, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_diagonal_scales, m)?)?;

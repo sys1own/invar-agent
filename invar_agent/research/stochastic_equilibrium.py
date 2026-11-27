@@ -335,10 +335,6 @@ class _Roundoff:
             nlo, nhi = float(fn(lo)), float(fn(hi))
             alo, ahi = float(fn(math.nextafter(lo - error, -math.inf))), float(fn(math.nextafter(hi + error, math.inf)))
             return ((nlo, nhi), max(abs(ahi - nlo), abs(nhi - alo)))
-        if isinstance(node, ast.IfExp):
-            (alo, ahi), ea = self.expression(node.body, env, depth + 1)
-            (blo, bhi), eb = self.expression(node.orelse, env, depth + 1)
-            return ((min(alo, blo), max(ahi, bhi)), max(ea, eb))
         if isinstance(node,ast.Call) and ast.unparse(node.func) in {"min","max"}:
             if len(node.args) < 2 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
             evals = [self.expression(arg, env, depth + 1) for arg in node.args]
@@ -358,9 +354,18 @@ class _Roundoff:
                 if not math.isfinite(error+actual.lo+actual.hi): raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
                 return ((nominal.lo,nominal.hi),error)
             raise UnsupportedVerification("RIGOROUS_ROUNDING_BOUND_UNAVAILABLE")
+        if isinstance(node, ast.IfExp):
+            then_ok, else_ok, then_upd, else_upd = self._branch_bounds(node.test, env)
+            if then_ok and not else_ok:
+                return self.expression(node.body, {**env, **then_upd}, depth + 1)
+            if else_ok and not then_ok:
+                return self.expression(node.orelse, {**env, **else_upd}, depth + 1)
+            t_val = self.expression(node.body, {**env, **then_upd}, depth + 1)
+            e_val = self.expression(node.orelse, {**env, **else_upd}, depth + 1)
+            return self._hull_with_jump(t_val, e_val)
         if isinstance(node,ast.Call) and ast.unparse(node.func) in {
-            "exp","log","sqrt","sin","cos","abs","fabs","logistic_sigmoid",
-            "math.exp","math.log","math.sqrt","math.sin","math.cos","math.fabs","math.logistic_sigmoid",
+            "exp","log","log10","sqrt","sin","cos","tan","tanh","sinh","cosh","abs","fabs","logistic_sigmoid",
+            "math.exp","math.log","math.log10","math.sqrt","math.sin","math.cos","math.tan","math.tanh","math.sinh","math.cosh","math.fabs","math.logistic_sigmoid",
         }:
             if len(node.args) != 1 or node.keywords: raise UnsupportedVerification("ROUNDING_LIBRARY_SIGNATURE_UNBOUND")
             (lo,hi),error = self.expression(node.args[0],env,depth+1)
@@ -372,14 +377,29 @@ class _Roundoff:
                 act_lo = math.nextafter(lo - error, -math.inf)
                 if self.guarded_sqrt_log and name == "sqrt":
                     act_lo = max(0.0, act_lo)
-                elif self.guarded_sqrt_log and name == "log":
+                elif self.guarded_sqrt_log and name in {"log", "log10"}:
                     act_lo = max(1e-300, act_lo)
-                actual = m._iv(m._parse(f"{name}(a)"),{"a":(act_lo,math.nextafter(hi+error,math.inf))})
+                act_hi = math.nextafter(hi + error, math.inf)
+                actual = m._iv(m._parse(f"{name}(a)"),{"a":(act_lo, act_hi)})
             except m._DomainError:
                 if self.minimum_divisor > 0.0:
                     return ((-math.inf, math.inf), math.inf)
                 raise
-            error = math.nextafter(max(abs(actual.lo-nominal.hi),abs(actual.hi-nominal.lo)),math.inf)
+            # NF-19: Lipschitz unary rounding bound `L * e_in + 16 * ulp(M)` upward-rounded
+            from ..ir.function_registry import FUNCTION_REGISTRY
+            spec = FUNCTION_REGISTRY.get(name)
+            if spec is not None and spec.roundoff_bound is not None:
+                try:
+                    _, error = spec.roundoff_bound([((lo, hi), error)])
+                except Exception:
+                    error = math.nextafter(max(abs(actual.lo-nominal.hi),abs(actual.hi-nominal.lo)),math.inf)
+            else:
+                # logistic_sigmoid: |f'| <= 0.25
+                M = max(abs(actual.lo), abs(actual.hi))
+                if name == "logistic_sigmoid" and math.isfinite(M):
+                    error = math.nextafter(0.25 * error + 16.0 * math.ulp(max(M, 1e-300)), math.inf)
+                else:
+                    error = math.nextafter(max(abs(actual.lo-nominal.hi),abs(actual.hi-nominal.lo)),math.inf)
             if not math.isfinite(error+actual.lo+actual.hi):
                 if self.minimum_divisor > 0.0:
                     return ((-math.inf, math.inf), math.inf)
@@ -423,8 +443,20 @@ class _Roundoff:
                 if exp_int >= 0:
                     expression = m._parse(f"a**{exp_int}")
                     nominal = m._iv(expression, {"a": (lo, hi)})
-                    actual = m._iv(expression, {"a": (math.nextafter(lo - error, -math.inf), math.nextafter(hi + error, math.inf))})
-                    error = math.nextafter(max(abs(actual.lo - nominal.hi), abs(actual.hi - nominal.lo)), math.inf)
+                    act_lo = math.nextafter(lo - error, -math.inf)
+                    act_hi = math.nextafter(hi + error, math.inf)
+                    actual = m._iv(expression, {"a": (act_lo, act_hi)})
+                    # NF-19: L = k * max(|act_lo|, |act_hi|)^(k-1)
+                    M = max(abs(actual.lo), abs(actual.hi))
+                    if exp_int == 0:
+                        error = 0.0
+                    else:
+                        base_max = max(abs(act_lo), abs(act_hi))
+                        L = exp_int * (base_max ** (exp_int - 1))
+                        if math.isfinite(L) and math.isfinite(M):
+                            error = math.nextafter(L * error + 16.0 * math.ulp(max(M, 1e-300)), math.inf)
+                        else:
+                            error = math.nextafter(max(abs(actual.lo - nominal.hi), abs(actual.hi - nominal.lo)), math.inf)
                     if not math.isfinite(error + actual.lo + actual.hi): raise UnsupportedVerification("NONFINITE_ROUNDING_BOUND")
                     return ((nominal.lo, nominal.hi), error)
                 # BUG-028: Negative integer power (e.g. rational saturation (1 + h*y)**-1)
@@ -477,6 +509,15 @@ class _Roundoff:
         (l1, h1), e1 = v1
         (l2, h2), e2 = v2
         return ((min(l1, l2), max(h1, h2)), max(e1, e2))
+
+    @staticmethod
+    def _hull_with_jump(v1, v2):
+        """Ambiguous conditional merge (§2.5): includes branch jump discrepancy."""
+        (l1, h1), e1 = v1
+        (l2, h2), e2 = v2
+        jump = max(abs(h1 - l2), abs(h2 - l1))
+        err = math.nextafter(max(e1, e2) + jump, math.inf) if math.isfinite(jump) else math.inf
+        return ((min(l1, l2), max(h1, h2)), err)
 
     @staticmethod
     def _branch_bounds(test, env):
@@ -559,7 +600,7 @@ class _Roundoff:
                     for k in set(then_env) | set(else_env):
                         if k in then_env and k in else_env:
                             if isinstance(then_env[k], tuple) and isinstance(else_env[k], tuple):
-                                env[k] = self._hull(then_env[k], else_env[k])
+                                env[k] = self._hull_with_jump(then_env[k], else_env[k])
                             else:
                                 env[k] = then_env[k]
                         elif k in then_env:
@@ -569,12 +610,12 @@ class _Roundoff:
                     merged_vals = dict(orig_values)
                     for k in set(then_vals) | set(else_vals):
                         if k in then_vals and k in else_vals:
-                            merged_vals[k] = self._hull(then_vals[k], else_vals[k])
+                            merged_vals[k] = self._hull_with_jump(then_vals[k], else_vals[k])
                         else:
                             merged_vals[k] = then_vals.get(k, else_vals.get(k))
                     self.values = merged_vals
                     if then_ret is not None and else_ret is not None:
-                        return self._hull(then_ret, else_ret)
+                        return self._hull_with_jump(then_ret, else_ret)
                 elif then_ok:
                     env.update(then_env)
                     self.values = then_vals

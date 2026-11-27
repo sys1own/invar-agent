@@ -114,7 +114,30 @@ fn eval_interval_with_deadline(expr: &CselExpr, env: &HashMap<String, IntervalF6
             let (lo, hi) = match func.as_str() {
                 "exp" => (a.lo.exp(), a.hi.exp()),
                 "log" if a.lo > 0.0 => (a.lo.ln(), a.hi.ln()),
+                "log10" if a.lo > 0.0 => (a.lo.log10(), a.hi.log10()),
                 "sqrt" if a.lo >= 0.0 => (a.lo.sqrt(), a.hi.sqrt()),
+                "tanh" => (a.lo.tanh(), a.hi.tanh()),
+                "sinh" => (a.lo.sinh(), a.hi.sinh()),
+                "cosh" => {
+                    if a.lo <= 0.0 && a.hi >= 0.0 {
+                        (1.0, a.lo.cosh().max(a.hi.cosh()))
+                    } else {
+                        let c1 = a.lo.cosh();
+                        let c2 = a.hi.cosh();
+                        (c1.min(c2), c1.max(c2))
+                    }
+                }
+                "tan" => {
+                    if (a.hi - a.lo) >= 3.14159 {
+                        return Err("TAN_POLE_IN_DOMAIN: interval width >= pi".into());
+                    }
+                    let c_lo = a.lo.cos();
+                    let c_hi = a.hi.cos();
+                    if c_lo * c_hi <= 0.0 || c_lo.abs() < 1e-12 || c_hi.abs() < 1e-12 {
+                        return Err("TAN_POLE_IN_DOMAIN: cos crosses zero".into());
+                    }
+                    (a.lo.tan(), a.hi.tan())
+                }
                 // Full codomain avoids platform-dependent argument reduction assumptions.
                 "sin" | "cos" => return Ok(IntervalF64 { lo: -1.0, hi: 1.0 }),
                 _ => return Err(format!("unsupported function or invalid domain: {func}")),
@@ -818,6 +841,23 @@ pub fn reverse_adjoint(
                 "safe_tanh" | "tanh" => {
                     let t = call1("safe_tanh", a0);
                     let da = mul(adjoint, sub(lit(1.0), mul(t.clone(), t)));
+                    reverse_adjoint(&args[0], da, grads)
+                }
+                "log10" => {
+                    let da = sdiv(adjoint, mul(a0, lit(std::f64::consts::LN_10)));
+                    reverse_adjoint(&args[0], da, grads)
+                }
+                "safe_tan" | "tan" => {
+                    let t = call1("tan", a0);
+                    let da = mul(adjoint, add(lit(1.0), mul(t.clone(), t)));
+                    reverse_adjoint(&args[0], da, grads)
+                }
+                "sinh" => {
+                    let da = mul(adjoint, call1("cosh", a0));
+                    reverse_adjoint(&args[0], da, grads)
+                }
+                "cosh" => {
+                    let da = mul(adjoint, call1("sinh", a0));
                     reverse_adjoint(&args[0], da, grads)
                 }
                 "safe_pow" | "pow" if args.len() >= 2 => {

@@ -181,8 +181,37 @@ def _tagged(expressions, tags):
     return [{"expr": m._json(m._csel(m._parse(expr))), "symbols": {s: tags[s] for s in sorted(m._variables(m._parse(expr)))}} for expr in expressions]
 
 
+def _scale_fractional_si_dims(equations):
+    """NF-08(a): Scale all si_dim exponents by LCM of denominators (1, 2, or 4) ONLY when a fraction is present."""
+    denoms = set()
+    for eq in equations:
+        for sym_meta in (eq.get("symbols") or {}).values():
+            for exp in sym_meta.get("si_dim") or ():
+                if isinstance(exp, Fraction) and exp.denominator != 1:
+                    denoms.add(exp.denominator)
+                elif isinstance(exp, float) and not exp.is_integer():
+                    f = Fraction(str(exp)).limit_denominator(4)
+                    if f.denominator != 1:
+                        denoms.add(f.denominator)
+    if not denoms:
+        return equations
+    lcm = 1
+    for d in denoms:
+        lcm = math.lcm(lcm, d)
+    if lcm not in (1, 2, 4):
+        raise CanonicalizationError(f"unsupported fractional SI denominator LCM={lcm}")
+    scaled = copy.deepcopy(equations)
+    for eq in scaled:
+        for sym_meta in (eq.get("symbols") or {}).values():
+            raw = sym_meta.get("si_dim")
+            if raw is not None:
+                sym_meta["si_dim"] = [int(Fraction(str(x)).limit_denominator(4) * lcm) for x in raw]
+    return scaled
+
+
 def _native_canonical(equations):
-    try: result = json.loads(_native.py_compute_alpha_canonical_system(m._json(equations), max_aut_branches=64))
+    scaled = _scale_fractional_si_dims(equations)
+    try: result = json.loads(_native.py_compute_alpha_canonical_system(m._json(scaled), max_aut_branches=64))
     except ValueError as error: raise CanonicalizationError(str(error)) from error
     if not result["saturated"]: raise CanonicalizationError("native canonicalization did not saturate")
     return result["canonical_system"]

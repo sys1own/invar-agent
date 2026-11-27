@@ -96,7 +96,7 @@ impl Dual {
 
 pub fn eval_expr(node: &ExprNode, ctx: &EvalContext<'_>) -> f64 {
     match node {
-        ExprNode::Const { value } => *value,
+        ExprNode::Const { value, .. } => *value,
         ExprNode::Sym {
             role, slot_index, ..
         } => match role {
@@ -154,11 +154,31 @@ pub fn eval_expr(node: &ExprNode, ctx: &EvalContext<'_>) -> f64 {
                 CondOp::Gt => l > r,
                 CondOp::Ge => l >= r,
                 CondOp::Eq => (l - r).abs() <= 1e-12,
+                CondOp::Ne => (l - r).abs() > 1e-12,
             };
             if cond {
                 eval_expr(then_branch, ctx)
             } else {
                 eval_expr(else_branch, ctx)
+            }
+        }
+        ExprNode::Call { func, args } => {
+            let vals: Vec<f64> = args.iter().map(|a| eval_expr(a, ctx)).collect();
+            match (func.as_str(), vals.as_slice()) {
+                ("log10", [x]) => x.log10(),
+                ("tan", [x]) => x.tan(),
+                ("sinh", [x]) => x.sinh(),
+                ("cosh", [x]) => x.cosh(),
+                ("tanh", [x]) => x.tanh(),
+                ("exp", [x]) => x.exp(),
+                ("log", [x]) => x.ln(),
+                ("sqrt", [x]) => x.sqrt(),
+                ("sin", [x]) => x.sin(),
+                ("cos", [x]) => x.cos(),
+                ("abs", [x]) => x.abs(),
+                ("min", [a, b]) => a.min(*b),
+                ("max", [a, b]) => a.max(*b),
+                _ => f64::NAN,
             }
         }
         ExprNode::Rand {
@@ -175,7 +195,7 @@ fn eval_dual(
     wrt_slot: usize,
 ) -> Dual {
     match node {
-        ExprNode::Const { value } => Dual::c(*value),
+        ExprNode::Const { value, .. } => Dual::c(*value),
         ExprNode::Sym {
             role, slot_index, ..
         } => {
@@ -306,11 +326,88 @@ fn eval_dual(
                 CondOp::Gt => l > r,
                 CondOp::Ge => l >= r,
                 CondOp::Eq => (l - r).abs() <= 1e-12,
+                CondOp::Ne => (l - r).abs() > 1e-12,
             };
             if cond {
                 eval_dual(then_branch, ctx, wrt_role, wrt_slot)
             } else {
                 eval_dual(else_branch, ctx, wrt_role, wrt_slot)
+            }
+        }
+        ExprNode::Call { func, args } => {
+            let ds: Vec<Dual> = args
+                .iter()
+                .map(|a| eval_dual(a, ctx, wrt_role, wrt_slot))
+                .collect();
+            match (func.as_str(), ds.as_slice()) {
+                ("log10", [u]) => Dual {
+                    v: u.v.log10(),
+                    d: u.d / (u.v * std::f64::consts::LN_10),
+                },
+                ("tan", [u]) => {
+                    let t = u.v.tan();
+                    Dual {
+                        v: t,
+                        d: u.d * (1.0 + t * t),
+                    }
+                }
+                ("sinh", [u]) => Dual {
+                    v: u.v.sinh(),
+                    d: u.d * u.v.cosh(),
+                },
+                ("cosh", [u]) => Dual {
+                    v: u.v.cosh(),
+                    d: u.d * u.v.sinh(),
+                },
+                ("tanh", [u]) => {
+                    let t = u.v.tanh();
+                    Dual {
+                        v: t,
+                        d: u.d * (1.0 - t * t),
+                    }
+                }
+                ("exp", [u]) => {
+                    let e = u.v.exp();
+                    Dual { v: e, d: u.d * e }
+                }
+                ("log", [u]) => Dual {
+                    v: u.v.ln(),
+                    d: u.d / u.v,
+                },
+                ("sqrt", [u]) => {
+                    let s = u.v.sqrt();
+                    Dual {
+                        v: s,
+                        d: u.d / (2.0 * s),
+                    }
+                }
+                ("sin", [u]) => Dual {
+                    v: u.v.sin(),
+                    d: u.d * u.v.cos(),
+                },
+                ("cos", [u]) => Dual {
+                    v: u.v.cos(),
+                    d: -u.d * u.v.sin(),
+                },
+                ("abs", [u]) => Dual {
+                    v: u.v.abs(),
+                    d: if u.v >= 0.0 { u.d } else { -u.d },
+                },
+                ("min", [a, b]) => {
+                    if a.v <= b.v {
+                        *a
+                    } else {
+                        *b
+                    }
+                }
+                ("max", [a, b]) => {
+                    if a.v >= b.v {
+                        *a
+                    } else {
+                        *b
+                    }
+                }
+                _ => Dual::c(f64::NAN),
             }
         }
         ExprNode::Rand {
@@ -478,7 +575,7 @@ pub fn eval_ir_df_dt(
 
 fn emit_cpp_expr(node: &ExprNode) -> String {
     match node {
-        ExprNode::Const { value } => format!("{:.17e}", value),
+        ExprNode::Const { value, .. } => format!("{:.17e}", value),
         ExprNode::Sym {
             role, slot_index, ..
         } => match role {
@@ -528,6 +625,7 @@ fn emit_cpp_expr(node: &ExprNode) -> String {
                 CondOp::Gt => ">",
                 CondOp::Ge => ">=",
                 CondOp::Eq => "==",
+                CondOp::Ne => "!=",
             };
             format!(
                 "(({} {} {}) ? ({}) : ({}))",
@@ -537,6 +635,15 @@ fn emit_cpp_expr(node: &ExprNode) -> String {
                 emit_cpp_expr(then_branch),
                 emit_cpp_expr(else_branch)
             )
+        }
+        ExprNode::Call { func, args } => {
+            let rargs: Vec<String> = args.iter().map(emit_cpp_expr).collect();
+            let cpp_fn = match func.as_str() {
+                "log10" | "tan" | "sinh" | "cosh" | "tanh" | "exp" | "log" | "sqrt" | "sin"
+                | "cos" | "abs" | "min" | "max" => format!("std::{func}"),
+                other => other.to_string(),
+            };
+            format!("{cpp_fn}({})", rargs.join(", "))
         }
         ExprNode::Rand { draw_stream_id, .. } => {
             format!("sci_rand_draw(seed, rep, {})", draw_stream_id)

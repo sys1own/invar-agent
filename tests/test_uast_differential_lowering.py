@@ -84,7 +84,7 @@ def test_invalid_inputs_and_unsupported_interval_operation(tmp_path):
     with pytest.raises(ValueError, match="finite inputs"):
         check_kernel(KERNELS["ode"][0], [math.nan], dt=0.1, steps=1, cache_dir=tmp_path)
     with pytest.raises(ValueError, match="unsupported"):
-        _native.evaluate_interval_f64(json.dumps({"kind": "call", "func": "tan",
+        _native.evaluate_interval_f64(json.dumps({"kind": "call", "func": "lgamma",
             "args": [{"kind": "literal", "value": 1.0}]}), {})
     with pytest.raises(ValueError, match="invalid interval"):
         _native.evaluate_interval_f64('{"kind":"symbol","name":"x"}', {"x": (2.0, 1.0)})

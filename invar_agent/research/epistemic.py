@@ -80,7 +80,11 @@ def incomplete_certificate(run_id, hypothesis, reason, *, diagnostics=None):
 def parse_run_certificate(raw):
     if hasattr(raw, "model_dump"): raw = raw.model_dump(mode="json")
     if isinstance(raw, str): raw = json.loads(raw)
-    if raw.get("schema_version") == "meaningfulness_incomplete.v1":
+    if raw.get("schema_version") == "computation_no_claim.v1":
+        from .claims import ComputationCertificate, verify_computation_certificate
+        certificate = ComputationCertificate.model_validate_json(json.dumps(raw, allow_nan=False))
+        valid = verify_computation_certificate(certificate)
+    elif raw.get("schema_version") == "meaningfulness_incomplete.v1":
         certificate = IncompleteRunCertificate.model_validate_json(json.dumps(raw, allow_nan=False))
         if certificate.epistemic_verdict != m.EpistemicVerdict.INCONCLUSIVE_UNVERIFIED:
             raise ValueError("incomplete evidence cannot certify a terminal discovery")

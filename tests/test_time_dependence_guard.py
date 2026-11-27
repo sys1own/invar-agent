@@ -1,62 +1,64 @@
-"""HOTFIX-C (NF-03) tests: refuse non-autonomous ODE_PDE referencing INDEPENDENT_VAR."""
+"""UPG-006 / NF-03: Non-autonomous ODE_PDE autonomization (`dt/dt = 1`) verification."""
 from __future__ import annotations
-
-import pytest
 
 from invar_agent.ir.lower_uast import emit_python_kernel_from_sciir
 from invar_agent.ir.schema import (
     Archetype,
-    FrozenSymbolTable,
-    ModelBodyDraft,
-    OdePdeConfig,
-    RawEquationDraft,
+    EquationSpec,
+    IntervalBound,
+    SciIR,
     ScientificDomain,
     SiDimension,
     SlotRole,
     SymbolDecl,
 )
-from invar_agent.ir.typechecker import scope_check_and_lower
 
 
-def test_nonautonomous_ode_referencing_independent_var_is_refused():
-    dimless = SiDimension.dimensionless()
-    time_dim = SiDimension(exponents=[(0, 1), (0, 1), (1, 1), (0, 1), (0, 1), (0, 1), (0, 1)], unit_label="s")
-    table = FrozenSymbolTable(
-        ir_id="nonauto_t",
+def test_nf03_nonautonomous_ode_autonomizes_and_integrates_exact_half():
+    ir = SciIR(
+        ir_id="nonaut_t_sq",
+        domain=list(ScientificDomain)[0],
+        user_prompt_digest="0" * 64,
         archetype=Archetype.ODE_PDE,
-        domain=ScientificDomain.PHYSICS_THERMO,
         symbols=[
-            SymbolDecl(name="x", display_symbol="x", role=SlotRole.STATE, slot_index=0, dimension=dimless, initial_or_default=0.0),
-            SymbolDecl(name="t", display_symbol="t", role=SlotRole.INDEPENDENT_VAR, slot_index=1, dimension=time_dim, initial_or_default=0.0),
+            SymbolDecl(
+                name="t",
+                display_symbol="t",
+                role=SlotRole.INDEPENDENT_VAR,
+                slot_index=0,
+                dimension=SiDimension(exponents=[(0, 1)] * 7, unit_label="1"),
+                initial_or_default=0.0,
+                domain=IntervalBound(lo=0.0, hi=1.0),
+            ),
+            SymbolDecl(
+                name="x",
+                display_symbol="x",
+                role=SlotRole.STATE,
+                slot_index=1,
+                dimension=SiDimension(exponents=[(0, 1)] * 7, unit_label="1"),
+                initial_or_default=0.0,
+                domain=IntervalBound(lo=0.0, hi=1.0),
+            ),
+        ],
+        dynamics_or_residuals=[
+            EquationSpec(
+                target="x",
+                expr={"kind": "sym", "name": "t", "role": "INDEPENDENT_VAR", "slot_index": 0},
+            )
         ],
     )
-    body = ModelBodyDraft(
-        dynamics_or_residuals=[RawEquationDraft(target="x", expr_text="t")],
-        config=OdePdeConfig(t_span=(0.0, 1.0), sample_points=20),
-    )
-    outcome = scope_check_and_lower(table, body)
-    assert outcome.ok and outcome.sci_ir is not None
-    with pytest.raises(ValueError, match="NONAUTONOMOUS_TIME_UNSUPPORTED"):
-        emit_python_kernel_from_sciir(outcome.sci_ir)
+    code = emit_python_kernel_from_sciir(ir)
+    assert "_k1_t = 1.0" in code
+    ns: dict = {}
+    exec(code, ns)
 
+    class _Buf:
+        def __init__(self, data):
+            self.data = list(data)
 
-def test_autonomous_ode_with_unused_independent_var_is_allowed():
-    dimless = SiDimension.dimensionless()
-    time_dim = SiDimension(exponents=[(0, 1), (0, 1), (1, 1), (0, 1), (0, 1), (0, 1), (0, 1)], unit_label="s")
-    table = FrozenSymbolTable(
-        ir_id="auto_t_unused",
-        archetype=Archetype.ODE_PDE,
-        domain=ScientificDomain.PHYSICS_THERMO,
-        symbols=[
-            SymbolDecl(name="x", display_symbol="x", role=SlotRole.STATE, slot_index=0, dimension=dimless, initial_or_default=1.0),
-            SymbolDecl(name="t", display_symbol="t", role=SlotRole.INDEPENDENT_VAR, slot_index=1, dimension=time_dim, initial_or_default=0.0),
-        ],
-    )
-    body = ModelBodyDraft(
-        dynamics_or_residuals=[RawEquationDraft(target="x", expr_text="-x")],
-        config=OdePdeConfig(t_span=(0.0, 1.0), sample_points=20),
-    )
-    outcome = scope_check_and_lower(table, body)
-    assert outcome.ok and outcome.sci_ir is not None
-    code = emit_python_kernel_from_sciir(outcome.sci_ir)
-    assert "def simulation_step(buf, dt):" in code
+    buf = _Buf([0.0, 0.0])
+    dt = 0.01
+    for _ in range(100):
+        ns["simulation_step"](buf, dt)
+    assert abs(buf.data[0] - 1.0) < 1e-12
+    assert abs(buf.data[1] - 0.5) < 1e-12

@@ -73,7 +73,7 @@ fn strict_builder_dimensions(expr: &crate::holographic_hin::CselExpr, symbols: &
             let arity = match func.as_str() {
                 "safe_div" | "min" | "max" | "kl_term" | "gammainc_reg" => 2,
                 "smooth_clamp" | "where" | "hill_eq" | "michaelis_menten" | "betainc_reg" => 3,
-                "safe_sqrt" | "sqrt" | "safe_exp" | "exp" | "safe_log" | "log" | "log1p" | "expm1" | "safe_sin" | "sin" | "safe_cos" | "cos" | "safe_tanh" | "tanh" | "safe_acos" | "acos" | "safe_asin" | "asin" | "abs" | "fabs" | "norm_cdf" | "norm_ppf" | "logistic_sigmoid" | "logit" | "shannon_term" => 1,
+                "safe_sqrt" | "sqrt" | "safe_exp" | "exp" | "safe_log" | "log" | "log10" | "log1p" | "expm1" | "safe_sin" | "sin" | "safe_cos" | "cos" | "safe_tan" | "tan" | "safe_tanh" | "tanh" | "sinh" | "cosh" | "safe_acos" | "acos" | "safe_asin" | "asin" | "abs" | "fabs" | "norm_cdf" | "norm_ppf" | "logistic_sigmoid" | "logit" | "shannon_term" => 1,
                 _ => return Err(format!("HIN_UNKNOWN_FUNCTION: {func}")),
             };
             if dims.len() != arity { return Err(format!("HIN_FUNCTION_ARITY: {func}")); }

@@ -59,8 +59,10 @@ pub fn sanitize_expr_text(input: &str) -> String {
         .replace("\\left(", "(")
         .replace("\\right)", ")")
         .replace("math.", "");
-    // Strip leading backslash on known math functions (\exp, \log, \ln, \sqrt, \sin, \cos, \tanh, \abs).
-    for fn_name in ["exp", "log", "ln", "sqrt", "sin", "cos", "tanh", "abs", "min", "max"] {
+    // Strip leading backslash on known math functions (longest names first so log10 precedes log, tanh precedes tan).
+    for fn_name in [
+        "log10", "tanh", "sinh", "cosh", "sqrt", "exp", "log", "tan", "sin", "cos", "abs", "min", "max", "ln",
+    ] {
         s = s.replace(&format!("\\{}", fn_name), fn_name);
     }
     s

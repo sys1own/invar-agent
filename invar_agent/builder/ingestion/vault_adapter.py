@@ -172,6 +172,12 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
             title=metadata.get('title') or run_id, meaningfulness_certificates=certificates,
             meaningfulness_certificate=certificates[run_id], epistemic_verdict='VERIFIED_FALSIFICATION', certified_valid_domain=certified_valid_domain,
             research_import_role='NEGATIVE_CONSTRAINT_ONLY', negative_constraints=[{'run_id': run_id, 'certificate': certificates[run_id]}])
+    if verdict_val == 'COMPUTED_NO_CLAIM':
+        raise IngestionError(
+            'COMPUTED_NO_CLAIM_NOT_EVIDENCE',
+            f"Vault entry {run_id!r} has verdict COMPUTED_NO_CLAIM and cannot be admitted as verified claim evidence",
+            details={'epistemic_verdict': verdict_val},
+        )
     if verdict_val not in {'VERIFIED_DISCOVERY', 'VERIFIED_BOUNDARY_DISCOVERY'}:
         raise IngestionError(
             'INCONCLUSIVE_UNVERIFIED',

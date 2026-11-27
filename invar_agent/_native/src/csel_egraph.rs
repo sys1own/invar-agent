@@ -104,7 +104,7 @@ fn parse_verification_expr(text: &str) -> Result<RecExpr<CselLanguage>, String> 
                 CselExpr::Binary { op,left,right } if ["+","-","*","/","^","**"].contains(&op.as_str()) => { validate(left)?; validate(right) },
                 CselExpr::Call { func,args } => {
                     let arity=match func.as_str() {
-                        "safe_sqrt"|"sqrt"|"safe_log"|"log"|"safe_exp"|"exp"|"safe_sin"|"sin"|"safe_cos"|"cos"|"safe_tan"|"tan"|"safe_tanh"|"tanh"|"safe_acos"|"acos"|"safe_asin"|"asin"|"abs"|"fabs"|"log1p"|"expm1"|"norm_cdf"|"norm_ppf"|"logistic_sigmoid"|"logit"|"shannon_term" => 1,
+                        "safe_sqrt"|"sqrt"|"safe_log"|"log"|"log10"|"safe_exp"|"exp"|"safe_sin"|"sin"|"safe_cos"|"cos"|"safe_tan"|"tan"|"safe_tanh"|"tanh"|"sinh"|"cosh"|"safe_acos"|"acos"|"safe_asin"|"asin"|"abs"|"fabs"|"log1p"|"expm1"|"norm_cdf"|"norm_ppf"|"logistic_sigmoid"|"logit"|"shannon_term" => 1,
                         "safe_div"|"safe_pow"|"pow"|"min"|"max"|"kl_term"|"gammainc_reg" => 2,
                         "smooth_clamp"|"where"|"hill_eq"|"michaelis_menten"|"betainc_reg" => 3,
                         _ => return Err(format!("unsupported proof function: {func}")),
