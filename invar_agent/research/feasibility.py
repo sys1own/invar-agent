@@ -419,7 +419,42 @@ def compile_ingest_ihcg(prompt, evidence, domain, archetype):
     obligations = [o.expression for o in graph.obligations]
     lock = verify_entailment_lock(graph, obligations)
     vacuity = classify_contract_vacuity(graph)
-    if not lock.entailment_locked or not vacuity.passed:
+    # ARCH-008: Separate claim truth from model admissibility.
+    # 1. If a subset of HYPOTHESIS_TARGET conjuncts are implied (redundant) while
+    #    other targets remain non-trivial, demote only the implied conjuncts to
+    #    CONSERVATION_GUARD rather than rejecting the entire claim set.
+    hyp_obs = [o for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]
+    if vacuity.redundant_conjuncts and len(vacuity.redundant_conjuncts) < len(hyp_obs):
+        red_idxs = {int(i) for i in vacuity.redundant_conjuncts if str(i).isdigit()}
+        new_obs = []
+        hyp_i = 0
+        for o in graph.obligations:
+            if o.obligation_class == "HYPOTHESIS_TARGET":
+                if hyp_i in red_idxs:
+                    new_obs.append(o.model_copy(update={"obligation_class": "CONSERVATION_GUARD"}))
+                else:
+                    new_obs.append(o)
+                hyp_i += 1
+            else:
+                new_obs.append(o)
+        ev_copy = dict(evidence)
+        ev_copy["obligations"] = [o.model_dump(mode="json") for o in new_obs]
+        graph = IhcgCompiler().compile_from_prompt(prompt, ev_copy, domain, archetype)
+        obligations = [o.expression for o in graph.obligations]
+        lock = verify_entailment_lock(graph, obligations)
+        vacuity = classify_contract_vacuity(graph)
+
+    # 2. ARCH-008: Ingest checks ONLY model/domain satisfiability (Q1=SAT) and
+    #    non-tautology (Q3!=UNSAT). A claim that is INFEASIBLE (Q2=UNSAT) or
+    #    hard-nonlinear UNKNOWN (Q2=UNKNOWN) over a satisfiable model/domain
+    #    MUST seal cleanly so it routes to Mode 1 / 2A / 2B falsification or verification.
+    claim_admissible_for_testing = (
+        vacuity.classification in ("INFEASIBLE", "UNKNOWN")
+        and vacuity.queries.get("Q1") is not None
+        and vacuity.queries["Q1"].status == "SAT"
+        and (vacuity.queries.get("Q3") is None or vacuity.queries["Q3"].status != "UNSAT")
+    )
+    if not lock.entailment_locked or (not vacuity.passed and not claim_admissible_for_testing):
         extra = ""
         if vacuity.redundant_conjuncts:
             hyp_exprs = [o.expression for o in graph.obligations if o.obligation_class == "HYPOTHESIS_TARGET"]

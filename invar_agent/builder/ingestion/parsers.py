@@ -146,18 +146,23 @@ def _text(doc: ParsedDocument, text: str, location: str = "line") -> None:
     table_rows = [line.strip().strip("|").split("|") for line in text.splitlines() if "|" in line]
     _table(doc, table_rows, f"{location}:table")
     for index, line in enumerate(text.splitlines(), 1):
-        stripped = line.strip()
+        stripped = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", line.strip())
         if index in covered or "|" in line or not stripped:
             continue
-        assignment = re.fullmatch(rf"([A-Za-z_]\w*)\s*=\s*({NUMBER})\s*([A-Za-zµμ°%][\w/*^(). -]*)?", stripped)
+        assignment = re.fullmatch(rf"([A-Za-z_]\w*)\s*=\s*({NUMBER})\s*([A-Za-zµμ°%][\w/*^(). -]*)?", stripped.rstrip(".,;"))
         span = _span(doc.path, f"{location}:{index}", line)
         if assignment:
-            doc.constants.append(RawConstant(symbol=assignment[1], value=assignment[2], unit=assignment[3] or "1", provenance=span))
-        elif re.fullmatch(r"[A-Za-z_\d\s+*/^().<>=!{}\\-]+", stripped) and re.search(r"[=<>]", stripped):
+            raw_u = (assignment[3] or "1").strip().rstrip(".,;")
+            doc.constants.append(RawConstant(symbol=assignment[1], value=assignment[2], unit=raw_u or "1", provenance=span))
+        elif (
+            re.fullmatch(r"[A-Za-z_\d\s+*/^().<>=!{}\\-]+", stripped)
+            and re.search(r"[=<>]", stripped)
+            and not re.search(r"\b[A-Za-z]{2,}\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}\b", stripped)
+        ):
             doc.equations.append(RawEquation(text=stripped, provenance=span))
         else:
             inline_assigns = list(re.finditer(
-                rf"(?<![A-Za-z0-9_])([A-Za-z_]\w*)\s*=\s*({NUMBER})(?:\s+(1/(?:s|min|hr|day|yr)|s\^-1|m/s|M|mM|uM|nM|cm|mm|m|kg|g|mol|s|min|hr|K|Pa|W|J|V|A|Hz|eV))?(?![A-Za-z0-9_.])",
+                rf"(?<![A-Za-z0-9_])([A-Za-z_]\w*)\s*=\s*({NUMBER})(?:\s+(1/(?:s|min|hr|day|yr)|s\^-1|m/s|M|mM|uM|nM|cm|mm|m|kg|g|mol|s|min|hr|K|Pa|W|J|V|A|Hz|eV))?(?![A-Za-z0-9_])",
                 stripped,
             ))
             if inline_assigns:

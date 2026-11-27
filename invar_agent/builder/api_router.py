@@ -254,6 +254,7 @@ def create_builder_router(state):
 
     @router.post('/ingest')
     async def ingest(files: list[UploadFile] = File(default=[]), vault_ids: str = Form(default='[]'),
+                     spec_text: str | None = Form(default=None),
                      allow_llm_disambiguation: bool = Form(default=True)):
         stage = service.root / 'uploads' / uuid4().hex
         stage.mkdir(parents=True)
@@ -266,6 +267,10 @@ def create_builder_router(state):
             ids = [item.removeprefix('@research:') for item in ids]
             for item in ids:
                 identifier(item)
+            if spec_text and spec_text.strip():
+                spec_path = stage / 'inline_spec.md'
+                spec_path.write_text(spec_text, encoding='utf-8')
+                paths.append(str(spec_path))
             for index, upload in enumerate(files):
                 name = Path(upload.filename or 'upload').name
                 path = stage / (str(index)+'_'+name)
@@ -277,12 +282,11 @@ def create_builder_router(state):
                         output.write(chunk)
                 paths.append(str(path))
             if not paths and not ids:
-                raise HTTPException(422, 'Supply uploads or vault_ids')
+                raise HTTPException(422, 'Supply uploads, spec_text, or vault_ids')
             pipeline = CanonicalResearchIngestionPipeline(state.workspace_root,
                 llm_client=service.client() if allow_llm_disambiguation else None)
             def extract():
-                with _FORMAL_LOCK:
-                    return pipeline.ingest(IngestionRequest(upload_paths=paths,vault_run_ids=ids))
+                return pipeline.ingest(IngestionRequest(upload_paths=paths,vault_run_ids=ids))
             ir = await run_in_threadpool(extract)
             service.save('ir',ir.ir_id,ir.model_dump(mode='json'))
             service.emit('log','builder.ingest_complete',{'build_id':None,'ir_id':ir.ir_id,'source_mode':ir.source_mode,
@@ -296,6 +300,14 @@ def create_builder_router(state):
         except (ValueError,TypeError) as error:
             shutil.rmtree(stage,ignore_errors=True)
             raise HTTPException(422,str(error)) from error
+        except TimeoutError as error:
+            shutil.rmtree(stage,ignore_errors=True)
+            raise HTTPException(422,{'code':'SOLVER_TIMEOUT','message':str(error)}) from error
+        except RuntimeError as error:
+            if getattr(error, 'code', None) == 'SOLVER_BUSY':
+                shutil.rmtree(stage,ignore_errors=True)
+                raise HTTPException(503,{'code':'SOLVER_BUSY','message':str(error)}) from error
+            raise
         except HTTPException:
             shutil.rmtree(stage,ignore_errors=True)
             raise
@@ -310,10 +322,15 @@ def create_builder_router(state):
     @router.patch('/ir/{ir_id}/override')
     def override(ir_id: str, request: IRReviewOverride):
         try:
-            with _FORMAL_LOCK:
-                ir = apply_ir_override(service.ir(ir_id),request)
+            ir = apply_ir_override(service.ir(ir_id),request)
         except IngestionError as error:
             raise HTTPException(422,{'code':error.code,'message':str(error),'details':error.details}) from error
+        except TimeoutError as error:
+            raise HTTPException(422,{'code':'SOLVER_TIMEOUT','message':str(error)}) from error
+        except RuntimeError as error:
+            if getattr(error, 'code', None) == 'SOLVER_BUSY':
+                raise HTTPException(503,{'code':'SOLVER_BUSY','message':str(error)}) from error
+            raise
         service.save('ir',ir_id,ir.model_dump(mode='json'))
         return ir
 
@@ -395,45 +412,29 @@ def create_builder_router(state):
 
     @router.get('/export/{build_id}.zip')
     def export(build_id: str):
+        from .export_utils import ExportBlockedError, build_verified_export_zip
+
         status = service.status(build_id)
-        if status.get('status') not in {'COMPLETED', 'COMPLETED_WITH_FALLBACKS'}:
-            raise HTTPException(
-                409,
-                f"Cannot export build with status {status.get('status')!r}; a completed build is required",
-            )
         root = service.build_root(build_id)
         workspace = (root/'workspace').resolve()
         if not workspace.is_dir() or not workspace.is_relative_to(root.resolve()):
+            if status.get('status') not in {'COMPLETED', 'COMPLETED_WITH_FALLBACKS'}:
+                raise HTTPException(
+                    409,
+                    f"Cannot export build with status {status.get('status')!r}; a completed build is required",
+                )
             raise HTTPException(404,'Committed workspace not found')
         cache_manifest = HISCache(state.workspace_root, build_id, workspace).load()
-        if cache_manifest is not None:
-            from .his_cache import blake3_file
-            for entry in (getattr(cache_manifest, 'entries', None) or {}).values():
-                if getattr(entry, 'verified_status', None) not in {'VERIFIED', 'FALLBACK_VERIFIED'}:
-                    continue
-                for rel_artifact, expected_digest in (getattr(entry, 'artifact_digests', None) or {}).items():
-                    art_path = (workspace / rel_artifact).resolve()
-                    if not art_path.is_file() or not art_path.is_relative_to(workspace):
-                        raise HTTPException(409, f"Export blocked: missing verified artifact {rel_artifact}")
-                    if blake3_file(art_path) != expected_digest:
-                        raise HTTPException(409, f"Export blocked: receipt digest mismatch for {rel_artifact}")
-            for receipt in getattr(cache_manifest, 'receipts', None) or []:
-                for rel_artifact, expected_digest in (getattr(receipt, 'output_hashes', None) or {}).items():
-                    art_path = (workspace / rel_artifact).resolve()
-                    if not art_path.is_file() or not art_path.is_relative_to(workspace):
-                        raise HTTPException(409, f"Export blocked: missing verified artifact {rel_artifact}")
-                    if blake3_file(art_path) != expected_digest:
-                        raise HTTPException(409, f"Export blocked: receipt digest mismatch for {rel_artifact}")
         archive = root / ('export-'+uuid4().hex+'.zip')
-        with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
-            for path in sorted(workspace.rglob('*')):
-                if path.is_symlink():
-                    raise HTTPException(400,'Unsafe workspace symlink')
-                if path.is_file():
-                    rel_posix = path.relative_to(workspace).as_posix()
-                    if rel_posix.startswith('.invar/') or 'diagnostics/leaf_responses' in rel_posix:
-                        continue
-                    output.write(path, rel_posix)
+        try:
+            build_verified_export_zip(
+                workspace,
+                archive,
+                build_status=status.get('status'),
+                cache_manifest=cache_manifest,
+            )
+        except ExportBlockedError as exc:
+            raise HTTPException(exc.status_code, exc.message) from exc
         def chunks():
             try:
                 with archive.open('rb') as stream:
@@ -497,6 +498,7 @@ def create_builder_router(state):
 
     @router.delete('/instrument/{build_id}/launch')
     @router.delete('/instrument/{build_id}')
+    @router.post('/instrument/{build_id}/teardown')
     def stop(build_id: str):
         identifier(build_id); service.stop_instrument(build_id)
         return {'build_id':build_id,'status':'STOPPED'}

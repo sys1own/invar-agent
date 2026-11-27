@@ -2916,6 +2916,7 @@ async def generate_plan_with_feasibility(question: str,
                 ihcg_ev.get("obligations") or [],
                 ihcg_ev.get("environmental_assumptions") or [],
                 sciir_bp_dict.get("ihcg_evidence", {}).get("domain") or {},
+                equations=ihcg_ev.get("equations") or {},
             )
             if any(getattr(d, "code", "") == "TAUTOLOGICAL_TARGET" for d in fidelity_diags):
                 raise FormalizationError([{
@@ -2924,6 +2925,15 @@ async def generate_plan_with_feasibility(question: str,
                     "error_type": "TautologicalTargetError",
                     "code": "TAUTOLOGICAL_TARGET",
                     "error": "TAUTOLOGICAL_TARGET: TRIVIAL_DEDUCIBLE_WITHOUT_MODEL — claim is entailed without model dynamics",
+                    "diagnostics": [{"code": d.code, "message": d.message} for d in fidelity_diags],
+                }])
+            if any(getattr(d, "code", "") == "CLAIM_UNCOVERED" for d in fidelity_diags):
+                raise FormalizationError([{
+                    "attempt": 1,
+                    "ok": False,
+                    "error_type": "ClaimUncoveredError",
+                    "code": "CLAIM_UNCOVERED",
+                    "error": "CLAIM_UNCOVERED: prompt claim thresholds are missing from HYPOTHESIS_TARGET obligations",
                     "diagnostics": [{"code": d.code, "message": d.message} for d in fidelity_diags],
                 }])
             preflight = compile_and_preflight_blueprint(
@@ -2964,41 +2974,38 @@ async def generate_plan_with_feasibility(question: str,
                 "sciir_staged_fallback",
                 f"StagedSciIR synthesis returned {synth_res.reason_code.value}: {str(synth_res.diagnostics[:2])[:300]}",
             )
-    if shbt_res.should_activate and not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
-        if True:
-                shbt_prompt = (
-                    prompt
-                    + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "
-                    "via the SHBT Frontier Knowledge Federation (`OPTIMAL_DIRECT`). Do NOT "
-                    "refuse and NEVER set `blueprint` to null. Output a complete valid `blueprint` "
-                    "JSON object using the exact SHBT equations, SI constants, and invariants provided above."
-                )
-                with llm_call_context("blueprint_shbt_rescue", attempt=2):
-                    raw2 = await llm_complete(shbt_prompt)
-                data2 = _extract_json(str(raw2))
-                if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
-                    data = data2
-                elif isinstance(data2, dict) and isinstance(data2.get("contracts"), list) and data2.get("title"):
-                    data = data2
+    if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
+        if shbt_res.should_activate:
+            shbt_prompt = (
+                prompt
+                + "\n\nIMPORTANT OVERRIDE: This frontier physics problem is SOLVABLE "
+                "via the SHBT Frontier Knowledge Federation (`OPTIMAL_DIRECT`). Do NOT "
+                "refuse and NEVER set `blueprint` to null. Output a complete valid `blueprint` "
+                "JSON object using the exact SHBT equations, SI constants, and invariants provided above."
+            )
+            with llm_call_context("blueprint_shbt_rescue", attempt=2):
+                raw2 = await llm_complete(shbt_prompt)
+            data2 = _extract_json(str(raw2))
+            if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
+                data = data2
+            elif isinstance(data2, dict) and isinstance(data2.get("contracts"), list) and data2.get("title"):
+                data = data2
         elif is_computational_dynamical_benchmark(question):
             feasibility = override_refusal_for_computational_benchmark(question, feasibility)
             if feasibility.verdict in (FeasibilityVerdict.REFUSED_IMPOSSIBLE, FeasibilityVerdict.REFUSED_UNSUITABLE):
                 return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
-            if not isinstance(data.get("blueprint"), dict) and not (isinstance(data.get("contracts"), list) and data.get("title")):
-                surrogate_prompt = (
-                    prompt
-                    + "\n\nIMPORTANT OVERRIDE: The feasibility verdict is REFORMULATED_SURROGATE. "
-                    "Do NOT refuse. You MUST output a complete valid blueprint JSON using "
-                    "symmetric/compatible surrogate coupling parameters so all stated invariants "
-                    "are mathematically consistent and falsifiable."
-                )
-                with llm_call_context("blueprint_surrogate_rescue", attempt=2):
-                    raw2 = await llm_complete(surrogate_prompt)
-                data2 = _extract_json(str(raw2))
-                if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
-                    data = data2
-        else:
-            return {"feasibility": feasibility, "blueprint": None, "source": "llm"}
+            surrogate_prompt = (
+                prompt
+                + "\n\nIMPORTANT OVERRIDE: The feasibility verdict is REFORMULATED_SURROGATE. "
+                "Do NOT refuse. You MUST output a complete valid blueprint JSON using "
+                "symmetric/compatible surrogate coupling parameters so all stated invariants "
+                "are mathematically consistent and falsifiable."
+            )
+            with llm_call_context("blueprint_surrogate_rescue", attempt=2):
+                raw2 = await llm_complete(surrogate_prompt)
+            data2 = _extract_json(str(raw2))
+            if isinstance(data2, dict) and isinstance(data2.get("blueprint"), dict):
+                data = data2
     bp_raw = data.get("blueprint")
     if not isinstance(bp_raw, dict) and isinstance(data.get("contracts"), list) and data.get("title"):
         bp_raw = data

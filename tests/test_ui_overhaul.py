@@ -47,14 +47,15 @@ def test_comprehensive_report_structure():
         bp, {"final_l2": 0.01},
         [{"source": "arxiv", "title": "Mars aerothermodynamics", "url": "https://arxiv.org/x",
           "year": 2024, "summary": "s"}],
-        results=[_result()], status="VERIFIED", checkpoint_path="checkpoints/bp-ui")
+        results=[_result()], status="VERIFIED", checkpoint_path="checkpoints/bp-ui",
+        epistemic_verdict="VERIFIED_DISCOVERY")
     for section in [
         "# Quantitative Research Report: Martian entry probe",
         "## 1. Executive Summary & Verified Numerical Findings",
         "## 2. Epistemic Feasibility & Governing Modeling Regime",
         "## 3. Literature Ingest & Parameter Extraction",
         "## 4. Computational Implementation & Accretion History",
-        "## 5. Formal Invariant Verification & Precision Shield Audit",
+        "## 5. Formal Invariant Audit & Precision Shield",
         "## 6. Process Notes & Execution Log",
     ]:
         assert section in report

@@ -6,8 +6,8 @@
 <link rel="icon" type="image/png" href="/static/assets/logo.png">
 <title>invar-agent — Verified Agent Chat</title>
 <script src="/static/vendor/marked.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+<script defer src="/static/vendor/katex/katex.min.js"></script>
 <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
 <script src="/static/vendor/xterm.min.js"></script>
 <script src="/static/vendor/addon-fit.min.js"></script>
@@ -23,6 +23,11 @@
   #view-builder button:focus-visible, #builder-files:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   #view-builder button:disabled { opacity:.45; cursor:not-allowed; }
   #builder-files::file-selector-button { margin-right:10px; }
+  #builder-download, #builder-instrument { color:#79c0ff; text-decoration:underline; font-weight:600; margin-left:8px; }
+  #builder-download:hover, #builder-instrument:hover { color:#bae6fd; }
+  .vault-card { max-width:100%; overflow-wrap:anywhere; box-sizing:border-box; }
+  header, .topbar { flex-wrap:wrap; gap:6px; }
+  .step.inc, .step.failed { color:var(--amber); border-color:var(--amber); }
   .builder-card input:not([type=checkbox]), .builder-card select, .builder-card textarea { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; }
   #builder-drop { border:1px dashed var(--accent); padding:18px; border-radius:8px; color:var(--text2); }
   #builder-drop.dragover { background:#143047; }
@@ -393,9 +398,9 @@
           <div class="step-line"></div>
           <div class="step" id="step-ingest"><span class="step-icon">📚</span> Literature (<span id="stepper-lit-count">0</span>)</div>
           <div class="step-line"></div>
-          <div class="step" id="step-stage1"><span class="step-icon">🚀</span> Stage 1: Kinematics</div>
+          <div class="step" id="step-stage1"><span class="step-icon">🚀</span> Stage 1: Model &amp; Execute</div>
           <div class="step-line"></div>
-          <div class="step" id="step-stage2"><span class="step-icon">🔥</span> Stage 2: Thermal</div>
+          <div class="step" id="step-stage2"><span class="step-icon">🔬</span> Stage 2: Verify &amp; Certify</div>
           <div class="step-line"></div>
           <div class="step" id="step-report"><span class="step-icon">📊</span> Report &amp; Vault</div>
         </div>
@@ -439,7 +444,7 @@
       <div class="rv-tabs">
         <button class="rv-tab active" data-rtab="report" onclick="switchResearchTab('report')">📊 Executive Summary &amp; Report</button>
         <button class="rv-tab" data-rtab="equations" onclick="switchResearchTab('equations')">🧮 Equations &amp; Constants</button>
-        <button class="rv-tab" data-rtab="kernel" onclick="switchResearchTab('kernel')">💻 Verified Unified Kernel</button>
+        <button class="rv-tab" id="rv-tab-kernel" data-rtab="kernel" onclick="switchResearchTab('kernel')">💻 Unified Kernel</button>
       </div>
       <div class="rv-body">
         <div id="rv-pane-report" class="rv-pane active"><div class="md" id="rv-report-md"></div></div>
@@ -493,6 +498,8 @@
       <div class="builder-grid">
         <section class="builder-card"><h3>1 · Research sources</h3>
           <label for="builder-vault">Attach @research runs</label><select multiple id="builder-vault" aria-label="Research sources"></select>
+          <label for="builder-spec-text">Or paste natural-language / LaTeX specification</label>
+          <textarea id="builder-spec-text" rows="3" placeholder="e.g. Parameters: k = 0.05 1/s. Equations: dx/dt = -k*x"></textarea>
           <div id="builder-drop">Drop scientific files here · 50 MB total
             <input id="builder-files" type="file" multiple accept=".pdf,.tex,.md,.ipynb,.py,.csv,.tsv,.json,.zip" aria-label="Upload scientific files">
           </div><div id="builder-file-summary"></div>
@@ -500,24 +507,26 @@
         </section>
         <section class="builder-card"><h3>2 · Instrument profiles</h3>
           <label><input type="checkbox" name="builder-profile" value="hybrid_compute_library" checked> Hybrid compute library</label>
-          <label><input type="checkbox" name="builder-profile" value="interactive_workbench" checked> Interactive workbench</label>
-          <label><input type="checkbox" name="builder-profile" value="executable_paper_audit" checked> Executable paper &amp; audit</label>
-          <label><input type="checkbox" name="builder-profile" value="calibration_inverse_design" checked> Calibration &amp; inverse design</label>
+          <label><input type="checkbox" name="builder-profile" value="interactive_workbench"> Interactive workbench</label>
+          <label><input type="checkbox" name="builder-profile" value="executable_paper_audit"> Executable paper &amp; audit</label>
+          <label><input type="checkbox" name="builder-profile" value="calibration_inverse_design"> Calibration &amp; inverse design</label>
           <label><input id="builder-cpp" type="checkbox" checked> C++20 C-ABI</label><label><input id="builder-adjoint" type="checkbox" checked> Analytical adjoint Jacobian</label>
           <textarea id="builder-prompt" rows="2" placeholder="Optional leaf intent, e.g. domain_visualization"></textarea>
         </section>
       </div>
       <section class="builder-card"><h3>3 · Extraction verification</h3>
-        <div id="builder-ir-status">Upload a paper or choose a Research Vault source.</div>
-        <div style="overflow:auto"><table class="builder-table"><thead><tr><th>Equation / constant</th><th>Role &amp; checks</th><th>Verified override</th></tr></thead><tbody id="builder-verification"></tbody></table></div>
+        <div id="builder-ir-status">Upload a paper, paste a spec, or choose a Research Vault source.</div>
+        <div style="overflow:auto"><table class="builder-table"><thead><tr><th>Equation / constant</th><th>Role &amp; checks</th><th>Override</th></tr></thead><tbody id="builder-verification"></tbody></table></div>
         <label for="builder-state-order">State order (comma-separated, required when flagged)</label><input id="builder-state-order" placeholder="e.g. substrate, product">
         <button id="builder-plan" disabled onclick="builderPlan()">Approve IR &amp; Plan Build</button>
-        <button id="builder-execute" disabled onclick="builderExecute()">Execute verified plan</button>
+        <button id="builder-execute" disabled onclick="builderExecute()">Execute plan</button>
       </section>
       <section class="builder-card"><h3>4 · Live GoI wavefronts</h3><div id="builder-status" role="status">Ready</div>
         <div id="builder-wavefronts"></div><pre id="builder-events"></pre><div id="builder-receipt"></div>
         <a id="builder-download" hidden>Download instrument .zip</a>
-        <button id="builder-launch" disabled onclick="builderLaunch()">Launch Workbench</button><a id="builder-instrument" target="_blank" rel="noopener"></a>
+        <button id="builder-launch" disabled onclick="builderLaunch()">Launch Workbench</button>
+        <button id="builder-stop" disabled onclick="builderStop()">Stop / Teardown Workbench</button>
+        <a id="builder-instrument" target="_blank" rel="noopener"></a>
       </section>
     </div>
   </main>
@@ -1288,7 +1297,7 @@ async function runResearchDirect(text, feasibility) {
   setComposerEnabled(false);
   statusEl.textContent = 'starting deep research…';
   try {
-    const body = {question: text, attached_research_ids: attachedResearchIds()};
+    const body = {question: text, attached_research_ids: attachedResearchIds(), async_plan: true};
     // Carry the Plan Mode feasibility approval so pre-flight heuristics do
     // not reject an already-approved expert prompt on execution.
     if (feasibility && feasibility.verdict) body.prior_feasibility = feasibility;
@@ -1296,45 +1305,103 @@ async function runResearchDirect(text, feasibility) {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
-    // Refusal cards render ONLY on actual refusals — a passing feasibility
-    // verdict (OPTIMAL_DIRECT / REFORMULATED_SURROGATE) must never look like
-    // an abort; execution streams proceed normally.
-    if (data.status === 'inconclusive') {
-      const diags = ((data.diagnostics && data.diagnostics.per_field_diagnostics) || []).slice(0, 4)
-        .map(d => `${d.field || 'field'}: ${d.message || d.code}${d.column ? ' (col ' + d.column + ')' : ''}`)
-        .join('; ');
-      addMsg('system', `Research inconclusive (${data.code || 'PLANNING_VALIDATION_FAILED'}): ${diags || (data.diagnostics && data.diagnostics.message) || 'formalization did not validate.'}`);
-      statusEl.textContent = '';
-      return;
+    const resolvedState = _resolveResearchState(data);
+    switch (resolvedState) {
+      case 'NEEDS_CLARIFICATION': {
+        const qs = data.questions || (data.feasibility && data.feasibility.questions) || [];
+        renderClarificationCard(qs, data.feasibility);
+        resetResearchStepper();
+        statusEl.textContent = '';
+        return;
+      }
+      case 'REFUSED_IMPOSSIBLE':
+      case 'REFUSED_UNSUITABLE': {
+        renderResearchRefusal(data.refusal || data.feasibility);
+        resetResearchStepper();
+        statusEl.textContent = '';
+        return;
+      }
+      case 'INCONCLUSIVE_UNVERIFIED': {
+        const diags = ((data.diagnostics && data.diagnostics.per_field_diagnostics) || []).slice(0, 4)
+          .map(d => `${d.field || 'field'}: ${d.message || d.code}${d.column ? ' (col ' + d.column + ')' : ''}`)
+          .join('; ');
+        addMsg('system', `Research inconclusive (${data.code || 'PLANNING_VALIDATION_FAILED'}): ${diags || data.diagnostics_summary || (data.diagnostics && data.diagnostics.message) || 'formalization did not validate.'}`);
+        resetResearchStepper();
+        statusEl.textContent = '';
+        return;
+      }
+      case 'PLANNING':
+      case 'RUNNING': {
+        const verdict = data.feasibility ? String(data.feasibility.verdict || '').toUpperCase() : '';
+        if (verdict) {
+          addMsg('system', `Feasibility gate: ${verdict} — dispatching research loop.`);
+        }
+        const runUid = data.run_uid || ('srv-' + Date.now());
+        seenResearchBanners.clear();
+        lastSeenResearchSeq = 0;
+        activeBackendRunUid = runUid;
+        resetResearchStepper();
+        resetLiteratureCount();
+        const tel = document.getElementById('research-telemetry');
+        if (tel) tel.textContent = '';
+        resetRunLogCard('Research Agent Execution Log', runUid);
+        activateStep('step-feasibility');
+        appendActivity({
+          stage: 'FEASIBILITY',
+          step: 'dispatched',
+          message: resolvedState === 'PLANNING'
+            ? 'Evaluating epistemic feasibility and planning model…'
+            : 'Research run started; streaming live progress…',
+          timestamp: new Date().toISOString()
+        });
+        openResearchStream(runUid);
+        return;
+      }
+      default: {
+        addMsg('system', `Unexpected research response state: ${resolvedState}`);
+        resetResearchStepper();
+        statusEl.textContent = '';
+        return;
+      }
     }
-    const verdict = data.feasibility ? String(data.feasibility.verdict || '').toUpperCase() : '';
-    const isRefused = data.status === 'refused' ||
-      verdict === 'REFUSED_IMPOSSIBLE' || verdict === 'REFUSED_UNSUITABLE' ||
-      data.started === false;
-    if (isRefused) {
-      renderResearchRefusal(data.feasibility);
-      statusEl.textContent = '';
-      return;
-    }
-    if (verdict) {
-      addMsg('system', `Feasibility gate: ${verdict} — dispatching verified research loop.`);
-    }
-    const runUid = data.run_uid || ('srv-' + Date.now());
-    seenResearchBanners.clear();
-    lastSeenResearchSeq = 0;
-    activeBackendRunUid = runUid;
-    resetResearchStepper();
-    resetLiteratureCount();
-    const tel = document.getElementById('research-telemetry');
-    if (tel) tel.textContent = '';
-    resetRunLogCard('Research Agent Execution Log', runUid);
-    openResearchStream(runUid);
   } catch (e) {
     addMsg('system', 'Research run error: ' + e);
+    resetResearchStepper();
+    statusEl.textContent = '';
   } finally {
     setComposerEnabled(true);
     input.focus();
   }
+}
+function _resolveResearchState(data) {
+  if (!data || typeof data !== 'object') return 'INCONCLUSIVE_UNVERIFIED';
+  if (data.state) return String(data.state).toUpperCase();
+  const st = String(data.status || '').toLowerCase();
+  const v = data.feasibility ? String(data.feasibility.verdict || '').toUpperCase() : '';
+  if (st === 'needs_clarification' || v === 'NEEDS_CLARIFICATION') return 'NEEDS_CLARIFICATION';
+  if (st === 'refused' || v === 'REFUSED_IMPOSSIBLE' || v === 'REFUSED_UNSUITABLE') {
+    return v.startsWith('REFUSED_') ? v : 'REFUSED_UNSUITABLE';
+  }
+  if (st === 'inconclusive') return 'INCONCLUSIVE_UNVERIFIED';
+  if (st === 'planning') return 'PLANNING';
+  if (st === 'running' || data.started === true) return 'RUNNING';
+  if (data.started === false) return 'INCONCLUSIVE_UNVERIFIED';
+  return 'RUNNING';
+}
+function renderClarificationCard(questions, feasibility) {
+  clearResearchCards();
+  const f = feasibility || {};
+  const qs = Array.isArray(questions) ? questions.filter(Boolean) : [];
+  const listHtml = qs.length
+    ? `<ol style="margin:6px 0 8px 18px;font-size:12.5px">${qs.map(q => `<li>${escapeHtml(String(q))}</li>`).join('')}</ol>`
+    : '<div class="rcard-sub">Please specify the missing physical parameters, initial conditions, or target claim and resend.</div>';
+  const card = el(`<div class="rcard clarification-card" style="border-color:#d29922">
+    <h4>❓ Clarification Needed Before Running</h4>
+    ${f.rationale ? `<div class="rcard-sub">${renderMarkdown(f.rationale)}</div>` : ''}
+    ${listHtml}
+    <div class="row"><button class="btn-dismiss" onclick="this.closest('.rcard').remove()">✕ Dismiss</button></div>
+  </div>`);
+  chat.appendChild(card); scrollChat();
 }
 /* Research action cards live in the main conversation flow (#chat) so the
    conversation, cards and results own 85%+ of the screen. */
@@ -1453,7 +1520,7 @@ const STEPPER_STEPS = ['step-feasibility', 'step-ingest', 'step-stage1', 'step-s
 let stepperMax = -1;
 function setStepState(id, state) {
   const n = document.getElementById(id); if (!n) return;
-  n.classList.remove('active', 'completed', 'failed');
+  n.classList.remove('active', 'completed', 'failed', 'inc');
   if (state) n.classList.add(state);
 }
 function activateStep(id) {
@@ -1570,9 +1637,21 @@ function finishRunLogCard(status) {
   const badge = card.querySelector('.process-log-status');
   if (badge) {
     const s = String(status || '').toUpperCase();
-    const ok = s === 'VERIFIED' || s === 'COMPLETED';
-    badge.textContent = ok ? 'VERIFIED' : 'PARTIAL / HALTED';
-    badge.className = 'process-log-status badge ' + (ok ? 'VERIFIED' : 'HALTED');
+    const isVerified = s.startsWith('VERIFIED_');
+    const isCompleted = s === 'COMPLETED';
+    if (isVerified) {
+      badge.textContent = s;
+      badge.className = 'process-log-status badge VERIFIED';
+    } else if (isCompleted) {
+      badge.textContent = 'COMPLETED';
+      badge.className = 'process-log-status badge VERIFIED';
+    } else if (s === 'INCONCLUSIVE_UNVERIFIED' || s === 'NEEDS_CLARIFICATION') {
+      badge.textContent = s;
+      badge.className = 'process-log-status badge HALTED';
+    } else {
+      badge.textContent = s || 'HALTED';
+      badge.className = 'process-log-status badge HALTED';
+    }
   }
 }
 function scrollChatIfNearBottom() {
@@ -1602,10 +1681,11 @@ function _removeSameRunCards(selector) {
 }
 function renderResearchCompletion(runId, status) {
   _removeSameRunCards('.completion-card');
-  const verified = String(status).toUpperCase() === 'VERIFIED';
+  const s = String(status || '').toUpperCase();
+  const verified = s.startsWith('VERIFIED_');
   const card = el(`<div class="rcard completion-card" data-run-uid="${escapeHtml(activeRunUid || '')}">
     <div class="rcard-sub" style="font-size:13px">
-      ${verified ? '✅ Research Completed & Verified! Archived to Research Vault.' : `🏁 Research run finished (${escapeHtml(status || 'done')}) and archived to the Research Vault.`}
+      ${verified ? `✅ Research Completed (${escapeHtml(s)}) and archived to Research Vault.` : `🏁 Research run finished (${escapeHtml(s || 'INCONCLUSIVE_UNVERIFIED')}) and archived to the Research Vault.`}
     </div>
     <div class="row">
       <button class="btn-approve" id="btn-open-viewer">📖 Open in Research Viewer</button>
@@ -1744,18 +1824,53 @@ function openResearchStream(expectedRunUid) {
       setDrawerSummary('synthesizing final quantitative report…');
     }
     if (msg.event === 'research_completed' && msg.report) {
+      const evVerdict = String(msg.epistemic_verdict || msg.status || 'INCONCLUSIVE_UNVERIFIED').toUpperCase();
       statusEl.textContent = '';
-      setDrawerSummary(`Report ready — run ${msg.status || ''}`);
+      setDrawerSummary(`Report ready — ${evVerdict}`);
       if (msg.literature_count) updateLiteratureCount(msg.literature_count);
       _removeSameRunCards('.report-card');  // reconnect replay dedupe within current run only
       activateStep('step-report');
-      setStepState('step-report', 'completed');
-      finishRunLogCard(msg.status || 'VERIFIED');
+      if (evVerdict.startsWith('VERIFIED_')) {
+        setStepState('step-report', 'completed');
+      } else if (evVerdict === 'INCONCLUSIVE_UNVERIFIED') {
+        setStepState('step-report', 'inc');
+      } else {
+        setStepState('step-report', 'failed');
+      }
+      finishRunLogCard(evVerdict);
       addResearchReportCard(msg.report, msg.report_path || '', msg.run_id || '');
-      renderResearchCompletion(msg.run_id || '', msg.status || '');
+      renderResearchCompletion(msg.run_id || '', evVerdict);
       sealActiveRunLogCard();
       loadVault();
       if (researchSource) { researchSource.close(); researchSource = null; }
+    }
+    if (msg.event === 'terminal_verdict') {
+      const evVerdict = String(msg.epistemic_verdict || msg.status || 'INCONCLUSIVE_UNVERIFIED').toUpperCase();
+      statusEl.textContent = '';
+      if (evVerdict === 'NEEDS_CLARIFICATION') {
+        const qs = msg.questions || (msg.feasibility && msg.feasibility.questions) || [];
+        renderClarificationCard(qs, msg.feasibility);
+        resetResearchStepper();
+        finishRunLogCard('NEEDS_CLARIFICATION');
+        sealActiveRunLogCard();
+        setComposerEnabled(true);
+        if (researchSource) { researchSource.close(); researchSource = null; }
+      } else if (evVerdict.startsWith('REFUSED')) {
+        renderResearchRefusal(msg.feasibility);
+        resetResearchStepper();
+        finishRunLogCard(evVerdict);
+        sealActiveRunLogCard();
+        setComposerEnabled(true);
+        if (researchSource) { researchSource.close(); researchSource = null; }
+      } else if (evVerdict === 'INCONCLUSIVE_UNVERIFIED' || evVerdict === 'FAILED') {
+        setStepState('step-report', evVerdict === 'FAILED' ? 'failed' : 'inc');
+        finishRunLogCard(evVerdict);
+        if (msg.error) addMsg('system', `Research ${evVerdict}: ${String(msg.error).slice(0, 300)}`);
+        sealActiveRunLogCard();
+        loadVault();
+        setComposerEnabled(true);
+        if (researchSource) { researchSource.close(); researchSource = null; }
+      }
     }
     if (msg.event === 'research_failed') {
       statusEl.textContent = `research halted: ${String(msg.error || '').slice(0, 120)}`;
@@ -1764,7 +1879,7 @@ function openResearchStream(expectedRunUid) {
       finishRunLogCard('HALTED');
       renderResearchFailure(msg);
       sealActiveRunLogCard();
-      loadVault();  // partial verified results stay visible in the Explorer
+      loadVault();  // partial results stay visible in the Explorer
       if (researchSource) { researchSource.close(); researchSource = null; }
     }
     if (msg.event === 'vault_updated') {
@@ -1780,7 +1895,7 @@ function openResearchStream(expectedRunUid) {
       const rcKey = `research_complete:${msg.verified_stages || ''}:${msg.unified_module_hash || ''}`;
       if (!seenResearchBanners.has(rcKey)) {
         seenResearchBanners.add(rcKey);
-        addMsg('system', `🏁 Research complete: ${msg.verified_stages} verified stage(s). Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
+        addMsg('system', `🏁 Research complete: ${msg.verified_stages} stage(s) with invariants held. Unified module hash ${String(msg.unified_module_hash || '').slice(0, 16)}`);
       }
     }
     if (msg.event === 'refused' && msg.feasibility) {
@@ -1920,7 +2035,7 @@ function builderError(error) { document.getElementById('builder-status').textCon
 async function builderLoadVault() {
   try { const response=await api('/api/v1/research/vault');const select=document.getElementById('builder-vault');
     const selected=new Set(Array.from(select.selectedOptions).map(option=>option.value));select.replaceChildren();
-    for(const run of response.runs||[]) {const option=document.createElement('option');option.value=run.run_id;option.textContent='@research:'+run.run_id+' · '+(run.title||run.run_id);option.selected=selected.has(run.run_id);select.append(option);}
+    for(const run of response.runs||[]) {const option=document.createElement('option');option.value=run.run_id;const vBadge=run.epistemic_verdict||run.status||'UNKNOWN';option.textContent='@research:'+run.run_id+' ['+vBadge+'] · '+(run.title||run.run_id);option.selected=selected.has(run.run_id);select.append(option);}
   } catch(error) { builderError(error); }
 }
 function builderSetFiles(files) {
@@ -1936,6 +2051,8 @@ builderDrop.ondrop=event=>{event.preventDefault();builderDrop.classList.remove('
 async function builderIngest() {
   try {document.getElementById('builder-status').textContent='Extracting and formally verifying…';const form=new FormData();
     for(const file of builderState.files) form.append('files',file);
+    const specEl=document.getElementById('builder-spec-text');
+    if(specEl&&specEl.value.trim()) form.append('spec_text',specEl.value);
     form.append('vault_ids',JSON.stringify(Array.from(document.getElementById('builder-vault').selectedOptions).map(option=>option.value)));
     builderState.ir=await builderRequest('/ingest',{method:'POST',body:form});builderState.plan=null;
     document.getElementById('builder-execute').disabled=true;builderRenderIR();
@@ -1995,7 +2112,12 @@ async function builderExecute() {
   } catch(error) {builderError(error);document.getElementById('builder-execute').disabled=false;}
 }
 async function builderLaunch() {
-  try {const result=await builderRequest('/instrument/'+builderState.buildId+'/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const link=document.getElementById('builder-instrument');link.href=result.url;link.textContent='Open workbench ↗';}
+  try {const result=await builderRequest('/instrument/'+builderState.buildId+'/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const link=document.getElementById('builder-instrument');link.href=result.url;link.textContent='Open workbench ↗';const stopBtn=document.getElementById('builder-stop');if(stopBtn)stopBtn.disabled=false;}
+  catch(error){builderError(error);}
+}
+async function builderStop() {
+  if(!builderState.buildId) return;
+  try {await builderRequest('/instrument/'+builderState.buildId+'/teardown',{method:'POST'});const link=document.getElementById('builder-instrument');link.removeAttribute('href');link.textContent='';const stopBtn=document.getElementById('builder-stop');if(stopBtn)stopBtn.disabled=true;document.getElementById('builder-status').textContent='Workbench stopped';}
   catch(error){builderError(error);}
 }
 /* ---- sidebar dual-explorer ---- */
@@ -2178,9 +2300,15 @@ function renderResearchViewer(detail) {
   const meta = detail.metadata || {};
   const litCount = meta.literature_count || (meta.sources || []).length || 0;
   if (litCount) updateLiteratureCount(litCount);
+  const epistemicVerdict = String(meta.epistemic_verdict || '').toUpperCase();
+  const isVerifiedRun = epistemicVerdict.startsWith('VERIFIED_');
+  const kernelTabBtn = document.getElementById('rv-tab-kernel');
+  if (kernelTabBtn) {
+    kernelTabBtn.textContent = isVerifiedRun ? '💻 Verified Unified Kernel' : '💻 Unified Kernel (Unverified)';
+  }
   document.getElementById('rv-title').textContent = meta.title || meta.run_id || 'Research Run';
   document.getElementById('rv-sub').textContent =
-    `@research:${meta.run_id || ''} · ${meta.status || ''} · ${meta.verdict || ''}` +
+    `@research:${meta.run_id || ''} · ${epistemicVerdict || meta.status || ''} · ${meta.verdict || ''}` +
     (meta.target_backend ? ` · ${meta.target_backend}` : '');
   const reportMd = detail.report_md || '# (no report archived)';
   document.getElementById('rv-report-md').innerHTML = renderMarkdown(reportMd);
@@ -2190,12 +2318,15 @@ function renderResearchViewer(detail) {
   const equations = meta.governing_equations || [];
   const metrics = meta.key_metrics || {};
   let html = '';
-  if (Object.keys(metrics).length) {
-    html += '<div class="rv-card"><h4>📊 Verified Numerical Metrics</h4><div class="kv">' +
-      Object.entries(metrics).map(([k, v]) => {
+  const visibleMetrics = Object.entries(metrics).filter(([k]) => !/^state_\d+$/.test(k));
+  if (visibleMetrics.length) {
+    const metricsTitle = isVerifiedRun ? '📊 Verified Numerical Metrics' : '📊 Observed Numerical Metrics (Unverified)';
+    html += `<div class="rv-card"><h4>${metricsTitle}</h4><div class="kv">` +
+      visibleMetrics.map(([k, v]) => {
         const val = v && typeof v === 'object' ? v.value : v;
         const unit = v && typeof v === 'object' ? (v.unit || '') : '';
-        return `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(String(val))} ${escapeHtml(unit)}</div>`;
+        const evStatus = v && typeof v === 'object' ? (v.evidence_status || (isVerifiedRun ? 'CERTIFIED' : 'OBSERVED_UNVERIFIED')) : (isVerifiedRun ? 'CERTIFIED' : 'OBSERVED_UNVERIFIED');
+        return `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(String(val))} ${escapeHtml(unit)} <span class="badge">${escapeHtml(evStatus)}</span></div>`;
       }).join('') + '</div></div>';
   }
   if (Object.keys(constants).length) {
@@ -2210,7 +2341,8 @@ function renderResearchViewer(detail) {
   }
   const functions = meta.verified_functions || [];
   if (functions.length) {
-    html += '<div class="rv-card"><h4>🔧 Verified Function Signatures</h4><div class="mono" style="font-size:12px">' +
+    const fnTitle = isVerifiedRun ? '🔧 Verified Function Signatures' : '🔧 Module Function Signatures';
+    html += `<div class="rv-card"><h4>${fnTitle}</h4><div class="mono" style="font-size:12px">` +
       functions.map(f => escapeHtml(f)).join('<br>') + '</div></div>';
   }
   if (!html) html = '<div class="vault-empty">No equations or constants archived for this run.</div>';

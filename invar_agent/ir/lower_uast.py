@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from invar_agent.ir.function_registry import FUNCTION_REGISTRY, lower_nary_binary_tree
 from invar_agent.ir.ihcg_bridge import SealedSciIR, seal_sciir_ihcg
 from invar_agent.ir.schema import SciIR, SlotRole
 
@@ -75,14 +76,47 @@ def lower_sciir_to_builder_uast(
     }
 
 
+_SPLITMIX64_HELPERS = """_SPLITMIX_STATE = {}
+
+def _splitmix64_next(stream_id):
+    z = (_SPLITMIX_STATE.get(stream_id, (int(stream_id) + 1) * 0x9E3779B97F4A7C15) + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    _SPLITMIX_STATE[stream_id] = z
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+def _splitmix64_uniform01(stream_id=0):
+    return ((_splitmix64_next(stream_id) >> 11) + 0.5) * (1.0 / (1 << 53))
+
+def _splitmix64_normal01(stream_id=0):
+    u1 = max(1e-15, _splitmix64_uniform01(stream_id))
+    u2 = _splitmix64_uniform01(stream_id + 104729)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+def _splitmix64_exponential1(stream_id=0):
+    u = max(1e-15, 1.0 - _splitmix64_uniform01(stream_id))
+    return -math.log(u)
+"""
+
+
 def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = False) -> str:
-    """Deterministically lower a SciIR ExprNode AST to pure scalar Python (or IHCG formula)."""
+    """ARCH-006: Single lowering authority for SciIR ExprNode -> executable & formal Python.
+
+    - Exhaustive node matching: unknown node kinds raise ValueError (never 0.0).
+    - Identical piecewise semantics for ``step(x)`` and ``if_then_else`` across
+      executable and formal paths.
+    - Seeded SplitMix64 streams for ``rand`` draws (never constant 0.5).
+    - n-ary ``min``/``max`` lowered via balanced binary trees; ``ln``/``clamp``/``tanh``
+      resolved through the single canonical function registry.
+    """
     if isinstance(expr, str):
         return expr
     if hasattr(expr, "model_dump"):
         expr = expr.model_dump(mode="json")
+    if isinstance(expr, (int, float)) and not isinstance(expr, bool):
+        return repr(float(expr))
     if not isinstance(expr, dict):
-        return repr(float(expr)) if isinstance(expr, (int, float)) else str(expr)
+        raise ValueError(f"Unsupported SciIR expression node: {expr!r}")
     kind = expr.get("kind") or expr.get("op")
     if kind in ("const", "literal", "number", "Literal") or ("value" in expr and kind is None):
         return repr(float(expr["value"]))
@@ -96,27 +130,44 @@ def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = F
         if op == "abs":
             return f"abs({inner})"
         if op == "step":
-            return f"(1.0 if ({inner}) >= 0.0 else 0.0)" if not for_ihcg else f"max(0.0, min(1.0, ({inner})))"
+            # Identical Heaviside semantics in both executable and formal paths.
+            return f"(1.0 if ({inner}) >= 0.0 else 0.0)"
+        if op == "ln":
+            return f"log({inner})" if for_ihcg else f"math.log({inner})"
         math_unary = {"exp", "log", "sqrt", "sin", "cos", "tanh", "tan", "sinh", "cosh"}
         if op in math_unary:
             return f"{op}({inner})" if for_ihcg else f"math.{op}({inner})"
-        return f"({inner})"
+        raise ValueError(f"Unsupported SciIR unary operator: {op!r}")
     if kind in ("binary", "Binary"):
-        raw_op = str(expr.get("op") or expr.get("operator") or "+")
+        raw_op = str(expr.get("op") or expr.get("operator") or "")
+        if not raw_op:
+            raise ValueError("Missing binary operator in SciIR expression")
         l = _render_expr_to_python(expr.get("lhs") if "lhs" in expr else expr["left"], sym_names, for_ihcg=for_ihcg)
         r = _render_expr_to_python(expr.get("rhs") if "rhs" in expr else expr["right"], sym_names, for_ihcg=for_ihcg)
         if raw_op in ("min", "max"):
             return f"{raw_op}({l}, {r})"
         op_map = {"add": "+", "sub": "-", "mul": "*", "div": "/", "pow": "**"}
         op = op_map.get(raw_op, raw_op)
+        if op not in {"+", "-", "*", "/", "**"}:
+            raise ValueError(f"Unsupported SciIR binary operator: {raw_op!r}")
         return f"({l} {op} {r})"
     if kind in ("call", "Call"):
-        fn = str(expr.get("func") or expr.get("name"))
+        fn = str(expr.get("func") or expr.get("name") or "")
         args = [_render_expr_to_python(a, sym_names, for_ihcg=for_ihcg) for a in (expr.get("args") or [])]
+        if fn == "ln" and len(args) == 1:
+            return f"log({args[0]})" if for_ihcg else f"math.log({args[0]})"
+        if fn == "clamp" and len(args) == 3:
+            return f"min({args[2]}, max({args[1]}, {args[0]}))"
+        if fn == "step" and len(args) == 1:
+            return f"(1.0 if ({args[0]}) >= 0.0 else 0.0)"
+        if fn in ("min", "max") and len(args) >= 2:
+            return lower_nary_binary_tree(fn, args)
         math_fns = {"exp", "log", "sqrt", "sin", "cos", "tan", "tanh", "sinh", "cosh", "fabs", "floor", "ceil"}
         if fn in math_fns:
             return f"{fn}({', '.join(args)})" if for_ihcg else f"math.{fn}({', '.join(args)})"
-        return f"{fn}({', '.join(args)})"
+        if fn in FUNCTION_REGISTRY:
+            return f"{fn}({', '.join(args)})"
+        raise ValueError(f"Unsupported SciIR function call: {fn!r}")
     if kind in ("if_then_else", "IfThenElse"):
         cond_ops = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "=="}
         if "cond_op" in expr:
@@ -132,46 +183,104 @@ def _render_expr_to_python(expr: Any, sym_names: set[str], *, for_ihcg: bool = F
             e = _render_expr_to_python(expr["else_expr"], sym_names, for_ihcg=for_ihcg)
         return f"({t} if ({c}) else {e})"
     if kind == "rand":
-        return "0.5"
-    if "expr_text" in expr:
+        dist = str(expr.get("dist") or "uniform01").lower()
+        stream_id = int(expr.get("draw_stream_id", 0) or 0)
+        if dist in ("uniform01", "uniform"):
+            return f"rand_uniform01({stream_id})" if for_ihcg else f"_splitmix64_uniform01({stream_id})"
+        if dist in ("normal01", "normal", "gaussian"):
+            return f"rand_normal01({stream_id})" if for_ihcg else f"_splitmix64_normal01({stream_id})"
+        if dist in ("exponential1", "exponential", "exp"):
+            return f"rand_exponential1({stream_id})" if for_ihcg else f"_splitmix64_exponential1({stream_id})"
+        raise ValueError(f"Unsupported SciIR random distribution: {dist!r}")
+    if "expr_text" in expr and kind is None:
         return str(expr["expr_text"])
-    return "0.0"
+    raise ValueError(f"Unsupported SciIR expression node kind: {kind!r}")
+
+
+def _substitute_state_vars(expr_str: str, replacements: dict[str, str]) -> str:
+    import re as _re
+    if not replacements:
+        return expr_str
+    pattern = _re.compile(r"\b(" + "|".join(_re.escape(k) for k in sorted(replacements, key=len, reverse=True)) + r")\b")
+    return pattern.sub(lambda m: f"({replacements[m.group(1)]})", expr_str)
 
 
 def emit_python_kernel_from_sciir(ir: SciIR) -> str:
-    """ARCH-004: Deterministically emit a pure v9_transpiler_friendly Python kernel from SciIR.
+    """ARCH-006: Deterministically emit a pure v9-friendly Python kernel from SciIR.
 
-    Control parameters are strictly read-only (never written back to buf.data),
-    making T_CONST_PARAM_WRITE (BUG-027) impossible by construction.
+    - ODE_PDE emits genuine 4-stage classical RK4 matching ``_prove_rk4_assignments``.
+    - Rejects archetype/equation mismatches (derivative equations on STATE symbols
+      require ``ODE_PDE``).
+    - Supports first-class ``TRAJECTORY_MAX`` / ``TRAJECTORY_MIN`` / ``TRAJECTORY_FINAL``
+      observable reductions.
+    - Control parameters are strictly read-only.
     """
-    lines: list[str] = ["import math", "", "def simulation_step(buf, dt):"]
     symbols_sorted = sorted(ir.symbols, key=lambda x: (x.slot_index, x.name))
     slot_idx_map = {s.name: idx for idx, s in enumerate(symbols_sorted)}
     sym_names = set(slot_idx_map.keys())
-    # 1. Read all symbols from their unique contiguous canonical slots (CONTROL_PARAM read-only)
-    for idx, s in enumerate(symbols_sorted):
-        if s.role == SlotRole.CONSTANT:
-            lines.append(f"    {s.name} = {float(s.initial_or_default)!r}")
-        else:
-            lines.append(f"    {s.name} = buf.data[{idx}]")
-
-    # 2. Emit let-bindings in topological order
-    for lb in ir.let_bindings:
-        rhs = getattr(lb, "expr_text", None) or _render_expr_to_python(lb.expr, sym_names)
-        lines.append(f"    {lb.name} = {rhs}")
-
-    # 3. Emit dynamics (ODE) or algebraic updates
     state_syms = [s for s in symbols_sorted if s.role == SlotRole.STATE]
+    state_names = [s.name for s in state_syms]
     state_eqs = {eq.target: eq for eq in ir.dynamics_or_residuals}
+
+    # Reject archetype/equation mismatches: PARAM_SWEEP / ALGEBRAIC_CLOSURE cannot
+    # assign ODE derivatives directly onto evolving STATE variables.
+    if state_syms and ir.archetype.value in ("PARAM_SWEEP", "ALGEBRAIC_CLOSURE"):
+        has_state_dynamics = any(eq.target in set(state_names) for eq in ir.dynamics_or_residuals)
+        if has_state_dynamics:
+            raise ValueError(
+                f"ARCHETYPE_EQUATION_MISMATCH: archetype={ir.archetype.value} cannot "
+                f"evolve STATE variables {state_names}; derivative equations require ODE_PDE"
+            )
+
+    lines: list[str] = ["import math", "", "def simulation_step(buf, dt):"]
+    # 1. Read all symbols from their unique contiguous canonical slots (CONTROL_PARAM / CONSTANT read-only)
+    for idx, s in enumerate(symbols_sorted):
+        lines.append(f"    {s.name} = buf.data[{idx}]")
+
+    # Build inlined let-binding map so RK4 stages re-evaluate let-bindings at intermediate states
+    let_exprs: list[tuple[str, str]] = []
+    let_map: dict[str, str] = {}
+    for lb in ir.let_bindings:
+        rhs = _render_expr_to_python(lb.expr, sym_names) if getattr(lb, "expr", None) is not None else str(getattr(lb, "expr_text", "0.0"))
+        inlined = _substitute_state_vars(rhs, let_map)
+        let_map[lb.name] = inlined
+        let_exprs.append((lb.name, rhs))
+
+    # 2. Emit dynamics (genuine RK4 for ODE_PDE) or algebraic updates
     if state_syms and ir.archetype.value == "ODE_PDE":
+        raw_rhs: dict[str, str] = {}
         for s in state_syms:
             eq = state_eqs.get(s.name)
-            rhs = _render_expr_to_python(eq.expr, sym_names) if eq else "0.0"
-            lines.append(f"    _d_{s.name} = {rhs}")
+            base_rhs = _render_expr_to_python(eq.expr, sym_names) if eq else "0.0"
+            raw_rhs[s.name] = _substitute_state_vars(base_rhs, let_map)
+
+        # Stage 1: k1 = f(y)
         for s in state_syms:
-            lines.append(f"    {s.name} = {s.name} + dt * _d_{s.name}")
+            lines.append(f"    _k1_{s.name} = {raw_rhs[s.name]}")
+        # Stage 2: k2 = f(y + (dt / 2) * k1)
+        sub2 = {s.name: f"{s.name} + (dt / 2) * _k1_{s.name}" for s in state_syms}
+        for s in state_syms:
+            lines.append(f"    _k2_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub2)}")
+        # Stage 3: k3 = f(y + (dt / 2) * k2)
+        sub3 = {s.name: f"{s.name} + (dt / 2) * _k2_{s.name}" for s in state_syms}
+        for s in state_syms:
+            lines.append(f"    _k3_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub3)}")
+        # Stage 4: k4 = f(y + dt * k3)
+        sub4 = {s.name: f"{s.name} + dt * _k3_{s.name}" for s in state_syms}
+        for s in state_syms:
+            lines.append(f"    _k4_{s.name} = {_substitute_state_vars(raw_rhs[s.name], sub4)}")
+        # Combine RK4 update
+        for s in state_syms:
+            lines.append(
+                f"    {s.name} = {s.name} + dt * (_k1_{s.name} + 2 * _k2_{s.name} + 2 * _k3_{s.name} + _k4_{s.name}) / 6"
+            )
             lines.append(f"    buf.data[{slot_idx_map[s.name]}] = {s.name}")
+        # Re-emit let-bindings at the updated state for downstream observables
+        for lname, lrhs in let_exprs:
+            lines.append(f"    {lname} = {lrhs}")
     else:
+        for lname, lrhs in let_exprs:
+            lines.append(f"    {lname} = {lrhs}")
         for eq in ir.dynamics_or_residuals:
             rhs = _render_expr_to_python(eq.expr, sym_names)
             tgt = next((s for s in symbols_sorted if s.name == eq.target), None)
@@ -179,17 +288,31 @@ def emit_python_kernel_from_sciir(ir: SciIR) -> str:
                 lines.append(f"    {tgt.name} = {rhs}")
                 lines.append(f"    buf.data[{slot_idx_map[tgt.name]}] = {tgt.name}")
 
-    # 4. Emit derived observables (and trajectory reductions)
+    # 3. Emit derived observables (with first-class TRAJECTORY_MAX / TRAJECTORY_MIN / TRAJECTORY_FINAL)
     for obs in ir.observables:
         rhs = _render_expr_to_python(obs.expr, sym_names)
         tgt = next((s for s in symbols_sorted if s.name == obs.target), None)
         if tgt is not None and tgt.role != SlotRole.CONTROL_PARAM:
-            lines.append(f"    {tgt.name} = {rhs}")
-            lines.append(f"    buf.data[{slot_idx_map[tgt.name]}] = {tgt.name}")
+            slot_i = slot_idx_map[tgt.name]
+            reduction = str(getattr(obs, "reduction", "") or "").upper()
+            if reduction == "TRAJECTORY_MAX":
+                lines.append(f"    _obs_cur_{tgt.name} = {rhs}")
+                lines.append(f"    {tgt.name} = max({tgt.name}, _obs_cur_{tgt.name})")
+                lines.append(f"    buf.data[{slot_i}] = {tgt.name}")
+            elif reduction == "TRAJECTORY_MIN":
+                lines.append(f"    _obs_cur_{tgt.name} = {rhs}")
+                lines.append(f"    {tgt.name} = min({tgt.name}, _obs_cur_{tgt.name})")
+                lines.append(f"    buf.data[{slot_i}] = {tgt.name}")
+            else:
+                lines.append(f"    {tgt.name} = {rhs}")
+                lines.append(f"    buf.data[{slot_i}] = {tgt.name}")
 
     if len(lines) == 3:
         lines.append("    pass")
-    return "\n".join(lines) + "\n"
+    code = "\n".join(lines) + "\n"
+    if "_splitmix64_" in code:
+        code = "import math\n\n" + _SPLITMIX64_HELPERS + "\n" + "\n".join(lines[2:]) + "\n"
+    return code
 
 
 def sciir_to_research_blueprint(
@@ -247,10 +370,10 @@ def sciir_to_research_blueprint(
             init_v = float(s.initial_or_default or 0.0)
         else:
             v0 = float(s.initial_or_default or 0.0)
-            if s.role == SlotRole.CONSTANT or s.name in pinned_syms or s.name.lower() in pinned_syms:
+            if s.role == SlotRole.CONSTANT or s.role == SlotRole.CONTROL_PARAM or s.name in pinned_syms or s.name.lower() in pinned_syms:
                 lo, hi = v0, v0
             else:
-                span = max(1.0, abs(v0) * 2.0)
+                span = max(1.0, abs(v0) * 1.5)
                 lo = 0.0 if s.strictly_positive else (v0 - span)
                 hi = v0 + span
             if lo > hi:
@@ -382,6 +505,24 @@ def sciir_to_research_blueprint(
     if ir.archetype.value == "ODE_PDE" and hasattr(ir.config, "t_span"):
         t0, t1 = ir.config.t_span
         span = max(1e-6, float(t1) - float(t0))
+        # ARCH-006: If no explicit user duration, ensure horizon >= 10x slowest SI timescale
+        ledger = extract_claim_ledger(user_prompt)
+        if ledger.duration_si_s is None:
+            rate_values: list[float] = []
+            for s in symbols_sorted:
+                exps = [
+                    (int(n // d) if (d != 0 and n % d == 0) else (n / d if d != 0 else 0))
+                    for n, d in s.dimension.exponents
+                ]
+                if exps == [0, 0, -1, 0, 0, 0, 0]:
+                    val = float(s.initial_or_default or 0.0)
+                    if 1e-7 < abs(val) < 1e6:
+                        rate_values.append(abs(val))
+            if rate_values:
+                slowest_tau = 1.0 / min(rate_values)
+                min_horizon = min(1e7, 10.0 * slowest_tau)
+                if span < min_horizon:
+                    span = min_horizon
         steps = max(20, min(4000, int(getattr(ir.config, "sample_points", 200) or 200)))
         dt = span / steps
 
@@ -411,13 +552,18 @@ def sciir_to_research_blueprint(
         },
     }
 
+    prompt_tokens = [
+        tok for tok in _re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", user_prompt or "")
+        if tok.lower() not in {"verify", "whether", "check", "compute", "model", "with", "that", "from", "this", "using", "given", "show", "prove"}
+    ]
+    derived_query = " ".join(prompt_tokens[:8]) or (title or getattr(ir, "title", None) or ir.ir_id)
     kernel_code = emit_python_kernel_from_sciir(ir)
     return {
         "blueprint_id": ir.ir_id[:32],
         "title": title or getattr(ir, "title", None) or ir.ir_id,
         "research_prompt": user_prompt,
         "falsifiable_hypothesis": " and ".join(ob["expression"] for ob in ihcg_obligations) or user_prompt[:200],
-        "search_queries": [getattr(ir, "title", None) or "scientific model"],
+        "search_queries": [derived_query],
         "variable_map": slot_map,
         "code_template": kernel_code,
         "contracts": [

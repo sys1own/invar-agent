@@ -11,7 +11,8 @@ from invar_agent.runtime import research_reference
 import sympy as sp
 from sympy.printing.cxx import CXX17CodePrinter
 
-from .base import model, observations, package_name, selected
+from .base import infer_program_kind, model, observations, package_name, selected
+from ..uast_models import ProgramKind
 from . import calibration, workbench
 from ..ingestion.equation_lowerer import equation_parts
 
@@ -208,6 +209,20 @@ def compute_jacobian(state=None,parameters=None,t=0.):
     function=cabi_runtime.jacobian if cabi_runtime else kernel_py.jacobian
     return function([state[key] for key in STATE_NAMES],[parameters[key] for key in PARAMETER_NAMES],t)
 
+def evaluate(parameters=None,backend='auto'):
+    """ARCH-005: Horizon-independent algebraic evaluation (no t, dt, or steps)."""
+    params={**DEFAULT_PARAMETERS,**(parameters or {})}
+    validate(params,MODEL['parameter_definitions'])
+    state=[DEFAULT_INITIAL_STATE[key] for key in STATE_NAMES]
+    pvec=[params[key] for key in PARAMETER_NAMES]
+    if backend=='rust' and cabi_runtime and cabi_runtime.rust_library() is not None:
+        out=cabi_runtime.step_rust(state,pvec,0.0,0.0)
+    elif backend!='python' and cabi_runtime and cabi_runtime.library() is not None and MODEL.get('program_kind')=='AlgebraicMap':
+        out=cabi_runtime.step(state,pvec,0.0,0.0)
+    else:
+        out=kernel_py.rhs(state,pvec,0.0)
+    return dict(zip(STATE_NAMES,out))
+
 def simulate(config=None,**kwargs):
     if isinstance(config,dict):
         config=SimulationConfig(**config)
@@ -226,13 +241,18 @@ def simulate(config=None,**kwargs):
     else:
         native=cabi_runtime and config.backend!='python' and cabi_runtime.library() is not None
         advance=cabi_runtime.step if native else kernel_py.step
-    state=[initial[key] for key in STATE_NAMES]
-    values={key:[state[index]] for index,key in enumerate(STATE_NAMES)}
-    for index in range(config.steps):
-        state=advance(state,[parameters[key] for key in PARAMETER_NAMES],config.dt,index*config.dt)
-        validate(dict(zip(STATE_NAMES,state)),MODEL['state_definitions'])
-        for key,value in zip(STATE_NAMES,state):
-            values[key].append(value)
+    if MODEL.get('program_kind')=='AlgebraicMap':
+        evaluated=advance([initial[key] for key in STATE_NAMES],[parameters[key] for key in PARAMETER_NAMES],config.dt,0.0)
+        validate(dict(zip(STATE_NAMES,evaluated)),MODEL['state_definitions'])
+        values={key:[evaluated[index]]*(config.steps+1) for index,key in enumerate(STATE_NAMES)}
+    else:
+        state=[initial[key] for key in STATE_NAMES]
+        values={key:[state[index]] for index,key in enumerate(STATE_NAMES)}
+        for index in range(config.steps):
+            state=advance(state,[parameters[key] for key in PARAMETER_NAMES],config.dt,index*config.dt)
+            validate(dict(zip(STATE_NAMES,state)),MODEL['state_definitions'])
+            for key,value in zip(STATE_NAMES,state):
+                values[key].append(value)
     statuses={equation: True for equation in MODEL['invariants']}
     for index in range(config.steps+1):
         environment={**parameters,**{key:values[key][index] for key in STATE_NAMES},'t':index*config.dt}
@@ -378,15 +398,20 @@ def sources(context):
     def rust_expr(expression):
         return rust_printer.doprint(expression.xreplace(replacement))
     bindings = "\n".join(f"    v{i} = {'state' if i<len(names) else 'params'}[{i if i<len(names) else i-len(names)}]" for i in range(len(symbols)))
-    scheme = context.ir.research_reference.integration_scheme if context.ir.research_reference else 'rk4'
+    program_kind = infer_program_kind(context.ir)
+    is_algebraic = program_kind == ProgramKind.ALGEBRAIC_MAP
+    scheme = 'algebraic' if is_algebraic else (context.ir.research_reference.integration_scheme if context.ir.research_reference else 'rk4')
     runtime = KERNEL_RUNTIME
-    if scheme != 'rk4':
+    if is_algebraic:
+        runtime = runtime.replace('def step(', 'def step_rk4(')
+        runtime += "\ndef step(state,params,dt,t=0.):\n    return rhs(state,params,0.0)\n"
+    elif scheme != 'rk4':
         helper = next(node for node in ast.parse(Path(research_reference.__file__).read_text(encoding="utf-8")).body
                       if isinstance(node,ast.FunctionDef) and node.name=='integrate_rhs')
         runtime = runtime.replace('def step(', 'def step_rk4(')
         runtime += '\n'+ast.unparse(helper).replace('ReferenceError(', 'ValueError(')+'\n'
         runtime += f"def step(state,params,dt,t=0.):\n    return integrate_rhs(rhs,state,params,dt,t,{scheme!r})\n"
-    kernel = "import math\n" + runtime + f"\nINTEGRATION_SCHEME={scheme!r}\n" + "\ndef rhs(state,params,t=0.):\n" + bindings + "\n    return [" + ",".join(python(e) for e in expressions) + "]\n"
+    kernel = "import math\n" + runtime + f"\nPROGRAM_KIND={program_kind.value!r}\nINTEGRATION_SCHEME={scheme!r}\n" + "\ndef rhs(state,params,t=0.):\n" + bindings + "\n    return [" + ",".join(python(e) for e in expressions) + "]\n"
     kernel += "\ndef jacobian(state,params,t=0.):\n" + bindings + "\n    return " + "[" + ",".join("[" + ",".join(python(e) for e in row) + "]" for row in jacobian) + "]\n"
     observable_names, observable_values, observable_jacobian = observations(context, names + parameters)
     kernel += "\ndef observable_values(state,params,t=0.):\n" + bindings + "\n    return {" + ','.join(repr(name)+':'+python(expression) for name,expression in zip(observable_names,observable_values)) + '}\n'
@@ -422,7 +447,9 @@ def sources(context):
     native = '#include <cmath>\n#include "kernel.h"\nstatic double invar_exp(double x){return std::exp(x>700.?700.:x<-700.?-700.:x);}\nstatic double invar_log(double x){return std::log(x<1e-300?1e-300:x);}\nstatic double invar_div(double a,double b){double v=b==0.?0.:a/b;return std::isfinite(v)?v:0.;}\nstatic double invar_pow(double a,double b){double v=std::pow(a,b);return std::isfinite(v)?v:0.;}\n'
     native += f"static void rhs(const double*x,const double*p,double t,double*out){{{binding_cpp}" + "".join(f"out[{i}]={cpp(e)};" for i,e in enumerate(expressions)) + "}\n"
     native += f'extern "C" void invar_step(const double*x,const double*p,double dt,double t,double*out){{double a[{n}],b[{n}],c[{n}],d[{n}],q[{n}];rhs(x,p,t,a);'
-    if scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
+    if is_algebraic:
+        native += f"for(int i=0;i<{n};++i)out[i]=a[i];}}\n"
+    elif scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
         native += f"for(int i=0;i<{n};++i)out[i]=x[i]+dt*a[i];}}\n"
     elif scheme == 'midpoint':
         native += f"for(int i=0;i<{n};++i)q[i]=x[i]+dt*a[i]/2;rhs(q,p,t+dt/2,b);for(int i=0;i<{n};++i)out[i]=x[i]+dt*b[i];}}\n"
@@ -436,7 +463,9 @@ def sources(context):
     rust_src = '#![allow(unused_variables, non_snake_case, unused_parens, clippy::all)]\n#[inline] fn invar_exp(x: f64) -> f64 { x.clamp(-700.0, 700.0).exp() }\n#[inline] fn invar_log(x: f64) -> f64 { x.max(1e-300).ln() }\n#[inline] fn invar_div(a: f64, b: f64) -> f64 { if b == 0.0 { 0.0 } else { let v = a / b; if v.is_finite() { v } else { 0.0 } } }\n#[inline] fn invar_pow(a: f64, b: f64) -> f64 { let v = a.powf(b); if v.is_finite() { v } else { 0.0 } }\n'
     rust_src += f"unsafe fn rhs(x: *const f64, p: *const f64, t: f64, out: *mut f64) {{\n{binding_rs}\n" + "".join(f"*out.add({i}) = {rust_expr(e)};\n" for i,e in enumerate(expressions)) + "}\n"
     rust_src += f'#[no_mangle]\npub unsafe extern "C" fn invar_step(x: *const f64, p: *const f64, dt: f64, t: f64, out: *mut f64) {{\nlet (mut a, mut b, mut c, mut d, mut q) = ([0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}], [0.0_f64; {n}]);\nrhs(x, p, t, a.as_mut_ptr());\n'
-    if scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
+    if is_algebraic:
+        rust_src += f"for i in 0..{n} {{ *out.add(i) = a[i]; }}\n}}\n"
+    elif scheme in ('euler', 'semi_implicit', 'semi_implicit_euler', 'symplectic_euler'):
         rust_src += f"for i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * a[i]; }}\n}}\n"
     elif scheme == 'midpoint':
         rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, b.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * b[i]; }}\n}}\n"
@@ -446,11 +475,12 @@ def sources(context):
         rust_src += f"for i in 0..{n} {{ q[i] = *x.add(i) + dt * a[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, b.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * b[i] / 2.0; }}\nrhs(q.as_ptr(), p, t + dt / 2.0, c.as_mut_ptr());\nfor i in 0..{n} {{ q[i] = *x.add(i) + dt * c[i]; }}\nrhs(q.as_ptr(), p, t + dt, d.as_mut_ptr());\nfor i in 0..{n} {{ *out.add(i) = *x.add(i) + dt * (a[i] + 2.0 * b[i] + 2.0 * c[i] + d[i]) / 6.0; }}\n}}\n"
     rust_src += '#[no_mangle]\npub unsafe extern "C" fn invar_jacobian(x: *const f64, p: *const f64, t: f64, out: *mut f64) {\n' + binding_rs + "\n" + "".join(f"*out.add({i*width+j}) = {rust_expr(e)};\n" for i,row in enumerate(jacobian) for j,e in enumerate(row)) + "}\n"
     cargo_toml = f'[package]\nname = "{pkg}_native"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "{pkg}_native"\npath = "lib.rs"\ncrate-type = ["cdylib", "rlib"]\n'
+    from ..export_utils import sanitize_ir_for_export
     ir = context.ir
-    metadata = dict(states=names, parameters=parameters, defaults={c.symbol:c.si_value for c in ir.constants}, initial={s.symbol:s.initial_value or 0.0 for s in states},
+    metadata = dict(program_kind=program_kind.value, states=names, parameters=parameters, defaults={c.symbol:c.si_value for c in ir.constants}, initial={s.symbol:s.initial_value or 0.0 for s in states},
         state_definitions={s.symbol:s.model_dump(mode="json") for s in states}, parameter_definitions={c.symbol:c.model_dump(mode="json") for c in ir.constants},
         dt=ir.default_dt_si_s or .01, steps=ir.default_steps or 100, derivative_backend=backend, observables=observable_names,
-        invariants=[e.equation_id for e in ir.equations if e.role.value=="INVARIANT_CONTRACT"], ir=ir.model_dump(mode="json"))
+        invariants=[e.equation_id for e in ir.equations if e.role.value=="INVARIANT_CONTRACT"], ir=sanitize_ir_for_export(ir.model_dump(mode="json")))
     manifest=f'''[build-system]
 requires=["setuptools>=68"]
 build-backend="setuptools.build_meta"
@@ -500,17 +530,27 @@ def test_pinned_research_reference_and_runtime_guards():
 
 
 def test_sources(pkg, reference):
+    syspath_hdr = "import sys\nfrom pathlib import Path\n_SRC = str(Path(__file__).resolve().parents[1] / 'src')\nif _SRC not in sys.path:\n    sys.path.insert(0, _SRC)\n"
     return {
-        "tests/test_kernel_contracts.py":f'''import math
-from {pkg}.sdk import simulate,SimulationConfig,compute_jacobian,MODEL
+        "tests/test_kernel_contracts.py": syspath_hdr + f'''import math
+from {pkg}.sdk import simulate,evaluate,SimulationConfig,compute_jacobian,MODEL
 def test_cabi_parity():
     python=simulate(SimulationConfig(steps=5,backend='python'))
     native=simulate(SimulationConfig(steps=5))
+    rust=simulate(SimulationConfig(steps=5,backend='rust'))
     for name in MODEL['states']:
         assert all(abs(a-b)<=max(1e-10,1e-10*max(abs(a),abs(b))) for a,b in zip(python.trajectories[name],native.trajectories[name]))
+        assert all(abs(a-b)<=max(1e-10,1e-10*max(abs(a),abs(b))) for a,b in zip(python.trajectories[name],rust.trajectories[name]))
+    if MODEL.get('program_kind')=='AlgebraicMap':
+        ev=evaluate()
+        short=simulate(SimulationConfig(dt=0.1,steps=1))
+        long=simulate(SimulationConfig(dt=1.0,steps=5))
+        for name in MODEL['states']:
+            assert abs(short.trajectories[name][-1]-ev[name])<=1e-12
+            assert abs(long.trajectories[name][-1]-ev[name])<=1e-12
     assert all(math.isfinite(v) for row in compute_jacobian() for v in row)
 ''',
-        "tests/test_z3_invariants.py":f'''import z3
+        "tests/test_z3_invariants.py": syspath_hdr + f'''import z3
 from {pkg}.sdk import MODEL,simulate,SimulationConfig
 def test_z3_bound_closure():
     for name,item in MODEL['state_definitions'].items():
@@ -523,14 +563,15 @@ def test_z3_bound_closure():
         assert solver.check()==z3.sat
     assert all(simulate(SimulationConfig(steps=5)).invariant_status.values())
 ''',
-        "tests/test_research_parity.py":f'''from {pkg}.sdk import MODEL,DEFAULT_PARAMETERS,simulate,SimulationConfig,DEFAULT_INITIAL_STATE,STATE_NAMES,PARAMETER_NAMES
+        "tests/test_research_parity.py": syspath_hdr + f'''from {pkg}.sdk import MODEL,DEFAULT_PARAMETERS,simulate,SimulationConfig,DEFAULT_INITIAL_STATE,STATE_NAMES,PARAMETER_NAMES
 from {pkg}.kernel_py import rhs
 def test_research_constants_and_initial_values():
     for item in MODEL['ir']['constants']:
         assert DEFAULT_PARAMETERS[item['symbol']]==item['si_value']
     run=simulate(SimulationConfig(steps=0))
-    for item in MODEL['ir']['state_variables']:
-        assert run.trajectories[item['symbol']][0]==(item['initial_value'] or 0.)
+    if MODEL.get('program_kind')!='AlgebraicMap':
+        for item in MODEL['ir']['state_variables']:
+            assert run.trajectories[item['symbol']][0]==(item['initial_value'] or 0.)
     assert all(e['hin_homogeneous'] for e in MODEL['ir']['equations'] if e['csel_ast'])
     expected={reference!r}
     actual=rhs([DEFAULT_INITIAL_STATE[key] for key in STATE_NAMES],[DEFAULT_PARAMETERS[key] for key in PARAMETER_NAMES])
@@ -547,7 +588,7 @@ def emit(node,context):
         prefix=f"src/{package_name(context)}/native"
         directory=context.overlay/prefix
         directory.mkdir(parents=True,exist_ok=True)
-        for name in ("kernel.cpp","kernel.h"):
+        for name in ("kernel.cpp","kernel.h","lib.rs"):
             (directory/name).write_text(content[f"{prefix}/{name}"], encoding="utf-8")
         compiler=shutil.which('g++') or shutil.which('clang++')
         binary=b''
@@ -557,6 +598,15 @@ def emit(node,context):
                 raise ValueError(completed.stderr)
             binary=(directory/'kernel.so').read_bytes()
         content[f"{prefix}/kernel.so"]=binary
+        rustc=shutil.which('rustc')
+        if rustc and not context.python_fallback_active:
+            rs_out = directory / 'kernel_rs.so'
+            rs_proc = subprocess.run(
+                [rustc, '--crate-type', 'cdylib', '-C', 'opt-level=3', str(directory / 'lib.rs'), '-o', str(rs_out)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if rs_proc.returncode != 0:
+                raise ValueError(f"Rust kernel compilation failed: {rs_proc.stderr}")
     paths=[path for path in node.target_relpaths if path.startswith('tests/') and 'workbench' not in path and 'calibration' not in path]
     emission = selected(node,content,paths)
     if node.node_id == 'mod_sdk':

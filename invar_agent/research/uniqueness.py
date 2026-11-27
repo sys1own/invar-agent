@@ -445,10 +445,16 @@ def check_intra_vault_uniqueness(candidate_cds: CdsTriplet, ihcg: m.IhcgGraph, v
     for entry in entries:
         old = entry.cds
         if old.model_hash != candidate_cds.model_hash: continue
+        same_claim = old.claim_hash == candidate_cds.claim_hash
+        # ARCH-008 (BUG-027): Distinct / opposite-polarity claim on the same model
+        # (e.g. a VERIFIED_FALSIFICATION following a VERIFIED_DISCOVERY with a
+        # different claim polarity or environmental slice) is a distinct epistemic
+        # finding, never UNIQUENESS_FAILED:UNCLASSIFIED.
+        if not same_claim and verdict != entry.verdict and verdict == m.EpistemicVerdict.VERIFIED_FALSIFICATION:
+            admissions.append(VaultUniquenessAudit(passed=True, vault_class="NOVEL_INDEPENDENT", related_run_id=f"@research:{entry.run_id}")); continue
         relation = _relations(candidate_cds.pi_domain, old.pi_domain)
         if relation is None: unresolved = True; continue
         subset, overlap, extension = relation
-        same_claim = old.claim_hash == candidate_cds.claim_hash
         if same_claim and overlap and verdict == m.EpistemicVerdict.VERIFIED_FALSIFICATION and entry.verdict in {m.EpistemicVerdict.VERIFIED_DISCOVERY, m.EpistemicVerdict.VERIFIED_BOUNDARY_DISCOVERY}:
             admissions.append(VaultUniquenessAudit(passed=True, vault_class="VALID_REFUTATION_OF_PRIOR", related_run_id=f"@research:{entry.run_id}", lineage_edge="refutes")); continue
         precision = entry.epsilon_disc > 0 and epsilon_disc <= entry.epsilon_disc/10
@@ -463,7 +469,7 @@ def check_intra_vault_uniqueness(candidate_cds: CdsTriplet, ihcg: m.IhcgGraph, v
             admissions.append(VaultUniquenessAudit(passed=True, vault_class="VALID_DOMAIN_EXTENSION", related_run_id=f"@research:{entry.run_id}", lineage_edge="extends_domain_of")); continue
         unresolved = True
     if admissions:
-        rank = {"VALID_REFUTATION_OF_PRIOR": 0, "VALID_BOUND_SHARPENING": 1, "VALID_DOMAIN_EXTENSION": 2}
+        rank = {"VALID_REFUTATION_OF_PRIOR": 0, "VALID_BOUND_SHARPENING": 1, "VALID_DOMAIN_EXTENSION": 2, "NOVEL_INDEPENDENT": 3}
         return min(admissions, key=lambda a: (rank[a.vault_class], a.related_run_id))
     if all(entry.cds.model_hash != candidate_cds.model_hash for entry in entries):
         if compared_run_id is not None and compared_run_id in {e.run_id for e in entries}:

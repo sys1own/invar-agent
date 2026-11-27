@@ -185,11 +185,35 @@ def _verified_functions(code: str, limit: int = 12) -> List[str]:
     return names
 
 
-def _key_metrics(blueprint: ResearchBlueprint, telemetry: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract named observables (``obs_*`` telemetry) as verified metrics."""
+_PLACEHOLDER_STATE_RE = re.compile(r"^state_\d+$")
+
+
+def _key_metrics(
+    blueprint: ResearchBlueprint,
+    telemetry: Dict[str, Any],
+    *,
+    epistemic_verdict: Any = None,
+    violated_metrics: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    """Extract named observables (``obs_*`` telemetry) with verdict-derived EvidenceStatus.
+
+    ARCH-002: ``verified: bool`` is removed. Every metric carries
+    ``evidence_status`` in ``{CERTIFIED, OBSERVED_UNVERIFIED, VIOLATED, NOT_COMPUTED}``,
+    computed strictly from the certificate's ``epistemic_verdict``.
+    Placeholder ``state_N`` slots are dropped.
+    """
+    from .epistemic import compute_evidence_status
+
+    violated_set = set(violated_metrics or ())
     metrics: Dict[str, Any] = {}
-    obs = {k[4:]: v for k, v in telemetry.items()
-           if k.startswith("obs_") and isinstance(v, (int, float))}
+    obs = {
+        k[4:]: v
+        for k, v in telemetry.items()
+        if k.startswith("obs_")
+        and isinstance(v, (int, float))
+        and not isinstance(v, bool)
+        and not _PLACEHOLDER_STATE_RE.match(k[4:])
+    }
     variable_map = getattr(blueprint, "variable_map", {}) or {}
     for name, value in obs.items():
         unit = ""
@@ -199,12 +223,23 @@ def _key_metrics(blueprint: ResearchBlueprint, telemetry: Dict[str, Any]) -> Dic
             if name.endswith(suffix):
                 unit = u
                 break
-        metrics[name] = {"value": value, "unit": unit, "verified": True}
+        metrics[name] = {
+            "value": value,
+            "unit": unit,
+            "evidence_status": compute_evidence_status(
+                epistemic_verdict, value, violated=(name in violated_set)
+            ),
+        }
     # Fall back to the blueprint's declared observables when telemetry lacks them.
     for name in variable_map:
-        key = name if name in metrics else name
-        if key not in metrics:
-            metrics[key] = {"value": None, "unit": "", "verified": False}
+        if _PLACEHOLDER_STATE_RE.match(str(name)):
+            continue
+        if name not in metrics:
+            metrics[name] = {
+                "value": None,
+                "unit": "",
+                "evidence_status": "NOT_COMPUTED",
+            }
     return metrics
 
 
@@ -380,7 +415,11 @@ class ResearchVaultManager:
                 "status": status,
                 "target_backend": target_backend,
                 "stages_completed": stages,
-                "key_metrics": _key_metrics(blueprint, telemetry),
+                "key_metrics": _key_metrics(
+                    blueprint,
+                    telemetry,
+                    epistemic_verdict=epistemic_verdict,
+                ),
                 "extracted_constants": _extracted_constants(blueprint),
                 "governing_equations": _governing_equations(blueprint),
                 "contracts_summary": _contracts_summary(blueprint),

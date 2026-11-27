@@ -4,9 +4,42 @@ from __future__ import annotations
 import ast
 import hmac
 import json
+import math
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
+
+EvidenceStatus = Literal["CERTIFIED", "OBSERVED_UNVERIFIED", "VIOLATED", "NOT_COMPUTED"]
+
+
+def is_verified_epistemic_verdict(verdict_or_cert: Any) -> bool:
+    """True iff the certificate or verdict string is a certified VERIFIED_* outcome."""
+    if verdict_or_cert is None:
+        return False
+    if hasattr(verdict_or_cert, "epistemic_verdict"):
+        raw = getattr(verdict_or_cert, "epistemic_verdict")
+    elif isinstance(verdict_or_cert, Mapping) and "epistemic_verdict" in verdict_or_cert:
+        raw = verdict_or_cert.get("epistemic_verdict")
+    else:
+        raw = verdict_or_cert
+    val = getattr(raw, "value", raw)
+    return str(val or "").startswith("VERIFIED_")
+
+
+def compute_evidence_status(
+    verdict_or_cert: Any,
+    value: Any,
+    *,
+    violated: bool = False,
+) -> EvidenceStatus:
+    """Single authoritative function deriving metric EvidenceStatus from the certificate."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "NOT_COMPUTED"
+    if violated:
+        return "VIOLATED"
+    if is_verified_epistemic_verdict(verdict_or_cert):
+        return "CERTIFIED"
+    return "OBSERVED_UNVERIFIED"
 
 from pydantic import Field
 

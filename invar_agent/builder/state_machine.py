@@ -40,12 +40,16 @@ from .uast_models import BuilderArchitectureSpec, BuilderProfile, BuilderUAST, I
 from .wavefront_scheduler import WavefrontScheduler
 
 
-from ..runtime.isolation import Z3_GLOBAL_LOCK as _FORMAL_LOCK
+import contextlib
+
+# ARCH-003: Z3 is confined to a lock-free single-thread actor; callers never
+# acquire a cross-thread lock around Z3 actor submissions.
+_FORMAL_LOCK = contextlib.nullcontext()
 
 
 def _verify_ir(ir):
-    with _FORMAL_LOCK:
-        reverify_ir(ir.model_copy(deep=True))
+    from ..runtime.isolation import run_on_z3_thread
+    run_on_z3_thread(reverify_ir, ir.model_copy(deep=True))
 
 
 def _port_constraint(condition):
@@ -329,6 +333,36 @@ class BuilderStateMachine:
             rollback_overlay(parent / module_id)
         rollback_overlay(self.root / "overlays" / "fallback" / module_id)
 
+    def _remaining_wall_clock(self) -> float:
+        limit = float(
+            getattr(self.budget, "max_wall_clock_sec", None)
+            or getattr(self.budget, "max_wall_clock_seconds", None)
+            or 300.0
+        )
+        elapsed = time.monotonic() - self._started
+        return limit - elapsed
+
+    async def _run_bounded(self, fn, *args, label: str = "stage", **kwargs):
+        """ARCH-004: Preemptively bound any emit/compile/test step to remaining wall budget."""
+        limit = float(
+            getattr(self.budget, "max_wall_clock_sec", None)
+            or getattr(self.budget, "max_wall_clock_seconds", None)
+            or 300.0
+        )
+        remaining = self._remaining_wall_clock()
+        if remaining <= 0.0:
+            raise BuildFault(
+                "BUILD_WALL_CLOCK_EXCEEDED",
+                f"Build wall-clock budget ({limit:.1f}s) exceeded before {label}",
+            )
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise BuildFault(
+                "BUILD_WALL_CLOCK_EXCEEDED",
+                f"Build wall-clock budget ({limit:.1f}s) exceeded during {label}",
+            ) from exc
+
     async def _module(self, node):
         slot = node.kind == "llm_extension_slot"
         port = self._port(node)
@@ -350,10 +384,18 @@ class BuilderStateMachine:
                     pass
                 elif slot and "slot" not in self.emitters.emitters:
                     async with self._llm_lock:
-                        result = await asyncio.to_thread(self.healer.tier2, "", node, port, self.uast, node.intent_summary, self.budget)
+                        result = await self._run_bounded(
+                            self.healer.tier2, "", node, port, self.uast, node.intent_summary, self.budget,
+                            label=f"tier2:{node.node_id}",
+                        )
                     emission = ModuleEmission({node.target_relpath: result.source})
                 else:
-                    emission = await asyncio.to_thread(self.emitters.emit, node, EmitterContext(self.ir.model_copy(deep=True), self.uast.model_copy(deep=True), overlay, self.state.python_fallback_active))
+                    emission = await self._run_bounded(
+                        self.emitters.emit,
+                        node,
+                        EmitterContext(self.ir.model_copy(deep=True), self.uast.model_copy(deep=True), overlay, self.state.python_fallback_active),
+                        label=f"emit:{node.node_id}",
+                    )
                 if emission.python_fallback_active:
                     self.state.python_fallback_active = True
                 for relpath, content in emission.files.items():
@@ -362,19 +404,22 @@ class BuilderStateMachine:
                     path.write_bytes(content.encode() if isinstance(content, str) else content)
                 stage = BuilderStage.PREWRITE_GUARD
                 await self._event(stage, module_id=node.node_id)
-                await asyncio.to_thread(self._guard, node, overlay, emission)
+                await self._run_bounded(self._guard, node, overlay, emission, label=f"guard:{node.node_id}")
                 stage = BuilderStage.SMT_CONCOLIC_VERIFY
                 await self._event(stage, module_id=node.node_id)
-                await asyncio.to_thread(self._formal, node)
+                await self._run_bounded(self._formal, node, label=f"formal:{node.node_id}")
                 if port and (node.target_relpath.endswith(".py") if slot else emission.port_file is not None):
-                    await asyncio.to_thread(self._sandbox, node, overlay, emission, True)
+                    await self._run_bounded(self._sandbox, node, overlay, emission, True, label=f"concolic:{node.node_id}")
                 stage = BuilderStage.SANDBOX_EXECUTE
                 await self._event(stage, module_id=node.node_id, channel="accelerator_log")
-                await asyncio.to_thread(self._sandbox, node, overlay, emission, False)
+                await self._run_bounded(self._sandbox, node, overlay, emission, False, label=f"sandbox:{node.node_id}")
                 if fallback:
                     next(record for record in self.state.fallbacks if record["module_id"] == node.node_id)["fallback_verified"] = True
                 return overlay, emission, fallback
             except Exception as exc:
+                if getattr(exc, "code", None) == "BUILD_WALL_CLOCK_EXCEEDED":
+                    rollback_overlay(overlay)
+                    raise
                 if fallback:
                     rollback_overlay(overlay)
                     raise BuildFault("DETERMINISTIC_EMITTER_BUG", "Registered fallback failed verification: " + str(exc)) from exc

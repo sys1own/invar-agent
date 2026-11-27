@@ -127,23 +127,28 @@ def load_vault_bundle(workspace_root: Path, run_id: str) -> CanonicalResearchIR:
     if not run_id or manager.run_dir(run_id).name != run_id:
         raise IngestionError("VAULT_INVALID_RUN_ID", run_id)
     root = manager.run_dir(run_id)
-    # ARCH-007: Verify manifest and every persisted artifact digest BEFORE parsing any file.
-    if (root / "manifest.json").is_file():
-        try:
-            verify_vault_manifest(root)
-        except VaultIntegrityError as error:
-            raise IngestionError(error.code, error.message) from error
-    try:
-        texts = {name: (root/name).read_text(encoding='utf-8') for name in ('metadata.json','blueprint.json','unified_module.py','report.md')}
-        metadata, blueprint = json.loads(texts['metadata.json']), json.loads(texts['blueprint.json'])
-    except (OSError, ValueError) as error:
-        raise IngestionError('VAULT_BUNDLE_INVALID', str(error)) from error
     certificate_path = root/'meaningfulness_certificate.json'
     if not certificate_path.is_file():
         raise IngestionError(
             'VAULT_CERTIFICATE_MISSING',
             f"Vault entry {run_id!r} is missing meaningfulness_certificate.json",
         )
+    # ARCH-012 (BUG-019): manifest.json is mandatory for Vault admission.
+    # Deleting manifest.json fails closed (HTTP 422 VAULT_MANIFEST_MISSING).
+    if not (root / "manifest.json").is_file():
+        raise IngestionError(
+            "VAULT_MANIFEST_MISSING",
+            f"Vault entry {run_id!r} is missing mandatory manifest.json",
+        )
+    try:
+        verify_vault_manifest(root)
+    except VaultIntegrityError as error:
+        raise IngestionError(error.code, error.message) from error
+    try:
+        texts = {name: (root/name).read_text(encoding='utf-8') for name in ('metadata.json','blueprint.json','unified_module.py','report.md')}
+        metadata, blueprint = json.loads(texts['metadata.json']), json.loads(texts['blueprint.json'])
+    except (OSError, ValueError) as error:
+        raise IngestionError('VAULT_BUNDLE_INVALID', str(error)) from error
     try:
         raw_certificate = json.loads(certificate_path.read_text(encoding='utf-8'))
     except (OSError, ValueError) as error:

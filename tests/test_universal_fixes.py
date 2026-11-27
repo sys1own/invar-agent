@@ -278,25 +278,10 @@ def test_tier0_conditions_abs_target_sum_partition_and_compound_invariants():
         }
     ]
     san = sanitize_intrinsics(kernel, contracts=contracts)
-    assert san.changed
-    # Idempotency check
+    # ARCH-001: sanitize_intrinsics does NOT inject invariant-forcing clamps.
+    assert san.changed is False
     san2 = sanitize_intrinsics(san.code, contracts=contracts)
     assert san2.changed is False
-
-    class _Buf:
-        def __init__(self):
-            self.data = [0.0] * 20
-
-    ns = {}
-    exec(compile(san.code, "<cond>", "exec"), ns)
-    b = _Buf()
-    ns["simulation_step"](b, 0.01)
-    assert abs(b.data[1] + b.data[2] - 1.0) <= 1e-12
-    assert abs(b.data[6] - 999054.0) <= 1.0
-    assert abs(b.data[18] - 100.0 / 1089.0) <= 1e-12
-    assert abs(b.data[4] - b.data[5]) <= 1e-9
-    assert 0.0 <= b.data[17] <= 1.0
-    assert b.data[7] >= 1.0
 
 
 def test_strip_buf_size_and_protect_overwritten_input_param():
@@ -322,20 +307,10 @@ def test_strip_buf_size_and_protect_overwritten_input_param():
         }
     ]
     san = sanitize_intrinsics(kernel, contracts=contracts)
-    assert "0.535385" not in san.code
-
-    class _Buf:
-        def __init__(self, data):
-            self.data = list(data)
-            self.size = len(self.data)
-
-    ns = {}
-    exec(compile(san.code, "<prot>", "exec"), ns)
-    b = _Buf([1800.0, 555.03] + [0.0] * 30)
-    for _ in range(5):
-        ns["simulation_step"](b, 0.01)
-    assert abs(b.data[6] - 999054.0) <= 1.0
-    assert abs(b.data[1] - 10.0 / 33.0) <= 1e-12
+    # ARCH-001: sanitize_intrinsics preserves exact kernel dynamics without stripping
+    # executable branches or redirecting overwritten input slots.
+    assert "0.535385" in san.code
+    assert san.backup_slot_map == {}
 
 
 def test_extractor_filters_shbt_prompt_noise():
@@ -436,28 +411,10 @@ def test_overwritten_input_slots_backed_up_and_vmap_updated():
         contracts=contracts,
     )
     san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
-    assert "n_cell" in san.backup_slot_map and "u_eff" in san.backup_slot_map
-    _apply_backup_slots_to_vmap(bp, san.backup_slot_map, san.code)
-    assert bp.variable_map["n_cell"] != 6
-    assert bp.variable_map["u_eff"] != 7
+    # ARCH-001: name-based parameter slot backup redirection is permanently removed.
+    assert san.backup_slot_map == {}
     assert bp.variable_map["dT_Kapitza"] == 6
     assert bp.variable_map["headroom"] == 7
-
-    class _Buf:
-        def __init__(self, data):
-            self.data = list(data)
-            self.size = len(self.data)
-
-    ns = {}
-    exec(compile(san.code, "<bak>", "exec"), ns)
-    b = _Buf([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1800.0, 5.64735e-17] + [0.0] * 32)
-    for _ in range(5):
-        ns["simulation_step"](b, 0.01)
-    assert b.data[bp.variable_map["n_cell"]] == pytest.approx(1800.0)
-    assert b.data[bp.variable_map["u_eff"]] == pytest.approx(5.64735e-17)
-    assert b.data[6] == pytest.approx(3.546)
-    assert b.data[7] == pytest.approx(31.254)
-    assert b.data[3] == pytest.approx(999054.0)
 
 
 def test_relevance_filtered_shbt_and_arxiv_generic_tokens():
@@ -612,7 +569,6 @@ def test_intra_function_overwrite_splitter_and_relative_error_product_reconcile(
         }),
     ]
     san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
-    assert san.changed
     san2 = sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts)
     assert san2.changed is False
 
@@ -730,7 +686,6 @@ def test_chained_bounds_general_upper_bound_and_exact_name_bridge():
         contracts=[vc],
     )
     san = sanitize_intrinsics(kernel, contracts=[vc], all_contracts=[vc], variable_map=bp.variable_map)
-    assert san.changed
     san2 = sanitize_intrinsics(san.code, contracts=[vc], all_contracts=[vc], variable_map=bp.variable_map)
     assert san2.changed is False
     _auto_populate_variable_map(bp, san.code)
@@ -751,13 +706,9 @@ def test_chained_bounds_general_upper_bound_and_exact_name_bridge():
     b = _Buf(init + [0.0] * 8)
     for _ in range(1800):
         ns["simulation_step"](b, 1.0)
-    assert 2.5 <= b.data[15] <= 4.3
     assert b.data[20] == pytest.approx(8.4)
     assert b.data[24] == pytest.approx(1800.0)
     assert b.data[20] <= 15.0
-    tel = {"final_max": max(b.data)}
-    for inv in vc.invariants:
-        assert _eval_invariant(inv.assertion, b.data, tel, {"tol": inv.tolerance})
 
 
 def test_zero_cross_run_commit_bleed_and_katex_ui_and_subscripts(tmp_path):
@@ -892,7 +843,6 @@ def test_ratio_product_or_disjunction_and_witness_cpp_cabi_and_fraction_extracto
         }),
     ]
     san = sanitize_intrinsics(kernel, contracts=contracts, all_contracts=contracts)
-    assert san.changed
     san2 = sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts)
     assert san2.changed is False
 
@@ -1018,13 +968,7 @@ def test_tier0_tuple_loop_tuple_return_builtins_bridge_order_and_cpp20_execution
             entry="execute_step",
         )
         assert res["finite"] is True
-        assert res["state"][6] <= 1e-3
-        assert res["state"][16] <= 1e-3
         assert res["state"][7] == pytest.approx(5.0)
-        for inv in vc.invariants:
-            assert _eval_invariant(inv.assertion, res["state"], {}, {"tol": inv.tolerance}), (
-                f"{vc.contract_id}.{inv.variable_name} failed: {inv.assertion}, state={res['state'][:20]}"
-            )
 
     # Direct CppEmitter range-for fallback check on an unsanitized scalar tuple loop
     direct_src = (
@@ -1056,8 +1000,8 @@ def test_tier0_tuple_loop_tuple_return_builtins_bridge_order_and_cpp20_execution
         ],
     })
     san_sx = sanitize_intrinsics(simplex_src, contracts=[vc_simplex], all_contracts=[vc_simplex])
-    assert san_sx.changed
-    assert sanitize_intrinsics(san_sx.code, contracts=[vc_simplex], all_contracts=[vc_simplex]).changed is False
+    # ARCH-001: sanitize_intrinsics never injects silent simplex clamping.
+    assert san_sx.changed is False
     res_sx = DynamicCABIBridge(tmp_path / "cabi_msum").run(
         cpp_code=CppEmitter().emit_module(python_source_to_uast(san_sx.code)),
         initial_state=list(vc_simplex.initial_state),
@@ -1065,7 +1009,7 @@ def test_tier0_tuple_loop_tuple_return_builtins_bridge_order_and_cpp20_execution
         steps=3,
         entry="execute_step",
     )
-    assert _eval_invariant(vc_simplex.invariants[0].assertion, res_sx["state"], {}, {"tol": 1e-12})
+    assert res_sx["finite"] is True
 
 
 def test_latex_normalizer_no_double_subscripts_no_bare_latex_and_table_wrapping():
@@ -1159,7 +1103,6 @@ def test_initial_k_folding_introspection_desugaring_heal_fallback_and_norm_latex
         }),
     ]
     san = sanitize_intrinsics(grmhd_kernel, contracts=contracts, all_contracts=contracts)
-    assert san.changed
     assert sanitize_intrinsics(san.code, contracts=contracts, all_contracts=contracts).changed is False
 
     bridge = DynamicCABIBridge(tmp_path / "cabi_initk")
@@ -1167,10 +1110,6 @@ def test_initial_k_folding_introspection_desugaring_heal_fallback_and_norm_latex
     init2, _ = _guard_contract_initial_state(san.code, contracts[1], all_contracts=contracts)
     res = bridge.run(cpp, list(init2), dt=0.01, steps=3, entry="execute_step")
     assert res["finite"] is True
-    for inv in contracts[1].invariants:
-        assert _eval_invariant(inv.assertion, res["state"], {}, {"initial": init2, "tol": inv.tolerance}), (
-            f"{inv.variable_name} failed: state={res['state'][16:19]}"
-        )
 
     # 2. Tier-0 desugaring of hasattr/getattr/setattr/isinstance/print and custom buf.<attr>
     intro_kernel = (
@@ -1372,12 +1311,8 @@ def test_helper_inlining_unconditional_slot0_3_enforcement_no_fibonacci_finance_
         init_v, _ = _guard_contract_initial_state(san.code, vc, all_contracts=contracts)
         res = bridge.run(cpp, list(init_v), dt=0.01, steps=4, entry="execute_step")
         assert res["finite"] is True
-        for inv in vc.invariants:
-            assert _eval_invariant(inv.assertion, res["state"], {}, {"initial": init_v, "tol": inv.tolerance}), (
-                f"[{vc.contract_id}] {inv.variable_name} failed: state={res['state'][:18]}"
-            )
 
-    # Also verify negative abs(state[3]) <= 1e-15 (signed negative drift) gets clamped to 0.0
+    # ARCH-001: signed negative drift is preserved faithfully (NOT clamped to 0.0).
     neg_kernel = "def stage_n(buf, dt):\n    buf.data[3] = -0.0053474936\n\ndef simulation_step(buf, dt):\n    stage_n(buf, dt)\n"
     vc_neg = VerificationContract.model_validate({
         "contract_id": "c_neg_abs3",
@@ -1390,7 +1325,7 @@ def test_helper_inlining_unconditional_slot0_3_enforcement_no_fibonacci_finance_
     san_neg = sanitize_intrinsics(neg_kernel, contracts=[vc_neg])
     assert sanitize_intrinsics(san_neg.code, contracts=[vc_neg]).changed is False
     res_neg = bridge.run(CppEmitter().emit_module(python_source_to_uast(san_neg.code)), list(vc_neg.initial_state), dt=0.01, steps=2, entry="execute_step")
-    assert _eval_invariant("abs(state[3]) <= 1e-15", res_neg["state"], {}, {"tol": 1e-15})
+    assert res_neg["state"][3] == pytest.approx(-0.0053474936)
 
     # 2. "Fibonacci braids" / "Fibonacci anyons" must NOT trigger discrete_finance or rust_hin
     braid_prompt = (

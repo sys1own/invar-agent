@@ -58,6 +58,8 @@ def bundle(tmp_path, *, coherent=False):
         for contract in bp['contracts']:
             contract['steps'] = 20
         (root/'blueprint.json').write_text(json.dumps(bp, indent=2), encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="example", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED_DISCOVERY")
     return root
 
 
@@ -110,6 +112,8 @@ def test_missing_law_names_missing_states(tmp_path):
     (root/'blueprint.json').write_text(json.dumps(bp), encoding="utf-8")
     (root/'metadata.json').write_text('{}', encoding="utf-8")
     (root/'unified_module.py').write_text('def simulation_step(buf, dt):\n    pass\n', encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="example", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED_DISCOVERY")
     with pytest.raises(IngestionError, match='alpha.*omega') as caught:
         CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(vault_run_ids=['example']))
     assert caught.value.code == 'VAULT_MISSING_EVOLUTION_LAW'
@@ -123,6 +127,8 @@ def test_literature_relations_do_not_become_unclaimed_model_closures(tmp_path):
         dict(lhs='A(S,E)',rhs_latex='0',source='arxiv'),
         dict(lhs='mass',rhs_latex='S+P',source='user_prompt')]
     (root/'blueprint.json').write_text(json.dumps(bp), encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="example", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED_DISCOVERY")
     ir = CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(vault_run_ids=['example']))
     assert not any(eq.raw_latex.startswith('A(') for eq in ir.equations)
     assert any(eq.lhs_symbol=='mass' for eq in ir.equations)
@@ -151,6 +157,8 @@ def test_metadata_structured_model_is_not_shadowed_by_empty_blueprint(tmp_path):
     d=-k*(x+dt*c)
     buf.data[0]=x+dt*(a+2*b+2*c+d)/6
 ''', encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="example", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED_DISCOVERY")
     ir = CanonicalResearchIngestionPipeline(tmp_path).ingest(IngestionRequest(vault_run_ids=['example']))
     assert ir.llm_disambiguation_tokens_used == 0
     assert ir.equations[0].hin_homogeneous
@@ -398,6 +406,8 @@ def test_euler_vault_emits_matching_python_native_sdk_and_calibration(tmp_path):
     (root/'blueprint.json').write_text(json.dumps(bp), encoding="utf-8")
     (root/'metadata.json').write_text(json.dumps({'title':'Euler decay'}), encoding="utf-8")
     (root/'unified_module.py').write_text('def simulation_step(buf,dt):\n    buf.data[0] -= dt*buf.data[1]*buf.data[0]\n', encoding="utf-8")
+    from invar_agent.research.vault import write_vault_manifest
+    write_vault_manifest(root, run_id="example", epistemic_verdict="VERIFIED_DISCOVERY", status="VERIFIED_DISCOVERY")
     pipeline = CanonicalResearchIngestionPipeline(tmp_path)
     ir = pipeline.ingest(IngestionRequest(vault_run_ids=['example']))
     assert ir.research_reference.integration_scheme=='euler'

@@ -253,6 +253,7 @@ def test_build_research_report_contains_quantities():
     )
     state = ResearchRunState(blueprint=bp)
     state.status = "VERIFIED"
+    state.epistemic_verdict = "VERIFIED_DISCOVERY"
     state.results = [_fake_result("c1", 1, {
         "obs_magnetic_field_B_tesla": 0.042, "final_l2": 0.01})]
     bp.evolution_history = [StageTelemetry(
@@ -454,7 +455,8 @@ async def test_assume_feasible_bypasses_heuristic_refusal():
         await generate_plan_with_feasibility(
             "perpetual motion COP = 1.25 approved expert prompt",
             llm_complete=llm, fallback=False, assume_feasible=True)
-    assert len(calls) == 4
+    # BUG-030: identical-fingerprint circuit breaker stops on formalization attempt 2 (1 plan + 2 formalization = 3).
+    assert len(calls) == 3
 
 
 @pytest.mark.asyncio

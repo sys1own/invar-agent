@@ -114,6 +114,46 @@ def llm_call_context(
             _CURRENT_ATTEMPT.reset(tok_a)
 
 
+@dataclass
+class RunContext:
+    """ARCH-010: Run-scoped execution context propagated via contextvars."""
+    run_uid: str
+    telemetry_session: LLMTelemetrySession
+    literature: List[Dict[str, Any]] = field(default_factory=list)
+    deadline: Optional[float] = None
+
+
+_ACTIVE_RUN_CONTEXT: ContextVar[Optional[RunContext]] = ContextVar(
+    "invar_active_run_context", default=None
+)
+
+
+def get_active_run_context() -> Optional[RunContext]:
+    return _ACTIVE_RUN_CONTEXT.get()
+
+
+@contextmanager
+def run_context_scope(
+    run_uid: str,
+    *,
+    literature: Optional[List[Dict[str, Any]]] = None,
+    deadline: Optional[float] = None,
+):
+    """Create a run-scoped RunContext with an isolated LLMTelemetrySession."""
+    with llm_telemetry_scope(run_id=run_uid) as session:
+        ctx = RunContext(
+            run_uid=run_uid,
+            telemetry_session=session,
+            literature=list(literature or []),
+            deadline=deadline,
+        )
+        token = _ACTIVE_RUN_CONTEXT.set(ctx)
+        try:
+            yield ctx
+        finally:
+            _ACTIVE_RUN_CONTEXT.reset(token)
+
+
 @contextmanager
 def llm_telemetry_scope(run_id: str = "run"):
     """Create an isolated per-run telemetry accumulator (while also updating global)."""

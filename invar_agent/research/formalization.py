@@ -582,9 +582,9 @@ async def formalize_blueprint(question, blueprint, complete, *, repair_complete=
             if attempt_sink is not None:
                 attempt_sink.append(attempt_record)
             fp = compute_healing_error_fingerprint(err_text)
-            # ARCH-008 (BUG-037): Circuit breaker triggers on the 2nd identical error fingerprint
-            # (not only on attempt >= 3), avoiding wasted identical retries.
-            if attempt >= 3 and fp in seen_fingerprints:
+            # ARCH-008 (BUG-030): Circuit breaker triggers on the 2nd identical error fingerprint
+            # (attempt >= 2), avoiding wasted identical retries.
+            if attempt >= 2 and fp in seen_fingerprints:
                 break
             seen_fingerprints.add(fp)
             diag_section = (

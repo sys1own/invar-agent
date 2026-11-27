@@ -14,22 +14,62 @@ import json
 import math
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, TypeVar
 
 _T = TypeVar("_T")
 
-# Process-wide reentrant lock + dedicated single-thread executor for Z3.
+
+class SolverBusyError(RuntimeError):
+    """Raised when the Z3 actor queue is saturated."""
+    code = "SOLVER_BUSY"
+
+
+class SolverTimeoutError(TimeoutError):
+    """Raised when a Z3 actor task exceeds its deadline."""
+    code = "SOLVER_TIMEOUT"
+
+
+_Z3_LOCK_DEPTH = threading.local()
+
+
+class _TrackedZ3Lock:
+    """Legacy reentrant lock wrapper that tracks per-thread acquisition depth
+    so run_on_z3_thread can assert no caller holds it across the actor boundary."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            _Z3_LOCK_DEPTH.depth = getattr(_Z3_LOCK_DEPTH, "depth", 0) + 1
+        return ok
+
+    def release(self) -> None:
+        self._lock.release()
+        _Z3_LOCK_DEPTH.depth = max(0, getattr(_Z3_LOCK_DEPTH, "depth", 0) - 1)
+
+    def __enter__(self) -> "_TrackedZ3Lock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+# Process-wide dedicated single-thread actor for Z3 (ARCH-003: lock-free actor).
 # On Windows, Z3's global C++ context is thread-affine and crashes with
 # access violations / `b'unreachable'` / 0xC0000374 heap corruption when
 # Z3 objects are created, used, or finalized across multiple OS threads.
-Z3_GLOBAL_LOCK = threading.RLock()
+Z3_GLOBAL_LOCK = _TrackedZ3Lock()
 _Z3_THREAD_NAME = "invar-z3-worker"
 _Z3_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix=_Z3_THREAD_NAME)
 _Z3_WORKER_TID: Optional[int] = None
@@ -39,6 +79,23 @@ _Z3_DEFERRED_COUNT = 0
 _Z3_FINALIZERS_INSTALLED = False
 _Z3_INSTALL_LOCK = threading.Lock()
 _Z3_DRAIN_SCHEDULED = False
+_Z3_PENDING_LOCK = threading.Lock()
+_Z3_PENDING_TIMESTAMPS: Dict[int, float] = {}
+_Z3_TASK_SEQ = 0
+
+
+def get_z3_solver_status() -> Dict[str, Any]:
+    """Return live Z3 actor queue telemetry for /api/status."""
+    now = time.monotonic()
+    with _Z3_PENDING_LOCK:
+        pending = len(_Z3_PENDING_TIMESTAMPS)
+        oldest = min(_Z3_PENDING_TIMESTAMPS.values()) if _Z3_PENDING_TIMESTAMPS else None
+    queue_age_s = round(max(0.0, now - oldest), 3) if oldest is not None else 0.0
+    return {
+        "queue_age_s": queue_age_s,
+        "pending": pending,
+        "deferred_releases": _Z3_DEFERRED_COUNT,
+    }
 
 
 def get_z3_worker_tid() -> Optional[int]:
@@ -164,11 +221,47 @@ def _run_confined(fn: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str
             _drain_z3_deferred_releases()
 
 
-def run_on_z3_thread(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
-    """Execute a Z3 computation on the dedicated single-threaded Z3 OS worker."""
+def run_on_z3_thread(
+    fn: Callable[..., _T],
+    *args: Any,
+    deadline: Optional[float] = None,
+    **kwargs: Any,
+) -> _T:
+    """Execute a Z3 computation on the dedicated single-threaded Z3 OS actor.
+
+    ARCH-003: Lock-free actor submission. Raises RuntimeError if called from a
+    non-Z3 thread while holding the legacy ``Z3_GLOBAL_LOCK``, and raises
+    ``SolverTimeoutError`` (SOLVER_TIMEOUT) if ``deadline`` (monotonic seconds)
+    expires.
+    """
+    global _Z3_TASK_SEQ
     if is_on_z3_thread():
         return _run_confined(fn, args, kwargs)
-    return _Z3_EXECUTOR.submit(_run_confined, fn, args, kwargs).result()
+    if getattr(_Z3_LOCK_DEPTH, "depth", 0) > 0:
+        raise RuntimeError(
+            "Z3_LOCK_INVERSION: cannot submit to Z3 actor while holding Z3_GLOBAL_LOCK"
+        )
+    with _Z3_PENDING_LOCK:
+        _Z3_TASK_SEQ += 1
+        task_id = _Z3_TASK_SEQ
+        _Z3_PENDING_TIMESTAMPS[task_id] = time.monotonic()
+
+    def _tracked_run() -> _T:
+        try:
+            return _run_confined(fn, args, kwargs)
+        finally:
+            with _Z3_PENDING_LOCK:
+                _Z3_PENDING_TIMESTAMPS.pop(task_id, None)
+
+    future = _Z3_EXECUTOR.submit(_tracked_run)
+    timeout: Optional[float] = None
+    if deadline is not None:
+        timeout = max(0.0, float(deadline) - time.monotonic())
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise SolverTimeoutError("SOLVER_TIMEOUT: Z3 actor deadline exceeded") from exc
 
 
 def _direct_python_executable() -> str:

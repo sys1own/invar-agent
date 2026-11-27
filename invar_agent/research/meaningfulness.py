@@ -573,9 +573,17 @@ def meaningfulness_gates(certificate: MeaningfulnessCertificate) -> dict[str, bo
     )
 
 
-_ARITIES = {"exp": 1, "log": 1, "sqrt": 1, "sin": 1, "cos": 1, "abs": 1,
-            "logistic_sigmoid": 1, "kl_term": 2, "hill_eq": 3, "michaelis_menten": 3,
-            "pow": 2, "min": 2, "max": 2, "implies": 2}
+from invar_agent.ir.function_registry import FormalFunctionNormalizer, formal_gate_arities
+
+_ARITY_RANGES = formal_gate_arities()
+_ARITIES = {k: v[0] for k, v in _ARITY_RANGES.items()}
+
+
+def _arity_valid(name: str, argc: int) -> bool:
+    if name not in _ARITY_RANGES:
+        return False
+    lo, hi = _ARITY_RANGES[name]
+    return argc >= lo and (hi is None or argc <= hi)
 
 
 def _parse(text: str) -> ast.AST:
@@ -591,16 +599,17 @@ def _parse(text: str) -> ast.AST:
         if depth > 64: raise ValueError("formal expression exceeds the nesting budget")
         stack.extend((child, depth+1) for child in ast.iter_child_nodes(current))
     allowed = (ast.Constant, ast.Name, ast.Load, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
-               ast.Call, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd, ast.Not,
+               ast.Call, ast.IfExp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd, ast.Not,
                ast.And, ast.Or, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)
     for n in nodes:
         if not isinstance(n, allowed):
             raise ValueError(f"unsupported formal syntax: {type(n).__name__}")
         if isinstance(n, ast.Constant) and (not isinstance(n.value, (bool, int, float)) or not math.isfinite(n.value)):
             raise ValueError("only finite real and boolean constants are supported")
-        if isinstance(n, ast.Call) and (not isinstance(n.func, ast.Name) or n.func.id not in _ARITIES
-                                       or len(n.args) != _ARITIES[n.func.id] or n.keywords):
-            raise ValueError(f"unsupported formal function or arity: {ast.unparse(n.func)}({len(n.args)} args); allowed: {sorted(_ARITIES)}")
+        if isinstance(n, ast.Call) and (not isinstance(n.func, ast.Name) or not _arity_valid(n.func.id, len(n.args)) or n.keywords):
+            raise ValueError(f"unsupported formal function or arity: {ast.unparse(n.func)}({len(n.args)} args); allowed: {sorted(_ARITY_RANGES)}")
+    node = FormalFunctionNormalizer().visit(node)
+    ast.fix_missing_locations(node)
     return node
 
 
@@ -912,6 +921,14 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
             return _IV(max(0.0, sq.lo), sq.hi)
         b = _iv(node.right, box)
         return {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b, ast.Div: lambda: a / b}[type(node.op)]()
+    if isinstance(node, ast.IfExp):
+        cond_val = _truth(node.test, box)
+        if cond_val is True:
+            return _iv(node.body, box)
+        if cond_val is False:
+            return _iv(node.orelse, box)
+        t_iv, e_iv = _iv(node.body, box), _iv(node.orelse, box)
+        return _IV(min(t_iv.lo, e_iv.lo), max(t_iv.hi, e_iv.hi))
     if isinstance(node, ast.Call):
         if node.func.id == "kl_term":
             p, q = (_iv(a, box) for a in node.args)
@@ -925,6 +942,20 @@ def _iv(node: ast.AST, box: Bounds) -> _IV:
         if name == "abs":
             a = args[0]
             return _IV(0 if a.lo <= 0 <= a.hi else min(abs(a.lo), abs(a.hi)), max(abs(a.lo), abs(a.hi)))
+        if name == "step":
+            a = args[0]
+            if a.lo >= 0.0: return _IV(1.0, 1.0)
+            if a.hi < 0.0: return _IV(0.0, 0.0)
+            return _IV(0.0, 1.0)
+        if name == "tanh":
+            a = args[0]
+            return _IV(math.nextafter(math.tanh(a.lo), -math.inf), math.nextafter(math.tanh(a.hi), math.inf))
+        if name == "rand_uniform01":
+            return _IV(0.0, 1.0)
+        if name == "rand_normal01":
+            return _IV(-10.0, 10.0)
+        if name == "rand_exponential1":
+            return _IV(0.0, 100.0)
         if name in {"min", "max"}:
             f = min if name == "min" else max
             return _IV(f(a.lo for a in args), f(a.hi for a in args))
@@ -1039,6 +1070,8 @@ class _Translator:
                     interval = interval * _iv(node.left, self.box)
                 return out
             return self.term(_parse(f"exp(({ast.unparse(node.right)}) * log({ast.unparse(node.left)}))"))
+        if isinstance(node, ast.IfExp):
+            return z3.If(self.formula(node.test), self.term(node.body), self.term(node.orelse))
         if isinstance(node, ast.Call):
             if node.func.id == "kl_term":
                 p = _iv(node.args[0], self.box)
@@ -1046,8 +1079,12 @@ class _Translator:
                 if p.lo <= 0: raise _DomainError("KL box straddles its zero-mass branch")
             expanded = _expand(node)
             if expanded is not node: return self.term(expanded)
+            if node.func.id == "rand_uniform01": return self.fresh(_IV(0.0, 1.0))
+            if node.func.id == "rand_normal01": return self.fresh(_IV(-10.0, 10.0))
+            if node.func.id == "rand_exponential1": return self.fresh(_IV(0.0, 100.0))
             a = self.term(node.args[0])
             if node.func.id == "abs": return z3.If(a >= 0, a, -a)
+            if node.func.id == "step": return z3.If(a >= 0, _q(1), _q(0))
             if node.func.id in {"min", "max"}:
                 b = self.term(node.args[1]); return z3.If(a <= b, a, b) if node.func.id == "min" else z3.If(a >= b, a, b)
             return self.univariate(node.func.id, a, _iv(node.args[0], self.box))
@@ -1059,6 +1096,7 @@ class _Translator:
         if not math.isfinite(lo) or not math.isfinite(hi): raise _DomainError("finite nonlinear bounds required")
         def function(x):
             if name == "reciprocal": return _IV(1) / x
+            if name == "tanh": return _IV(math.nextafter(math.tanh(x.lo), -math.inf), math.nextafter(math.tanh(x.hi), math.inf))
             return _trig(x, name == "cos") if name in {"sin", "cos"} else x.op(name)
         def derivative(x):
             if name == "exp": return x.op("exp")
@@ -1066,6 +1104,10 @@ class _Translator:
             if name == "sqrt": return _IV(0.5) / x.op("sqrt")
             if name == "sin": return _trig(x, True)
             if name == "cos": return -_trig(x, False)
+            if name == "tanh":
+                t = function(x)
+                t2 = t * t
+                return _IV(max(0.0, 1.0 - t2.hi), min(1.0, 1.0 - t2.lo))
             return -(_IV(1) / (x * x))
         value = self.fresh(function(interval))
         center = lo/2 + hi/2
@@ -1229,36 +1271,32 @@ def _solve_query(expression: str, domain: Mapping[str, Sequence[float]], *, witn
     node = Fixed().visit(node)
     degree = _degree(node)
     if degree <= 1 or not prefer_linear_outer and degree <= 6 and len(_variables(node)) <= 8:
-        from ..runtime.isolation import Z3_GLOBAL_LOCK
         tier = "QF_LRA" if degree <= 1 else "QF_NRA"
-        with Z3_GLOBAL_LOCK:
-            tr = _Translator(box, False)
-            formula = tr.formula(node)
-            solver = z3.SolverFor(tier)
-            remaining = max(0, int((deadline-time.monotonic())*1000))
-            if remaining:
-                solver.set(timeout=min(500 if tier == "QF_LRA" else 1200, remaining), rlimit=1_000_000 if tier == "QF_LRA" else 5_000_000)
-                solver.add(*tr.constraints, formula)
-                answer = solver.check()
-                if answer == z3.unsat: return QueryResult(status="UNSAT", z3_tier_used=tier)
-                if answer == z3.sat:
-                    model = solver.model()
-                    return QueryResult(status="SAT", z3_tier_used=tier, witness=_model_point(model, tr.vars), exact_model=str(model))
+        tr = _Translator(box, False)
+        formula = tr.formula(node)
+        solver = z3.SolverFor(tier)
+        remaining = max(0, int((deadline-time.monotonic())*1000))
+        if remaining:
+            solver.set(timeout=min(500 if tier == "QF_LRA" else 1200, remaining), rlimit=1_000_000 if tier == "QF_LRA" else 5_000_000)
+            solver.add(*tr.constraints, formula)
+            answer = solver.check()
+            if answer == z3.unsat: return QueryResult(status="UNSAT", z3_tier_used=tier)
+            if answer == z3.sat:
+                model = solver.model()
+                return QueryResult(status="SAT", z3_tier_used=tier, witness=_model_point(model, tr.vars), exact_model=str(model))
     queue, evaluated, unresolved = [box], 0, False
     outer_deadline = deadline - (min(0.3, timeout_ms/2000) if witness else 0)
-    from ..runtime.isolation import Z3_GLOBAL_LOCK
     while queue and evaluated < max_boxes and time.monotonic() < outer_deadline:
         current = queue.pop(); evaluated += 1
         candidate = None
         try:
-            with Z3_GLOBAL_LOCK:
-                tr = _Translator(current, True); formula = tr.formula(node)
-                solver = z3.SolverFor("QF_LRA")
-                solver.set(timeout=max(1, min(100, int((outer_deadline-time.monotonic())*1000))), rlimit=1_000_000)
-                solver.add(*tr.constraints, formula); answer = solver.check()
-                if answer == z3.unsat: continue
-                if answer == z3.sat:
-                    candidate = _model_point(solver.model(), tr.vars)
+            tr = _Translator(current, True); formula = tr.formula(node)
+            solver = z3.SolverFor("QF_LRA")
+            solver.set(timeout=max(1, min(100, int((outer_deadline-time.monotonic())*1000))), rlimit=1_000_000)
+            solver.add(*tr.constraints, formula); answer = solver.check()
+            if answer == z3.unsat: continue
+            if answer == z3.sat:
+                candidate = _model_point(solver.model(), tr.vars)
             if candidate is not None and _truth(node, {s: (x, x) for s, x in candidate.items()}) is True:
                 return QueryResult(status="SAT", z3_tier_used="MCCORMICK_QF_LRA", witness=candidate, boxes_evaluated=evaluated)
         except (ValueError, OverflowError, ZeroDivisionError):
@@ -1546,22 +1584,35 @@ def verify_entailment_lock(ihcg: IhcgGraph, compiled_contracts: Sequence[str]) -
     deadline = time.monotonic() + min(10.0, (SMT_TIMEOUT_MS / 1000) * max(1, len(ihcg.obligations)))
     base = [*ihcg.environmental_assumptions, *compiled_contracts]
     affine_compiled = _degree(_parse(_and(base))) <= 1
-    queries = {o.id: solve_query(_and([*base, f"not ({o.expression})"]), ihcg.omega, _deadline=deadline,
-        prefer_linear_outer=affine_compiled and _degree(_parse(o.expression)) > 1) for o in ihcg.obligations}
+    compiled_ast_dumps = {ast.dump(_parse(c)) for c in compiled_contracts}
+    queries = {}
+    for o in ihcg.obligations:
+        if ast.dump(_parse(o.expression)) in compiled_ast_dumps:
+            queries[o.id] = QueryResult(status="UNSAT", z3_tier_used="QF_LRA")
+        else:
+            queries[o.id] = solve_query(
+                _and([*base, f"not ({o.expression})"]),
+                ihcg.omega,
+                _deadline=deadline,
+                prefer_linear_outer=affine_compiled and _degree(_parse(o.expression)) > 1,
+            )
     feasibility = solve_query(_and(base), ihcg.omega, witness=True, _deadline=deadline)
     entailed = all(q.status == "UNSAT" for q in queries.values())
-    # ARCH-003 (BUG-003): Decouple Q_model from Q_claim.
-    # If env ∧ compiled_contracts is UNSAT ONLY because a physically false claim conflicts
-    # with environmental physics bounds (while env alone is SAT and compiled_contracts alone
-    # is SAT over omega), allow Mode 1 deductive falsification rather than rejecting at ingest.
+    # ARCH-008: Decouple model/domain admissibility (Q1) from claim feasibility (Q2).
+    # If env ∧ compiled_contracts is UNSAT or UNKNOWN because a false/nonlinear claim
+    # conflicts with omega or environmental bounds while env alone is SAT, allow entailment
+    # lock so the sealed IHCG routes to Mode 1 / 2A / 2B VERIFIED_FALSIFICATION.
     model_vs_claim_falsifiable = False
-    if entailed and feasibility.status == "UNSAT" and ihcg.environmental_assumptions and compiled_contracts:
-        env_sat = solve_query(_and(ihcg.environmental_assumptions), ihcg.omega, witness=True, _deadline=deadline)
-        contracts_sat = solve_query(_and(compiled_contracts), ihcg.omega, witness=True, _deadline=deadline)
-        if env_sat.status == "SAT" and contracts_sat.status == "SAT":
-            # Verify contracts genuinely entail obligations even without env contradiction
+    if entailed and feasibility.status in ("UNSAT", "UNKNOWN") and compiled_contracts:
+        env_sat = (
+            solve_query(_and(ihcg.environmental_assumptions), ihcg.omega, witness=True, _deadline=deadline)
+            if ihcg.environmental_assumptions
+            else QueryResult(status="SAT", z3_tier_used="QF_LRA")
+        )
+        if env_sat.status == "SAT":
+            # Only allow syntactic identity (never Z3 explosion on self-contradictory compiled_contracts)
             direct_entailed = all(
-                solve_query(_and([*compiled_contracts, f"not ({o.expression})"]), ihcg.omega, _deadline=deadline).status == "UNSAT"
+                ast.dump(_parse(o.expression)) in compiled_ast_dumps
                 for o in ihcg.obligations
                 if o.obligation_class == "HYPOTHESIS_TARGET"
             )

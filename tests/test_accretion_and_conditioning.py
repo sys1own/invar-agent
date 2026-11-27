@@ -50,7 +50,8 @@ def simulation_step(buf, dt):
         },
     ]
     res = sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
-    assert res.changed
+    # ARCH-001: sanitize_intrinsics never mutates executable dynamics to force invariants.
+    assert not res.changed
     ns = {}
     exec(res.code, ns)
 
@@ -61,7 +62,7 @@ def simulation_step(buf, dt):
     b = Buf()
     ns["simulation_step"](b, 0.05)
     assert b.data[13] == -1e-12
-    assert b.data[14] <= 1.0 + 1e-14
+    assert b.data[14] > 1.0 + 1e-14
     assert b.data[15] == 1.83e-9
     assert b.data[11] == 2.5e-11
 
@@ -271,7 +272,7 @@ def simulation_step(buf, dt):
         }
     ]
     res = sanitize_intrinsics(broken_euler, contracts=contracts, all_contracts=contracts)
-    assert res.changed
+    # ARCH-001: broken stiff Euler must NOT be silently clamped into passing invariants.
     ns = {}
     exec(res.code, ns)
 
@@ -281,18 +282,8 @@ def simulation_step(buf, dt):
             self.size = len(data)
 
     b = Buf([0.85, 0.15, 0.2, 0.1, 100000.0] + [0.0] * 11)
-    for step in range(5000):
-        ns["simulation_step"](b, 0.25)
-        assert all(math.isfinite(v) for v in b.data), f"Non-finite at step {step}"
-        assert 0.0 <= b.data[0] <= 1.0
-        assert 0.0 <= b.data[1] <= 1.0
-        assert -0.5 <= b.data[2] <= 0.5
-        assert -0.5 <= b.data[3] <= 0.5
-    assert b.data[6] <= 1e-14
-    assert b.data[7] >= -1e-15
-    assert 0.0 < b.data[8] <= 1.0 + 1e-14
-    assert b.data[10] <= 1e-12
-    assert b.data[11] <= 1e-13
+    ns["simulation_step"](b, 0.25)
+    assert b.data[0] < 0.0  # unmodified stiff Euler diverges honestly
 
 
 def test_prune_unused_helpers_preserves_read_before_write_and_no_post_return_conditioning():
@@ -441,7 +432,8 @@ def simulation_step(buf, dt):
     pruned = prune_unused_helpers(san.code, entrypoints=("simulation_step",))
     assert "def _invar_sdiv(" in pruned.code
     assert "_invar_sdiv(d2, c2)" in pruned.code
-    assert "_invar_project_mass_simplex" in pruned.code
+    # ARCH-001: invariant-forcing mass simplex projection is removed; safe division remains intact.
+    assert "_invar_project_mass_simplex" not in pruned.code
 
     ns = {}
     exec(pruned.code, ns)
@@ -451,12 +443,10 @@ def simulation_step(buf, dt):
             self.data = data
             self.size = len(data)
 
+    import math as _math
     b = Buf([1.0, 0.0, 0.0, 0.5] + [0.0] * 12)
-    for _ in range(500):
-        ns["simulation_step"](b, 0.25)
-        assert all(v >= 0.0 for v in b.data[:4])
-        assert abs(sum(b.data[:4]) - 1.5) <= 1e-13
-    assert b.data[9] <= 1e-14
+    ns["simulation_step"](b, 0.25)
+    assert all(_math.isfinite(v) for v in b.data[:4])
 
 
 @pytest.mark.asyncio
@@ -529,7 +519,8 @@ def test_strict_gt_conditioning_6slot_triad_and_local_var_resync():
         }
     ]
     san_triad = sanitize_intrinsics(triad_code, contracts=triad_contracts, all_contracts=triad_contracts)
-    assert "_invar_stabilize_state_6" in san_triad.code
+    # ARCH-001: state stabilization and invariant-forcing clamps are removed.
+    assert "_invar_stabilize_state_6" not in san_triad.code
     assert "if buf.data[17] <= 0.0:" not in san_triad.code
 
     patankar_code = '''def simulation_step(buf, dt):
@@ -562,7 +553,8 @@ def test_strict_gt_conditioning_6slot_triad_and_local_var_resync():
 
     b = Buf([1.0, 0.0, 0.0, 0.5] + [0.0] * 10)
     ns["simulation_step"](b, 0.1)
-    assert b.data[8] <= 1e-14
+    # ARCH-001: unprojected kernel computes exact mass drift |2.5 - 1.5| = 1.0
+    assert abs(b.data[8] - 1.0) <= 1e-12
 
 
 def test_latex_normalizer_repairs_escapes_wraps_bare_math_and_balances_braces():
@@ -616,7 +608,8 @@ def test_1arg_signature_normalization_auto_variable_map_and_s2_projection():
     san = sanitize_intrinsics(code, contracts=[c1], all_contracts=[c1])
     assert "def simulation_step(buf, dt=0.01):" in san.code
     assert "buf.dt" not in san.code
-    assert "_invar_project_sphere_s2" in san.code
+    # ARCH-001: silent S2 sphere projection is removed; signature normalization and variable_map remain.
+    assert "_invar_project_sphere_s2" not in san.code
 
     bp = ResearchBlueprint(
         blueprint_id="cayley_llg_macrospin",
@@ -639,11 +632,10 @@ def test_1arg_signature_normalization_auto_variable_map_and_s2_projection():
             self.data = data
             self.size = len(data)
 
+    import math as _math
     b = Buf([0.6, 0.0, 0.8] + [0.0] * 7)
-    for _ in range(100):
-        ns["simulation_step"](b, 0.05)
-    norm2 = b.data[0] ** 2 + b.data[1] ** 2 + b.data[2] ** 2
-    assert abs(norm2 - 1.0) <= 1e-14
+    ns["simulation_step"](b, 0.05)
+    assert _math.isfinite(b.data[6])
 
 
 def test_const_expr_lower_bound_running_min_sentinel_and_tuple_unpacking_cpp(tmp_path):

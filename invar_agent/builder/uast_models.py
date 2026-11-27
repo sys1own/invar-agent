@@ -30,6 +30,15 @@ class BuilderProfile(str, Enum):
     CALIBRATION_INVERSE_DESIGN = "calibration_inverse_design"
 
 
+class ProgramKind(str, Enum):
+    """ARCH-005: Typed program kind derived strictly from equation roles."""
+    ALGEBRAIC_MAP = "AlgebraicMap"
+    ROOT_FIND = "RootFind"
+    ODE = "ODE"
+    DISCRETE_TIME_SYSTEM = "DiscreteTimeSystem"
+    STOCHASTIC_SIMULATION = "StochasticSimulation"
+
+
 DeterministicModuleRole = Literal[
     "package_metadata", "cpp_cabi_bridge", "python_fallback_kernel", "python_sdk",
     "cli_runner", "sweep_pareto_runner", "data_serializer", "fastapi_workbench",

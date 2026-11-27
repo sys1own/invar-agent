@@ -1138,10 +1138,26 @@ def normalize_expression(
         elif ch in ")]":
             cur_nest = max(0, cur_nest - 1)
 
-    # Fast path: if meaningfulness._parse(text) already accepts it (and no unsafe power tower),
+    # Fast path: if meaningfulness._parse(text) already accepts it (and no unsafe power tower,
+    # no ternary IfExp that should canonicalize to min/max/abs, and no variadic min/max > 2 args),
     # return BYTE-IDENTICAL with zero transforms.
+    _needs_canonical_lowering = (" if " in text and " else " in text)
+    if not _needs_canonical_lowering and ("min(" in text or "max(" in text):
+        try:
+            _raw_tree = ast.parse(text, mode="eval")
+            for _sub in ast.walk(_raw_tree):
+                if (
+                    isinstance(_sub, ast.Call)
+                    and isinstance(_sub.func, ast.Name)
+                    and _sub.func.id in ("min", "max")
+                    and len(_sub.args) > 2
+                ):
+                    _needs_canonical_lowering = True
+                    break
+        except SyntaxError:
+            pass
     try:
-        fast_node = m._parse(text)
+        fast_node = None if _needs_canonical_lowering else m._parse(text)
     except (ValueError, SyntaxError):
         fast_node = None
 
@@ -1225,7 +1241,7 @@ def normalize_expression(
 
     # Re-check fast path after wrapper stripping (preserves inner expression cleanly)
     try:
-        stripped_node = m._parse(cleaned)
+        stripped_node = None if _needs_canonical_lowering else m._parse(cleaned)
     except (ValueError, SyntaxError):
         stripped_node = None
     if stripped_node is not None:

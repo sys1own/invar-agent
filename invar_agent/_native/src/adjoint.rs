@@ -898,15 +898,85 @@ pub struct JacobianAnalysisResult {
     pub jacobian: Vec<Vec<f64>>,
     pub symbolic_jacobian: Vec<Vec<String>>,
     pub eigenvalues: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub spectrum: Option<Vec<[f64; 2]>>,
     pub spectral_radius: f64,
     pub stiffness_ratio: f64,
     pub recommended_solver: String,
+}
+
+fn is_all_zero(jacobian: &[Vec<f64>]) -> bool {
+    jacobian.iter().all(|row| row.iter().all(|&v| v == 0.0))
+}
+
+fn is_upper_triangular(jacobian: &[Vec<f64>]) -> bool {
+    for (r, row) in jacobian.iter().enumerate() {
+        for (c, &v) in row.iter().enumerate() {
+            if r > c && v != 0.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_lower_triangular(jacobian: &[Vec<f64>]) -> bool {
+    for (r, row) in jacobian.iter().enumerate() {
+        for (c, &v) in row.iter().enumerate() {
+            if c > r && v != 0.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn compute_bounded_eigenvalues(jacobian: &[Vec<f64>]) -> Option<Vec<[f64; 2]>> {
+    let n = jacobian.len();
+    if n == 0 {
+        return Some(vec![]);
+    }
+    if is_all_zero(jacobian) {
+        return Some(vec![[0.0, 0.0]; n]);
+    }
+    if is_upper_triangular(jacobian) || is_lower_triangular(jacobian) {
+        let diag = (0..n)
+            .map(|i| {
+                let v = jacobian[i][i];
+                [if v.is_finite() { v } else { 0.0 }, 0.0]
+            })
+            .collect();
+        return Some(diag);
+    }
+    let mut flat = Vec::with_capacity(n * n);
+    for row in jacobian {
+        flat.extend_from_slice(row);
+    }
+    let mat = DMatrix::from_row_slice(n, n, &flat);
+    let schur = nalgebra::Schur::try_new(mat, 1e-12, 500)?;
+    let eigs = schur.complex_eigenvalues();
+    let mut out = Vec::with_capacity(n);
+    for c in eigs.iter() {
+        let re = if c.re.is_finite() { c.re } else { 0.0 };
+        let im = if c.im.is_finite() { c.im } else { 0.0 };
+        out.push([re, im]);
+    }
+    Some(out)
 }
 
 pub fn analyze_jacobian_spectrum(
     state_vars: &[String],
     equations: &[(String, CselExpr)],
     env: &HashMap<String, f64>,
+) -> JacobianAnalysisResult {
+    analyze_jacobian_spectrum_opts(state_vars, equations, env, true)
+}
+
+pub fn analyze_jacobian_spectrum_opts(
+    state_vars: &[String],
+    equations: &[(String, CselExpr)],
+    env: &HashMap<String, f64>,
+    compute_spectrum: bool,
 ) -> JacobianAnalysisResult {
     let n = state_vars.len();
     let mut jacobian = vec![vec![0.0; n]; n];
@@ -927,34 +997,41 @@ pub fn analyze_jacobian_spectrum(
         }
     }
 
-    if n == 0 {
+    if n == 0 || !compute_spectrum {
         return JacobianAnalysisResult {
-            state_vars: vec![],
+            state_vars: state_vars.to_vec(),
             jacobian,
             symbolic_jacobian,
             eigenvalues: vec![],
+            spectrum: None,
             spectral_radius: 0.0,
             stiffness_ratio: 1.0,
             recommended_solver: "rk4".into(),
         };
     }
 
-    let mut flat = Vec::with_capacity(n * n);
-    for row in &jacobian {
-        flat.extend_from_slice(row);
-    }
-    let mat = DMatrix::from_row_slice(n, n, &flat);
-    let eigs = mat.complex_eigenvalues();
+    let spectrum = compute_bounded_eigenvalues(&jacobian);
+    let eigenvalues = match &spectrum {
+        Some(eigs) => eigs.clone(),
+        None => {
+            return JacobianAnalysisResult {
+                state_vars: state_vars.to_vec(),
+                jacobian,
+                symbolic_jacobian,
+                eigenvalues: vec![],
+                spectrum: None,
+                spectral_radius: 0.0,
+                stiffness_ratio: 1.0,
+                recommended_solver: "rk4".into(),
+            };
+        }
+    };
 
-    let mut eigenvalues = Vec::with_capacity(n);
     let mut spectral_radius = 0.0_f64;
     let mut max_re = 0.0_f64;
     let mut min_nonzero_re = f64::INFINITY;
 
-    for c in eigs.iter() {
-        let re = if c.re.is_finite() { c.re } else { 0.0 };
-        let im = if c.im.is_finite() { c.im } else { 0.0 };
-        eigenvalues.push([re, im]);
+    for &[re, im] in &eigenvalues {
         let mag = (re * re + im * im).sqrt();
         if mag > spectral_radius {
             spectral_radius = mag;
@@ -991,6 +1068,7 @@ pub fn analyze_jacobian_spectrum(
         jacobian,
         symbolic_jacobian,
         eigenvalues,
+        spectrum,
         spectral_radius,
         stiffness_ratio,
         recommended_solver,
@@ -1027,17 +1105,22 @@ impl PyAdjointHin {
         })
     }
 
-    /// Computes symbolic Jacobian via Reverse-Mode Adjoint HIN and evaluates
-    /// the Jacobian matrix, eigenvalues, spectral radius, and stiffness ratio
-    /// at `state_env_json` with the Python GIL released.
-    pub fn analyze(&self, py: Python<'_>, state_env_json: &str) -> PyResult<String> {
+    /// Computes symbolic Jacobian via Reverse-Mode Adjoint HIN and optionally evaluates
+    /// the bounded Schur spectrum at `state_env_json` with the Python GIL released.
+    #[pyo3(signature = (state_env_json, compute_spectrum = true))]
+    pub fn analyze(
+        &self,
+        py: Python<'_>,
+        state_env_json: &str,
+        compute_spectrum: bool,
+    ) -> PyResult<String> {
         let env: HashMap<String, f64> = serde_json::from_str(state_env_json)
             .map_err(|e| PyValueError::new_err(format!("Invalid state_env JSON: {}", e)))?;
         let state_vars = self.state_vars.clone();
         let equations = self.equations.clone();
 
         let result = py.allow_threads(move || {
-            analyze_jacobian_spectrum(&state_vars, &equations, &env)
+            analyze_jacobian_spectrum_opts(&state_vars, &equations, &env, compute_spectrum)
         });
 
         serde_json::to_string(&result)
@@ -1076,5 +1159,41 @@ mod tests {
         assert!(res.spectral_radius >= 1e6 - 1.0);
         assert!(res.stiffness_ratio >= 1e5);
         assert_eq!(res.recommended_solver, "ros3pr");
+    }
+
+    #[test]
+    fn test_adjoint_terminates_for_zero_and_nilpotent_jacobians() {
+        for n in 1..=32 {
+            let vars: Vec<String> = (0..n).map(|i| format!("x_{}", i)).collect();
+            let env: HashMap<String, f64> = vars.iter().map(|v| (v.clone(), 1.0)).collect();
+
+            // 1. All-zero Jacobian (constant outputs)
+            let zero_eqs: Vec<(String, CselExpr)> = vars
+                .iter()
+                .map(|v| (v.clone(), CselExpr::Literal { value: 0.1 }))
+                .collect();
+            let zres = analyze_jacobian_spectrum(&vars, &zero_eqs, &env);
+            assert_eq!(zres.eigenvalues.len(), n);
+            assert_eq!(zres.spectral_radius, 0.0);
+
+            // 2. Strictly upper-triangular nilpotent Jordan block
+            let nilp_eqs: Vec<(String, CselExpr)> = (0..n)
+                .map(|i| {
+                    if i + 1 < n {
+                        (vars[i].clone(), CselExpr::Symbol { name: vars[i + 1].clone() })
+                    } else {
+                        (vars[i].clone(), CselExpr::Literal { value: 0.0 })
+                    }
+                })
+                .collect();
+            let nres = analyze_jacobian_spectrum(&vars, &nilp_eqs, &env);
+            assert_eq!(nres.eigenvalues.len(), n);
+            assert_eq!(nres.spectral_radius, 0.0);
+
+            // 3. compute_spectrum = false skips Schur entirely
+            let no_spec = analyze_jacobian_spectrum_opts(&vars, &nilp_eqs, &env, false);
+            assert!(no_spec.spectrum.is_none());
+            assert!(no_spec.eigenvalues.is_empty());
+        }
     }
 }

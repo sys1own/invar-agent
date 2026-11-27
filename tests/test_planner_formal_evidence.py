@@ -53,7 +53,8 @@ async def test_saved_missing_evidence_requires_bounded_formalization(saved_plan,
     planner = generate_plan_with_feasibility if combined else generate_research_plan
     with pytest.raises((ValueError,RuntimeError),match="FORMALIZATION_VALIDATION_FAILED"):
         await planner(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
-    assert len(calls) == 4
+    # BUG-030: identical-fingerprint breaker stops on formalization attempt 2 (1 plan + 2 formalization = 3).
+    assert len(calls) == 3
     assert "ihcg_evidence" in calls[1] and "expected ONLY" in calls[2]
 
 
@@ -151,4 +152,5 @@ async def test_invalid_formal_repair_is_not_admitted(saved_plan,fault):
     else:
         with pytest.raises(ValueError):
             await generate_plan_with_feasibility(saved_plan["blueprint"]["research_prompt"],llm_complete=provider,fallback=False)
-        assert len(calls) == 4
+        # BUG-030: identical-fingerprint breaker stops on formalization attempt 2 (1 plan + 2 formalization = 3).
+        assert len(calls) == 3

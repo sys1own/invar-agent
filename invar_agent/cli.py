@@ -48,6 +48,17 @@ def main(argv: list[str] | None = None) -> int:
     pb_ingest.add_argument("--title", default="Scientific instrument")
     pb_ingest.add_argument("--out", default=None, help="Optional path to write CanonicalResearchIR JSON")
 
+    pb_approve = b_sub.add_parser("approve", help="Approve an ingested CanonicalResearchIR JSON for planning and execution")
+    pb_approve.add_argument("workspace")
+    pb_approve.add_argument("ir_json")
+    pb_approve.add_argument("--out", default=None, help="Output path (defaults to overwriting ir_json)")
+
+    pb_override = b_sub.add_parser("override", help="Apply an IRReviewOverride JSON patch to an ingested IR")
+    pb_override.add_argument("workspace")
+    pb_override.add_argument("ir_json")
+    pb_override.add_argument("override_json")
+    pb_override.add_argument("--out", default=None, help="Output path (defaults to overwriting ir_json)")
+
     pb_plan = b_sub.add_parser("plan", help="Synthesize a verified Builder UAST & wavefront plan from an approved IR JSON")
     pb_plan.add_argument("workspace")
     pb_plan.add_argument("ir_json")
@@ -144,6 +155,31 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.out).write_text(payload, encoding="utf-8")
             print(payload)
             return 0
+        if args.builder_command == "approve":
+            from invar_agent.builder.ingestion.pipeline import apply_ir_override
+            from invar_agent.builder.ingestion.schemas import IRReviewOverride
+
+            ir_path = Path(args.ir_json)
+            ir = CanonicalResearchIR.model_validate_json(ir_path.read_text(encoding="utf-8"))
+            approved_ir = apply_ir_override(ir, IRReviewOverride(approve=True))
+            payload = approved_ir.model_dump_json(indent=2)
+            out_path = Path(args.out) if args.out else ir_path
+            out_path.write_text(payload, encoding="utf-8")
+            print(payload)
+            return 0
+        if args.builder_command == "override":
+            from invar_agent.builder.ingestion.pipeline import apply_ir_override
+            from invar_agent.builder.ingestion.schemas import IRReviewOverride
+
+            ir_path = Path(args.ir_json)
+            ir = CanonicalResearchIR.model_validate_json(ir_path.read_text(encoding="utf-8"))
+            ov = IRReviewOverride.model_validate_json(Path(args.override_json).read_text(encoding="utf-8"))
+            patched_ir = apply_ir_override(ir, ov)
+            payload = patched_ir.model_dump_json(indent=2)
+            out_path = Path(args.out) if args.out else ir_path
+            out_path.write_text(payload, encoding="utf-8")
+            print(payload)
+            return 0
         if args.builder_command == "plan":
             ir = CanonicalResearchIR.model_validate_json(Path(args.ir_json).read_text(encoding="utf-8"))
             profiles = [BuilderProfile(p) for p in args.profiles] if args.profiles else None
@@ -171,29 +207,29 @@ def main(argv: list[str] | None = None) -> int:
             print(result.model_dump_json(indent=2))
             return 0 if result.status in {"COMPLETED", "COMPLETED_WITH_FALLBACKS"} else 1
         if args.builder_command == "export":
+            from invar_agent.builder.export_utils import ExportBlockedError, build_verified_export_zip
+
             build_dir = ws / ".invar" / "builds" / args.build_id
+            receipt_path = build_dir / "build_receipt.json"
+            build_status = None
+            if receipt_path.is_file():
+                try:
+                    build_status = json.loads(receipt_path.read_text(encoding="utf-8")).get("status")
+                except Exception:
+                    build_status = None
             workspace = (build_dir / "workspace").resolve()
-            if not workspace.is_dir():
-                print(json.dumps({"error": "Build workspace not found", "build_id": args.build_id}))
-                return 1
-            cache_manifest = HISCache(ws, args.build_id, workspace).load()
-            if cache_manifest is not None:
-                for entry in cache_manifest.entries.values():
-                    if entry.verified_status not in {"VERIFIED", "FALLBACK_VERIFIED"}:
-                        continue
-                    for rel_art, expected in entry.artifact_digests.items():
-                        art_path = (workspace / rel_art).resolve()
-                        if not art_path.is_file() or blake3_file(art_path) != expected:
-                            print(json.dumps({"error": f"Receipt digest mismatch for {rel_art}"}))
-                            return 1
+            cache_manifest = HISCache(ws, args.build_id, workspace).load() if workspace.is_dir() else None
             out = Path(args.out) if args.out else Path(f"{args.build_id}.zip")
-            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in sorted(workspace.rglob("*")):
-                    if p.is_file() and not p.is_symlink():
-                        rel = p.relative_to(workspace).as_posix()
-                        if rel.startswith(".invar/") or "diagnostics/leaf_responses" in rel:
-                            continue
-                        zf.write(p, rel)
+            try:
+                build_verified_export_zip(
+                    workspace,
+                    out,
+                    build_status=build_status,
+                    cache_manifest=cache_manifest,
+                )
+            except ExportBlockedError as exc:
+                print(json.dumps({"error": exc.message, "code": exc.code, "build_id": args.build_id}))
+                return 1
             print(f"wrote {out}")
             return 0
         return 2

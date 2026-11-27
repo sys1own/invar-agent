@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies and build native core
+        run: |
+          python -m pip install --upgrade pip maturin pytest pytest-asyncio pytest-timeout hypothesis
+          python -m pip install -e ".[dev,ingest,scientific]"
+          maturin develop --release
+
+      - name: Run Rust native tests
+        working-directory: invar_agent/_native
+        run: cargo test
+
+      - name: Run offline Python test suite (PYTHONUTF8 unset)
+        shell: bash
+        run: |
+          unset PYTHONUTF8
+          pytest -v -m "not live" --ignore=tests/test_phase5_playwright_ui.py

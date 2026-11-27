@@ -926,36 +926,14 @@ _DISSIPATION_CONTRACT_TOKENS = ("stiff", "kraus", "dissipat", "damping", "entrop
 
 def _parameter_initial_defaults(py_code: str, contract: VerificationContract,
                                 initial: List[float], warnings: List[str]) -> None:
-    """Seed read-only physical parameter slots that the planner left at 0.0."""
-    closed = _contract_is_closed_or_reversible(contract)
-    dt = float(getattr(contract, "dt", 0.0) or 0.0)
-    contract_text = " ".join([
-        str(getattr(contract, "contract_id", "") or ""),
-        " ".join(getattr(i, "variable_name", "") for i in (contract.invariants or [])),
-        " ".join(str(getattr(i, "assertion", "") or "") for i in (contract.invariants or [])),
-    ]).lower()
-    dissipation_contract = any(tok in contract_text for tok in _DISSIPATION_CONTRACT_TOKENS)
-    stiff_contract = "stiff" in contract_text or "1e5" in contract_text
-    for m in re.finditer(
-            r"\b(omega0|omega|k0|m_mass|kappa|stiffness|gamma|damping|nu)\s*=\s*"
-            r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
-        name, slot = m.group(1).lower(), int(m.group(2))
-        if slot >= len(initial) or initial[slot] != 0.0:
-            continue
-        if name in _PARAM_OMEGA_NAMES:
-            initial[slot] = 1.0
-            warnings.append(
-                f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded 1.0")
-        elif name in _PARAM_KAPPA_NAMES and not closed:
-            initial[slot] = 1.0e5 if (stiff_contract or dt >= 0.2) else 1.0
-            warnings.append(
-                f"auto-init: parameter state[{slot}] ({name}) was 0.0; seeded "
-                f"{initial[slot]:.6g} for dt={dt}")
-        elif name in _PARAM_DISSIPATION_NAMES and not closed and (dissipation_contract or dt >= 0.2):
-            initial[slot] = 1.0e5 if stiff_contract else 1.0
-            warnings.append(
-                f"auto-init: dissipation parameter state[{slot}] ({name}) was 0.0; "
-                f"seeded {initial[slot]:.6g}")
+    """ARCH-001: Name-based parameter seeding is permanently disabled.
+
+    Initial state values are read-only post-seal and must come strictly from
+    the sealed IR / contract initial_state, never inferred from identifier names
+    such as ``omega``, ``kappa``, ``gamma``, ``damping``, or ``nu``.
+    """
+    _ = (py_code, contract, initial, warnings)
+    return None
 
 
 def _initialize_physical_state(py_code: str, contract: VerificationContract,
@@ -1255,34 +1233,10 @@ def _initialize_physical_state(py_code: str, contract: VerificationContract,
                                 f"auto-init: unified lower bound slot state[{k}] ({inv.variable_name}) "
                                 f"raised from {initial[k]} to {req_v}")
                             initial[k] = req_v
-    # 1b. Reversibility / closed-limit flag auto-seeding: if the contract checks
-    # reversibility/chiasmus/closed-limit and the kernel reads a reversibility flag
-    # from buf.data[p] and branches on it, seed initial[p] = 1.0 and zero dissipation slots.
-    if _contract_is_closed_or_reversible(contract):
-        for m_rev in re.finditer(
-                r"\b(rev|closed|is_closed|rev_flag|reversible|mode|flag|chiasmus)\s*=\s*"
-                r"(?:buf\.data|state|data)\[(\d+)\]", py_code or ""):
-            rev_var, rev_slot = m_rev.group(1), int(m_rev.group(2))
-            if rev_slot not in dyn_set and rev_slot < len(initial):
-                if re.search(rf"\bif\s+{re.escape(rev_var)}\b", py_code or ""):
-                    if initial[rev_slot] == 0.0:
-                        initial[rev_slot] = 1.0
-                        warnings.append(
-                            f"auto-init: reversibility flag state[{rev_slot}] ({rev_var}) "
-                            f"set to 1.0 for closed/reversibility contract '{contract.contract_id}'")
-        for p_slot, p_var in (cls.get("parameter_vars") or {}).items():
-            if p_var.lower() in {
-                "gx", "gy", "gz", "g", "g1", "g2", "gphi", "g_phi",
-                "gam", "gam1", "gam2", "gam_phi", "gamma", "gamma1",
-                "gamma2", "gamma_phi", "kappa", "stiffness", "damping", "nu",
-            }:
-                if p_slot < len(initial) and initial[p_slot] != 0.0:
-                    initial[p_slot] = 0.0
-                    warnings.append(
-                        f"auto-init: zeroed dissipation state[{p_slot}] ({p_var}) "
-                        f"for closed/reversibility contract '{contract.contract_id}'")
-    # 2. Physical parameter slots must not start as silent zeros.
-    _parameter_initial_defaults(py_code, contract, initial, warnings)
+    # 1b. ARCH-001: Name-based zeroing of dissipation/gravity/damping slots
+    # (g, gamma, kappa, damping, nu, etc.) is permanently removed. Initial
+    # state is read-only post-seal and never mutated by identifier heuristics.
+    # 2. Physical parameter seeding by name is disabled (ARCH-001).
     # 2b. Bloch ball initial norm contraction: ensure initial dynamical Bloch vector is physical.
     r_max = _detect_bloch_radius(py_code, [contract])
     if r_max is not None and len(dyn_slots) >= 3:
@@ -1644,6 +1598,8 @@ class ResearchRunState:
     preserved_vs_enforced: Dict[str, Any] = field(default_factory=dict)
     heal_count: int = 0
     precision_refined: bool = False
+    executed_module_digest: Optional[str] = None
+    accepted_repairs: List[str] = field(default_factory=list)
 
     def snapshot(self) -> Dict[str, Any]:
         bp = self.blueprint
@@ -1903,6 +1859,13 @@ class ResearchStateMachine:
         return await self.run(blueprint)
 
     async def run(self, blueprint: ResearchBlueprint) -> ResearchRunState:
+        from ..llm.telemetry import _ACTIVE_SESSION, llm_telemetry_scope
+        if _ACTIVE_SESSION.get() is None:
+            with llm_telemetry_scope(run_id=blueprint.blueprint_id):
+                return await self._run_scoped(blueprint)
+        return await self._run_scoped(blueprint)
+
+    async def _run_scoped(self, blueprint: ResearchBlueprint) -> ResearchRunState:
         self._provider_failure = None
         from .formal_evidence import attach_formal_evidence
         ingest_error = None
@@ -2358,6 +2321,11 @@ class ResearchStateMachine:
                         stage += 1
                         continue
                     state.status = "ABORTED" if state.aborted else "PARTIAL"
+                    # Roll back unverified Stage N code to the last verified pinned layer.
+                    restored_code = pinned_layers[-1].code
+                    state.blueprint = state.blueprint.model_copy(update={"unified_module_code": restored_code})
+                    state.executed_module_digest = hashlib.sha256(restored_code.encode("utf-8")).hexdigest()
+                    self.blueprint = state.blueprint
                     await self.emit_activity(
                         "VAULT", "partial_finalization",
                         f"Stage {stage} retries exhausted after {max_attempts} "
@@ -2412,6 +2380,17 @@ class ResearchStateMachine:
         if state.meaningfulness_certificate is None:
             state.meaningfulness_certificate = incomplete_certificate(state.blueprint.blueprint_id,
                 state.blueprint.falsifiable_hypothesis, "FORMAL_IHCG_OR_EXECUTION_EVIDENCE_MISSING")
+        # ARCH-001: Execute and archive identical bytes; fail closed on digest mismatch.
+        if state.executed_module_digest is not None:
+            archived_code = state.blueprint.unified_module_code or state.blueprint.code_template or ""
+            archived_digest = hashlib.sha256(archived_code.encode("utf-8")).hexdigest()
+            if archived_digest != state.executed_module_digest:
+                state.epistemic_verdict = "INCONCLUSIVE_UNVERIFIED"
+                state.meaningfulness_certificate = incomplete_certificate(
+                    state.blueprint.blueprint_id,
+                    state.blueprint.falsifiable_hypothesis,
+                    "EXECUTED_ARCHIVE_DIGEST_MISMATCH",
+                )
         if state.ihcg is not None and state.status == "VERIFIED": state.status = state.epistemic_verdict
         await self._emit("accelerator_log", "synthesizing_report", {
             "research_stage": state.research_stage, "status": state.status})
@@ -2428,7 +2407,8 @@ class ResearchStateMachine:
             state.report = generate_comprehensive_research_report(
                 state.blueprint, telemetry, state.literature,
                 results=state.results, status=state.status,
-                checkpoint_path=state.checkpoint_path)
+                checkpoint_path=state.checkpoint_path,
+                epistemic_verdict=state.epistemic_verdict)
         except Exception as exc:  # noqa: BLE001 - report is best-effort
             state.report = f"(report synthesis failed: {str(exc)[:200]})"
         from .report import render_meaningfulness_certificate
@@ -2474,7 +2454,8 @@ class ResearchStateMachine:
                 literature_count=(self._literature_count()
                                   or len(state.literature)),
                 meaningfulness_certificate=state.meaningfulness_certificate,
-                canonical_signature=state.canonical_signature)
+                canonical_signature=state.canonical_signature,
+                llm_telemetry=llm_summary)
             report_path = vault.run_dir(state.blueprint.blueprint_id) / "report.md"
             await self._emit("accelerator_log", "vault_archived", {
                 "run_id": meta.get("run_id"), "status": state.status})
@@ -3028,6 +3009,9 @@ class ResearchStateMachine:
         # 7. Sandbox_Execute: regression of pinned layers + new contracts.
         state.stage = "Sandbox_Execute"
         await emit("accelerator_log", "kernel_stage", {**tag, "stage": "Sandbox_Execute"})
+        # ARCH-001: Execute and archive identical bytes.
+        state.executed_module_digest = hashlib.sha256(unified.encode("utf-8")).hexdigest()
+        state.blueprint = state.blueprint.model_copy(update={"unified_module_code": unified})
         km_kw = {} if kernel_mode == "rk4_ode" else {"kernel_mode": kernel_mode}
         results, regression = await self._sandbox_execute(
             bp, uast, cpp_code, unified, contracts, pinned_layers, stage, tag,
@@ -4194,22 +4178,9 @@ def _extract_insights(text: str, limit: int = 2) -> List[str]:
 
 def _deterministic_physics_guard_fallback(code: str, contracts: List[Any]
                                           ) -> Tuple[str, List[str]]:
-    """Run conservation/Lyapunov/monotone projection passes deterministically.
-
-    Invoked when the LLM directive pass produced 0 changes on a FALSIFIED
-    attempt, before the stage is declared unfixable. Returns ``(code, notes)``;
-    ``notes`` is empty when nothing applied.
-    """
-    notes: List[str] = []
-    for fn in (enforce_conservation_projection, enforce_lyapunov_sign):
-        try:
-            res = fn(code, contracts=contracts)
-        except Exception:  # noqa: BLE001 - never block healing on a pass error
-            continue
-        if res.changed:
-            code = res.code
-            notes.extend(res.notes or [getattr(fn, "__name__", "physics_guard")])
-    return code, notes
+    """ARCH-001: Invariant-forcing projection fallbacks are forbidden in research."""
+    _ = contracts
+    return code, []
 
 
 def tier0_heal(code: str, *, allow_egg: bool = True,

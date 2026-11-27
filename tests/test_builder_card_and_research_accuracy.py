@@ -336,10 +336,11 @@ def test_reporter_unit_suffix_mapping_and_deduplication():
         {"source": "arxiv", "title": "Mars entry heating", "year": 2021,
          "url": "https://arxiv.org/abs/2101.00001"}]
     report = generate_comprehensive_research_report(
-        _mars_blueprint(), telemetry, history, status="VERIFIED")
+        _mars_blueprint(), telemetry, history, status="VERIFIED",
+        epistemic_verdict="VERIFIED_DISCOVERY")
 
     rows = {m.group(1): m.group(2) for m in re.finditer(
-        r"^\| (.+?) \| `[^`]*` \| \*\*[^*]+\*\* \| ([^|]+?) \| VERIFIED \|$",
+        r"^\| (.+?) \| `[^`]*` \| \*\*[^*]+\*\* \| ([^|]+?) \| `?(?:VERIFIED|CERTIFIED)`? \|$",
         report, re.MULTILINE)}
     assert rows["Impact velocity m s"] == "m/s"
     assert rows["Peak g ge"] == "g_E"

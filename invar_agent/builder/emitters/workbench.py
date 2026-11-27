@@ -46,8 +46,23 @@ async def simulation(payload: dict):
 
 @app.post('/api/sweep')
 async def parameter_sweep(payload: SweepRequest):
+    known_params = set(MODEL.get('parameter_definitions', {}).keys())
+    unknown = set(payload.grid.keys()) - known_params
+    if unknown:
+        raise HTTPException(422, f'Unknown sweep parameter(s): {sorted(unknown)}')
+    keys = list(payload.grid)
+    def _run_grid():
+        out = []
+        for point in itertools.product(*(payload.grid[k] for k in keys)):
+            pt_params = dict(zip(keys, point))
+            try:
+                res = sweep({k: [v] for k, v in pt_params.items()}, payload.config, 'grid', 1)[0]
+                out.append({'ok': True, 'parameters': res['parameters'], 'result': res, 'trajectories': res['trajectories'], 'violations': []})
+            except Exception as err:
+                out.append({'ok': False, 'parameters': pt_params, 'result': None, 'trajectories': {}, 'violations': [str(err)]})
+        return out
     try:
-        return await run_in_threadpool(sweep,payload.grid,payload.config,payload.method,payload.samples)
+        return await run_in_threadpool(_run_grid)
     except (ValueError,TypeError) as error:
         raise HTTPException(422,str(error)) from error
 
@@ -55,16 +70,26 @@ async def parameter_sweep(payload: SweepRequest):
 async def sweep_stream(grid: str='{}'):
     try:
         options=json.loads(grid)
+        if not isinstance(options, dict):
+            raise ValueError('grid must be a JSON object')
         keys=list(options)
-        count=math.prod(len(options[key]) for key in keys)
+        known_params = set(MODEL.get('parameter_definitions', {}).keys())
+        unknown = set(keys) - known_params
+        if unknown:
+            raise ValueError(f'Unknown sweep parameter(s): {sorted(unknown)}')
+        count=math.prod(len(options[key]) for key in keys) if keys else 0
         if count>4096:
             raise ValueError('Sweep limit exceeded')
     except (ValueError,TypeError) as error:
         raise HTTPException(422,str(error)) from error
     async def events():
         for index,point in enumerate(itertools.product(*(options[key] for key in keys))):
-            results=await run_in_threadpool(sweep,{key:[value] for key,value in zip(keys,point)})
-            yield 'data: '+json.dumps({'index':index,'total':count,'result':results[0]})+'\\n\\n'
+            pt = {key:[value] for key,value in zip(keys,point)}
+            try:
+                results=await run_in_threadpool(sweep,pt)
+                yield 'data: '+json.dumps({'index':index,'total':count,'ok':True,'result':results[0],'violations':[]})+'\\n\\n'
+            except Exception as err:
+                yield 'data: '+json.dumps({'index':index,'total':count,'ok':False,'parameters':dict(zip(keys,point)),'violations':[str(err)]})+'\\n\\n'
     return StreamingResponse(events(),media_type='text/event-stream')
 
 @app.post('/api/export/{kind}')
@@ -93,15 +118,17 @@ if __name__=='__main__':
 '''
 
 HTML = '''<!doctype html><html><head><meta charset="utf-8"><title>Scientific Workbench</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:3em auto;background:#101b29;color:#e3f2ff}label{display:block;margin:1em}svg{background:white;width:100%;height:320px}button{padding:1em}.ok{color:#5f9}</style></head>
-<body><h1>Scientific Workbench</h1><section id="controls"></section><button id="run">Simulate</button><button id="sweep">2D sweep</button><button id="csv">CSV</button><button id="json">JSON</button><div id="status" role="status"></div><svg id="plot" viewBox="0 0 800 320"></svg><pre id="results"></pre>
+<style>body{font:16px system-ui;max-width:1100px;margin:3em auto;background:#101b29;color:#e3f2ff}label{display:flex;align-items:center;gap:12px;margin:0.8em 0}svg{background:#0b1420;border:1px solid #2b415a;width:100%;height:340px}button{padding:0.7em 1.2em;margin-right:8px;cursor:pointer}.ok{color:#5f9}.err{color:#f87171;font-weight:600}.legend{display:flex;gap:16px;margin:8px 0;font-size:13px}.readout{font-family:monospace;min-width:72px;color:#93c5fd}</style></head>
+<body><h1>Scientific Workbench</h1><section id="controls"></section><button id="run">Simulate</button><button id="sweep">2D sweep</button><button id="csv">CSV</button><button id="json">JSON</button><div id="status" role="status"></div><div id="legend" class="legend"></div><svg id="plot" viewBox="0 0 800 340"></svg><pre id="results"></pre>
 <script>
-let model,config=()=>({parameters:Object.fromEntries([...document.querySelectorAll('input')].map(e=>[e.name,Number(e.value)]))});
+let model,config=()=>({parameters:Object.fromEntries([...document.querySelectorAll('input[type=range]')].map(e=>[e.name,Number(e.value)]))});
+const COLORS=['#60a5fa','#f87171','#34d399','#c084fc','#fbbf24'];
 async function post(path,data){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw Error(await r.text());return r}
-fetch('/api/schema').then(r=>r.json()).then(m=>{model=m;for(let [name,d] of Object.entries(m.parameter_definitions)){let label=document.createElement('label');label.textContent=name+' ['+d.dimension.canonical_unit+'] ';let input=document.createElement('input');input.type='range';input.name=name;input.min=d.bounds?.lower??0;input.max=d.bounds?.upper??Math.max(1,d.si_value*2);input.step='any';input.value=d.si_value;label.append(input);document.getElementById('controls').append(label)}});
-document.getElementById('run').onclick=async()=>{try{let data=await(await post('/api/simulate',config())).json(),svg=document.getElementById('plot');svg.replaceChildren();let color=0;for(let [name,values] of Object.entries(data.trajectories)){let scale=Math.max(...values.map(Math.abs),1e-30),p=document.createElementNS('http://www.w3.org/2000/svg','polyline');p.setAttribute('points',values.map((v,i)=>`${20+760*i/Math.max(1,values.length-1)},${290-260*v/scale}`).join(' '));p.setAttribute('fill','none');p.setAttribute('stroke',['blue','red','green','purple'][color++%4]);p.setAttribute('aria-label',name);svg.append(p)}document.getElementById('status').textContent=Object.entries(data.invariant_status).map(([k,v])=>(v?'● ':'✖ ')+k).join(' ')||'● finite and within bounds';document.getElementById('status').className='ok'}catch(e){document.getElementById('status').textContent=e.message}};
-document.getElementById('sweep').onclick=async()=>{try{let grid=Object.fromEntries(Object.entries(model.parameter_definitions).slice(0,2).map(([n,d])=>[n,[d.bounds?.lower??d.si_value*.5,d.bounds?.upper??d.si_value*1.5]])),data=await(await post('/api/sweep',{grid,config:config()})).json(),keys=Object.keys(grid),svg=document.getElementById('plot');svg.replaceChildren();for(let result of data){let coordinates=keys.map(k=>(result.parameters[k]-Math.min(...grid[k]))/(Math.max(...grid[k])-Math.min(...grid[k])||1)),circle=document.createElementNS('http://www.w3.org/2000/svg','circle'),title=document.createElementNS('http://www.w3.org/2000/svg','title');circle.setAttribute('cx',40+720*coordinates[0]);circle.setAttribute('cy',280-240*(coordinates[1]??.5));circle.setAttribute('r',12);circle.setAttribute('fill','teal');title.textContent=JSON.stringify({parameters:result.parameters,final:Object.fromEntries(Object.entries(result.trajectories).map(([k,v])=>[k,v[v.length-1]]))});circle.append(title);svg.append(circle)}document.getElementById('results').textContent=JSON.stringify({axes:keys,runs:data.length},null,2)}catch(e){document.getElementById('status').textContent=e.message}};
-for(let kind of ['csv','json'])document.getElementById(kind).onclick=async()=>{let blob=await(await post('/api/export/'+kind,config())).blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='simulation.'+kind;a.click();URL.revokeObjectURL(a.href)};
+function setStatus(text,ok){const el=document.getElementById('status');el.textContent=text;el.className=ok?'ok':'err'}
+fetch('/api/schema').then(r=>r.json()).then(m=>{model=m;for(let [name,d] of Object.entries(m.parameter_definitions)){let label=document.createElement('label');let txt=document.createElement('span');txt.textContent=name+' ['+d.dimension.canonical_unit+']';let input=document.createElement('input');input.type='range';input.name=name;input.min=d.bounds?.lower??0;input.max=d.bounds?.upper??Math.max(1,d.si_value*2);input.step='any';input.value=d.si_value;let out=document.createElement('span');out.className='readout';out.textContent=Number(input.value).toPrecision(4);input.oninput=()=>{out.textContent=Number(input.value).toPrecision(4)};label.append(txt,input,out);document.getElementById('controls').append(label)}});
+document.getElementById('run').onclick=async()=>{try{let data=await(await post('/api/simulate',config())).json(),svg=document.getElementById('plot'),leg=document.getElementById('legend');svg.replaceChildren();leg.replaceChildren();let ax=document.createElementNS('http://www.w3.org/2000/svg','path');ax.setAttribute('d','M 40 20 L 40 300 L 780 300');ax.setAttribute('stroke','#475569');ax.setAttribute('fill','none');svg.append(ax);let color=0;for(let [name,values] of Object.entries(data.trajectories)){let c=COLORS[color++%COLORS.length],scale=Math.max(...values.map(Math.abs),1e-30),p=document.createElementNS('http://www.w3.org/2000/svg','polyline');p.setAttribute('points',values.map((v,i)=>`${40+740*i/Math.max(1,values.length-1)},${300-260*v/scale}`).join(' '));p.setAttribute('fill','none');p.setAttribute('stroke',c);p.setAttribute('stroke-width','2');p.setAttribute('aria-label',name);svg.append(p);let item=document.createElement('span');item.style.color=c;item.textContent='● '+name+' (final='+values[values.length-1].toPrecision(4)+')';leg.append(item)}setStatus(Object.entries(data.invariant_status).map(([k,v])=>(v?'● ':'✖ ')+k).join(' ')||'● finite and within bounds',true)}catch(e){setStatus(e.message,false)}};
+document.getElementById('sweep').onclick=async()=>{try{let cur=config().parameters;let grid=Object.fromEntries(Object.entries(model.parameter_definitions).slice(0,2).map(([n,d])=>{let base=cur[n]??d.si_value;let lo=d.bounds?.lower??base*0.5;let hi=d.bounds?.upper??base*1.5;let span=Math.max(1e-6,(hi-lo)*0.25);let a=Math.max(lo,base-span),b=Math.min(hi,base+span);return [n,[a,base,b]]}));let data=await(await post('/api/sweep',{grid,config:config()})).json(),keys=Object.keys(grid),svg=document.getElementById('plot'),leg=document.getElementById('legend');svg.replaceChildren();leg.innerHTML='<span style="color:#34d399">● Valid</span><span style="color:#f87171">● Violated</span>';let ax=document.createElementNS('http://www.w3.org/2000/svg','path');ax.setAttribute('d','M 40 20 L 40 300 L 780 300');ax.setAttribute('stroke','#475569');ax.setAttribute('fill','none');svg.append(ax);let okCount=0;for(let pt of data){let coordinates=keys.map(k=>(pt.parameters[k]-Math.min(...grid[k]))/(Math.max(...grid[k])-Math.min(...grid[k])||1)),circle=document.createElementNS('http://www.w3.org/2000/svg','circle'),title=document.createElementNS('http://www.w3.org/2000/svg','title');circle.setAttribute('cx',60+700*coordinates[0]);circle.setAttribute('cy',280-240*(coordinates[1]??.5));circle.setAttribute('r',10);circle.setAttribute('fill',pt.ok?'#34d399':'#f87171');if(pt.ok)okCount++;title.textContent=JSON.stringify(pt.ok?{parameters:pt.parameters,final:Object.fromEntries(Object.entries(pt.trajectories).map(([k,v])=>[k,v[v.length-1]]))}:{parameters:pt.parameters,violations:pt.violations});circle.append(title);svg.append(circle)}setStatus(`2D sweep: ${okCount}/${data.length} valid points`,okCount>0);document.getElementById('results').textContent=JSON.stringify({axes:keys,total:data.length,valid:okCount,points:data.map(p=>({ok:p.ok,parameters:p.parameters,violations:p.violations}))},null,2)}catch(e){setStatus(e.message,false)}};
+for(let kind of ['csv','json'])document.getElementById(kind).onclick=async()=>{try{let blob=await(await post('/api/export/'+kind,config())).blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='simulation.'+kind;a.click();URL.revokeObjectURL(a.href)}catch(e){setStatus(e.message,false)}};
 </script></body></html>'''
 
 

@@ -217,8 +217,8 @@ def test_latch_floor_strictly_above_max_contract_slot_plus_2() -> None:
         }
     ]
     san = sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
-    assert "_invar_psz_6" in san.code
-    # All latch slots (bak, flag) must be >= max(44, 16) + 3 = 47
+    # ARCH-001: slot-protection shadow latches (_invar_psz_*) are permanently removed.
+    assert "_invar_psz_6" not in san.code
     for idx in range(47):
         assert f"buf.data[{idx}] = buf.data[6]" not in san.code
 
@@ -299,9 +299,9 @@ def simulation_step(buf, dt):
         }
     ]
     san = sanitize_intrinsics(code, contracts=contracts, all_contracts=contracts)
-    # Projection call inside the step function must not be duplicated inline AND at exit
+    # ARCH-001: invariant-forcing simplex projection is permanently removed from sanitize_intrinsics.
     fn_txt = san.code.split("def simulation_step")[1]
-    assert fn_txt.count("_invar_project_mass_simplex(buf, _invar_m_prev)") == 1
+    assert "_invar_project_mass_simplex" not in fn_txt
 
     # Explicit K=3 Rock-Paper-Scissors simplex with bounded oscillations:
     # legacy 4-slot _invar_project_mass_simplex must be suppressed, and bounded
@@ -326,22 +326,10 @@ def simulation_step(buf, dt):
         }
     ]
     san_rps = sanitize_intrinsics(rps_code, contracts=rps_contracts, all_contracts=rps_contracts)
+    # ARCH-001: neither legacy 4-slot nor K=3 simplex projection is injected by sanitize_intrinsics.
     assert "_invar_project_mass_simplex(" not in san_rps.code
-    assert "_msum_rem_0" in san_rps.code
-    assert any("projected K=3 simplex sum" in n for n in san_rps.notes)
-
-    class _Buf:
-        def __init__(self, data):
-            self.data = list(data)
-            self.size = len(data)
-
-    ns: dict = {}
-    exec(san_rps.code, ns)  # noqa: S102
-    b = _Buf([0.5, 0.3, 0.2, 1.0] + [0.0] * 12)
-    for _ in range(200):
-        ns["simulation_step"](b, 0.05)
-    assert abs((b.data[0] + b.data[1] + b.data[2]) - 1.0) <= 1e-10
-    assert any(abs(b.data[i] - init) > 1e-3 for i, init in enumerate((0.5, 0.3, 0.2)))
+    assert "_msum_rem_0" not in san_rps.code
+    assert not san_rps.changed
 
 
 # ---------------------------------------------------------------------------

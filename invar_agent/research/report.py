@@ -62,7 +62,8 @@ def _stage_rows(state) -> List[str]:
         # Multi-line tracebacks / notes must never corrupt the Markdown table.
         note = (f" — {h.note[:120]}" if h.note else "")
         note = note.replace("\n", " ").replace("|", "/").replace("\r", " ")
-        rows.append(f"| {h.stage} | {h.status} | `{h.bundle_hash[:16]}` |{note} |")
+        display_status = "INVARIANTS_HELD" if str(h.status or "").upper() == "VERIFIED" else h.status
+        rows.append(f"| {h.stage} | {display_status} | `{h.bundle_hash[:16]}` |{note} |")
     return rows
 
 
@@ -143,17 +144,16 @@ def _literature_rows(
 
 
 def _fallback_variable_map(bp: ResearchBlueprint) -> Dict[str, int]:
-    """Deterministic variable_map fallback so reports never show an empty map."""
+    """Deterministic variable_map fallback without placeholder state_N slots."""
     mapping: Dict[str, int] = {}
     for contract in getattr(bp, "contracts", None) or []:
         for inv in getattr(contract, "invariants", None) or []:
             import re as _re
             text = f"{getattr(inv, 'variable_name', '')} {getattr(inv, 'assertion', '')}"
             m = _re.search(r"(?:state|initial|buf(?:\.data)?)\[(\d+)\]", text)
-            if m and getattr(inv, "variable_name", ""):
-                mapping.setdefault(str(inv.variable_name), int(m.group(1)))
-    if not mapping:
-        mapping = {f"state_{i}": i for i in range(4)}
+            vname = str(getattr(inv, "variable_name", "") or "")
+            if m and vname and not _re.match(r"^state_\d+$", vname):
+                mapping.setdefault(vname, int(m.group(1)))
     return dict(list(mapping.items())[:64])
 
 
@@ -188,18 +188,33 @@ def render_meaningfulness_certificate(certificate, preserved=None) -> str:
 
 
 def build_research_report(state) -> str:
-    """Markdown Verified Quantitative Research Report for a finished run."""
+    """Markdown Quantitative Research Report for a finished run (verdict-derived)."""
+    import re as _re
+    from .epistemic import compute_evidence_status, is_verified_epistemic_verdict
+
     bp: ResearchBlueprint = state.blueprint
     results: List[SimulationResult] = list(state.results)
     feasibility = bp.feasibility
-    variable_map = dict(bp.variable_map or {})
+    epistemic_verdict = getattr(state, "epistemic_verdict", None)
+    if epistemic_verdict is None and getattr(state, "meaningfulness_certificate", None) is not None:
+        epistemic_verdict = getattr(state.meaningfulness_certificate, "epistemic_verdict", None)
+    is_certified = is_verified_epistemic_verdict(epistemic_verdict)
+    variable_map = {
+        k: v for k, v in dict(bp.variable_map or {}).items()
+        if not _re.match(r"^state_\d+$", str(k))
+    }
     if not variable_map:
         variable_map = _fallback_variable_map(bp)
     observables = extract_observables(variable_map, results)
-    variable_map = {name:slot for name,slot in variable_map.items() if name in observables}
+    variable_map = {name: slot for name, slot in variable_map.items() if name in observables}
 
     lines: List[str] = []
-    lines.append(f"# Verified Quantitative Research Report — {bp.title}")
+    report_heading = (
+        f"# Verified Quantitative Research Report — {bp.title}"
+        if is_certified
+        else f"# Quantitative Research Report (Unverified) — {bp.title}"
+    )
+    lines.append(report_heading)
     lines.append("")
     lines.append(f"**Blueprint:** `{bp.blueprint_id}`  ")
     lines.append(f"**Hypothesis:** {bp.falsifiable_hypothesis}")
@@ -209,30 +224,36 @@ def build_research_report(state) -> str:
     lines.append("## 1. Executive Summary & Numerical Results")
     lines.append("")
     if variable_map:
-        lines.append("| Observable (units in name) | State slot | Value | Source contract | Stage |")
-        lines.append("|---|---:|---|---|---|")
+        lines.append("| Observable (units in name) | State slot | Value | Evidence Status | Source contract | Stage |")
+        lines.append("|---|---:|---|---|---|---|")
         for name in sorted(variable_map):
             obs = observables.get(name)
             if obs is None:
-                lines.append(f"| `{name}` | {variable_map[name]} | n/a | - | - |")
+                lines.append(f"| `{name}` | {variable_map[name]} | n/a | NOT_COMPUTED | - | - |")
             else:
+                ev_status = compute_evidence_status(
+                    epistemic_verdict,
+                    obs["value"],
+                    violated=(str(obs.get("status") or "").upper() == "FALSIFIED"),
+                )
                 lines.append(
                     f"| `{name}` | {variable_map[name]} | **{_fmt_value(obs['value'])}** | "
-                    f"`{obs['contract_id']}` | {obs['stage']} |")
+                    f"`{ev_status}` | `{obs['contract_id']}` | {obs['stage']} |")
         lines.append("")
     else:
         lines.append("_No named observables were mapped in this blueprint "
                      "(`variable_map` empty); see telemetry below._")
         lines.append("")
-    verified = [r for r in results if r.status == "VERIFIED"]
-    if verified:
-        r = verified[-1]
+    invariants_held = [r for r in results if r.status == "VERIFIED"]
+    if invariants_held:
+        r = invariants_held[-1]
         tel_bits = ", ".join(
             f"{k}={_fmt_value(v)}" for k, v in sorted(r.telemetry.items())
             if isinstance(v, (int, float)) and math.isfinite(v)
             and (k.startswith('final_') or (k.startswith('obs_') and k[4:] in variable_map))
         )
-        lines.append(f"**Final verified telemetry** ({r.contract_id}, "
+        tel_label = "Final verified telemetry" if is_certified else "Final observed telemetry (unverified)"
+        lines.append(f"**{tel_label}** ({r.contract_id}, "
                      f"{r.execution_time_ms:.1f} ms): {tel_bits or 'n/a'}")
         lines.append("")
 
@@ -286,16 +307,17 @@ def build_research_report(state) -> str:
     else:
         lines.append("_No literature hits retrieved (offline cache or no hits)._")
     lines.append("")
-    lines.append("Governing equations are those implemented in the verified "
-                 "unified module (`unified_module_code`) and enforced by the "
-                 "contracts below.")
+    lines.append("Governing equations are those implemented in the "
+                 + ("verified " if is_certified else "")
+                 + "unified module (`unified_module_code`) and evaluated by the "
+                 + "contracts below.")
     lines.append("")
 
     # 4. Computational verification & invariant audit
-    lines.append("## 4. Computational Verification & Invariant Audit")
+    lines.append("## 4. Computational Execution & Invariant Audit")
     lines.append("")
     lines.append(f"- **Run status:** `{state.status}` "
-                 f"({len(state.blueprint.verified_layers)} verified stage(s) of "
+                 f"({len(state.blueprint.verified_layers)} stage(s) with invariants held of "
                  f"{bp.target_research_stages})")
     lines.append(f"- **Checkpoint:** `{state.checkpoint_path or 'n/a'}`")
     stage_rows = _stage_rows(state)
@@ -306,19 +328,21 @@ def build_research_report(state) -> str:
         lines.extend(stage_rows)
     lines.append("")
     if results:
-        lines.append("| Contract | Status | Time (ms) | Telemetry (final) |")
+        lines.append("| Contract | Stage Status | Time (ms) | Telemetry (final) |")
         lines.append("|---|---|---|---|")
         for r in results[-6:]:
             tel = ", ".join(
                 f"{k}={_fmt_value(v)}" for k, v in sorted(r.telemetry.items())
                 if isinstance(v, (int, float)) and k.startswith(("final_", "obs_"))
             ) or "n/a"
-            lines.append(f"| `{r.contract_id}` | {r.status} | "
+            row_status = "INVARIANTS_HELD" if str(r.status or "").upper() == "VERIFIED" else r.status
+            lines.append(f"| `{r.contract_id}` | {row_status} | "
                          f"{r.execution_time_ms:.1f} | {tel[:220]} |")
         lines.append("")
     lines.append("---")
-    lines.append("_Generated deterministically from verified sandbox telemetry; "
-                 "no values are extrapolated._")
+    lines.append("_Generated deterministically from "
+                 + ("certified " if is_certified else "sandbox ")
+                 + "telemetry; no values are extrapolated._")
     certificate = getattr(state, "meaningfulness_certificate", None)
     if certificate is not None: lines += ["", render_meaningfulness_certificate(certificate, getattr(state, "preserved_vs_enforced", {}))]
     return normalize_report_latex("\n".join(lines))

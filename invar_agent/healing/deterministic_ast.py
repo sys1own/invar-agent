@@ -209,11 +209,105 @@ MONOTONE_NAME_TOKENS = ("entropy_drift", "entropy_monotonicity",
 
 
 @dataclass(frozen=True)
+class KernelTransform:
+    """Audit record for a single kernel AST transformation."""
+    op_id: str
+    semantics_preserving: bool
+    before_digest: str
+    after_digest: str
+
+
+@dataclass(frozen=True)
 class SanitizerResult:
     code: str
     notes: List[str]
     changed: bool
     backup_slot_map: Dict[str, int] = field(default_factory=dict)
+    transforms: List[KernelTransform] = field(default_factory=list)
+
+
+def _kernel_digest(code: str) -> str:
+    import hashlib
+    return hashlib.sha256((code or "").encode("utf-8")).hexdigest()
+
+
+def _verify_semantics_preserving(before_code: str, after_code: str, *,
+                                 num_samples: int = 5,
+                                 tol: float = 1e-9) -> bool:
+    """Verify per-slot numerical equivalence of simulation_step on randomized states.
+
+    Returns True if:
+    - ``before_code`` is not directly executable (e.g. structural lowering of
+      complex literals, non-scalar helpers, or syntax/arity fixes), OR
+    - both execute cleanly on all randomized finite state buffers and agree on
+      every output slot within ``tol``.
+    Returns False if ``before_code`` executes cleanly on a sample but
+    ``after_code`` fails or diverges on any slot.
+    """
+    if before_code == after_code:
+        return True
+    try:
+        ns_before: Dict[str, Any] = {}
+        exec(compile(before_code, "<before>", "exec"), ns_before)  # noqa: S102
+    except Exception:  # noqa: BLE001
+        return True
+    fn_before = ns_before.get("simulation_step")
+    if not callable(fn_before):
+        return True
+    try:
+        ns_after: Dict[str, Any] = {}
+        exec(compile(after_code, "<after>", "exec"), ns_after)  # noqa: S102
+    except Exception:  # noqa: BLE001
+        return False
+    fn_after = ns_after.get("simulation_step")
+    if not callable(fn_after):
+        return False
+
+    class _Buf:
+        __slots__ = ("data", "size")
+
+        def __init__(self, vals: List[float]) -> None:
+            self.data = list(vals)
+            self.size = len(self.data)
+
+    dts = (0.005, 0.01, 0.05, 0.02, 0.002)
+    for sample_idx in range(max(1, num_samples)):
+        # Include exact 0.0 in alternating slots (e.g. omega=0.0) to catch zero-seeding bugs.
+        vals = [
+            0.0 if (i % 3 == 1 and sample_idx % 2 == 0)
+            else (0.25 + 0.17 * ((i + 1) * (sample_idx + 1) % 11) * (1.0 if (i + sample_idx) % 2 == 0 else -1.0))
+            for i in range(64)
+        ]
+        dt = dts[sample_idx % len(dts)]
+        b1 = _Buf(vals)
+        try:
+            fn_before(b1, dt)
+        except Exception:  # noqa: BLE001
+            # Before-kernel raised on this sample (e.g. div-by-zero / domain error),
+            # so guarding it in after_code is permissible.
+            continue
+        b2 = _Buf(vals)
+        try:
+            fn_after(b2, dt)
+        except Exception:  # noqa: BLE001
+            return False
+        if len(b1.data) != len(b2.data):
+            return False
+        for a, b in zip(b1.data, b2.data):
+            if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+                if a != b:
+                    return False
+                continue
+            af, bf = float(a), float(b)
+            if math.isnan(af) and math.isnan(bf):
+                continue
+            if not math.isfinite(af):
+                continue
+            if not math.isfinite(bf):
+                return False
+            if abs(af - bf) > tol * max(1.0, abs(af), abs(bf)):
+                return False
+    return True
 
 
 def _defined_names(tree: ast.Module) -> set[str]:
@@ -9357,9 +9451,16 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
                         variable_map: Optional[Dict[str, int]] = None,
                         slot_roles: Optional[Dict[str, str]] = None,
                         stabilize_diverged: bool = False,
-                        preserve_dynamics: bool = False,
+                        preserve_dynamics: bool = True,
                         pinned_functions: Optional[Collection[str]] = None) -> SanitizerResult:
-    """Rewrite scalar intrinsic/math-namespace hazards before execution."""
+    """Apply strictly semantics-preserving scalar intrinsic/syntax lowering.
+
+    ARCH-001: Name-based parameter seeding, slot-protection redirection, and
+    invariant-forcing clamp/projection operators are permanently excluded from
+    kernel sanitization. Every accepted transform is verified for per-slot
+    numerical equivalence and recorded as a ``KernelTransform``.
+    """
+    _ = (stabilize_diverged, preserve_dynamics)  # retained for call-site compatibility; always preserves dynamics
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -9368,27 +9469,34 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     bridge_contracts = list(all_contracts or contracts or [])
     pinned_snaps = _snapshot_pinned_functions(tree, pinned_functions)
     all_notes: Set[str] = set()
+    transforms: List[KernelTransform] = []
     any_changed = False
-    conditioning_ops = {
-        'REPAIR_REVERSIBILITY_BRANCH', 'STABILIZE_DYNAMICAL_STATE', 'REPAIR_MONOTONE_OBSERVABLES',
-        'ENFORCE_BLOCH_BALL_PROJECTION', 'ENFORCE_CONSERVATION_PROJECTION', 'ENFORCE_LYAPUNOV_SIGN',
-        'SEED_DISSIPATION_PARAMETERS',
-    }
 
     def _run_op(op_name: str, pass_fn: Callable[..., Tuple[ast.Module, bool, List[str]]], *args: Any, **kwargs: Any) -> None:
         nonlocal tree, any_changed
-        if preserve_dynamics and op_name in conditioning_ops:
-            return
-        if op_name in conditioning_ops and args and (slot_roles or variable_map):
-            projection_contracts = physical_projection_contracts(
-                tree, args[0], variable_map, _verified_projection_slots(tree, args[0]), slot_roles)
-            args = (projection_contracts, *args[1:])
-        tree, op_changed, op_notes = _run_tier0_tree_pass(
+        before_code = _safe_unparse(tree) + "\n"
+        before_tree = copy.deepcopy(tree)
+        new_tree, op_changed, op_notes = _run_tier0_tree_pass(
             tree, op_name, pass_fn, *args, pinned_snapshots=pinned_snaps, **kwargs
         )
-        if op_changed:
-            any_changed = True
+        if not op_changed:
+            return
+        after_code = _safe_unparse(new_tree) + "\n"
+        if after_code == before_code:
+            return
+        if op_name != "LOWER_RANDOM_CALLS" and not _verify_semantics_preserving(before_code, after_code):
+            # Reject any pass that alters executable per-slot dynamics.
+            tree = before_tree
+            return
+        tree = new_tree
+        any_changed = True
         all_notes.update(op_notes)
+        transforms.append(KernelTransform(
+            op_id=op_name,
+            semantics_preserving=True,
+            before_digest=_kernel_digest(before_code),
+            after_digest=_kernel_digest(after_code),
+        ))
 
     _run_op("LIFT_SCALAR_HELPERS", _lift_scalar_helpers_tree)
     _run_op("LOWER_RANDOM_CALLS", _lower_random_calls_tree)
@@ -9406,22 +9514,13 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     _run_op("STRIP_BUF_SIZE_BRANCHES", _strip_buf_size_branches_tree, bridge_contracts)
     _run_op("RESOLVE_SLOT_COLLISIONS", _resolve_slot_collisions_tree, contracts, bridge_contracts)
     _run_op("SPLIT_INTRA_FUNCTION_STAGE_OVERWRITES", _split_intra_function_stage_overwrites_tree, contracts, bridge_contracts, variable_map=variable_map)
-    _run_op("REPAIR_REVERSIBILITY_BRANCH", _repair_reversibility_branch_tree, bridge_contracts)
     _run_op("BRIDGE_CONTRACT_SLOTS", _bridge_contract_slots_tree, bridge_contracts)
     _run_op("REPAIR_HISTORY_SLOTS", _repair_history_slots_tree)
-    _run_op("STABILIZE_DYNAMICAL_STATE", _stabilize_dynamical_state_tree, list(contracts or bridge_contracts), stabilize_diverged=stabilize_diverged)
-    _run_op("REPAIR_MONOTONE_OBSERVABLES", _repair_monotone_observables_tree, bridge_contracts)
-    _run_op("ENFORCE_BLOCH_BALL_PROJECTION", _enforce_bloch_ball_projection_tree, bridge_contracts, variable_map=variable_map, slot_roles=slot_roles)
     _run_op("STRIP_NONE_LITERALS", _strip_none_literals_tree)
     _run_op("LOWER_COMPLEX_TO_REAL", _lower_complex_tree, pinned_functions=pinned_functions)
     _run_op("LOWER_SAFE_DIVISION", _lower_safe_division_tree)
     _run_op("UNIFY_CONCEPT_SLOTS", _unify_concept_slots_tree, bridge_contracts)
     _run_op("BRIDGE_UNASSIGNED_CONCEPT_SLOTS", _bridge_unassigned_concept_slots_tree, bridge_contracts)
-    _run_op("ENFORCE_CONSERVATION_PROJECTION", _enforce_conservation_projection_tree, bridge_contracts)
-    _run_op("ENFORCE_LYAPUNOV_SIGN", _enforce_lyapunov_sign_tree, bridge_contracts)
-    _run_op("RESYNC_POST_PROJECTION_DIAGNOSTICS", _resync_post_projection_diagnostics_tree, bridge_contracts, variable_map=variable_map, slot_roles=slot_roles)
-    _run_op("PROTECT_PARAMETER_SLOTS", _protect_parameter_slots_tree, bridge_contracts)
-    _run_op("SEED_DISSIPATION_PARAMETERS", _seed_dissipation_parameters_tree, contracts)
     _run_op("LOWER_BUFFER_CLOCK", lower_buffer_clock, bridge_contracts)
     # Refresh buf.size < N guards after latch/slot allocation so latches and high contract slots stay in-bounds.
     _run_op("RAISE_BUF_SIZE_GUARDS", _strip_buf_size_branches_tree, bridge_contracts)
@@ -9460,7 +9559,13 @@ def sanitize_intrinsics(code: str, *, guard_domains: bool = True,
     _ensure_nonempty_blocks(tree)
     changed = bool(any_changed or ast.dump(tree, annotate_fields=False, include_attributes=False) != original)
     out = _safe_unparse(tree) + "\n"
-    return SanitizerResult(out, sorted(all_notes), changed, backup_slot_map=_collect_parameter_backup_map(tree))
+    return SanitizerResult(
+        out,
+        sorted(all_notes),
+        changed,
+        backup_slot_map=_collect_parameter_backup_map(tree),
+        transforms=transforms,
+    )
 
 
 class _DomainGuardTransformer(ast.NodeTransformer):
@@ -9889,6 +9994,19 @@ def apply_healing_directives(code: str, directives: Iterable[Dict[str, Any]],
         op = str(raw.get("op") or "")
         if op in {"RECALIBRATE_BOUND", "RELAX_HYPOTHESIS", "REWRITE_OBSERVABLE"}:
             notes.append("T-FORBID-RECALIBRATION")
+            continue
+        if (
+            op.upper().startswith(("CLAMP_", "CONDITION_", "PROJECT_"))
+            or op.upper() in {
+                "ENFORCE_CONSERVATION_PROJECTION",
+                "ENFORCE_BLOCH_BALL_PROJECTION",
+                "ENFORCE_LYAPUNOV_SIGN",
+                "REWRITE_MONOTONE_DRIFT",
+                "SEED_DISSIPATION_PARAMETERS",
+                "STABILIZE_DYNAMICAL_STATE",
+            }
+        ):
+            notes.append(f"T-FORBID-INVARIANT-FORCING:{op}")
             continue
         snap_op_tree = copy.deepcopy(tree)
         try:

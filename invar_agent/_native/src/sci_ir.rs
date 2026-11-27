@@ -245,6 +245,8 @@ pub struct EquationSpec {
     pub target_slot: usize,
     pub expr: ExprNode,
     pub source_text: String,
+    #[serde(default)]
+    pub reduction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

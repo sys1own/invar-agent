@@ -87,6 +87,18 @@ class EmitterRegistry:
         return emission
 
 
+def infer_program_kind(ir):
+    """ARCH-005: Derive typed ProgramKind strictly from IR equation roles."""
+    from ..uast_models import ProgramKind
+    has_evolution = any(eq.role == EquationRole.EVOLUTION_LAW for eq in ir.equations)
+    has_algebraic = any(eq.role == EquationRole.ALGEBRAIC_CLOSURE and eq.lhs_symbol for eq in ir.equations)
+    if has_evolution:
+        return ProgramKind.ODE
+    if has_algebraic:
+        return ProgramKind.ALGEBRAIC_MAP
+    raise ValueError("EMPTY_EQUATION_SET: IR contains no governing equations")
+
+
 def package_name(context):
     return context.uast.project_id
 
@@ -147,7 +159,10 @@ def differentiate(expressions, variables, environment, enabled=True):
     while set(outputs) & set(variables):
         outputs = ['_' + name for name in outputs]
     native = PyAdjointHin(outputs + variables, json.dumps({name: to_csel(expression) for name, expression in zip(outputs, expressions)}))
-    report = json.loads(native.analyze(json.dumps(environment)))
+    try:
+        report = json.loads(native.analyze(json.dumps(environment), compute_spectrum=False))
+    except TypeError:
+        report = json.loads(native.analyze(json.dumps(environment)))
     symbols = {name: sp.Symbol(name) for name in variables + ['t']}
     functions = {'safe_div': lambda a,b:a/b, 'safe_pow': lambda a,b:a**b,
                  'safe_sqrt':sp.sqrt, 'safe_log':sp.log, 'safe_exp':sp.exp,

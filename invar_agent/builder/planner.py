@@ -94,6 +94,22 @@ class BuilderPlanner:
     def compile(self, ir: CanonicalResearchIR, spec: BuilderArchitectureSpec) -> BuilderUAST:
         return compile_builder_uast(ir, spec)
 
+    def plan(
+        self,
+        ir: CanonicalResearchIR,
+        *,
+        build_goal: str = "",
+        profiles: list[BuilderProfile | str] | None = None,
+        project_name: str | None = None,
+    ):
+        """ARCH-013: Unified plan entry point shared by CLI and HTTP service."""
+        from .wavefront_scheduler import WavefrontScheduler
+
+        spec = self.translate_intent(ir, build_goal, profiles=profiles, project_name=project_name)
+        uast = self.compile(ir, spec)
+        schedule = WavefrontScheduler().plan(uast)
+        return uast, schedule, spec
+
 
 def _research_compute_uast(ir: CanonicalResearchIR, spec: BuilderArchitectureSpec) -> dict:
     quantities = {}
@@ -121,6 +137,12 @@ def compile_builder_uast(ir: CanonicalResearchIR, spec: BuilderArchitectureSpec)
     spec = BuilderArchitectureSpec.model_validate(spec.model_dump(mode="json"))
     if not ir.user_approved or any(not f.resolved for f in ir.disambiguation_flags):
         raise ValueError("IR_UNVERIFIED_FLAGGED: researcher approval is required")
+    governing = [
+        e for e in ir.equations
+        if e.role in {EquationRole.EVOLUTION_LAW, EquationRole.ALGEBRAIC_CLOSURE}
+    ]
+    if not governing:
+        raise ValueError("EMPTY_EQUATION_SET: IR contains no evolution or algebraic governing equations")
     if any(not e.hin_homogeneous or e.z3_satisfiable is not True for e in ir.equations):
         raise ValueError("IR_UNVERIFIED_FLAGGED: equations must pass HIN and Z3")
     if seal_ir(ir.model_copy(deep=True)).ir_blake3_digest != ir.ir_blake3_digest:

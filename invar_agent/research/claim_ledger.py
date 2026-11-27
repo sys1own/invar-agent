@@ -252,17 +252,87 @@ def pin_user_literals_in_domain(
     return out
 
 
+def _inline_static_algebraic_observables(
+    expr: str,
+    equations: Optional[Mapping[str, Any]],
+) -> str:
+    """ARCH-008: Inline algebraic observable definitions that do not depend on dynamics."""
+    if not equations:
+        return expr
+    alg_defs: Dict[str, str] = {}
+    for name, eq in equations.items():
+        if isinstance(eq, Mapping):
+            kind = str(eq.get("kind") or "")
+            rhs = str(eq.get("expression") or "").strip()
+        else:
+            kind = str(getattr(eq, "kind", "") or "")
+            rhs = str(getattr(eq, "expression", "") or "").strip()
+        if kind == "ALGEBRAIC" and rhs:
+            alg_defs[str(name)] = rhs
+    if not alg_defs:
+        return expr
+    out = expr
+    for _ in range(len(alg_defs) + 1):
+        changed = False
+        for name, rhs in sorted(alg_defs.items(), key=lambda kv: len(kv[0]), reverse=True):
+            replaced = re.sub(rf"\b{re.escape(name)}\b", f"({rhs})", out)
+            if replaced != out:
+                out = replaced
+                changed = True
+        if not changed:
+            break
+    return out
+
+
+def _is_symbolic_identity_tautology(expr: str) -> bool:
+    """Detect algebraic/trigonometric identities (e.g. sin(x)**2 + cos(x)**2 <= 1.05) via SymPy trigsimp."""
+    import ast as _ast
+    import sympy as sp
+    try:
+        node = _ast.parse(expr, mode="eval").body
+    except SyntaxError:
+        return False
+    if not isinstance(node, _ast.Compare) or len(node.ops) != 1:
+        return False
+    op = node.ops[0]
+    try:
+        lhs = sp.sympify(_ast.unparse(node.left))
+        rhs = sp.sympify(_ast.unparse(node.comparators[0]))
+        diff = sp.trigsimp(sp.simplify(lhs - rhs))
+    except Exception:
+        return False
+    if not diff.is_number or not diff.is_real:
+        return False
+    val = float(diff.evalf())
+    if not math.isfinite(val):
+        return False
+    if isinstance(op, _ast.LtE):
+        return val <= 0.0
+    if isinstance(op, _ast.Lt):
+        return val < 0.0
+    if isinstance(op, _ast.GtE):
+        return val >= 0.0
+    if isinstance(op, _ast.Gt):
+        return val > 0.0
+    if isinstance(op, _ast.Eq):
+        return abs(val) <= 1e-12
+    return False
+
+
 def verify_claim_fidelity(
     ledger: ClaimLedger,
     obligations: Sequence[Mapping[str, Any]],
     environmental_assumptions: Sequence[str],
     domain: Mapping[str, Sequence[float]],
+    *,
+    equations: Optional[Mapping[str, Any]] = None,
 ) -> List[ClaimFidelityViolation]:
-    """Verify obligations against the prompt's ClaimLedger (BUG-005).
+    """Verify obligations against the prompt's ClaimLedger (ARCH-008 / BUG-012).
 
-    1. Rejects any HYPOTHESIS_TARGET entailed by domain + environmental_assumptions
-       alone as `TAUTOLOGICAL_TARGET`.
-    2. Checks that explicit numeric claim thresholds from the prompt are covered
+    1. Inlines algebraic observable definitions (without dynamics) and checks
+       symbolic/trig identities before Z3, rejecting tautologies as `TAUTOLOGICAL_TARGET`.
+    2. Converts solver exceptions into `NONTRIVIALITY_UNDECIDED` (never silent pass).
+    3. Checks that explicit numeric claim thresholds from the prompt are covered
        by at least one HYPOTHESIS_TARGET obligation.
     """
     from .meaningfulness import _and, solve_query
@@ -285,6 +355,14 @@ def verify_claim_fidelity(
     env_list = [str(e) for e in environmental_assumptions if str(e).strip()]
     for ob in hyp_obs:
         expr = str(ob["expression"]).strip()
+        inlined_expr = _inline_static_algebraic_observables(expr, equations)
+        if _is_symbolic_identity_tautology(inlined_expr):
+            violations.append(ClaimFidelityViolation(
+                code="TAUTOLOGICAL_TARGET",
+                message=f"HYPOTHESIS_TARGET {expr!r} simplifies to a mathematical identity ({inlined_expr!r}).",
+                detail={"obligation_id": ob.get("id"), "expression": expr, "inlined": inlined_expr},
+            ))
+            continue
         try:
             q_neg = solve_query(_and([*env_list, f"not ({expr})"]), box, witness=True, timeout_ms=800)
             if q_neg.status == "UNSAT":
@@ -293,8 +371,12 @@ def verify_claim_fidelity(
                     message=f"HYPOTHESIS_TARGET {expr!r} is already entailed by domain/environment alone (tautology).",
                     detail={"obligation_id": ob.get("id"), "expression": expr},
                 ))
-        except Exception:
-            pass
+        except Exception as exc:
+            violations.append(ClaimFidelityViolation(
+                code="NONTRIVIALITY_UNDECIDED",
+                message=f"Nontriviality check raised {type(exc).__name__}: {exc}",
+                detail={"obligation_id": ob.get("id"), "expression": expr},
+            ))
 
     # Check threshold coverage for explicit prompt claim clauses
     all_hyp_text = " ".join(str(ob.get("expression") or "") for ob in hyp_obs)

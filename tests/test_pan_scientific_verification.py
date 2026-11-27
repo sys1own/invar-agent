@@ -308,8 +308,10 @@ def test_arbitrary_k_simplex_projector(k_slots: int, target_sum: float) -> None:
     for _ in range(25):
         ns["simulation_step"](buf, 0.05)
         buf.steps += 1
-    for inv in invariants:
-        assert _eval_invariant(inv.assertion, buf.data, {})
+    # ARCH-001: sanitize_intrinsics must NOT inject silent simplex projection to forge invariants;
+    # the unprojected kernel preserves its exact numerical dynamics.
+    assert "_invar_project" not in san.code
+    assert not _eval_invariant(invariants[0].assertion, buf.data, {})
 
 
 def test_statistical_domain_conditioners_and_semantic_tags() -> None:
@@ -360,8 +362,9 @@ def simulation_step(buf, dt):
 
     buf = _DummyBuf(contract.initial_state)
     ns["simulation_step"](buf, 0.01)
-    for inv in invariants:
-        assert _eval_invariant(inv.assertion, buf.data, {})
+    # ARCH-001: sanitize_intrinsics must NOT silently clamp state slots to satisfy invariants.
+    assert buf.data[2] == 10.0 and buf.data[3] == 0.05 and buf.data[4] == -1.5
+    assert not all(_eval_invariant(inv.assertion, buf.data, {}) for inv in invariants)
 
     # Native Rust PyHolographicHin semantic_tag check
     from invar_agent._native import PyHolographicHin

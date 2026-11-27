@@ -130,6 +130,9 @@ class ResearchRunRequest(BaseModel):
     # OPTIMAL_DIRECT / REFORMULATED_SURROGATE the pre-flight substring
     # heuristics must not reject the approved expert prompt on execution.
     prior_feasibility: Optional[Dict[str, Any]] = None
+    # ARCH-015: when True (used by Web UI), return HTTP 202 immediately with
+    # run_uid and stream planning/feasibility progress over SSE within <200ms.
+    async_plan: bool = False
 
 
 class ResearchActionRequest(BaseModel):
@@ -461,6 +464,15 @@ def _llm_status(state: ServerState) -> dict[str, Any]:
     }
 
 
+def _solver_status() -> dict[str, Any]:
+    """Z3 actor status for /api/status (ARCH-003)."""
+    try:
+        from invar_agent.runtime.isolation import get_z3_solver_status
+        return get_z3_solver_status()
+    except Exception:  # noqa: BLE001
+        return {"queue_age_s": 0.0, "pending": 0, "deferred_releases": 0}
+
+
 def _native_status() -> dict[str, Any]:
     status: dict[str, Any] = {"available": False, "modules": {}}
     try:
@@ -704,6 +716,7 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             },
             "workspace_root": str(state.workspace_root),
             "llm": _llm_status(state),
+            "solver": _solver_status(),
         }
 
     @app.post("/api/workspace/ingest")
@@ -1432,13 +1445,45 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
                     extra_secrets=[state.api_key] if state.api_key else (),
                 )
         feasibility = outcome["feasibility"]
-        if feasibility is not None and str(feasibility.verdict.value).upper().startswith("REFUSED"):
-            return {"status": "refused", "blueprint": None,
-                    "feasibility": feasibility.model_dump()}
+        if feasibility is not None:
+            verdict_upper = str(feasibility.verdict.value).upper()
+            if verdict_upper == "NEEDS_CLARIFICATION":
+                f_dump = feasibility.model_dump()
+                return {
+                    "state": "NEEDS_CLARIFICATION",
+                    "status": "needs_clarification",
+                    "run_uid": diag_run_uid,
+                    "blueprint": None,
+                    "questions": list(
+                        getattr(feasibility, "questions", None)
+                        or f_dump.get("questions")
+                        or getattr(feasibility, "clarifying_questions", None)
+                        or f_dump.get("clarifying_questions")
+                        or []
+                    ),
+                    "feasibility": f_dump,
+                    "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
+                }
+            if verdict_upper.startswith("REFUSED"):
+                f_dump = feasibility.model_dump()
+                return {
+                    "state": verdict_upper,
+                    "status": "refused",
+                    "run_uid": diag_run_uid,
+                    "blueprint": None,
+                    "refusal": f_dump,
+                    "feasibility": f_dump,
+                    "diagnostics_summary": {"verdict": verdict_upper, "rationale": f_dump.get("rationale", "")},
+                }
         blueprint_dict = outcome["blueprint"]
         if not blueprint_dict:
-            raise HTTPException(status_code=502,
-                                detail="research plan synthesis returned no blueprint")
+            return {
+                "state": "INCONCLUSIVE_UNVERIFIED",
+                "status": "inconclusive",
+                "run_uid": diag_run_uid,
+                "blueprint": None,
+                "diagnostics_summary": {"code": "NO_BLUEPRINT", "message": "research plan synthesis returned no blueprint"},
+            }
         bp = ResearchBlueprint.model_validate(blueprint_dict)
         if feasibility is not None:
             bp = bp.model_copy(update={"feasibility": feasibility})
@@ -1507,193 +1552,273 @@ def create_app(workspace_root: str | Path | None = None, provider: Optional[str]
             _research_vault_context(req.question, req.attached_research_ids)
             if req.attached_research_ids else ""
         )
-        # ARCH-006: Allocate run_uid BEFORE planning starts so every outcome emits
-        # exactly one terminal SSE v2.0 event scoped to this run_uid.
+        # ARCH-010: Allocate run_uid BEFORE planning starts and create a run-scoped
+        # telemetry session that propagates across planning + execution.
+        from invar_agent.llm.telemetry import (
+            LLMTelemetrySession,
+            _ACTIVE_SESSION,
+            get_llm_telemetry_summary,
+        )
+
         diag_run_uid = manager.allocate_run_uid()
-        attempt_sink: list[dict[str, Any]] = []
-        sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
-        diag_dir: Optional[Path] = None
 
         async def _scoped_plan_progress(channel: str, payload: dict[str, Any]) -> None:
             await manager._progress(channel, payload, run_uid=diag_run_uid)
 
-        try:
-            outcome = await generate_plan_with_feasibility(
-                req.question,
-                llm_complete=(
-                    (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
-                staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
-                fallback=not has_llm,
-                assume_feasible=assume_feasible,
-                extra_context=direct_ctx,
-                progress_cb=_scoped_plan_progress,
-            )
-        except (FormalizationError, ValueError) as exc:
-            from invar_agent.research.epistemic import incomplete_certificate
-            from invar_agent.research.vault import ResearchVaultManager, write_vault_manifest
+        async def _execute_plan_and_dispatch(*, background: bool = False) -> dict[str, Any]:
+            attempt_sink: list[dict[str, Any]] = []
+            sink_token = _FORMALIZATION_ATTEMPT_SINK.set(attempt_sink)
+            telemetry_token = _ACTIVE_SESSION.set(LLMTelemetrySession(run_id=diag_run_uid))
+            diag_dir: Optional[Path] = None
+            try:
+                try:
+                    outcome = await generate_plan_with_feasibility(
+                        req.question,
+                        llm_complete=(
+                            (lambda q: _plan_llm_callable(state, q)) if has_llm else None),
+                        staged_llm_call=(_staged_llm_callable(state) if has_llm else None),
+                        fallback=not has_llm,
+                        assume_feasible=assume_feasible,
+                        extra_context=direct_ctx,
+                        progress_cb=_scoped_plan_progress,
+                    )
+                except (FormalizationError, ValueError) as exc:
+                    from invar_agent.research.epistemic import incomplete_certificate
+                    from invar_agent.research.vault import ResearchVaultManager, write_vault_manifest
 
-            if isinstance(exc, FormalizationError):
-                attempts_to_save = attempt_sink or list(exc.validation_attempts)
-                diag_dir = persist_formalization_diagnostics(
-                    state.workspace_root,
-                    diag_run_uid,
-                    attempts_to_save,
-                    extra_secrets=[state.api_key] if state.api_key else (),
-                )
-                detail = exc.structured_detail(
-                    run_uid=diag_run_uid,
-                    diagnostics_dir=str(diag_dir) if diag_dir else None,
-                )
-            else:
-                detail = {
-                    "code": "PLANNING_VALIDATION_FAILED",
-                    "message": str(exc),
-                    "error_type": type(exc).__name__,
-                    "run_uid": diag_run_uid,
-                    "attempts": [],
-                    "per_field_diagnostics": [],
-                }
-            certificate = incomplete_certificate(
-                diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
-            )
-            vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
-            vault_dir.mkdir(parents=True, exist_ok=True)
-            (vault_dir / "meaningfulness_certificate.json").write_text(
-                certificate.model_dump_json(indent=2), encoding="utf-8"
-            )
-            (vault_dir / "blueprint.json").write_text(
-                json.dumps({"blueprint_id": diag_run_uid, "research_prompt": req.question}, indent=2),
-                encoding="utf-8",
-            )
-            (vault_dir / "unified_module.py").write_text("", encoding="utf-8")
-            (vault_dir / "report.md").write_text(
-                f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
-                encoding="utf-8",
-            )
-            (vault_dir / "metadata.json").write_text(
-                json.dumps(dict(
-                    run_id=diag_run_uid,
-                    status="INCONCLUSIVE_UNVERIFIED",
-                    epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
-                    failure_reason="PLANNING_VALIDATION_FAILED",
-                    planning_error=detail["message"],
-                    diagnostics=detail,
-                )),
-                encoding="utf-8",
-            )
-            write_vault_manifest(
-                vault_dir,
-                run_id=diag_run_uid,
-                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
-                status="INCONCLUSIVE_UNVERIFIED",
-            )
-            state.research_broadcaster.publish_terminal(
-                diag_run_uid,
-                status="INCONCLUSIVE_UNVERIFIED",
-                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
-                stage="Planning",
-                error=detail["message"],
-                extra={"code": "PLANNING_VALIDATION_FAILED"},
-            )
-            return {
-                "status": "inconclusive",
-                "code": "PLANNING_VALIDATION_FAILED",
-                "started": False,
-                "blueprint": None,
-                "run_uid": diag_run_uid,
-                "diagnostics": detail,
-            }
-        except Exception as exc:  # noqa: BLE001
-            from invar_agent.ir.total_fsm import TotalBoundaryAdapter
-            lifted = TotalBoundaryAdapter.lift_sync_error(exc)
-            state.research_broadcaster.publish_terminal(
-                diag_run_uid,
-                status="FAILED",
-                epistemic_verdict=lifted.get("terminal_state", "INCONCLUSIVE_UNVERIFIED"),
-                stage="Planning",
-                error=str(exc),
-                receipt=lifted,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"research plan synthesis failed: {str(exc)}")
-        finally:
-            _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
-            if attempt_sink and diag_dir is None:
-                persist_formalization_diagnostics(
-                    state.workspace_root,
-                    diag_run_uid,
-                    attempt_sink,
-                    extra_secrets=[state.api_key] if state.api_key else (),
-                )
-        feasibility = outcome["feasibility"]
-        if feasibility is not None:
-            verdict_upper = str(feasibility.verdict.value).upper()
-            if verdict_upper == "NEEDS_CLARIFICATION":
-                state.research_broadcaster.publish_terminal(
-                    diag_run_uid,
-                    status="NEEDS_CLARIFICATION",
-                    epistemic_verdict="NEEDS_CLARIFICATION",
-                    stage="Feasibility",
-                    extra={
-                        "questions": list(getattr(feasibility, "questions", None) or []),
-                        "missing_fields": list(getattr(feasibility, "missing_fields", None) or []),
-                    },
-                )
-                return {
-                    "status": "needs_clarification",
-                    "started": False,
-                    "blueprint": None,
-                    "run_uid": diag_run_uid,
-                    "feasibility": feasibility.model_dump(),
-                    "questions": list(getattr(feasibility, "questions", None) or []),
-                    "missing_fields": list(getattr(feasibility, "missing_fields", None) or []),
-                }
-            if verdict_upper.startswith("REFUSED"):
-                state.research_broadcaster.publish_terminal(
-                    diag_run_uid,
-                    status=verdict_upper,
-                    epistemic_verdict=verdict_upper,
-                    stage="Feasibility",
-                    extra={"feasibility": feasibility.model_dump()},
-                )
-                return {"status": "refused", "started": False, "blueprint": None,
+                    if isinstance(exc, FormalizationError):
+                        attempts_to_save = attempt_sink or list(exc.validation_attempts)
+                        diag_dir = persist_formalization_diagnostics(
+                            state.workspace_root,
+                            diag_run_uid,
+                            attempts_to_save,
+                            extra_secrets=[state.api_key] if state.api_key else (),
+                        )
+                        detail = exc.structured_detail(
+                            run_uid=diag_run_uid,
+                            diagnostics_dir=str(diag_dir) if diag_dir else None,
+                        )
+                    else:
+                        detail = {
+                            "code": "PLANNING_VALIDATION_FAILED",
+                            "message": str(exc),
+                            "error_type": type(exc).__name__,
+                            "run_uid": diag_run_uid,
+                            "attempts": [],
+                            "per_field_diagnostics": [],
+                        }
+                    certificate = incomplete_certificate(
+                        diag_run_uid, req.question, "PLANNING_VALIDATION_FAILED", diagnostics=detail
+                    )
+                    vault_dir = ResearchVaultManager(state.workspace_root).run_dir(diag_run_uid)
+                    vault_dir.mkdir(parents=True, exist_ok=True)
+                    (vault_dir / "meaningfulness_certificate.json").write_text(
+                        certificate.model_dump_json(indent=2), encoding="utf-8"
+                    )
+                    (vault_dir / "blueprint.json").write_text(
+                        json.dumps({"blueprint_id": diag_run_uid, "research_prompt": req.question}, indent=2),
+                        encoding="utf-8",
+                    )
+                    (vault_dir / "unified_module.py").write_text("", encoding="utf-8")
+                    (vault_dir / "report.md").write_text(
+                        f"# Research planning did not complete\n\nPLANNING_VALIDATION_FAILED\n\n{detail['message']}\n",
+                        encoding="utf-8",
+                    )
+                    scoped_llm_tel = get_llm_telemetry_summary()
+                    (vault_dir / "metadata.json").write_text(
+                        json.dumps(dict(
+                            run_id=diag_run_uid,
+                            status="INCONCLUSIVE_UNVERIFIED",
+                            epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                            failure_reason="PLANNING_VALIDATION_FAILED",
+                            planning_error=detail["message"],
+                            diagnostics=detail,
+                            llm_telemetry=scoped_llm_tel,
+                        )),
+                        encoding="utf-8",
+                    )
+                    write_vault_manifest(
+                        vault_dir,
+                        run_id=diag_run_uid,
+                        epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                        status="INCONCLUSIVE_UNVERIFIED",
+                        llm_telemetry=scoped_llm_tel,
+                    )
+                    state.research_broadcaster.publish_terminal(
+                        diag_run_uid,
+                        status="INCONCLUSIVE_UNVERIFIED",
+                        epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                        stage="Planning",
+                        error=detail["message"],
+                        extra={"code": "PLANNING_VALIDATION_FAILED", "diagnostics": detail},
+                    )
+                    return {
+                        "state": "INCONCLUSIVE_UNVERIFIED",
+                        "status": "inconclusive",
+                        "code": "PLANNING_VALIDATION_FAILED",
+                        "started": False,
+                        "blueprint": None,
                         "run_uid": diag_run_uid,
-                        "feasibility": feasibility.model_dump()}
-        blueprint_dict = outcome["blueprint"]
-        if not blueprint_dict:
-            state.research_broadcaster.publish_terminal(
-                diag_run_uid,
-                status="FAILED",
-                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
-                stage="Planning",
-                error="research plan synthesis returned no blueprint",
-            )
-            raise HTTPException(status_code=502,
-                                detail="research plan synthesis returned no blueprint")
-        bp = ResearchBlueprint.model_validate(blueprint_dict)
-        if feasibility is not None:
-            bp = bp.model_copy(update={"feasibility": feasibility})
-        bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
-        manager.seeded_upload_ids = seeded
-        manager.request_plan(bp)
-        try:
-            approved = manager.approve(run_uid=diag_run_uid)
-        except TypeError:
-            approved = manager.approve()
-        if not approved:
-            state.research_broadcaster.publish_terminal(
-                diag_run_uid,
-                status="FAILED",
-                epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
-                stage="Approval",
-                error="could not start research run",
-            )
-            raise HTTPException(status_code=409, detail="could not start research run")
-        return {"status": "running", "started": True, "blueprint_id": bp.blueprint_id,
+                        "diagnostics": detail,
+                        "diagnostics_summary": detail.get("message", "PLANNING_VALIDATION_FAILED"),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    from invar_agent.ir.total_fsm import TotalBoundaryAdapter
+                    lifted = TotalBoundaryAdapter.lift_sync_error(exc)
+                    state.research_broadcaster.publish_terminal(
+                        diag_run_uid,
+                        status="FAILED",
+                        epistemic_verdict=lifted.get("terminal_state", "INCONCLUSIVE_UNVERIFIED"),
+                        stage="Planning",
+                        error=str(exc),
+                        receipt=lifted,
+                    )
+                    if background:
+                        return {
+                            "state": "INCONCLUSIVE_UNVERIFIED",
+                            "status": "inconclusive",
+                            "started": False,
+                            "run_uid": diag_run_uid,
+                            "diagnostics_summary": str(exc),
+                        }
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"research plan synthesis failed: {str(exc)}")
+                finally:
+                    _FORMALIZATION_ATTEMPT_SINK.reset(sink_token)
+                    if attempt_sink and diag_dir is None:
+                        persist_formalization_diagnostics(
+                            state.workspace_root,
+                            diag_run_uid,
+                            attempt_sink,
+                            extra_secrets=[state.api_key] if state.api_key else (),
+                        )
+                feasibility = outcome["feasibility"]
+                if feasibility is not None:
+                    verdict_upper = str(feasibility.verdict.value).upper()
+                    if verdict_upper == "NEEDS_CLARIFICATION":
+                        questions = list(getattr(feasibility, "questions", None) or [])
+                        missing_fields = list(getattr(feasibility, "missing_fields", None) or [])
+                        state.research_broadcaster.publish_terminal(
+                            diag_run_uid,
+                            status="NEEDS_CLARIFICATION",
+                            epistemic_verdict="NEEDS_CLARIFICATION",
+                            stage="Feasibility",
+                            extra={
+                                "feasibility": feasibility.model_dump(),
+                                "questions": questions,
+                                "missing_fields": missing_fields,
+                            },
+                        )
+                        return {
+                            "state": "NEEDS_CLARIFICATION",
+                            "status": "needs_clarification",
+                            "started": False,
+                            "blueprint": None,
+                            "run_uid": diag_run_uid,
+                            "feasibility": feasibility.model_dump(),
+                            "questions": questions,
+                            "missing_fields": missing_fields,
+                            "diagnostics_summary": feasibility.rationale,
+                        }
+                    if verdict_upper.startswith("REFUSED"):
+                        state.research_broadcaster.publish_terminal(
+                            diag_run_uid,
+                            status=verdict_upper,
+                            epistemic_verdict=verdict_upper,
+                            stage="Feasibility",
+                            extra={"feasibility": feasibility.model_dump()},
+                        )
+                        return {
+                            "state": verdict_upper,
+                            "status": "refused",
+                            "started": False,
+                            "blueprint": None,
+                            "run_uid": diag_run_uid,
+                            "feasibility": feasibility.model_dump(),
+                            "refusal": feasibility.model_dump(),
+                            "diagnostics_summary": feasibility.rationale,
+                        }
+                blueprint_dict = outcome["blueprint"]
+                if not blueprint_dict:
+                    state.research_broadcaster.publish_terminal(
+                        diag_run_uid,
+                        status="FAILED",
+                        epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                        stage="Planning",
+                        error="research plan synthesis returned no blueprint",
+                    )
+                    if background:
+                        return {
+                            "state": "INCONCLUSIVE_UNVERIFIED",
+                            "status": "inconclusive",
+                            "started": False,
+                            "run_uid": diag_run_uid,
+                            "diagnostics_summary": "research plan synthesis returned no blueprint",
+                        }
+                    raise HTTPException(status_code=502,
+                                        detail="research plan synthesis returned no blueprint")
+                bp = ResearchBlueprint.model_validate(blueprint_dict)
+                if feasibility is not None:
+                    bp = bp.model_copy(update={"feasibility": feasibility})
+                bp, seeded = _seed_blueprint_from_uploads(bp, req.attached_research_ids)
+                manager.seeded_upload_ids = seeded
+                manager.request_plan(bp)
+                try:
+                    approved = manager.approve(run_uid=diag_run_uid)
+                except TypeError:
+                    approved = manager.approve()
+                if not approved:
+                    state.research_broadcaster.publish_terminal(
+                        diag_run_uid,
+                        status="FAILED",
+                        epistemic_verdict="INCONCLUSIVE_UNVERIFIED",
+                        stage="Approval",
+                        error="could not start research run",
+                    )
+                    if background:
+                        return {
+                            "state": "INCONCLUSIVE_UNVERIFIED",
+                            "status": "inconclusive",
+                            "started": False,
+                            "run_uid": diag_run_uid,
+                            "diagnostics_summary": "could not start research run",
+                        }
+                    raise HTTPException(status_code=409, detail="could not start research run")
+                return {
+                    "state": "RUNNING",
+                    "status": "running",
+                    "started": True,
+                    "blueprint_id": bp.blueprint_id,
+                    "run_uid": diag_run_uid,
+                    "source": outcome.get("source"),
+                    "feasibility": feasibility.model_dump() if feasibility else None,
+                }
+            finally:
+                _ACTIVE_SESSION.reset(telemetry_token)
+
+        if req.async_plan:
+            state.research_broadcaster.begin_run(diag_run_uid)
+            state.research_broadcaster.publish({
+                "channel": "activity_log",
+                "event": "activity",
+                "stage": "FEASIBILITY",
+                "step": "planning_started",
+                "message": "Evaluating epistemic feasibility and formalizing model…",
                 "run_uid": diag_run_uid,
-                "source": outcome.get("source"),
-                "feasibility": feasibility.model_dump() if feasibility else None}
+            })
+            asyncio.create_task(_execute_plan_and_dispatch(background=True))
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "state": "PLANNING",
+                    "status": "planning",
+                    "started": True,
+                    "run_uid": diag_run_uid,
+                },
+            )
+
+        return await _execute_plan_and_dispatch(background=False)
 
     @app.post("/api/v1/research/action")
     def api_research_action(req: ResearchActionRequest) -> dict[str, Any]:

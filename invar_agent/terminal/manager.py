@@ -101,7 +101,24 @@ class TerminalSession:
         self._reader.start()
 
     def _start_windows(self) -> None:  # pragma: no cover - Windows path
+        self._winpty = None
+        try:
+            from winpty import PtyProcess  # type: ignore
+            self._winpty = PtyProcess.spawn(
+                "cmd.exe /K chcp 65001 >nul",
+                cwd=str(self.cwd),
+                dimensions=(self.rows, self.cols),
+            )
+            self.pid = getattr(self._winpty, "pid", None)
+            self._reader = threading.Thread(
+                target=self._winpty_reader, name=f"terminal-winpty-{self.pid}", daemon=True)
+            self._reader.start()
+            return
+        except Exception:
+            self._winpty = None
+
         shell = _default_shell()
+        cmd = [shell, "/K", "chcp 65001 >nul"] if shell.lower().endswith("cmd.exe") else [shell]
         kwargs: Dict[str, Any] = {
             "cwd": str(self.cwd),
             "stdin": subprocess.PIPE,
@@ -111,8 +128,9 @@ class TerminalSession:
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        self._proc = subprocess.Popen([shell], **kwargs)
+        self._proc = subprocess.Popen(cmd, **kwargs)
         self.pid = self._proc.pid
+        self._out.put(b"[invar-terminal: Windows pipe fallback mode (UTF-8, CR->CRLF)]\r\n")
         self._reader = threading.Thread(
             target=self._windows_reader, name=f"terminal-reader-{self.pid}", daemon=True)
         self._reader.start()
@@ -138,6 +156,18 @@ class TerminalSession:
                 self._out.put(chunk)
         finally:
             sel.close()
+            self._out.put(None)
+
+    def _winpty_reader(self) -> None:  # pragma: no cover - Windows ConPTY path
+        try:
+            while not self._stop.is_set() and self._winpty is not None:
+                chunk = self._winpty.read(4096)
+                if not chunk:
+                    break
+                self._out.put(chunk.encode("utf-8", errors="replace") if isinstance(chunk, str) else chunk)
+        except (OSError, ValueError, EOFError):
+            pass
+        finally:
             self._out.put(None)
 
     def _windows_reader(self) -> None:  # pragma: no cover - Windows path
@@ -181,9 +211,17 @@ class TerminalSession:
                 except OSError:
                     return
                 view = view[n:]
-        else:
+        elif getattr(self, "_winpty", None) is not None:
             try:
-                self._proc.stdin.write(data)  # type: ignore[union-attr]
+                self._winpty.write(data.decode("utf-8", errors="replace"))
+            except (OSError, ValueError):
+                pass
+        else:
+            # ARCH-015 (BUG-023): Translate bare CR (\r) from xterm.js into CRLF (\r\n)
+            # so piped cmd.exe executes commands immediately on Enter.
+            translated = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+            try:
+                self._proc.stdin.write(translated)  # type: ignore[union-attr]
                 self._proc.stdin.flush()  # type: ignore[union-attr]
             except (OSError, ValueError):
                 pass

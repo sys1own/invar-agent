@@ -80,25 +80,46 @@ def apply_ir_override(ir: CanonicalResearchIR, override: IRReviewOverride) -> Ca
             target.canonical_latex = patch.canonical_latex
         if patch.role is not None:
             target.role = patch.role
+    override_invalidates_cert = bool(override.equation_patches)
+    cert_domain = candidate.certified_valid_domain if isinstance(candidate.certified_valid_domain, dict) else None
     for patch in override.constant_patches:
         target = next((c for c in candidate.constants if c.constant_id == patch.constant_id), None)
         if target is None:
             raise FormalGateError("IR_OVERRIDE_INVALID", patch.constant_id)
         if patch.drop:
             candidate.constants.remove(target)
+            override_invalidates_cert = True
             continue
         if patch.si_value is not None:
             target.si_value = patch.si_value
+            if cert_domain is None or target.symbol not in cert_domain:
+                override_invalidates_cert = True
+            else:
+                bounds_pair = cert_domain[target.symbol]
+                if (
+                    not isinstance(bounds_pair, (list, tuple))
+                    or len(bounds_pair) != 2
+                    or not (float(bounds_pair[0]) <= float(patch.si_value) <= float(bounds_pair[1]))
+                ):
+                    override_invalidates_cert = True
         if patch.raw_unit is not None:
             _, unit = normalize_to_si(1, patch.raw_unit)
             target.dimension = unit_dimension(unit)
             target.dimension.canonical_unit = unit
             target.raw_unit = patch.raw_unit
+            override_invalidates_cert = True
         if patch.bounds is not None:
             target.bounds = patch.bounds
         if patch.is_tunable_parameter is not None:
             target.is_tunable_parameter = patch.is_tunable_parameter
         target.verification_status = VerificationStatus.USER_OVERRIDDEN
+    if override_invalidates_cert and (
+        candidate.research_import_role == "POSITIVE_EVIDENCE"
+        or str(candidate.epistemic_verdict or "").startswith("VERIFIED_")
+    ):
+        # ARCH-012 (BUG-020): Override outside certified_valid_domain downgrades certificate role.
+        candidate.research_import_role = "USER_MODIFIED_UNVERIFIED"
+        candidate.epistemic_verdict = "USER_MODIFIED_UNVERIFIED"
     resolved_derived_symbols: set[str] = set()
     for resolution in override.symbol_resolutions:
         sym = resolution.symbol.strip()
@@ -285,8 +306,13 @@ class CanonicalResearchIngestionPipeline:
         for index, equation in enumerate(ir.equations):
             equation.equation_id = f"equation:{index}"
             if equation.role == EquationRole.EVOLUTION_LAW and equation.lhs_symbol and equation.lhs_symbol not in {s.symbol for s in ir.state_variables}:
+                state_dim = SIDimensionVectorModel()
+                if equation.dimension_lhs is not None:
+                    exps = list(equation.dimension_lhs.exponents)
+                    exps[2] = exps[2] + 1
+                    state_dim = SIDimensionVectorModel(exponents=tuple(exps))
                 ir.state_variables.append(StateVariableSpec(symbol=equation.lhs_symbol, slot_index=len(ir.state_variables),
-                    dimension=SIDimensionVectorModel(), provenance=equation.provenance))
+                    dimension=state_dim, provenance=equation.provenance))
         for index, flag in enumerate(ir.disambiguation_flags):
             flag.flag_id = f"flag:{index}"
         states = {state.symbol: state for state in ir.state_variables}

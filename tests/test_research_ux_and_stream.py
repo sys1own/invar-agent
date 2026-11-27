@@ -210,7 +210,7 @@ async def test_healing_activity_stream_and_sse_heartbeat(tmp_path):
 
     import invar_agent.server as server
     orig = server.RESEARCH_SSE_HEARTBEAT
-    server.RESEARCH_SSE_HEARTBEAT = 0.2
+    server.RESEARCH_SSE_HEARTBEAT = 0.05
     app = server.create_app(workspace_root=str(tmp_path))
     scope = {"type": "http", "http_version": "1.1", "method": "GET",
              "scheme": "http", "path": "/api/v1/research/stream",
@@ -218,12 +218,13 @@ async def test_healing_activity_stream_and_sse_heartbeat(tmp_path):
              "headers": [], "client": ("test", 50000), "server": ("test", 80),
              "asgi": {"version": "3.0", "spec_version": "2.4"}}
     request_sent = {"done": False}
+    got_keepalive = asyncio.Event()
 
     async def receive():
         if not request_sent["done"]:
             request_sent["done"] = True
             return {"type": "http.request", "body": b"", "more_body": False}
-        await asyncio.sleep(3600)
+        await got_keepalive.wait()
         return {"type": "http.disconnect"}
 
     async def collect_sse() -> List[bytes]:
@@ -231,14 +232,16 @@ async def test_healing_activity_stream_and_sse_heartbeat(tmp_path):
 
         async def send(msg):
             if msg.get("type") == "http.response.body":
-                bodies.append(msg.get("body") or b"")
+                chunk = msg.get("body") or b""
+                bodies.append(chunk)
+                if b": keep-alive" in chunk:
+                    got_keepalive.set()
 
         task = asyncio.create_task(app(scope, receive, send))
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if any(b": keep-alive" in body for body in bodies):
-                break
-            await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(got_keepalive.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            pass
         task.cancel()
         try:
             await task

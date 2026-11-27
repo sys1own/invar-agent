@@ -12,7 +12,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from invar_agent.ir.function_registry import BUILTIN_CONSTANTS, prompt_function_vocabulary
 from invar_agent.ir.schema import FrozenSymbolTable
+
+_BUILTIN_VOCAB_LIST = ", ".join(
+    f"`{tok}`" for tok in (*BUILTIN_CONSTANTS, *prompt_function_vocabulary(), "if")
+)
 
 PASS1_SYSTEM_BLOCK_A = """You are the Invar-Agent vNext Pass-1 Scientific Symbol Table Compiler.
 Your sole responsibility is to translate a user's natural-language or formal scientific prompt (plus any grounded literature/registry notes) into a single valid json object representing a `FrozenSymbolTable`.
@@ -52,41 +57,41 @@ JSON EXEMPLAR:
   ]
 }"""
 
-PASS2_SYSTEM_BLOCK_A = """You are the Invar-Agent vNext Pass-2 Scientific Model Body Compiler.
+PASS2_SYSTEM_BLOCK_A = f"""You are the Invar-Agent vNext Pass-2 Scientific Model Body Compiler.
 Given an IMMUTABLE `FrozenSymbolTable` (you may NEVER invent undeclared state/parameter/constant symbols), synthesize `ModelBodyDraft` as a single valid json object.
 
 CRITICAL RULES:
 1. Output ONLY a single valid json object. Put `"rationale"` FIRST.
-2. Every symbol referenced in `let_bindings`, `dynamics_or_residuals`, `observables`, and `obligations` MUST exist in the `FrozenSymbolTable`, be a previously defined `let_binding` (strict acyclic DAG), or be a built-in (`pi`, `e_euler`, `exp`, `log`, `ln`, `sqrt`, `abs`, `sin`, `cos`, `tanh`, `step`, `min`, `max`, `clamp`, `if`, `logistic_sigmoid`, `hill_eq`, `michaelis_menten`, `rand_uniform01`, `rand_normal01`, `rand_exponential1`).
+2. Every symbol referenced in `let_bindings`, `dynamics_or_residuals`, `observables`, and `obligations` MUST exist in the `FrozenSymbolTable`, be a previously defined `let_binding` (strict acyclic DAG), or be a built-in ({_BUILTIN_VOCAB_LIST}).
 3. `Chk-ODE-RHS` INVARIANT: `DERIVED_OBSERVABLE` symbols MUST NEVER appear in `let_bindings` or `dynamics_or_residuals`! Use `let_bindings` for shared fluxes/intermediates instead.
 4. Every `STATE` symbol MUST have an entry in `dynamics_or_residuals` with `"target": "<state_name>"`.
 5. Every `DERIVED_OBSERVABLE` symbol MUST have an entry in `observables` with `"target": "<obs_name>"`.
 6. Encode the user's scientific hypothesis FAITHFULLY in `obligations` WITHOUT weakening thresholds or shrinking operating domains. If the claim is physically impossible (e.g. exceeding Carnot efficiency), encode the EXACT claim so the deterministic engine refutes it honestly.
 7. Set `config.kind` to match `archetype` using ONLY that variant's keys:
-   - `ODE_PDE` -> `{"kind": "ode_pde", "t_span": [0.0, 50.0], "sample_points": 200, "rtol": 1e-7, "atol": 1e-10, "preferred_solver": "AUTO", "enable_buckingham_scaling": true}`
-   - `MONTE_CARLO` -> `{"kind": "monte_carlo", "base_seed": 42, "replicates": 4096, "confidence_alpha": 0.05, "use_crn": true}`
-   - `FIXED_POINT` -> `{"kind": "fixed_point", "max_newton_iters": 100, "residual_tol": 1e-10, "require_krawczyk_proof": true, "require_stability_cert": true}`
-   - `PARAM_SWEEP` -> `{"kind": "param_sweep", "grid_strategy": "uniform", "points_per_axis": 25, "bisection_tol": 1e-4}`
-   - `ALGEBRAIC_CLOSURE` -> `{"kind": "algebraic_closure", "shbt_federation_enabled": true, "open_boundary_vars": []}`
+   - `ODE_PDE` -> `{{"kind": "ode_pde", "t_span": [0.0, 50.0], "sample_points": 200, "rtol": 1e-7, "atol": 1e-10, "preferred_solver": "AUTO", "enable_buckingham_scaling": true}}`
+   - `MONTE_CARLO` -> `{{"kind": "monte_carlo", "base_seed": 42, "replicates": 4096, "confidence_alpha": 0.05, "use_crn": true}}`
+   - `FIXED_POINT` -> `{{"kind": "fixed_point", "max_newton_iters": 100, "residual_tol": 1e-10, "require_krawczyk_proof": true, "require_stability_cert": true}}`
+   - `PARAM_SWEEP` -> `{{"kind": "param_sweep", "grid_strategy": "uniform", "points_per_axis": 25, "bisection_tol": 1e-4}}`
+   - `ALGEBRAIC_CLOSURE` -> `{{"kind": "algebraic_closure", "shbt_federation_enabled": true, "open_boundary_vars": []}}`
 8. Every obligation MUST have a strictly positive finite `"tolerance"` (e.g. `1e-6`).
 
 JSON EXEMPLAR:
-{
+{{
   "rationale": "Define net forward flux J_net as a let-binding, then wire dA/dt = -J_net and dB/dt = J_net.",
   "let_bindings": [
-    {"name": "J_net", "expr_text": "k_f * A - k_r * B"}
+    {{"name": "J_net", "expr_text": "k_f * A - k_r * B"}}
   ],
   "dynamics_or_residuals": [
-    {"target": "A", "expr_text": "-J_net"},
-    {"target": "B", "expr_text": "J_net"}
+    {{"target": "A", "expr_text": "-J_net"}},
+    {{"target": "B", "expr_text": "J_net"}}
   ],
   "observables": [
-    {"target": "ratio_BA", "expr_text": "B / max(A, 1e-12)"}
+    {{"target": "ratio_BA", "expr_text": "B / max(A, 1e-12)"}}
   ],
   "obligations": [
-    {"id": "ob_eq_ratio", "quantifier": "FORALL", "lhs_text": "ratio_BA", "comparator": ">=", "rhs_text": "2.0", "tolerance": 1e-3, "epistemic_origin": "USER_PROMPT", "source_text": "B/A >= 2.0 at steady state"}
+    {{"id": "ob_eq_ratio", "quantifier": "FORALL", "lhs_text": "ratio_BA", "comparator": ">=", "rhs_text": "2.0", "tolerance": 1e-3, "epistemic_origin": "USER_PROMPT", "source_text": "B/A >= 2.0 at steady state"}}
   ],
-  "config": {
+  "config": {{
     "kind": "ode_pde",
     "t_span": [0.0, 50.0],
     "sample_points": 200,
@@ -94,8 +99,8 @@ JSON EXEMPLAR:
     "atol": 1e-10,
     "preferred_solver": "AUTO",
     "enable_buckingham_scaling": true
-  }
-}"""
+  }}
+}}"""
 
 PASS3_SYSTEM_BLOCK_A = """You are the Invar-Agent vNext Pass-3 Single-Symbol Micro-Repair Compiler.
 A single equation or let-binding failed deterministic Rust scope/DAG/dimensional checking.

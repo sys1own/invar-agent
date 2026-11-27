@@ -142,6 +142,38 @@ class StagedSciIRSynthesizer:
             result.reason_code = InconclusiveReasonCode.PASS2_SYNTHESIS_EXHAUSTED
             return result
 
+        # ARCH-009: Allow ONE versioned, ledgered symbol-table revision when Pass 2
+        # legitimately introduces a derived observable absent from the Pass-1 table.
+        existing_names = {s.name for s in frozen_table.symbols}
+        missing_obs_targets = [
+            obs.target for obs in (body.observables or [])
+            if obs.target and obs.target not in existing_names and obs.target.isidentifier()
+        ]
+        if missing_obs_targets:
+            from invar_agent.ir.schema import AssumptionEntry, SiDimension, SlotRole, SymbolDecl
+            new_syms = list(frozen_table.symbols)
+            new_ledger = list(frozen_table.assumptions_ledger)
+            for tgt in dict.fromkeys(missing_obs_targets):
+                new_syms.append(SymbolDecl(
+                    name=tgt,
+                    display_symbol=tgt,
+                    role=SlotRole.DERIVED_OBSERVABLE,
+                    slot_index=len(new_syms),
+                    dimension=SiDimension(),
+                    initial_or_default=0.0,
+                    description=f"Pass-2 derived observable {tgt} added via versioned table revision",
+                ))
+                new_ledger.append(AssumptionEntry(
+                    id=f"REV_OBS_{tgt}",
+                    statement=f"Added derived observable '{tgt}' introduced by Pass-2 body.",
+                    source="PASS3_TABLE_REVISION",
+                    falsifiable_impact="Observable slot only; dynamics unchanged.",
+                ))
+            frozen_table = frozen_table.model_copy(
+                update={"symbols": new_syms, "assumptions_ledger": new_ledger}
+            ).assign_canonical_slot_indices()
+            result.frozen_table = frozen_table
+
         # ---- PASS 3: Deterministic Rust Scope Check + Bounded Single-Symbol Micro-Repair ----
         outcome = scope_check_and_lower(
             frozen_table,

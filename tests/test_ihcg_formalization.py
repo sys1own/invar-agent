@@ -166,11 +166,11 @@ async def test_three_failed_formalizations_persist_terminal_certificate(response
     async def formalizer(prompt): calls.append(prompt);return response
     machine = ResearchStateMachine(tmp_path/'research',workspace_root=tmp_path,llm_planner=planner,llm_formalizer=formalizer)
     result = await machine.plan_and_run(_FORMAL_EXAMPLE_PROMPT)
-    assert len(calls) == 3 and result.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
+    assert len(calls) == 2 and result.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
     directory = tmp_path/'.invar'/'research_vault'/result.run_id
     assert parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8")).failure_reason == 'PLANNING_VALIDATION_FAILED'
     error = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))['planning_error']
-    assert 'attempt 1:' in error and 'attempt 2:' in error and 'attempt 3:' in error
+    assert 'attempt 1:' in error and 'attempt 2:' in error
 
 
 def test_symbol_aliases_bind_only_through_explicit_sealed_indices():
@@ -267,13 +267,14 @@ async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(n
         # Without brittle prose-unit rejection, run4 carnot seals cleanly and runs downstream!
         assert len(prompts) >= 2
         return
-    assert len(prompts) == 4
+    # BUG-030: identical-fingerprint breaker stops on attempt 2 (3 prompts total); distinct errors run all 3 attempts (4 prompts).
+    assert len(prompts) in (3, 4)
     assert state.epistemic_verdict == 'INCONCLUSIVE_UNVERIFIED'
     directory = tmp_path/'.invar'/'research_vault'/state.run_id
     certificate = parse_run_certificate((directory/'meaningfulness_certificate.json').read_text(encoding="utf-8"))
     assert certificate.failure_reason == 'PLANNING_VALIDATION_FAILED'
     attempts = certificate.diagnostics['validation_attempts']
-    assert len(attempts) == 3
+    assert len(attempts) == len(prompts) - 1
     for index, (record, historical) in enumerate(zip(attempts,case['validation_errors'])):
         assert record['attempt'] == index+1
         if name == 'seir' and index in (0, 1):
@@ -286,7 +287,7 @@ async def test_run4_replay_persists_each_exact_error_and_all_encoding_feedback(n
         elif name == 'shbt' and index > 0: assert 'DEGENERATE_MECHANISM_DOMAIN' in record['error'] or record['error'].startswith('compiled contract has no sealed symbolic binding:')
         else: assert any(tok in record['error'] for tok in ('DEGENERATE_MECHANISM_DOMAIN', 'PREFLIGHT_REDUNDANT_CONJUNCTS', 'IHCG_INGEST_REJECTED:'))
         assert record['error_type'] == 'ValueError'
-        if index < 2: assert record['error'] in prompts[index+2]
+        if index + 2 < len(prompts): assert record['error'] in prompts[index+2]
     metadata = json.loads((directory/'metadata.json').read_text(encoding="utf-8"))
     assert metadata['diagnostics'] == certificate.diagnostics
     terminal = next(event for event in events if event['event'] == 'research_completed')

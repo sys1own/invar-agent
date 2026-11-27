@@ -135,26 +135,41 @@ def generate_comprehensive_research_report(
     results: Optional[List[SimulationResult]] = None,
     status: str = "",
     checkpoint_path: Optional[str] = None,
+    epistemic_verdict: Optional[str] = None,
 ) -> str:
     """Publication-grade Markdown report for a finished research run.
 
-    ``telemetry`` carries the final verified run telemetry (flat dict);
-    ``search_history`` is the literature ingest (list of dicts with
-    source/title/url/year/summary). ``results`` (optional) enables the
-    per-contract invariant audit table.
+    ARCH-002: Headings, metric statuses, and telemetry labels are derived
+    strictly from ``epistemic_verdict``. ``Verified`` appears only when
+    ``epistemic_verdict`` starts with ``VERIFIED_``. Stage statuses use
+    ``INVARIANTS_HELD`` rather than ``VERIFIED``. Placeholder ``state_N``
+    slots are omitted.
     """
+    from .epistemic import compute_evidence_status, is_verified_epistemic_verdict
+
     results = list(results or [])
     bp = blueprint
     feasibility = bp.feasibility
-    observables = extract_observables(bp.variable_map or {}, results) if results else {}
+    verdict_val = epistemic_verdict if epistemic_verdict is not None else status
+    is_certified = is_verified_epistemic_verdict(verdict_val)
+    filtered_vmap = {
+        k: v for k, v in (bp.variable_map or {}).items()
+        if not re.match(r"^state_\d+$", str(k))
+    }
+    observables = extract_observables(filtered_vmap, results) if results else {}
     # Fall back to flat telemetry obs_* entries when no SimulationResult list
     # is available (e.g. direct calls from tests or partial states).
     if not observables and telemetry:
         for key, value in telemetry.items():
-            if key.startswith("obs_") and isinstance(value, (int, float)):
+            if (
+                key.startswith("obs_")
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and not re.match(r"^state_\d+$", key[4:])
+            ):
                 observables[key[4:]] = {"value": float(value), "contract_id": "final",
                                         "stage": bp.current_stage or 1,
-                                        "status": status or "VERIFIED"}
+                                        "status": status or "OBSERVED_UNVERIFIED"}
     observables = _deduplicate_observables(observables)
 
     lines: List[str] = []
@@ -164,31 +179,42 @@ def generate_comprehensive_research_report(
     lines.append(f"**Hypothesis:** {bp.falsifiable_hypothesis}")
     lines.append("")
 
-    # -- 1. Executive summary & verified numerical findings ------------------
-    lines.append("## 1. Executive Summary & Verified Numerical Findings")
+    # -- 1. Executive summary & numerical findings ---------------------------
+    findings_heading = (
+        "## 1. Executive Summary & Verified Numerical Findings"
+        if is_certified
+        else "## 1. Executive Summary & Observed Numerical Findings (Unverified)"
+    )
+    lines.append(findings_heading)
     lines.append("")
     if observables:
-        lines.append("| Metric Name | Symbol | Computed Value | Unit | Verification Status |")
+        lines.append("| Metric Name | Symbol | Computed Value | Unit | Evidence Status |")
         lines.append("| :--- | :--- | :--- | :--- | :--- |")
         for name in sorted(observables):
             obs = observables[name]
-            st = "VERIFIED" if status == "VERIFIED" else (obs.get("status") or status or "VERIFIED")
+            ev_status = compute_evidence_status(
+                verdict_val,
+                obs.get("value"),
+                violated=(str(obs.get("status") or "").upper() == "FALSIFIED"),
+            )
             lines.append(
                 f"| {_nice_metric(name)} | `{_symbol_for(name)}` | "
-                f"**{_fmt_value(obs['value'])}** | {_unit_for(name, blueprint=bp)} | {st} |")
+                f"**{_fmt_value(obs['value'])}** | {_unit_for(name, blueprint=bp)} | `{ev_status}` |")
         lines.append("")
     else:
         lines.append("_No named observables were mapped in this blueprint "
                      "(`variable_map` empty); see telemetry below._")
         lines.append("")
-    verified = [r for r in results if r.status == "VERIFIED"]
-    if verified:
-        r = verified[-1]
+    invariants_held = [r for r in results if r.status == "VERIFIED"]
+    if invariants_held:
+        r = invariants_held[-1]
         tel_bits = ", ".join(
             f"{k}={_fmt_value(v)}" for k, v in sorted(r.telemetry.items())
             if isinstance(v, (int, float)) and k.startswith(("final_", "obs_"))
+            and not re.match(r"^obs_state_\d+$", k)
         )
-        lines.append(f"**Final verified telemetry** ({r.contract_id}, "
+        tel_heading = "Final verified telemetry" if is_certified else "Final observed telemetry (unverified)"
+        lines.append(f"**{tel_heading}** ({r.contract_id}, "
                      f"{r.execution_time_ms:.1f} ms): {tel_bits or 'n/a'}")
         lines.append("")
     elif telemetry:
@@ -294,14 +320,15 @@ def generate_comprehensive_research_report(
         for h in bp.evolution_history:
             # Full note text: mid-word slicing corrupted accretion records.
             note = f" — {h.note}" if h.note else ""
-            lines.append(f"| {h.stage} | {h.status} | `{h.bundle_hash[:16]}` |{note} |")
+            h_status = "INVARIANTS_HELD" if str(h.status or "").upper() == "VERIFIED" else h.status
+            lines.append(f"| {h.stage} | {h_status} | `{h.bundle_hash[:16]}` |{note} |")
         lines.append("")
 
-    # -- 5. Formal invariant verification & precision shield audit -----------
-    lines.append("## 5. Formal Invariant Verification & Precision Shield Audit")
+    # -- 5. Formal invariant audit & precision shield audit ------------------
+    lines.append("## 5. Formal Invariant Audit & Precision Shield")
     lines.append("")
     lines.append(f"- **Total invariants tested:** {inv_count}")
-    lines.append(f"- **SMT/Z3 consistency:** {'PASSED' if status in ('VERIFIED', 'PARTIAL') or results else 'n/a'}")
+    lines.append(f"- **SMT/Z3 consistency:** {'PASSED' if is_certified or results else 'n/a'}")
     times = [r.execution_time_ms for r in results if r.execution_time_ms]
     if times:
         lines.append(f"- **Sandbox execution:** {len(results)} contract run(s), "
@@ -311,19 +338,20 @@ def generate_comprehensive_research_report(
     else:
         lines.append("- **Sandbox execution:** no contract runs recorded.")
     lines.append(f"- **Run status:** `{status or 'n/a'}` "
-                 f"({len(bp.verified_layers)} verified stage(s) of {bp.target_research_stages})")
+                 f"({len(bp.verified_layers)} stage(s) with invariants held of {bp.target_research_stages})")
     if checkpoint_path:
         lines.append(f"- **Checkpoint:** `{checkpoint_path}`")
     lines.append("")
     if results:
-        lines.append("| Contract | Status | Time (ms) | Telemetry (final) |")
+        lines.append("| Contract | Stage Status | Time (ms) | Telemetry (final) |")
         lines.append("| :--- | :--- | :--- | :--- |")
         for r in results[-8:]:
             tel = ", ".join(
                 f"{k}={_fmt_value(v)}" for k, v in sorted(r.telemetry.items())
                 if isinstance(v, (int, float)) and k.startswith(("final_", "obs_"))
             ) or "n/a"
-            lines.append(f"| `{r.contract_id}` | {r.status} | "
+            row_st = "INVARIANTS_HELD" if str(r.status or "").upper() == "VERIFIED" else r.status
+            lines.append(f"| `{r.contract_id}` | {row_st} | "
                          f"{r.execution_time_ms:.1f} | {tel} |")
         lines.append("")
 
@@ -333,19 +361,20 @@ def generate_comprehensive_research_report(
     lines.append("1. **Ingest** — live literature retrieval (arXiv/OpenAlex/Wikipedia) "
                  "for the blueprint search queries; hits cached under `research/literature_cache/`.")
     lines.append("2. **GoI_Plan** — accretive stage synthesis coupling the pinned "
-                 "verified layers of the unified module.")
+                 "layers of the unified module.")
     lines.append("3. **SMT_Concolic_Verify** — Z3 consistency check of every contract "
                  "invariant set before execution.")
     lines.append("4. **Sandbox_Execute** — transpiled C++20 kernels compiled with "
                  "`-O3 -std=c++20 -fPIC -shared` and executed in an air-gapped, "
                  "resource-limited subprocess (zero-copy `SimulationBuffer`).")
     lines.append("5. **Reflex_Heal / Adjoint_Commit_or_Rollback** — falsified or "
-                 "diverged candidates are rolled back stage-scoped; only verified "
+                 "diverged candidates are rolled back stage-scoped; only passing "
                  "layers are pinned as checkpoints.")
     lines.append("")
     lines.append("---")
-    lines.append("_Generated deterministically from verified sandbox telemetry; "
-                 "no values are extrapolated._")
+    lines.append("_Generated deterministically from "
+                 + ("certified " if is_certified else "sandbox ")
+                 + "telemetry; no values are extrapolated._")
     return "\n".join(lines)
 
 

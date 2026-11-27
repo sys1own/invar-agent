@@ -85,9 +85,21 @@ def unit_dimension(unit: str) -> SIDimensionVectorModel:
     return SIDimensionVectorModel(exponents=powers)
 
 
+_RESERVED_KW_MANGLE = {
+    "lambda": "lambda_var",
+    "from": "from_var",
+    "class": "class_var",
+    "global": "global_var",
+}
+
+
+def mangle_reserved_symbol(name: str) -> str:
+    return _RESERVED_KW_MANGLE.get(name, name)
+
+
 def normalize_constant(raw: RawConstant, constant_id: str) -> ExtractedConstant:
     unit = re.sub(r"\\(?:mathrm|text)\{([^{}]*)\}", r"\1", raw.unit.strip())
-    unit = unit.replace("{", "").replace("}", "").replace("\\,", "") or "1"
+    unit = unit.replace("{", "").replace("}", "").replace("\\,", "").rstrip(".,;") or "1"
     value, canonical = normalize_to_si(float(raw.value), unit)
     if not math.isfinite(value):
         raise FormalGateError("HIN_NONFINITE_LITERAL", raw.symbol)
@@ -180,16 +192,39 @@ def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
         return expr.xreplace(subs) if subs else expr
 
     def latex_expression(source):
+        # ARCH-014 (BUG-022):
+        # 1. Prefix bare Greek names (e.g. `sigma`) with `\` so parse_latex does not
+        #    split `sigma` into `s*i*g*m*a`.
+        # 2. Insert explicit `\cdot` for implicit products after closing parens like
+        #    `(...) P_0` and `(...) \exp(...)`.
+        src = re.sub(
+            r"(?<![\\A-Za-z])(alpha|beta|gamma|delta|epsilon|eta|theta|kappa|lambda|mu|nu|xi|rho|sigma|tau|phi|psi|omega)(?![A-Za-z])",
+            r"\\mathit{\1}",
+            source,
+        )
+        src = re.sub(r"([)}])\s+(?=[A-Za-z\\])", r"\1 \\cdot ", src)
         try:
-            result = parse_latex(source, backend="lark")
+            result = parse_latex(src, backend="lark")
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError(f"Unparseable LaTeX expression: {exc}") from exc
+        if isinstance(result, (list, tuple, set)):
+            basics = [item for item in result if isinstance(item, sp.Basic)]
+            if basics:
+                result = basics[0]
+        elif hasattr(result, "children"):
+            basics = [item for item in result.children if isinstance(item, sp.Basic)]
+            if basics:
+                result = basics[0]
         if not isinstance(result, sp.Basic):
             raise ValueError("Ambiguous LaTeX expression")
-        result = result.xreplace({symbol:sp.Symbol(re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}',r'\1_\2',str(symbol)))
-                                for symbol in result.free_symbols})
+        result = result.xreplace({
+            symbol: sp.Symbol(
+                re.sub(r'([A-Za-z]\w*)_\{([A-Za-z0-9_]+)\}', r'\1_\2', str(symbol))
+            )
+            for symbol in result.free_symbols
+        })
         return _restore_declared(result)
 
     ascii_text = re.sub(
@@ -206,8 +241,11 @@ def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
     ascii_text = re.sub(r"10\^\{([+-]?\d+)\}", r"10**(\1)", ascii_text)
     if "\\" in ascii_text or "{" in ascii_text:
         return latex_expression(latex_text)
-    # BUG-016: Allow `lambda` as a valid mathematical symbol name without Python syntax error.
-    text = re.sub(r"\blambda\b", "__invar_sym_lambda__", ascii_text)
+    # ARCH-014 (BUG-022): Temporarily escape Python keyword `lambda` for ast.parse,
+    # then restore exact mathematical symbol `sp.Symbol("lambda")` in convert().
+    # Also insert explicit `*` for implicit products after `)` like `(a + b) P_0`.
+    ascii_text = re.sub(r"\)\s+(?=[A-Za-z_])", ") * ", ascii_text)
+    text = re.sub(r"\blambda\b", "__invar_kw_lambda__", ascii_text)
     functions = {
         "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
         "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
@@ -221,7 +259,7 @@ def parse_expression(text: str, *, declared_symbols: set[str] | None = None):
 
     def convert(node):
         if isinstance(node, ast.Name):
-            name = "lambda" if node.id == "__invar_sym_lambda__" else node.id
+            name = "lambda" if node.id == "__invar_kw_lambda__" else node.id
             if name in declared:
                 return sp.Symbol(name)
             return {"pi": sp.pi, "e": sp.E, "True": sp.true, "False": sp.false}.get(name, sp.Symbol(name))

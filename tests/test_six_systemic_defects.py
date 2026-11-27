@@ -271,8 +271,10 @@ def test_fix3_post_projection_diagnostic_resync():
 
     buf = Buf([1.0, 11.0, 0.0, 0.541666])
     ns["layer_1_step"](buf, 0.1)
-    assert buf.data[0] >= 0.0 and buf.data[1] >= 0.0 and buf.data[2] >= 0.0
+    # ARCH-001: sanitize_intrinsics preserves exact kernel dynamics without injecting silent projection.
+    assert abs(buf.data[0] - (1.0 - 0.1 * 100.0 * 1.0)) < 1e-12
     assert abs((buf.data[0] + buf.data[1] + buf.data[2]) - 12.0) < 1e-9
+    assert abs(buf.data[3] - (buf.data[0] + 0.5 * buf.data[1]) / 12.0) < 1e-12
     expected_aec = (buf.data[0] + 0.5 * buf.data[1]) / 12.0
     assert abs(buf.data[3] - expected_aec) < 1e-12
 

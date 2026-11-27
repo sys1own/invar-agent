@@ -221,10 +221,10 @@ class CanonicalResearchIR(StrictModel):
     blake3_receipt: str = ""
     meaningfulness_certificates: dict[str, dict[str, Any]] = Field(default_factory=dict)
     meaningfulness_certificate: dict[str, Any] | None = None
-    epistemic_verdict: Literal["VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY", "VERIFIED_FALSIFICATION", "INCONCLUSIVE_UNVERIFIED"] | None = None
+    epistemic_verdict: Literal["VERIFIED_DISCOVERY", "VERIFIED_BOUNDARY_DISCOVERY", "VERIFIED_FALSIFICATION", "INCONCLUSIVE_UNVERIFIED", "USER_MODIFIED_UNVERIFIED"] | None = None
     certified_valid_domain: dict[str, Any] | None = None
     negative_constraints: list[dict[str, Any]] = Field(default_factory=list)
-    research_import_role: Literal["POSITIVE_EVIDENCE", "NEGATIVE_CONSTRAINT_ONLY", "LEGACY_UNVERIFIED"] = "LEGACY_UNVERIFIED"
+    research_import_role: Literal["POSITIVE_EVIDENCE", "NEGATIVE_CONSTRAINT_ONLY", "LEGACY_UNVERIFIED", "USER_MODIFIED_UNVERIFIED"] = "LEGACY_UNVERIFIED"
 
     @classmethod
     def from_sci_ir(cls, sealed_or_ir: Any) -> "CanonicalResearchIR":

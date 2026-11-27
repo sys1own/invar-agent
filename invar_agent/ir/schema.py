@@ -251,6 +251,7 @@ class EquationSpec(BaseModel):
     target_slot: int = 0
     expr: ExprNode
     source_text: str = ""
+    reduction: Optional[Literal["TRAJECTORY_MAX", "TRAJECTORY_MIN", "TRAJECTORY_FINAL"]] = None
 
 
 class ObligationSpec(BaseModel):
@@ -386,6 +387,7 @@ class RawEquationDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str
     expr_text: str
+    reduction: Optional[Literal["TRAJECTORY_MAX", "TRAJECTORY_MIN", "TRAJECTORY_FINAL"]] = None
 
 
 class RawObligationDraft(BaseModel):
